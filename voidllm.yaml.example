@@ -1,0 +1,190 @@
+# =============================================================================
+# VoidLLM Configuration
+# =============================================================================
+#
+# Environment variable interpolation: use ${VAR} or ${VAR:-default}
+# All secrets should be passed via environment variables, not hardcoded here.
+#
+# Config file location (in order of precedence):
+#   1. --config flag
+#   2. VOIDLLM_CONFIG env var
+#   3. ./voidllm.yaml
+#   4. /etc/voidllm/voidllm.yaml
+
+
+# =============================================================================
+# SERVER
+# =============================================================================
+
+server:
+  # Proxy port — OpenAI-compatible API (/v1/*)
+  # This is the hot path. LLM clients point here.
+  proxy:
+    port: 8080
+    read_timeout: 30s
+    write_timeout: 120s      # Must be high for streaming responses
+    idle_timeout: 60s
+
+  # Admin port — Admin API (/api/v1/*), UI (/), metrics, health
+  # port: 0 means everything runs on the proxy port (default, recommended for simple setups)
+  # Set to e.g. 8443 to isolate admin traffic (recommended for production)
+  admin:
+    port: 0
+    tls:
+      enabled: false
+      cert: /certs/tls.crt
+      key:  /certs/tls.key
+
+
+# =============================================================================
+# DATABASE
+# =============================================================================
+
+database:
+  # driver: sqlite (default) | postgres
+  driver: sqlite
+
+  # SQLite: path to the database file
+  # Use a persistent volume in Docker/Kubernetes
+  dsn: /data/voidllm.db
+
+  # PostgreSQL example:
+  # driver: postgres
+  # dsn: postgres://voidllm:${DB_PASSWORD}@postgres:5432/voidllm?sslmode=require
+
+  # Connection pool (ignored for SQLite)
+  max_open_conns: 25
+  max_idle_conns: 5
+  conn_max_lifetime: 5m
+
+
+# =============================================================================
+# CACHE
+# =============================================================================
+
+cache:
+  # How long to keep keys/models in the in-memory cache before refreshing from DB
+  # Lower = more responsive to changes, higher = less DB load
+  key_ttl:   30s
+  model_ttl: 60s
+  alias_ttl: 60s
+
+
+# =============================================================================
+# REDIS (optional)
+# =============================================================================
+# Only needed for multi-instance deployments.
+# Enables: distributed rate limiting, instant cache invalidation across instances.
+# Without Redis: rate limits and cache are per-instance (fine for single instance).
+
+redis:
+  enabled: false
+  url: redis://:${REDIS_PASSWORD}@redis:6379/0
+  # url: redis://redis:6379/0     # no password
+
+  # Prefix for all VoidLLM keys in Redis (useful if Redis is shared)
+  key_prefix: voidllm:
+
+
+# =============================================================================
+# MODELS
+# =============================================================================
+# Static model registry. Models defined here are loaded at startup.
+# Models can also be managed via the Admin API (stored in DB).
+# DB models take precedence over YAML models on name collision.
+#
+# Supported providers:
+#   vllm       — OpenAI-compatible, direct passthrough
+#   openai     — OpenAI API, direct passthrough
+#   anthropic  — Anthropic API, request/response translation applied
+#   azure      — Azure OpenAI, URL mapping applied
+#   custom     — Any OpenAI-compatible endpoint, direct passthrough
+
+models:
+  - name: gpt-oss-120b
+    provider: vllm
+    base_url: http://vllm-large:8000/v1
+    api_key: ${VLLM_LARGE_KEY}       # Optional, depends on upstream config
+    aliases:
+      - large
+      - default
+    max_context_tokens: 128000
+    pricing:
+      input_per_1m:  0.50
+      output_per_1m: 1.50
+
+  - name: gpt-oss-20b
+    provider: vllm
+    base_url: http://vllm-small:8000/v1
+    api_key: ${VLLM_SMALL_KEY}
+    aliases:
+      - small
+      - fast
+    max_context_tokens: 32000
+    pricing:
+      input_per_1m:  0.10
+      output_per_1m: 0.30
+
+  - name: claude-sonnet
+    provider: anthropic
+    base_url: https://api.anthropic.com
+    api_key: ${ANTHROPIC_KEY}
+    aliases:
+      - smart
+    max_context_tokens: 200000
+    pricing:
+      input_per_1m:  3.00
+      output_per_1m: 15.00
+
+  - name: gpt-4o-azure
+    provider: azure
+    base_url: https://mycompany.openai.azure.com
+    api_key: ${AZURE_OPENAI_KEY}
+    # Azure requires deployment name, passed via base_url or model name mapping
+    azure_deployment: gpt-4o
+    azure_api_version: "2024-02-01"
+    max_context_tokens: 128000
+
+  - name: text-embedding-3-small
+    provider: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_KEY}
+    aliases:
+      - embedding
+      - embed
+
+
+# =============================================================================
+# SETTINGS
+# =============================================================================
+
+settings:
+  # Bootstrap admin key — used ONLY when the database is empty (first startup).
+  # After first startup, create a proper user with system_admin role and remove this.
+  # Must be at least 32 characters.
+  admin_key: ${VOIDLLM_ADMIN_KEY}
+
+  # Encryption key for upstream API keys stored in the database.
+  # AES-256-GCM. Must be exactly 32 bytes (256 bits), base64-encoded.
+  # Generate with: openssl rand -base64 32
+  # Changing this key will invalidate all stored upstream API keys.
+  encryption_key: ${VOIDLLM_ENCRYPTION_KEY}
+
+  # Enterprise license key (leave empty for OSS mode)
+  license: ${VOIDLLM_LICENSE}
+
+  # Async usage logging
+  usage:
+    buffer_size:    1000    # Max events in buffer before flush
+    flush_interval: 5s      # Flush to DB at least every N seconds
+    # If buffer is full, new events are dropped (never blocks the hot path)
+    drop_on_full: true
+
+  # Token counting for soft pre-checks
+  # Uses tiktoken-go estimation (±3-5% accuracy for non-OpenAI models)
+  token_counting:
+    enabled: true
+
+  # Soft limit behavior: warn in logs when a key/team/org is approaching their limit
+  # Hard limits are always enforced via DB aggregate
+  soft_limit_threshold: 0.9   # Warn at 90% of limit

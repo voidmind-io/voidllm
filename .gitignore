@@ -1,0 +1,41 @@
+# Binaries
+bin/
+tmp/
+
+# Build output
+ui/dist/
+
+# Config (never commit secrets)
+voidllm.yaml
+*.license.jwt
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Environment
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Node
+node_modules/
+
+# Claude Code (auto-generated, never commit)
+.claude/
+
+# Binary (built by go build)
+/voidllm

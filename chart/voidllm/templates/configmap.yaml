@@ -1,0 +1,126 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "voidllm.fullname" . }}-config
+  labels:
+    {{- include "voidllm.labels" . | nindent 4 }}
+data:
+  voidllm.yaml: |
+    server:
+      proxy:
+        port: {{ .Values.config.server.proxy.port }}
+        read_timeout: {{ .Values.config.server.proxy.readTimeout }}
+        write_timeout: {{ .Values.config.server.proxy.writeTimeout }}
+        idle_timeout: {{ .Values.config.server.proxy.idleTimeout }}
+        max_request_body: {{ .Values.config.server.proxy.maxRequestBody }}
+        max_response_body: {{ .Values.config.server.proxy.maxResponseBody }}
+        max_stream_duration: {{ .Values.config.server.proxy.maxStreamDuration }}
+      {{- if gt (int .Values.config.server.admin.port) 0 }}
+      admin:
+        port: {{ .Values.config.server.admin.port }}
+        {{- if .Values.config.server.admin.tls.enabled }}
+        tls:
+          enabled: true
+          cert: {{ .Values.config.server.admin.tls.cert }}
+          key: {{ .Values.config.server.admin.tls.key }}
+        {{- end }}
+      {{- end }}
+
+    database:
+      {{- if .Values.postgresql.enabled }}
+      driver: postgres
+      {{- else }}
+      driver: {{ .Values.config.database.driver }}
+      {{- end }}
+      {{- if .Values.postgresql.enabled }}
+      dsn: postgres://{{ .Values.postgresql.auth.username }}:${POSTGRES_PASSWORD}@{{ include "voidllm.fullname" . }}-postgresql:5432/{{ .Values.postgresql.auth.database }}?sslmode=disable
+      {{- else }}
+      dsn: {{ .Values.config.database.dsn }}
+      {{- end }}
+      {{- if or .Values.postgresql.enabled (eq .Values.config.database.driver "postgres") }}
+      max_open_conns: {{ .Values.config.database.maxOpenConns }}
+      max_idle_conns: {{ .Values.config.database.maxIdleConns }}
+      conn_max_lifetime: {{ .Values.config.database.connMaxLifetime }}
+      {{- end }}
+
+    cache:
+      key_ttl: {{ .Values.config.cache.keyTTL }}
+      model_ttl: {{ .Values.config.cache.modelTTL }}
+      alias_ttl: {{ .Values.config.cache.aliasTTL }}
+
+    {{- if .Values.redis.enabled }}
+    redis:
+      enabled: true
+      url: redis://{{ include "voidllm.fullname" . }}-redis-master:6379
+      key_prefix: {{ .Values.config.redis.keyPrefix | default "voidllm:" }}
+    {{- end }}
+
+    logging:
+      level: {{ .Values.config.logging.level }}
+      format: {{ .Values.config.logging.format }}
+
+    settings:
+      admin_key: ${VOIDLLM_ADMIN_KEY}
+      encryption_key: ${VOIDLLM_ENCRYPTION_KEY}
+      {{- if .Values.secrets.license }}
+      license: ${VOIDLLM_LICENSE}
+      {{- end }}
+      bootstrap:
+        org_name: {{ .Values.config.settings.bootstrap.orgName | quote }}
+        {{- if .Values.config.settings.bootstrap.orgSlug }}
+        org_slug: {{ .Values.config.settings.bootstrap.orgSlug | quote }}
+        {{- end }}
+        admin_email: {{ .Values.config.settings.bootstrap.adminEmail | quote }}
+      usage:
+        buffer_size: {{ .Values.config.settings.usage.bufferSize }}
+        flush_interval: {{ .Values.config.settings.usage.flushInterval }}
+        drop_on_full: {{ .Values.config.settings.usage.dropOnFull }}
+      token_counting:
+        enabled: {{ .Values.config.settings.tokenCounting.enabled }}
+      soft_limit_threshold: {{ .Values.config.settings.softLimitThreshold }}
+      {{- if .Values.config.settings.audit.enabled }}
+      audit:
+        enabled: true
+        buffer_size: {{ .Values.config.settings.audit.bufferSize }}
+        flush_interval: {{ .Values.config.settings.audit.flushInterval }}
+      {{- end }}
+      {{- if .Values.config.settings.circuitBreaker.enabled }}
+      circuit_breaker:
+        enabled: true
+        threshold: {{ .Values.config.settings.circuitBreaker.threshold }}
+        timeout: {{ .Values.config.settings.circuitBreaker.timeout }}
+        half_open_max: {{ .Values.config.settings.circuitBreaker.halfOpenMax }}
+      {{- end }}
+      {{- if .Values.config.settings.otel.enabled }}
+      otel:
+        enabled: true
+        endpoint: {{ .Values.config.settings.otel.endpoint | quote }}
+        insecure: {{ .Values.config.settings.otel.insecure }}
+        sample_rate: {{ .Values.config.settings.otel.sampleRate }}
+      {{- end }}
+      {{- if .Values.config.settings.sso.enabled }}
+      sso:
+        enabled: true
+        issuer: {{ .Values.config.settings.sso.issuer | quote }}
+        client_id: {{ .Values.config.settings.sso.clientId | quote }}
+        client_secret: ${VOIDLLM_SSO_CLIENT_SECRET}
+        redirect_url: {{ .Values.config.settings.sso.redirectUrl | quote }}
+        scopes:
+          {{- toYaml .Values.config.settings.sso.scopes | nindent 10 }}
+        {{- if .Values.config.settings.sso.allowedDomains }}
+        allowed_domains:
+          {{- toYaml .Values.config.settings.sso.allowedDomains | nindent 10 }}
+        {{- end }}
+        default_role: {{ .Values.config.settings.sso.defaultRole | quote }}
+        {{- if .Values.config.settings.sso.defaultOrg }}
+        default_org: {{ .Values.config.settings.sso.defaultOrg | quote }}
+        {{- end }}
+        auto_provision: {{ .Values.config.settings.sso.autoProvision }}
+        group_sync: {{ .Values.config.settings.sso.groupSync }}
+        group_claim: {{ .Values.config.settings.sso.groupClaim | quote }}
+      {{- end }}
+
+    {{- if .Values.config.models }}
+    models:
+      {{- toYaml .Values.config.models | nindent 6 }}
+    {{- end }}

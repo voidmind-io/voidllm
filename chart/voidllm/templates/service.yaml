@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "voidllm.fullname" . }}
+  labels:
+    {{- include "voidllm.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+    {{- if gt (int .Values.config.server.admin.port) 0 }}
+    - port: {{ .Values.config.server.admin.port }}
+      targetPort: admin
+      protocol: TCP
+      name: admin
+    {{- end }}
+  selector:
+    {{- include "voidllm.selectorLabels" . | nindent 4 }}

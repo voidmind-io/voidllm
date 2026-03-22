@@ -1,0 +1,225 @@
+# -- Number of replicas. >1 requires PostgreSQL + Redis (Enterprise).
+replicaCount: 1
+
+image:
+  repository: ghcr.io/voidmind/voidllm
+  # -- Overrides the image tag (default: Chart appVersion)
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Create a ServiceAccount
+  create: true
+  annotations: {}
+  # -- Name override (default: release fullname)
+  name: ""
+
+# ---------------------------------------------------------------------------
+# VoidLLM application configuration (rendered as voidllm.yaml ConfigMap)
+# ---------------------------------------------------------------------------
+config:
+  server:
+    proxy:
+      port: 8080
+      readTimeout: 30s
+      writeTimeout: 120s
+      idleTimeout: 60s
+      maxRequestBody: 20971520    # 20 MB
+      maxResponseBody: 52428800   # 50 MB
+      maxStreamDuration: 5m
+    admin:
+      # -- Separate admin port. 0 = combined mode (everything on proxy port).
+      port: 0
+      tls:
+        # -- Enable TLS on the admin port. Requires cert and key paths.
+        enabled: false
+        cert: /certs/tls.crt
+        key: /certs/tls.key
+
+  database:
+    # -- Database driver: sqlite or postgres
+    driver: sqlite
+    # -- SQLite path (ignored when postgres). PG example:
+    #    postgres://user:pass@host:5432/voidllm?sslmode=require
+    dsn: /data/voidllm.db
+    maxOpenConns: 25
+    maxIdleConns: 5
+    connMaxLifetime: 5m
+
+  cache:
+    keyTTL: 30s
+    modelTTL: 60s
+    aliasTTL: 60s
+
+  redis:
+    # -- Key prefix for all Redis keys. Used when redis subchart is enabled.
+    keyPrefix: "voidllm:"
+
+  logging:
+    level: info
+    format: json
+
+  settings:
+    bootstrap:
+      orgName: "Default"
+      orgSlug: ""
+      adminEmail: "admin@voidllm.local"
+    usage:
+      bufferSize: 1000
+      flushInterval: 5s
+      dropOnFull: true
+    tokenCounting:
+      enabled: true
+    softLimitThreshold: 0.9
+    audit:
+      # -- Enable enterprise audit logging (requires license with audit_logs feature)
+      enabled: false
+      bufferSize: 500
+      flushInterval: 5s
+    circuitBreaker:
+      # -- Enable per-model circuit breaker for upstream errors
+      enabled: false
+      threshold: 5
+      timeout: 30s
+      halfOpenMax: 1
+    otel:
+      # -- Enable OpenTelemetry tracing (requires license with otel_tracing feature)
+      enabled: false
+      endpoint: "localhost:4317"
+      insecure: false
+      sampleRate: 1.0
+    sso:
+      # -- Enable SSO/OIDC (requires license with sso_oidc feature)
+      enabled: false
+      issuer: ""
+      clientId: ""
+      redirectUrl: ""
+      scopes: ["openid", "email", "profile"]
+      allowedDomains: []
+      defaultRole: "member"
+      defaultOrg: ""
+      autoProvision: true
+      groupSync: false
+      groupClaim: "groups"
+
+  # -- Static model definitions (optional — can be managed via Admin API)
+  models: []
+  # - name: gpt-4o
+  #   provider: openai
+  #   base_url: https://api.openai.com/v1
+  #   api_key: ${OPENAI_KEY}
+  #   aliases: [default]
+
+# ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+secrets:
+  # -- Admin bootstrap key (≥32 chars). Auto-generated if empty.
+  adminKey: ""
+  # -- AES-256-GCM encryption key (base64, 32 bytes). Auto-generated if empty.
+  encryptionKey: ""
+  # -- License key (optional, for Pro/Enterprise features)
+  license: ""
+  # -- SSO/OIDC client secret (required when SSO is enabled)
+  ssoClientSecret: ""
+  # -- Extra environment variables for model API keys
+  extraEnv: {}
+  # OPENAI_KEY: "sk-..."
+  # ANTHROPIC_KEY: "sk-ant-..."
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # kubernetes.io/ingress.class: nginx
+  # cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: voidllm.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  # - secretName: voidllm-tls
+  #   hosts:
+  #     - voidllm.example.com
+
+# ---------------------------------------------------------------------------
+# Persistence (SQLite only — ignored when database.driver=postgres)
+# ---------------------------------------------------------------------------
+persistence:
+  enabled: true
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+  size: 1Gi
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Resources & Scaling
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+autoscaling:
+  # -- Requires PostgreSQL + Redis for correct multi-instance operation.
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+
+# ---------------------------------------------------------------------------
+# Pod configuration
+# ---------------------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# ---------------------------------------------------------------------------
+# Optional subcharts
+# ---------------------------------------------------------------------------
+
+# -- Bitnami PostgreSQL subchart
+postgresql:
+  enabled: false
+  auth:
+    database: voidllm
+    username: voidllm
+    password: ""
+  primary:
+    persistence:
+      size: 10Gi
+
+# -- Bitnami Redis subchart (Enterprise feature)
+redis:
+  enabled: false
+  auth:
+    password: ""
+  architecture: standalone

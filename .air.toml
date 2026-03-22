@@ -1,0 +1,18 @@
+[build]
+  cmd = "go build -o ./tmp/voidllm ./cmd/voidllm"
+  bin = "./tmp/voidllm"
+  include_ext = ["go", "yaml"]
+  exclude_dir = ["ui", "tmp", "vendor", "docs", "enterprise"]
+  delay = 200
+
+[run]
+  args = ["--config", "voidllm.yaml"]
+
+[log]
+  time = false
+
+[color]
+  main = "magenta"
+  watcher = "cyan"
+  build = "yellow"
+  runner = "green"

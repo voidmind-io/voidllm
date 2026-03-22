@@ -1,0 +1,24 @@
+{{- if .Values.autoscaling.enabled }}
+{{/* WARNING: Multi-instance VoidLLM requires PostgreSQL + Redis (Enterprise).
+     Without Redis, rate limits and caches are per-process only. */}}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "voidllm.fullname" . }}
+  labels:
+    {{- include "voidllm.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "voidllm.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}

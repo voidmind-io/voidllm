@@ -1,0 +1,18 @@
+services:
+  voidllm:
+    build:
+      context: .
+      args:
+        VERSION: dev
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./voidllm.yaml:/etc/voidllm/voidllm.yaml:ro
+      - ./voidllm.license.jwt:/etc/voidllm/voidllm.license.jwt:ro
+      - voidllm_data:/data
+    environment:
+      - VOIDLLM_ADMIN_KEY=${VOIDLLM_ADMIN_KEY}
+      - VOIDLLM_ENCRYPTION_KEY=${VOIDLLM_ENCRYPTION_KEY}
+
+volumes:
+  voidllm_data:

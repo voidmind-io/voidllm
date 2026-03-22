@@ -1,0 +1,45 @@
+services:
+  voidllm:
+    image: voidmind/voidllm:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./voidllm.yaml:/etc/voidllm/voidllm.yaml:ro
+      - ./voidllm.license.jwt:/etc/voidllm/voidllm.license.jwt:ro
+    environment:
+      - VOIDLLM_ADMIN_KEY=${VOIDLLM_ADMIN_KEY}
+      - VOIDLLM_ENCRYPTION_KEY=${VOIDLLM_ENCRYPTION_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: voidllm
+      POSTGRES_USER: voidllm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voidllm"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

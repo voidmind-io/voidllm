@@ -1,0 +1,28 @@
+VoidLLM has been deployed!
+
+1. Get the application URL:
+{{- if .Values.ingress.enabled }}
+  {{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+  {{- end }}
+{{- else if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "voidllm.fullname" . }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo http://$NODE_IP:$NODE_PORT
+{{- else if contains "ClusterIP" .Values.service.type }}
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "voidllm.fullname" . }} 8080:{{ .Values.service.port }}
+  echo "Visit http://localhost:8080"
+{{- end }}
+
+2. Check the bootstrap credentials:
+  kubectl --namespace {{ .Release.Namespace }} logs deploy/{{ include "voidllm.fullname" . }} | grep "BOOTSTRAP"
+
+3. API documentation:
+  http://localhost:8080/api/docs
+
+4. Database: {{ .Values.config.database.driver }}
+{{- if .Values.postgresql.enabled }}
+   PostgreSQL subchart is enabled.
+{{- else if eq .Values.config.database.driver "sqlite" }}
+   SQLite with persistent volume at /data.
+{{- end }}

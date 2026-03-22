@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build UI (required for Go embed)
+        working-directory: ui
+        run: npm ci && npm run build
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install
+        working-directory: ui
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: ui
+        run: npx tsc --noEmit
+
+      - name: Lint
+        working-directory: ui
+        run: npm run lint
+
+      - name: Test
+        working-directory: ui
+        run: npm run test -- --run
+
+      - name: Build
+        working-directory: ui
+        run: npm run build
