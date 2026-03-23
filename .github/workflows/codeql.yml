@@ -24,10 +24,6 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - uses: github/codeql-action/init@480db559a14342288b67e54bd959dd52dc3ee68f # v3
-        with:
-          languages: ${{ matrix.language }}
-
       - if: matrix.language == 'go'
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
         with:
@@ -39,6 +35,13 @@ jobs:
           node-version: "20"
 
       - if: matrix.language == 'go'
-        run: cd ui && npm ci && npm run build && cd .. && go build ./...
+        run: cd ui && npm ci && npm run build && cd ..
+
+      - uses: github/codeql-action/init@480db559a14342288b67e54bd959dd52dc3ee68f # v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - if: matrix.language == 'go'
+        run: go build ./...
 
       - uses: github/codeql-action/analyze@480db559a14342288b67e54bd959dd52dc3ee68f # v3
