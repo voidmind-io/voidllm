@@ -10,6 +10,8 @@ export interface OrgListItem {
   monthly_token_limit: number
   requests_per_minute: number
   requests_per_day: number
+  member_count: number
+  team_count: number
   created_at: string
   updated_at: string
 }

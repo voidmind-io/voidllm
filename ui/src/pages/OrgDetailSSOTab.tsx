@@ -58,7 +58,7 @@ interface ReadOnlyFieldProps {
 function ReadOnlyField({ label, value }: ReadOnlyFieldProps) {
   return (
     <div>
-      <p className="text-xs font-medium text-text-tertiary uppercase tracking-wider mb-1">
+      <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-1">
         {label}
       </p>
       <div className="text-sm text-text-primary">{value}</div>
@@ -356,185 +356,196 @@ function SSOForm({ orgId, initial, hasExistingConfig, onDelete }: SSOFormProps) 
   return (
     <>
       <form onSubmit={handleSubmit} noValidate className="space-y-6">
-        {/* Enabled toggle */}
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-sm font-medium text-text-secondary">Enable SSO</p>
-            <p className="text-xs text-text-tertiary mt-0.5">
-              Require users to authenticate via OIDC
-            </p>
-          </div>
-          <Toggle
-            checked={form.enabled}
-            onChange={patch('enabled')}
-            disabled={isPending}
-          />
-        </div>
-
-        <div className="h-px bg-border" />
-
-        {/* Issuer URL + Test */}
-        <div className="space-y-1.5">
-          <label className="block text-sm font-medium text-text-secondary">
-            Issuer URL
-          </label>
-          <div className="flex gap-2 items-start">
-            <div className="flex-1">
-              <input
-                type="url"
-                value={form.issuer}
-                onChange={patchInput('issuer')}
-                placeholder="https://accounts.google.com"
-                disabled={isPending}
-                aria-invalid={!!errors.issuer}
-                className={[
-                  'block w-full rounded-md bg-bg-secondary border px-3 py-2 text-sm text-text-primary placeholder:text-text-tertiary',
-                  'transition-colors duration-150 focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/40',
-                  errors.issuer
-                    ? 'border-error focus:border-error focus:ring-error/40'
-                    : 'border-border',
-                  isPending ? 'opacity-50 cursor-not-allowed bg-bg-tertiary' : '',
-                ].join(' ')}
-              />
-              {errors.issuer && (
-                <p role="alert" className="mt-1.5 text-xs text-error">
-                  {errors.issuer}
-                </p>
-              )}
+        {/* Card 1: Status */}
+        <div className="bg-bg-secondary rounded-xl border border-border p-6">
+          <h3 className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-4">
+            Status
+          </h3>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-text-secondary">Enable SSO</p>
+              <p className="text-xs text-text-tertiary mt-0.5">
+                Require users to authenticate via OIDC
+              </p>
             </div>
-            <div className="flex items-center gap-2 pt-0.5">
-              <Button
-                type="button"
-                variant="secondary"
-                size="sm"
-                onClick={handleTest}
-                loading={activeTestStatus === 'loading'}
-                disabled={isPending || activeTestStatus === 'loading'}
-              >
-                Test
-              </Button>
-              <TestConnectionBadge status={activeTestStatus} message={activeTestMessage} />
+            <Toggle
+              checked={form.enabled}
+              onChange={patch('enabled')}
+              disabled={isPending}
+            />
+          </div>
+        </div>
+
+        {/* Card 2: Provider Configuration */}
+        <div className="bg-bg-secondary rounded-xl border border-border p-6 space-y-4">
+          <h3 className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-4">
+            Provider Configuration
+          </h3>
+
+          {/* Issuer URL + Test */}
+          <div className="space-y-1.5">
+            <label className="block text-sm font-medium text-text-secondary">
+              Issuer URL
+            </label>
+            <div className="flex gap-2 items-start">
+              <div className="flex-1">
+                <input
+                  type="url"
+                  value={form.issuer}
+                  onChange={patchInput('issuer')}
+                  placeholder="https://accounts.google.com"
+                  disabled={isPending}
+                  aria-invalid={!!errors.issuer}
+                  className={[
+                    'block w-full rounded-md bg-bg-secondary border px-3 py-2 text-sm text-text-primary placeholder:text-text-tertiary',
+                    'transition-colors duration-150 focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/40',
+                    errors.issuer
+                      ? 'border-error focus:border-error focus:ring-error/40'
+                      : 'border-border',
+                    isPending ? 'opacity-50 cursor-not-allowed bg-bg-tertiary' : '',
+                  ].join(' ')}
+                />
+                {errors.issuer && (
+                  <p role="alert" className="mt-1.5 text-xs text-error">
+                    {errors.issuer}
+                  </p>
+                )}
+              </div>
+              <div className="flex items-center gap-2 pt-0.5">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={handleTest}
+                  loading={activeTestStatus === 'loading'}
+                  disabled={isPending || activeTestStatus === 'loading'}
+                >
+                  Test
+                </Button>
+                <TestConnectionBadge status={activeTestStatus} message={activeTestMessage} />
+              </div>
             </div>
-          </div>
-          <p className="text-xs text-text-tertiary">
-            The OIDC provider's issuer URL. Used to fetch the discovery document.
-          </p>
-        </div>
-
-        {/* Client ID */}
-        <Input
-          label="Client ID"
-          value={form.clientId}
-          onChange={patchInput('clientId')}
-          placeholder="your-client-id"
-          error={errors.clientId}
-          disabled={isPending}
-          className="font-mono"
-        />
-
-        {/* Client Secret */}
-        <Input
-          label="Client Secret"
-          type="password"
-          value={form.clientSecret}
-          onChange={patchInput('clientSecret')}
-          placeholder={initial.clientSecret === '' && hasExistingConfig ? '••••••••' : ''}
-          description={
-            hasExistingConfig
-              ? 'Leave blank to keep the existing secret.'
-              : undefined
-          }
-          disabled={isPending}
-          className="font-mono"
-        />
-
-        {/* Redirect URL */}
-        <Input
-          label="Redirect URL"
-          type="url"
-          value={form.redirectUrl}
-          onChange={patchInput('redirectUrl')}
-          placeholder={DEFAULT_REDIRECT_URL}
-          description="The callback URL registered with your identity provider."
-          disabled={isPending}
-          className="font-mono text-xs"
-        />
-
-        {/* Scopes */}
-        <Input
-          label="Scopes"
-          value={form.scopes}
-          onChange={patchInput('scopes')}
-          placeholder="openid, email, profile"
-          description="Comma-separated list of OAuth scopes to request."
-          disabled={isPending}
-        />
-
-        {/* Allowed Domains */}
-        <Input
-          label="Allowed Domains"
-          value={form.allowedDomains}
-          onChange={patchInput('allowedDomains')}
-          placeholder="example.com, acme.org"
-          description="Comma-separated. Leave blank to allow all domains."
-          disabled={isPending}
-        />
-
-        <div className="h-px bg-border" />
-
-        {/* Auto-Provision */}
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-sm font-medium text-text-secondary">Auto-Provision Users</p>
-            <p className="text-xs text-text-tertiary mt-0.5">
-              Automatically create accounts for new SSO users
+            <p className="text-xs text-text-tertiary">
+              The OIDC provider's issuer URL. Used to fetch the discovery document.
             </p>
           </div>
-          <Toggle
-            checked={form.autoProvision}
-            onChange={patch('autoProvision')}
-            disabled={isPending}
-          />
-        </div>
 
-        {/* Default Role */}
-        <Select
-          label="Default Role"
-          options={DEFAULT_ROLE_OPTIONS}
-          value={form.defaultRole}
-          onChange={patch('defaultRole')}
-          disabled={isPending}
-        />
-
-        <div className="h-px bg-border" />
-
-        {/* Group Sync */}
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-sm font-medium text-text-secondary">Group Sync</p>
-            <p className="text-xs text-text-tertiary mt-0.5">
-              Sync user groups from the identity provider
-            </p>
-          </div>
-          <Toggle
-            checked={form.groupSync}
-            onChange={patch('groupSync')}
-            disabled={isPending}
-          />
-        </div>
-
-        {/* Group Claim — only visible when group sync is on */}
-        {form.groupSync && (
           <Input
-            label="Group Claim"
-            value={form.groupClaim}
-            onChange={patchInput('groupClaim')}
-            placeholder="groups"
-            description="The JWT claim that contains group memberships."
+            label="Client ID"
+            value={form.clientId}
+            onChange={patchInput('clientId')}
+            placeholder="your-client-id"
+            error={errors.clientId}
             disabled={isPending}
             className="font-mono"
           />
-        )}
+
+          <Input
+            label="Client Secret"
+            type="password"
+            value={form.clientSecret}
+            onChange={patchInput('clientSecret')}
+            placeholder={initial.clientSecret === '' && hasExistingConfig ? '••••••••' : ''}
+            description={
+              hasExistingConfig
+                ? 'Leave blank to keep the existing secret.'
+                : undefined
+            }
+            disabled={isPending}
+            className="font-mono"
+          />
+
+          <Input
+            label="Redirect URL"
+            type="url"
+            value={form.redirectUrl}
+            onChange={patchInput('redirectUrl')}
+            placeholder={DEFAULT_REDIRECT_URL}
+            description="The callback URL registered with your identity provider."
+            disabled={isPending}
+            className="font-mono text-xs"
+          />
+
+          <Input
+            label="Scopes"
+            value={form.scopes}
+            onChange={patchInput('scopes')}
+            placeholder="openid, email, profile"
+            description="Comma-separated list of OAuth scopes to request."
+            disabled={isPending}
+          />
+
+          <Input
+            label="Allowed Domains"
+            value={form.allowedDomains}
+            onChange={patchInput('allowedDomains')}
+            placeholder="example.com, acme.org"
+            description="Comma-separated. Leave blank to allow all domains."
+            disabled={isPending}
+          />
+        </div>
+
+        {/* Card 3: Provisioning */}
+        <div className="bg-bg-secondary rounded-xl border border-border p-6 space-y-4">
+          <h3 className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-4">
+            Provisioning
+          </h3>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-text-secondary">Auto-Provision Users</p>
+              <p className="text-xs text-text-tertiary mt-0.5">
+                Automatically create accounts for new SSO users
+              </p>
+            </div>
+            <Toggle
+              checked={form.autoProvision}
+              onChange={patch('autoProvision')}
+              disabled={isPending}
+            />
+          </div>
+
+          <Select
+            label="Default Role"
+            options={DEFAULT_ROLE_OPTIONS}
+            value={form.defaultRole}
+            onChange={patch('defaultRole')}
+            disabled={isPending}
+          />
+        </div>
+
+        {/* Card 4: Group Sync */}
+        <div className="bg-bg-secondary rounded-xl border border-border p-6 space-y-4">
+          <h3 className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-4">
+            Group Sync
+          </h3>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-text-secondary">Group Sync</p>
+              <p className="text-xs text-text-tertiary mt-0.5">
+                Sync user groups from the identity provider
+              </p>
+            </div>
+            <Toggle
+              checked={form.groupSync}
+              onChange={patch('groupSync')}
+              disabled={isPending}
+            />
+          </div>
+
+          {form.groupSync && (
+            <Input
+              label="Group Claim"
+              value={form.groupClaim}
+              onChange={patchInput('groupClaim')}
+              placeholder="groups"
+              description="The JWT claim that contains group memberships."
+              disabled={isPending}
+              className="font-mono"
+            />
+          )}
+        </div>
 
         {/* Actions */}
         <div className="flex items-center justify-between pt-2">
@@ -601,8 +612,8 @@ export default function OrgDetailSSOTab() {
   }
 
   return (
-    <div className="max-w-2xl space-y-6">
-      <div className="rounded-lg border border-border bg-bg-secondary">
+    <div className="max-w-3xl space-y-6">
+      <div className="rounded-xl border border-border bg-bg-secondary">
         <div className="px-6 py-4 border-b border-border flex items-center justify-between">
           <div>
             <h2 className="text-sm font-semibold text-text-primary">
@@ -653,7 +664,7 @@ export default function OrgDetailSSOTab() {
 
               {!globalSSO.isLoading && globalSSO.data && (
                 <div>
-                  <p className="text-xs font-medium text-text-tertiary uppercase tracking-wider mb-4">
+                  <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-4">
                     Global Config
                   </p>
                   <GlobalSSODisplay config={globalSSO.data} />

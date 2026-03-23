@@ -111,8 +111,12 @@ function OrgSettingsForm({ org }: OrgSettingsFormProps) {
   }
 
   return (
-    <form onSubmit={handleSubmit} noValidate className="p-6 space-y-6">
-      <div className="space-y-4">
+    <form onSubmit={handleSubmit} noValidate className="space-y-6">
+      {/* Card 1: Basic Information */}
+      <div className="bg-bg-secondary rounded-xl border border-border p-6 space-y-4">
+        <h3 className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-4">
+          Basic Information
+        </h3>
         <Input
           label="Name"
           value={form.name}
@@ -133,15 +137,11 @@ function OrgSettingsForm({ org }: OrgSettingsFormProps) {
         />
       </div>
 
-      <div>
-        <div className="flex items-center gap-3 mb-4">
-          <div className="h-px flex-1 bg-border" />
-          <span className="text-xs font-medium text-text-tertiary uppercase tracking-wider">
-            Limits
-          </span>
-          <div className="h-px flex-1 bg-border" />
-        </div>
-
+      {/* Card 2: Rate & Token Limits */}
+      <div className="bg-bg-secondary rounded-xl border border-border p-6 space-y-4">
+        <h3 className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-4">
+          Rate &amp; Token Limits
+        </h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <Input
             label="Daily Token Limit"
@@ -206,19 +206,18 @@ interface OrgSettingsCardProps {
 function OrgSettingsCard({ orgId }: OrgSettingsCardProps) {
   const { data: org, isLoading } = useOrg(orgId)
 
-  return (
-    <div className="rounded-lg border border-border bg-bg-secondary">
-      <div className="px-6 py-4 border-b border-border">
-        <h2 className="text-sm font-semibold text-text-primary">Organization</h2>
-      </div>
-
-      {isLoading || !org ? (
-        <div className="p-6 space-y-4">
-          <div className="h-4 w-32 rounded bg-bg-tertiary animate-pulse" />
+  if (isLoading || !org) {
+    return (
+      <div className="space-y-6">
+        {/* Basic Information skeleton */}
+        <div className="bg-bg-secondary rounded-xl border border-border p-6 space-y-4">
+          <div className="h-3 w-32 rounded bg-bg-tertiary animate-pulse" />
           <div className="h-9 w-full rounded bg-bg-tertiary animate-pulse" />
           <div className="h-9 w-full rounded bg-bg-tertiary animate-pulse" />
-          <div className="h-px bg-border" />
-          <div className="h-4 w-24 rounded bg-bg-tertiary animate-pulse" />
+        </div>
+        {/* Rate & Token Limits skeleton */}
+        <div className="bg-bg-secondary rounded-xl border border-border p-6 space-y-4">
+          <div className="h-3 w-40 rounded bg-bg-tertiary animate-pulse" />
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="h-9 rounded bg-bg-tertiary animate-pulse" />
             <div className="h-9 rounded bg-bg-tertiary animate-pulse" />
@@ -226,11 +225,11 @@ function OrgSettingsCard({ orgId }: OrgSettingsCardProps) {
             <div className="h-9 rounded bg-bg-tertiary animate-pulse" />
           </div>
         </div>
-      ) : (
-        <OrgSettingsForm key={org.id} org={org} />
-      )}
-    </div>
-  )
+      </div>
+    )
+  }
+
+  return <OrgSettingsForm key={org.id} org={org} />
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +240,7 @@ export default function OrgDetailSettingsTab() {
   const { orgId = '' } = useParams<{ orgId: string }>()
 
   return (
-    <div className="max-w-2xl space-y-6">
+    <div className="max-w-3xl">
       {orgId && <OrgSettingsCard orgId={orgId} />}
     </div>
   )

@@ -50,6 +50,8 @@ type orgResponse struct {
 	MonthlyTokenLimit int64   `json:"monthly_token_limit"`
 	RequestsPerMinute int     `json:"requests_per_minute"`
 	RequestsPerDay    int     `json:"requests_per_day"`
+	MemberCount       int     `json:"member_count"`
+	TeamCount         int     `json:"team_count"`
 	CreatedAt         string  `json:"created_at"`
 	UpdatedAt         string  `json:"updated_at"`
 	DeletedAt         *string `json:"deleted_at,omitempty"`
@@ -62,8 +64,9 @@ type paginatedOrgsResponse struct {
 	Cursor  string        `json:"next_cursor,omitempty"`
 }
 
-// orgToResponse converts a db.Org to its API wire representation.
-func orgToResponse(o *db.Org) orgResponse {
+// orgToResponse converts a db.OrgWithCounts to its API wire representation,
+// including the computed member_count and team_count fields.
+func orgToResponse(o *db.OrgWithCounts) orgResponse {
 	return orgResponse{
 		ID:                o.ID,
 		Name:              o.Name,
@@ -73,6 +76,8 @@ func orgToResponse(o *db.Org) orgResponse {
 		MonthlyTokenLimit: o.MonthlyTokenLimit,
 		RequestsPerMinute: o.RequestsPerMinute,
 		RequestsPerDay:    o.RequestsPerDay,
+		MemberCount:       o.MemberCount,
+		TeamCount:         o.TeamCount,
 		CreatedAt:         o.CreatedAt,
 		UpdatedAt:         o.UpdatedAt,
 		DeletedAt:         o.DeletedAt,
@@ -124,7 +129,7 @@ func (h *Handler) CreateOrg(c fiber.Ctx) error {
 		}
 	}
 
-	org, err := h.DB.CreateOrg(c.Context(), db.CreateOrgParams{
+	created, err := h.DB.CreateOrg(c.Context(), db.CreateOrgParams{
 		Name:              req.Name,
 		Slug:              req.Slug,
 		Timezone:          req.Timezone,
@@ -139,6 +144,12 @@ func (h *Handler) CreateOrg(c fiber.Ctx) error {
 		}
 		h.Log.ErrorContext(c.Context(), "create org", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to create organization")
+	}
+
+	org, err := h.DB.GetOrgWithCounts(c.Context(), created.ID)
+	if err != nil {
+		h.Log.ErrorContext(c.Context(), "create org: get with counts", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to retrieve organization")
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(orgToResponse(org))
@@ -170,7 +181,7 @@ func (h *Handler) GetOrg(c fiber.Ctx) error {
 		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "insufficient permissions")
 	}
 
-	org, err := h.DB.GetOrg(c.Context(), id)
+	org, err := h.DB.GetOrgWithCounts(c.Context(), id)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "organization not found")
@@ -214,7 +225,7 @@ func (h *Handler) ListOrgs(c fiber.Ctx) error {
 	includeDeleted := c.Query("include_deleted") == "true" && auth.HasRole(keyInfo.Role, auth.RoleSystemAdmin)
 
 	if !auth.HasRole(keyInfo.Role, auth.RoleSystemAdmin) {
-		org, err := h.DB.GetOrg(c.Context(), keyInfo.OrgID)
+		org, err := h.DB.GetOrgWithCounts(c.Context(), keyInfo.OrgID)
 		if err != nil {
 			if errors.Is(err, db.ErrNotFound) {
 				return c.JSON(paginatedOrgsResponse{Data: []orgResponse{}})
@@ -225,7 +236,7 @@ func (h *Handler) ListOrgs(c fiber.Ctx) error {
 		return c.JSON(paginatedOrgsResponse{Data: []orgResponse{orgToResponse(org)}})
 	}
 
-	orgs, err := h.DB.ListOrgs(c.Context(), p.Cursor, p.Limit+1, includeDeleted)
+	orgs, err := h.DB.ListOrgsWithCounts(c.Context(), p.Cursor, p.Limit+1, includeDeleted)
 	if err != nil {
 		h.Log.ErrorContext(c.Context(), "list orgs", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to list organizations")
@@ -289,7 +300,7 @@ func (h *Handler) UpdateOrg(c fiber.Ctx) error {
 		return apierror.BadRequest(c, "slug must be lowercase alphanumeric with hyphens, 2-63 characters")
 	}
 
-	org, err := h.DB.UpdateOrg(c.Context(), id, db.UpdateOrgParams{
+	_, err := h.DB.UpdateOrg(c.Context(), id, db.UpdateOrgParams{
 		Name:              req.Name,
 		Slug:              req.Slug,
 		Timezone:          req.Timezone,
@@ -314,6 +325,12 @@ func (h *Handler) UpdateOrg(c fiber.Ctx) error {
 		if pubErr := h.Redis.PublishInvalidation(c.Context(), voidredis.ChannelKeys, "org:"+id); pubErr != nil {
 			h.Log.ErrorContext(c.Context(), "publish key cache invalidation", slog.String("error", pubErr.Error()))
 		}
+	}
+
+	org, err := h.DB.GetOrgWithCounts(c.Context(), id)
+	if err != nil {
+		h.Log.ErrorContext(c.Context(), "update org: get with counts", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to retrieve organization")
 	}
 
 	return c.JSON(orgToResponse(org))
