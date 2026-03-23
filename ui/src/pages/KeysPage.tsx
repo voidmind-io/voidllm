@@ -153,10 +153,7 @@ function CreateKeyDialog({ open, onClose, onCreated, orgId }: CreateKeyDialogPro
       setNameError(undefined)
     }
 
-    if (keyType === 'user_key' && userTeams.length === 0) {
-      setTeamError('You must be a member of at least one team to create a user key')
-      hasError = true
-    } else if (keyType === 'user_key' && userTeams.length > 1 && !teamId) {
+    if (keyType === 'user_key' && userTeams.length > 1 && !teamId) {
       setTeamError('Select a team for this key')
       hasError = true
     } else if (keyType === 'team_key' && !teamId) {
