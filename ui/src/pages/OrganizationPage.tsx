@@ -10,13 +10,13 @@ export default function OrganizationPage() {
   const isOrgAdmin = me?.role === 'org_admin' || me?.role === 'system_admin'
 
   const tabs: Tab[] = [
-    { label: 'Settings', path: '/org/settings' },
     ...(isOrgAdmin
       ? [
-          { label: 'Users', path: '/org/users' },
+          { label: 'Members', path: '/org/users' },
           { label: 'Models', path: '/org/models' },
         ]
       : []),
+    { label: 'Settings', path: '/org/settings' },
   ]
 
   return (

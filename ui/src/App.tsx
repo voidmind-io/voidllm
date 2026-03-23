@@ -82,7 +82,7 @@ export default function App() {
                 <Route path="settings" element={<TeamSettingsTab />} />
               </Route>
               <Route path="org" element={<OrganizationPage />}>
-                <Route index element={<Navigate to="settings" replace />} />
+                <Route index element={<Navigate to="users" replace />} />
                 <Route path="settings" element={<SettingsPage />} />
                 <Route path="users" element={<OrgUsersPage />} />
                 <Route path="models" element={<ModelsAccessTab />} />

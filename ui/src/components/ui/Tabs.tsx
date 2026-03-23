@@ -13,7 +13,7 @@ export interface TabsProps {
 
 export function Tabs({ tabs }: TabsProps) {
   return (
-    <div className="flex gap-0 border-b border-border mb-6">
+    <div className="inline-flex gap-1 rounded-lg bg-bg-tertiary p-1 mb-6">
       {tabs.map(tab => (
         <NavLink
           key={tab.path}
@@ -21,10 +21,10 @@ export function Tabs({ tabs }: TabsProps) {
           end={tab.end ?? true}
           className={({ isActive }) =>
             cn(
-              'px-4 py-2.5 text-sm font-medium no-underline border-b-2 -mb-px transition-colors duration-200',
+              'px-4 py-2 text-sm font-medium rounded-md transition-all duration-200 no-underline',
               isActive
-                ? 'border-accent text-accent'
-                : 'border-transparent text-text-tertiary hover:text-text-secondary'
+                ? 'bg-bg-secondary text-text-primary shadow-sm'
+                : 'text-text-tertiary hover:text-text-secondary'
             )
           }
         >

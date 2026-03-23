@@ -301,3 +301,106 @@ func scanOrg(row *sql.Row) (*Org, error) {
 	}
 	return &o, nil
 }
+
+// OrgWithCounts extends Org with computed member and team counts.
+type OrgWithCounts struct {
+	Org
+	MemberCount int
+	TeamCount   int
+}
+
+// orgWithCountsBase is the SELECT expression used in all *WithCounts org queries.
+// Counts are computed via correlated subqueries. Placeholder positions are
+// dialect-specific: p(1)=cursor (optional), p(N)=limit for ListOrgsWithCounts;
+// or p(1)=org id for GetOrgWithCounts.
+const orgWithCountsBase = "SELECT o.id, o.name, o.slug, o.timezone, " +
+	"o.daily_token_limit, o.monthly_token_limit, " +
+	"o.requests_per_minute, o.requests_per_day, " +
+	"o.created_at, o.updated_at, o.deleted_at, " +
+	"(SELECT COUNT(*) FROM org_memberships WHERE org_id = o.id) AS member_count, " +
+	"(SELECT COUNT(*) FROM teams WHERE org_id = o.id AND deleted_at IS NULL) AS team_count " +
+	"FROM organizations o"
+
+// scanOrgWithCounts scans a single row from a *WithCounts query into an OrgWithCounts.
+func scanOrgWithCounts(rows interface {
+	Scan(...any) error
+}) (*OrgWithCounts, error) {
+	var o OrgWithCounts
+	err := rows.Scan(
+		&o.ID, &o.Name, &o.Slug, &o.Timezone,
+		&o.DailyTokenLimit, &o.MonthlyTokenLimit,
+		&o.RequestsPerMinute, &o.RequestsPerDay,
+		&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
+		&o.MemberCount, &o.TeamCount,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &o, nil
+}
+
+// ListOrgsWithCounts returns a page of organizations ordered by ID ascending,
+// each augmented with its total member count and active team count computed via
+// correlated subqueries. cursor is an exclusive lower bound on ID for keyset
+// pagination; pass "" to start from the beginning. limit controls the maximum
+// number of records returned. includeDeleted controls whether soft-deleted
+// organizations are included.
+func (d *DB) ListOrgsWithCounts(ctx context.Context, cursor string, limit int, includeDeleted bool) ([]OrgWithCounts, error) {
+	p := d.dialect.Placeholder
+	argN := 1
+	var conditions []string
+	var args []any
+
+	if !includeDeleted {
+		conditions = append(conditions, "o.deleted_at IS NULL")
+	}
+	if cursor != "" {
+		conditions = append(conditions, "o.id > "+p(argN))
+		args = append(args, cursor)
+		argN++
+	}
+
+	query := orgWithCountsBase
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY o.id ASC LIMIT " + p(argN)
+	args = append(args, limit)
+
+	rows, err := d.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("ListOrgsWithCounts query: %w", err)
+	}
+	defer rows.Close()
+
+	var orgs []OrgWithCounts
+	for rows.Next() {
+		o, scanErr := scanOrgWithCounts(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("ListOrgsWithCounts scan: %w", scanErr)
+		}
+		orgs = append(orgs, *o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListOrgsWithCounts rows: %w", err)
+	}
+
+	return orgs, nil
+}
+
+// GetOrgWithCounts retrieves an active organization by its ID along with its
+// total member count and active team count computed via correlated subqueries.
+// It returns ErrNotFound if the organization does not exist or has been soft-deleted.
+func (d *DB) GetOrgWithCounts(ctx context.Context, id string) (*OrgWithCounts, error) {
+	p := d.dialect.Placeholder
+
+	// p(1)=org id.
+	query := orgWithCountsBase + " WHERE o.id = " + p(1) + " AND o.deleted_at IS NULL"
+
+	row := d.sql.QueryRowContext(ctx, query, id)
+	o, err := scanOrgWithCounts(row)
+	if err != nil {
+		return nil, fmt.Errorf("GetOrgWithCounts %s: %w", id, translateError(err))
+	}
+	return o, nil
+}

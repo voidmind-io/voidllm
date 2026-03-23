@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useMemo, useState, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Table } from '../components/ui/Table'
@@ -12,6 +12,7 @@ import { Toggle } from '../components/ui/Toggle'
 import { KeyHint } from '../components/ui/KeyHint'
 import { TimeAgo } from '../components/ui/TimeAgo'
 import { CopyButton } from '../components/ui/CopyButton'
+import { StatCard } from '../components/ui/StatCard'
 import { useMe } from '../hooks/useMe'
 import { useAPIKeys, useCreateAPIKey, useDeleteAPIKey, useUpdateAPIKey, useRotateAPIKey } from '../hooks/useAPIKeys'
 import type { APIKeyResponse, CreateAPIKeyParams } from '../hooks/useAPIKeys'
@@ -55,6 +56,154 @@ function expiresAtFromOption(opt: string): string | undefined {
   const days: Record<string, number> = { '30d': 30, '90d': 90, '1y': 365 }
   if (opt === 'never' || !days[opt]) return undefined
   return new Date(Date.now() + days[opt] * 86400000).toISOString()
+}
+
+// ---------------------------------------------------------------------------
+// Inline SVG icons
+// ---------------------------------------------------------------------------
+
+function IconKey({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
+    </svg>
+  )
+}
+
+function IconCheck({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M20 6L9 17l-5-5" />
+    </svg>
+  )
+}
+
+function IconClock({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 6v6l4 2" />
+    </svg>
+  )
+}
+
+function IconPencil({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+    </svg>
+  )
+}
+
+function IconRefresh({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M1 4v6h6" />
+      <path d="M23 20v-6h-6" />
+      <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15" />
+    </svg>
+  )
+}
+
+function IconTrash({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="3 6 5 6 21 6" />
+      <path d="M19 6l-1 14H6L5 6" />
+      <path d="M10 11v6M14 11v6" />
+      <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+    </svg>
+  )
+}
+
+function IconCheckCircle({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+      <polyline points="22 4 12 14.01 9 11.01" />
+    </svg>
+  )
+}
+
+function IconChevronDown({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M6 9l6 6 6-6" />
+    </svg>
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -292,25 +441,23 @@ function CreateKeyDialog({ open, onClose, onCreated, orgId }: CreateKeyDialogPro
           disabled={createKey.isPending}
         />
 
-        {/* Advanced Limits */}
+        {/* Rate & Token Limits — collapsible */}
         <div className="border-t border-border pt-4">
           <button
             type="button"
-            className="flex items-center gap-2 text-sm text-text-secondary hover:text-text-primary transition-colors"
+            className="flex w-full items-center justify-between"
             onClick={() => setShowAdvancedLimits((v) => !v)}
             disabled={createKey.isPending}
           >
-            <svg
-              className={['h-4 w-4 transition-transform', showAdvancedLimits ? 'rotate-90' : ''].join(' ')}
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth={2}
-              aria-hidden="true"
-            >
-              <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-            </svg>
-            Set rate &amp; token limits
+            <span className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
+              Rate &amp; Token Limits
+            </span>
+            <IconChevronDown
+              className={[
+                'h-3.5 w-3.5 text-text-tertiary transition-transform duration-150',
+                showAdvancedLimits ? 'rotate-180' : '',
+              ].join(' ')}
+            />
           </button>
           {showAdvancedLimits && (
             <div className="mt-4 space-y-4">
@@ -354,24 +501,28 @@ function CreateKeyDialog({ open, onClose, onCreated, orgId }: CreateKeyDialogPro
           )}
         </div>
 
-        <div className="space-y-2">
-          <div className="flex items-center gap-3 border-t border-border pt-4">
+        {/* Model Access — collapsible */}
+        <div className="border-t border-border pt-4">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
+              Model Access
+            </span>
             <Toggle
               checked={restrictModels}
               onChange={setRestrictModels}
-              label="Restrict model access"
+              label="Restrict models"
               size="sm"
               disabled={createKey.isPending}
             />
           </div>
-          <p className="text-xs text-text-tertiary">
+          <p className="mt-2 text-xs text-text-tertiary">
             {restrictModels
               ? 'Only selected models will be accessible with this key.'
               : 'Key inherits model access from team and organization scope.'}
           </p>
 
           {restrictModels && (
-            <div className="space-y-1.5">
+            <div className="mt-3 space-y-1.5">
               {availableModels?.models && availableModels.models.length > 0 ? (
                 <div className="max-h-48 overflow-y-auto rounded-lg border border-border p-1.5">
                   {availableModels.models.map((modelName) => (
@@ -437,13 +588,21 @@ function KeyCreatedDialog({ keyValue, onClose }: KeyCreatedDialogProps) {
     <Dialog
       open={keyValue !== null}
       onClose={onClose}
-      title="API Key Created"
+      title="Key Created Successfully"
       closeOnBackdrop={false}
     >
-      <div className="space-y-4">
-        <div className="flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/5 px-3 py-2">
+      <div className="space-y-5">
+        {/* Success icon */}
+        <div className="flex justify-center">
+          <span className="flex h-14 w-14 items-center justify-center rounded-full bg-success/10">
+            <IconCheckCircle className="h-7 w-7 text-success" />
+          </span>
+        </div>
+
+        {/* Warning banner */}
+        <div className="flex items-start gap-2.5 rounded-lg border border-warning/25 bg-warning/5 px-3 py-2.5">
           <svg
-            className="h-4 w-4 shrink-0 text-warning"
+            className="mt-0.5 h-4 w-4 shrink-0 text-warning"
             fill="none"
             viewBox="0 0 24 24"
             stroke="currentColor"
@@ -456,18 +615,22 @@ function KeyCreatedDialog({ keyValue, onClose }: KeyCreatedDialogProps) {
               d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"
             />
           </svg>
-          <span className="text-xs text-warning">
-            This key will only be shown once. Copy it now.
+          <span className="text-xs leading-relaxed text-warning">
+            Copy this key now. You won&apos;t be able to see it again.
           </span>
         </div>
-        <div className="rounded-lg border border-border bg-bg-primary p-3 font-mono text-sm text-text-primary break-all">
-          {keyValue}
+
+        {/* Key display */}
+        <div className="rounded-lg border border-border bg-bg-primary px-4 py-3">
+          <p className="break-all font-mono text-sm leading-relaxed text-text-primary">
+            {keyValue}
+          </p>
         </div>
-        <div className="flex justify-end gap-2">
-          <CopyButton text={keyValue ?? ''} label="Copy Key" />
-          <Button variant="secondary" onClick={onClose}>
-            Close
-          </Button>
+
+        {/* Actions */}
+        <div className="flex items-center justify-end gap-2">
+          <CopyButton text={keyValue ?? ''} label="Copy Key" copiedLabel="Copied!" />
+          <Button onClick={onClose}>Done</Button>
         </div>
       </div>
     </Dialog>
@@ -665,12 +828,33 @@ export default function KeysPage() {
   const rotateKey = useRotateAPIKey(orgId)
   const { toast } = useToast()
 
+  const allKeys = useMemo(() => keys?.data ?? [], [keys?.data])
+
+  const [totalKeys, activeKeys, expiringSoon] = useMemo(() => {
+    // eslint-disable-next-line react-hooks/purity -- Date comparison is intentionally impure
+    const now = Date.now()
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000
+    const total = allKeys.length
+    const active = allKeys.filter((k) => {
+      if (!k.expires_at) return true
+      return new Date(k.expires_at).getTime() > now
+    }).length
+    const expiring = allKeys.filter((k) => {
+      if (!k.expires_at) return false
+      const exp = new Date(k.expires_at).getTime()
+      return exp > now && exp - now <= sevenDaysMs
+    }).length
+    return [total, active, expiring] as const
+  }, [allKeys])
+
   const columns: Column<APIKeyResponse>[] = [
     {
       key: 'key_hint',
       header: 'Key',
       render: (row) => (
-        <KeyHint hint={row.key_hint} />
+        <span className="font-mono text-xs">
+          <KeyHint hint={row.key_hint} />
+        </span>
       ),
     },
     {
@@ -708,31 +892,36 @@ export default function KeysPage() {
       render: (row) => {
         if (row.key_type === 'session_key') return null
         return (
-          <div className="flex items-center justify-end gap-1">
+          <div className="flex items-center justify-end gap-0.5">
             <Button
               variant="ghost"
               size="sm"
+              className="!px-1.5"
+              title="Edit key"
               onClick={() => setEditKey(row)}
               disabled={deleteKey.isPending || rotateKey.isPending}
             >
-              Edit
+              <IconPencil className="h-4 w-4" />
             </Button>
             <Button
               variant="ghost"
               size="sm"
+              className="!px-1.5"
+              title="Rotate key"
               onClick={() => setRotateKeyId(row.id)}
               disabled={deleteKey.isPending || rotateKey.isPending}
             >
-              Rotate
+              <IconRefresh className="h-4 w-4" />
             </Button>
             <Button
               variant="ghost"
               size="sm"
+              className="!px-1.5 text-error hover:text-error"
+              title="Revoke key"
               onClick={() => setRevokeKeyId(row.id)}
-              className="text-error hover:text-error"
               disabled={deleteKey.isPending || rotateKey.isPending}
             >
-              Revoke
+              <IconTrash className="h-4 w-4" />
             </Button>
           </div>
         )
@@ -776,6 +965,9 @@ export default function KeysPage() {
     })
   }
 
+  // Empty state (not loading, no keys, orgId resolved)
+  const showEmptyState = !isLoading && !!orgId && allKeys.length === 0 && !keys?.has_more
+
   return (
     <>
       <PageHeader
@@ -786,29 +978,64 @@ export default function KeysPage() {
         }
       />
 
-      <Table<APIKeyResponse>
-        columns={columns}
-        data={keys?.data ?? []}
-        keyExtractor={(row) => row.id}
-        loading={isLoading && !!orgId}
-        emptyMessage="No API keys found"
-        pagination={{
-          cursor: cursor ?? null,
-          hasMore: keys?.has_more ?? false,
-          hasPrevious: prevCursors.length > 0,
-          onNext: () => {
-            if (keys?.next_cursor) {
-              setPrevCursors((prev) => [...prev, cursor ?? ''])
-              setCursor(keys.next_cursor)
-            }
-          },
-          onPrevious: () => {
-            const prev = prevCursors[prevCursors.length - 1]
-            setPrevCursors((p) => p.slice(0, -1))
-            setCursor(prev || undefined)
-          },
-        }}
-      />
+      {/* Stat cards */}
+      <div className="grid grid-cols-3 gap-4 mb-6">
+        <StatCard
+          label="Total Keys"
+          value={totalKeys}
+          iconColor="purple"
+          icon={<IconKey className="h-4 w-4" />}
+        />
+        <StatCard
+          label="Active Keys"
+          value={activeKeys}
+          iconColor="green"
+          icon={<IconCheck className="h-4 w-4" />}
+        />
+        <StatCard
+          label="Expiring Soon"
+          value={expiringSoon}
+          iconColor="yellow"
+          icon={<IconClock className="h-4 w-4" />}
+        />
+      </div>
+
+      {showEmptyState ? (
+        <div className="flex flex-col items-center justify-center rounded-xl border border-border bg-bg-secondary py-16">
+          <span className="mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-bg-tertiary">
+            <IconKey className="h-7 w-7 text-text-tertiary" />
+          </span>
+          <h3 className="mb-1 text-base font-medium text-text-primary">No API keys yet</h3>
+          <p className="mb-6 text-sm text-text-secondary">
+            Create your first key to start using the proxy
+          </p>
+          <Button onClick={() => setShowCreateDialog(true)}>Create Key</Button>
+        </div>
+      ) : (
+        <Table<APIKeyResponse>
+          columns={columns}
+          data={allKeys}
+          keyExtractor={(row) => row.id}
+          loading={isLoading && !!orgId}
+          emptyMessage="No API keys found"
+          pagination={{
+            cursor: cursor ?? null,
+            hasMore: keys?.has_more ?? false,
+            hasPrevious: prevCursors.length > 0,
+            onNext: () => {
+              if (keys?.next_cursor) {
+                setPrevCursors((prev) => [...prev, cursor ?? ''])
+                setCursor(keys.next_cursor)
+              }
+            },
+            onPrevious: () => {
+              const prev = prevCursors[prevCursors.length - 1]
+              setPrevCursors((p) => p.slice(0, -1))
+              setCursor(prev || undefined)
+            },
+          }}
+        />
+      )}
 
       <CreateKeyDialog
         open={showCreateDialog}

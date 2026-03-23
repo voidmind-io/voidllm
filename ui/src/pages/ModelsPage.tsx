@@ -8,6 +8,7 @@ import { Button } from '../components/ui/Button'
 import { Input } from '../components/ui/Input'
 import { Select } from '../components/ui/Select'
 import { Toggle } from '../components/ui/Toggle'
+import { StatCard } from '../components/ui/StatCard'
 import {
   useModels,
   useCreateModel,
@@ -51,6 +52,59 @@ const BASE_URL_PLACEHOLDERS: Record<string, string> = {
   vllm: 'http://localhost:8000/v1',
   ollama: 'http://localhost:11434/v1',
   custom: 'https://your-endpoint/v1',
+}
+
+// ---------------------------------------------------------------------------
+// Icons
+// ---------------------------------------------------------------------------
+
+function IconLayers() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 2 2 7l10 5 10-5-10-5z" />
+      <path d="M2 17l10 5 10-5" />
+      <path d="M2 12l10 5 10-5" />
+    </svg>
+  )
+}
+
+function IconActivity() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+    </svg>
+  )
+}
+
+function IconPauseCircle() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="10" />
+      <line x1="10" y1="15" x2="10" y2="9" />
+      <line x1="14" y1="15" x2="14" y2="9" />
+    </svg>
+  )
+}
+
+function IconPencil() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+    </svg>
+  )
+}
+
+function IconTrash() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="3 6 5 6 21 6" />
+      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+      <path d="M10 11v6" />
+      <path d="M14 11v6" />
+      <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+    </svg>
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +616,10 @@ export default function ModelsPage() {
   const toggleModel = useToggleModel()
   const { toast } = useToast()
 
+  const allModels = models?.data ?? []
+  const activeCount = allModels.filter((m) => m.is_active).length
+  const inactiveCount = allModels.length - activeCount
+
   const columns: Column<ModelResponse>[] = [
     {
       key: 'name',
@@ -653,23 +711,24 @@ export default function ModelsPage() {
         if (row.source !== 'api') return null
         return (
           <div className="flex items-center justify-end gap-1">
-            <Button
-              variant="ghost"
-              size="sm"
+            <button
+              type="button"
               onClick={() => setEditModel(row)}
               disabled={deleteModel.isPending && deleteModelId === row.id}
+              title="Edit model"
+              className="p-1.5 rounded-md text-text-tertiary hover:text-text-primary hover:bg-bg-tertiary transition-colors disabled:opacity-40"
             >
-              Edit
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
+              <IconPencil />
+            </button>
+            <button
+              type="button"
               onClick={() => setDeleteModelId(row.id)}
-              className="text-error hover:text-error"
               disabled={deleteModel.isPending && deleteModelId === row.id}
+              title="Delete model"
+              className="p-1.5 rounded-md text-text-tertiary hover:text-error hover:bg-error/10 transition-colors disabled:opacity-40"
             >
-              Delete
-            </Button>
+              <IconTrash />
+            </button>
           </div>
         )
       },
@@ -703,9 +762,31 @@ export default function ModelsPage() {
         }
       />
 
+      {/* Stat cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+        <StatCard
+          label="Total Models"
+          value={isLoading ? '—' : allModels.length}
+          icon={<IconLayers />}
+          iconColor="purple"
+        />
+        <StatCard
+          label="Active"
+          value={isLoading ? '—' : activeCount}
+          icon={<IconActivity />}
+          iconColor="green"
+        />
+        <StatCard
+          label="Inactive"
+          value={isLoading ? '—' : inactiveCount}
+          icon={<IconPauseCircle />}
+          iconColor="yellow"
+        />
+      </div>
+
       <Table<ModelResponse>
         columns={columns}
-        data={models?.data ?? []}
+        data={allModels}
         keyExtractor={(row) => row.id}
         loading={isLoading}
         emptyMessage="No models configured"

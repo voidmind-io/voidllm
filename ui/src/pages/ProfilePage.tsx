@@ -13,6 +13,40 @@ function formatRole(role?: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// ConfigLabel — consistent section label style
+// ---------------------------------------------------------------------------
+
+function ConfigLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <p className="text-xs font-semibold text-text-tertiary uppercase tracking-wider mb-1">
+      {children}
+    </p>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// SectionCard — consistent card wrapper
+// ---------------------------------------------------------------------------
+
+interface SectionCardProps {
+  title: string
+  children: React.ReactNode
+}
+
+function SectionCard({ title, children }: SectionCardProps) {
+  return (
+    <div className="rounded-lg border border-border bg-bg-secondary">
+      <div className="px-6 py-4 border-b border-border">
+        <h2 className="text-sm font-semibold text-text-primary">{title}</h2>
+      </div>
+      <div className="p-6">
+        {children}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // EditProfileSection
 // ---------------------------------------------------------------------------
 
@@ -54,11 +88,8 @@ function EditProfileSection({ userId, initialDisplayName }: EditProfileSectionPr
   }
 
   return (
-    <div className="rounded-lg border border-border bg-bg-secondary">
-      <div className="px-6 py-4 border-b border-border">
-        <h2 className="text-sm font-semibold text-text-primary">Edit Profile</h2>
-      </div>
-      <form onSubmit={handleSubmit} noValidate className="p-6 space-y-4">
+    <SectionCard title="Profile Information">
+      <form onSubmit={handleSubmit} noValidate className="space-y-4">
         <Input
           label="Display Name"
           value={displayName}
@@ -80,7 +111,7 @@ function EditProfileSection({ userId, initialDisplayName }: EditProfileSectionPr
           </Button>
         </div>
       </form>
-    </div>
+    </SectionCard>
   )
 }
 
@@ -162,11 +193,8 @@ function ChangePasswordSection({ userId }: ChangePasswordSectionProps) {
   }
 
   return (
-    <div className="rounded-lg border border-border bg-bg-secondary">
-      <div className="px-6 py-4 border-b border-border">
-        <h2 className="text-sm font-semibold text-text-primary">Change Password</h2>
-      </div>
-      <form onSubmit={handleSubmit} noValidate className="p-6 space-y-4">
+    <SectionCard title="Change Password">
+      <form onSubmit={handleSubmit} noValidate className="space-y-4">
         <Input
           label="Current Password"
           type="password"
@@ -213,7 +241,7 @@ function ChangePasswordSection({ userId }: ChangePasswordSectionProps) {
           </Button>
         </div>
       </form>
-    </div>
+    </SectionCard>
   )
 }
 
@@ -229,10 +257,10 @@ export default function ProfilePage() {
       <>
         <PageHeader title="Profile" description="Manage your account settings" />
         <div className="max-w-2xl space-y-6">
-          <div className="rounded-lg border border-border bg-bg-secondary p-6 space-y-4">
-            <div className="h-4 w-24 rounded bg-bg-tertiary animate-pulse" />
-            <div className="h-9 w-full rounded bg-bg-tertiary animate-pulse" />
-            <div className="h-9 w-full rounded bg-bg-tertiary animate-pulse" />
+          <div className="rounded-lg border border-border bg-bg-secondary p-6 space-y-4 animate-pulse">
+            <div className="h-4 w-24 rounded bg-bg-tertiary" />
+            <div className="h-9 w-full rounded bg-bg-tertiary" />
+            <div className="h-9 w-full rounded bg-bg-tertiary" />
           </div>
         </div>
       </>
@@ -245,23 +273,24 @@ export default function ProfilePage() {
 
       <div className="max-w-2xl space-y-6">
         {/* Account Info */}
-        <div className="rounded-lg border border-border bg-bg-secondary">
-          <div className="px-6 py-4 border-b border-border">
-            <h2 className="text-sm font-semibold text-text-primary">Account Info</h2>
-          </div>
-          <div className="p-6 space-y-4">
-            <div className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-text-secondary uppercase tracking-wider">Email</span>
+        <SectionCard title="Account">
+          <div className="space-y-4">
+            <div>
+              <ConfigLabel>Email</ConfigLabel>
               <span className="text-sm text-text-primary">{me.email}</span>
             </div>
-            <div className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-text-secondary uppercase tracking-wider">Role</span>
-              <div>
-                <Badge variant="default">{formatRole(me.role)}</Badge>
-              </div>
+            <div>
+              <ConfigLabel>Role</ConfigLabel>
+              <Badge variant="default">{formatRole(me.role)}</Badge>
             </div>
+            {me.is_system_admin && (
+              <div>
+                <ConfigLabel>System Access</ConfigLabel>
+                <Badge variant="info">System Admin</Badge>
+              </div>
+            )}
           </div>
-        </div>
+        </SectionCard>
 
         <EditProfileSection userId={me.id} initialDisplayName={me.display_name} />
         <ChangePasswordSection userId={me.id} />

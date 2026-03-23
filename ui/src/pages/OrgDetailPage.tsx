@@ -30,7 +30,7 @@ export default function OrgDetailPage() {
     <>
       <PageHeader
         title={org?.name ?? 'Organization'}
-        description="Manage organization settings, members, and teams"
+        description={org?.slug ? `/${org.slug}` : 'Manage organization settings, members, and teams'}
       />
       <Tabs tabs={tabs} />
       <Outlet />

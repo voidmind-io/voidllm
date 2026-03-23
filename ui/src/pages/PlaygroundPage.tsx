@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Button } from '../components/ui/Button'
@@ -29,6 +29,74 @@ interface UsageInfo {
 }
 
 const MAX_MESSAGES = 50
+const DEFAULT_TEMPERATURE = 0.7
+const DEFAULT_MAX_TOKENS = 4096
+
+// ---------------------------------------------------------------------------
+// Simple markdown renderer: splits on ``` code fences, no external library
+// ---------------------------------------------------------------------------
+function AssistantMessageContent({ content }: { content: string }) {
+  if (!content) {
+    // Typing indicator while empty assistant message awaits first delta
+    return (
+      <div className="flex gap-1 items-center py-0.5">
+        <span
+          className="w-2 h-2 rounded-full bg-accent animate-bounce"
+          style={{ animationDelay: '0ms' }}
+        />
+        <span
+          className="w-2 h-2 rounded-full bg-accent animate-bounce"
+          style={{ animationDelay: '150ms' }}
+        />
+        <span
+          className="w-2 h-2 rounded-full bg-accent animate-bounce"
+          style={{ animationDelay: '300ms' }}
+        />
+      </div>
+    )
+  }
+
+  // Split on triple-backtick fences (optionally with language hint)
+  const parts = content.split(/(```[\s\S]*?```)/g)
+
+  return (
+    <div className="space-y-2">
+      {parts.map((part, idx) => {
+        if (part.startsWith('```')) {
+          // Strip leading ``` + optional language tag and trailing ```
+          const inner = part.replace(/^```[^\n]*\n?/, '').replace(/```$/, '')
+          return (
+            <pre
+              key={idx}
+              className="bg-bg-primary rounded-lg p-4 font-mono text-xs border border-border overflow-x-auto leading-relaxed"
+            >
+              {inner}
+            </pre>
+          )
+        }
+        return part ? (
+          <p key={idx} className="whitespace-pre-wrap leading-relaxed">
+            {part}
+          </p>
+        ) : null
+      })}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Label used above controls in the config panel
+// ---------------------------------------------------------------------------
+function ConfigLabel({ htmlFor, children }: { htmlFor?: string; children: React.ReactNode }) {
+  return (
+    <label
+      htmlFor={htmlFor}
+      className="block text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-1.5"
+    >
+      {children}
+    </label>
+  )
+}
 
 export default function PlaygroundPage() {
   const [model, setModel] = useState('')
@@ -40,10 +108,15 @@ export default function PlaygroundPage() {
   const [error, setError] = useState<string | null>(null)
   const [lastUsage, setLastUsage] = useState<UsageInfo | null>(null)
   const [streaming, setStreaming] = useState(true)
+  const [temperature, setTemperature] = useState(DEFAULT_TEMPERATURE)
+  const [maxTokens, setMaxTokens] = useState(DEFAULT_MAX_TOKENS)
 
   const chatEndRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+  const tempLabelId = useId()
+  const maxTokensLabelId = useId()
 
   // Cancel any in-flight request on unmount
   useEffect(() => {
@@ -115,19 +188,21 @@ export default function PlaygroundPage() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ model, messages, stream: streaming }),
+        body: JSON.stringify({
+          model,
+          messages,
+          stream: streaming,
+          temperature,
+          max_tokens: maxTokens,
+        }),
         signal: controller.signal,
       })
 
       if (res.status === 401) {
-        if (!apiKey.trim()) {
-          // Session key expired — clear it and redirect to login
-          localStorage.removeItem(LOCAL_STORAGE_KEY)
-          window.location.href = '/login'
-          return
-        }
-        // Custom key is invalid — show error, do NOT touch the session
-        setError('Invalid or expired API key')
+        // Show error instead of logging out — the 401 may come from an
+        // upstream provider (no API key configured for the model), not
+        // from the proxy rejecting our session.
+        setError('Authentication failed. Check that the model has a valid upstream API key configured.')
         return
       }
 
@@ -269,125 +344,217 @@ export default function PlaygroundPage() {
   const canSend = !!model && !!message.trim() && !loading
 
   return (
-    <>
-      <PageHeader title="Playground" description="Test models interactively" />
+    <div className="flex flex-col overflow-hidden" style={{ height: 'calc(100vh - 4rem)' }}>
+      <div className="shrink-0 mb-4">
+        <PageHeader title="Playground" description="Test models interactively" />
+      </div>
 
-      <div className="flex gap-6 h-[calc(100vh-180px)]">
-        {/* LEFT PANEL — 40% */}
-        <div className="w-[40%] shrink-0 flex flex-col gap-4 overflow-y-auto p-1">
-          {/* API Key input */}
-          <Input
-            label="API Key"
-            type="password"
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            placeholder="Session key (default)"
-            description="Leave empty to use your session key. Paste a different key to test its permissions."
-          />
+      <div className="flex gap-4 flex-1 min-h-0">
 
-          {/* Model selector */}
-          <Select
-            label="Model"
-            options={modelOptions}
-            value={model}
-            onChange={setModel}
-            placeholder={
-              modelsData
-                ? modelOptions.length === 0
-                  ? 'No models available'
-                  : 'Select a model...'
-                : 'Loading models...'
-            }
-            searchable={modelOptions.length > 8}
-            disabled={modelOptions.length === 0}
-            fullWidth
-          />
-
-          {/* Streaming toggle */}
-          <Toggle
-            checked={streaming}
-            onChange={setStreaming}
-            label="Stream response"
-            size="sm"
-          />
-
-          {/* System prompt */}
-          <Textarea
-            label="System Prompt"
-            value={systemPrompt}
-            onChange={(e) => setSystemPrompt(e.target.value)}
-            placeholder="You are a helpful assistant."
-            rows={4}
-            className="font-mono"
-            disabled={loading}
-          />
-
-          {/* Message + Send */}
-          <Textarea
-            ref={textareaRef}
-            label="Message"
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault()
-                void handleSend()
-              }
-            }}
-            placeholder="Type your message..."
-            rows={6}
-            disabled={loading}
-            description="Enter to send, Shift+Enter for new line"
-            className="flex-1 min-h-[120px]"
-            wrapperClassName="flex-1"
-          />
-
-          {/* Error */}
-          {error !== null && (
-            <div
-              role="alert"
-              className="rounded-lg border border-error/40 bg-error/10 px-4 py-3 text-sm text-error"
+        {/* ================================================================
+            LEFT PANEL — 35% — Configuration
+        ================================================================ */}
+        <div className="w-[32%] shrink-0 flex flex-col rounded-xl border border-border bg-bg-secondary overflow-hidden">
+          {/* Panel header */}
+          <div className="shrink-0 flex items-center gap-2.5 px-5 py-4 border-b border-border">
+            <svg
+              className="h-4 w-4 text-text-tertiary shrink-0"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={1.75}
+              aria-hidden="true"
             >
-              {error}
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"
+              />
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
+              />
+            </svg>
+            <span className="text-sm font-medium text-text-primary">Configuration</span>
+          </div>
+
+          {/* Scrollable config body */}
+          <div className="flex-1 overflow-y-auto px-5 py-5 space-y-5">
+
+            {/* Model selector */}
+            <div>
+              <ConfigLabel>Model</ConfigLabel>
+              <Select
+                options={modelOptions}
+                value={model}
+                onChange={setModel}
+                placeholder={
+                  modelsData
+                    ? modelOptions.length === 0
+                      ? 'No models available'
+                      : 'Select a model...'
+                    : 'Loading models...'
+                }
+                searchable={modelOptions.length > 8}
+                disabled={modelOptions.length === 0}
+                fullWidth
+              />
             </div>
-          )}
 
-          <div className="flex justify-end">
-            <Button
-              variant="primary"
-              loading={loading}
-              disabled={!canSend}
-              onClick={() => {
-                void handleSend()
-              }}
-            >
-              {!loading && (
+            {/* Streaming toggle */}
+            <div className="flex items-center justify-between">
+              <ConfigLabel>Stream response</ConfigLabel>
+              <Toggle
+                checked={streaming}
+                onChange={setStreaming}
+                size="sm"
+              />
+            </div>
+
+            {/* System prompt */}
+            <div>
+              <ConfigLabel>System prompt</ConfigLabel>
+              <Textarea
+                value={systemPrompt}
+                onChange={(e) => setSystemPrompt(e.target.value)}
+                placeholder="You are a helpful assistant."
+                rows={4}
+                className="font-mono text-xs"
+                disabled={loading}
+              />
+            </div>
+
+            {/* Advanced Parameters collapsible */}
+            <details className="group">
+              <summary className="flex items-center justify-between cursor-pointer list-none select-none">
+                <span className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
+                  Advanced parameters
+                </span>
                 <svg
-                  className="h-4 w-4"
+                  className="h-3.5 w-3.5 text-text-tertiary transition-transform duration-200 group-open:rotate-180"
                   fill="none"
                   viewBox="0 0 24 24"
                   stroke="currentColor"
                   strokeWidth={2}
                   aria-hidden="true"
                 >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M13 7l5 5m0 0l-5 5m5-5H6"
-                  />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
                 </svg>
-              )}
-              Send
-            </Button>
+              </summary>
+
+              <div className="mt-4 space-y-5">
+
+                {/* Temperature */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label
+                      id={tempLabelId}
+                      className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary"
+                    >
+                      Temperature
+                    </label>
+                    <span className="px-2 py-0.5 rounded-full bg-accent/15 text-accent text-xs font-mono">
+                      {temperature.toFixed(1)}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={2}
+                    step={0.1}
+                    value={temperature}
+                    aria-labelledby={tempLabelId}
+                    onChange={(e) => setTemperature(parseFloat(e.target.value))}
+                    className="w-full h-1.5 rounded-full appearance-none bg-bg-tertiary cursor-pointer accent-accent"
+                  />
+                  <div className="flex justify-between mt-1">
+                    <span className="text-[10px] text-text-tertiary">0</span>
+                    <span className="text-[10px] text-text-tertiary">2</span>
+                  </div>
+                </div>
+
+                {/* Max Tokens */}
+                <div>
+                  <label
+                    id={maxTokensLabelId}
+                    className="block text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-1.5"
+                  >
+                    Max tokens
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={128000}
+                    value={maxTokens}
+                    aria-labelledby={maxTokensLabelId}
+                    onChange={(e) => {
+                      const v = parseInt(e.target.value, 10)
+                      if (!isNaN(v) && v > 0) setMaxTokens(v)
+                    }}
+                    className={cn(
+                      'block w-full rounded-md border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary placeholder:text-text-tertiary',
+                      'transition-colors duration-150',
+                      'focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/40',
+                    )}
+                  />
+                </div>
+
+                {/* API Key override — moved here for power users */}
+                <Input
+                  label="API key override"
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="Session key (default)"
+                  description="Leave empty to use your session key."
+                />
+
+              </div>
+            </details>
+
           </div>
         </div>
 
-        {/* RIGHT PANEL — 60% */}
-        <div className="flex-1 flex flex-col rounded-lg border border-border bg-bg-secondary overflow-hidden">
+        {/* ================================================================
+            RIGHT PANEL — 65% — Chat
+        ================================================================ */}
+        <div className="flex-1 flex flex-col rounded-xl border border-border bg-bg-secondary min-h-0 overflow-hidden">
+
+          {/* Top bar */}
+          <div className="shrink-0 flex items-center justify-between px-5 py-3.5 border-b border-border">
+            <div className="flex items-center gap-3">
+              {model ? (
+                <span className="px-2.5 py-1 rounded-full bg-accent/15 border border-accent/20 text-accent text-xs font-medium truncate max-w-[220px]">
+                  {model}
+                </span>
+              ) : (
+                <span className="px-2.5 py-1 rounded-full bg-bg-tertiary border border-border text-text-tertiary text-xs">
+                  No model selected
+                </span>
+              )}
+              <div className="flex items-center gap-1.5">
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-success opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-success" />
+                </span>
+                <span className="text-xs text-text-tertiary">Ready</span>
+              </div>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleClear}
+              disabled={chatHistory.length === 0}
+            >
+              Clear chat
+            </Button>
+          </div>
+
           {/* Chat messages — scrollable */}
-          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          <div className="flex-1 min-h-0 overflow-y-auto px-5 py-5 space-y-5">
             {chatHistory.length === 0 && !loading && (
-              <div className="flex h-full items-center justify-center">
+              <div className="flex items-center justify-center py-20">
                 <p className="text-sm text-text-tertiary">
                   Send a message to start chatting
                 </p>
@@ -402,50 +569,73 @@ export default function PlaygroundPage() {
                   msg.role === 'user' ? 'justify-end' : 'justify-start',
                 )}
               >
+                {msg.role === 'assistant' && (
+                  <div className="shrink-0 w-8 h-8 rounded-lg bg-bg-tertiary border border-border flex items-center justify-center mt-0.5">
+                    <svg
+                      className="h-4 w-4 text-accent"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={1.75}
+                      aria-hidden="true"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714c0 .597.237 1.17.659 1.591L19.8 15.3M14.25 3.104c.251.023.501.05.75.082M19.8 15.3l-1.57.393A9.065 9.065 0 0112 15a9.065 9.065 0 00-6.23-.693L5 14.5m14.8.8l1.402 1.402c1 1 .03 2.798-1.402 2.798H4.2c-1.432 0-2.402-1.799-1.402-2.798L4.2 15.3"
+                      />
+                    </svg>
+                  </div>
+                )}
+
                 <div
                   className={cn(
-                    'max-w-[80%] rounded-lg px-4 py-2.5 text-sm',
+                    'px-5 py-4 text-sm leading-relaxed max-w-[80%]',
                     msg.role === 'user'
-                      ? 'bg-accent/15 text-accent'
-                      : 'bg-bg-tertiary text-text-primary',
+                      ? 'bg-accent/10 border border-accent/20 rounded-2xl rounded-tr-sm text-text-primary'
+                      : 'bg-bg-secondary border border-border rounded-2xl rounded-tl-sm text-text-primary',
                   )}
                 >
-                  {msg.content ? (
+                  {msg.role === 'user' ? (
                     <p className="whitespace-pre-wrap">{msg.content}</p>
                   ) : (
-                    <div className="flex gap-1 items-center">
-                      <span
-                        className="w-2 h-2 rounded-full bg-text-tertiary animate-bounce"
-                        style={{ animationDelay: '0ms' }}
-                      />
-                      <span
-                        className="w-2 h-2 rounded-full bg-text-tertiary animate-bounce"
-                        style={{ animationDelay: '150ms' }}
-                      />
-                      <span
-                        className="w-2 h-2 rounded-full bg-text-tertiary animate-bounce"
-                        style={{ animationDelay: '300ms' }}
-                      />
-                    </div>
+                    <AssistantMessageContent content={msg.content} />
                   )}
                 </div>
               </div>
             ))}
 
+            {/* Non-streaming loading indicator */}
             {loading && !streaming && (
-              <div className="flex justify-start">
-                <div className="bg-bg-tertiary rounded-lg px-4 py-3">
+              <div className="flex gap-3 justify-start">
+                <div className="shrink-0 w-8 h-8 rounded-lg bg-bg-tertiary border border-border flex items-center justify-center">
+                  <svg
+                    className="h-4 w-4 text-accent"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={1.75}
+                    aria-hidden="true"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714c0 .597.237 1.17.659 1.591L19.8 15.3M14.25 3.104c.251.023.501.05.75.082M19.8 15.3l-1.57.393A9.065 9.065 0 0112 15a9.065 9.065 0 00-6.23-.693L5 14.5m14.8.8l1.402 1.402c1 1 .03 2.798-1.402 2.798H4.2c-1.432 0-2.402-1.799-1.402-2.798L4.2 15.3"
+                    />
+                  </svg>
+                </div>
+                <div className="px-5 py-4 bg-bg-secondary border border-border rounded-2xl rounded-tl-sm">
                   <div className="flex gap-1 items-center">
                     <span
-                      className="w-2 h-2 rounded-full bg-text-tertiary animate-bounce"
+                      className="w-2 h-2 rounded-full bg-accent animate-bounce"
                       style={{ animationDelay: '0ms' }}
                     />
                     <span
-                      className="w-2 h-2 rounded-full bg-text-tertiary animate-bounce"
+                      className="w-2 h-2 rounded-full bg-accent animate-bounce"
                       style={{ animationDelay: '150ms' }}
                     />
                     <span
-                      className="w-2 h-2 rounded-full bg-text-tertiary animate-bounce"
+                      className="w-2 h-2 rounded-full bg-accent animate-bounce"
                       style={{ animationDelay: '300ms' }}
                     />
                   </div>
@@ -456,11 +646,89 @@ export default function PlaygroundPage() {
             <div ref={chatEndRef} />
           </div>
 
-          {/* Usage bar + Clear */}
-          <div className="shrink-0 border-t border-border px-4 py-2 flex items-center justify-between gap-4">
-            <span className="text-xs text-text-tertiary truncate">
-              {lastUsage !== null ? (
-                <>
+          {/* Input area — sticky bottom */}
+          <div className="shrink-0 border-t border-border px-5 py-4">
+
+            {/* Error banner */}
+            {error !== null && (
+              <div
+                role="alert"
+                className="mb-3 rounded-lg border border-error/40 bg-error/10 px-4 py-3 text-sm text-error"
+              >
+                {error}
+              </div>
+            )}
+
+            <div className="rounded-xl border border-border bg-bg-tertiary focus-within:border-accent/60 focus-within:ring-1 focus-within:ring-accent/30 transition-colors duration-150">
+              <textarea
+                ref={textareaRef}
+                value={message}
+                onChange={(e) => setMessage(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    void handleSend()
+                  }
+                }}
+                placeholder="Type your message..."
+                rows={3}
+                disabled={loading}
+                className={cn(
+                  'block w-full bg-transparent px-4 pt-4 pb-2 text-sm text-text-primary placeholder:text-text-tertiary resize-none',
+                  'focus:outline-none',
+                  loading && 'opacity-50 cursor-not-allowed',
+                )}
+              />
+              <div className="flex items-center justify-between px-4 pb-3 pt-1">
+                <span className="text-xs text-text-tertiary">
+                  Enter to send · Shift+Enter for new line
+                </span>
+                <button
+                  type="button"
+                  disabled={!canSend}
+                  onClick={() => void handleSend()}
+                  className={cn(
+                    'flex items-center justify-center w-8 h-8 rounded-lg transition-all duration-150',
+                    'focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 focus:ring-offset-bg-tertiary',
+                    canSend
+                      ? 'bg-gradient-to-br from-[#6366f1] via-[#8b5cf6] to-[#a855f7] text-white hover:brightness-110 hover:shadow-[0_0_16px_rgba(139,92,246,0.5)] cursor-pointer'
+                      : 'bg-bg-secondary border border-border text-text-tertiary cursor-not-allowed opacity-50',
+                  )}
+                  aria-label="Send message"
+                >
+                  {loading ? (
+                    <span
+                      role="status"
+                      aria-label="Loading"
+                      className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-white border-t-transparent"
+                    />
+                  ) : (
+                    <svg
+                      className="h-4 w-4"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2.5}
+                      aria-hidden="true"
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 15l7-7 7 7" />
+                    </svg>
+                  )}
+                </button>
+              </div>
+            </div>
+            {/* Usage stats — below input */}
+            {lastUsage !== null && (
+              <div className="flex items-center gap-2.5 px-2 pt-2">
+                <svg
+                  className="h-3.5 w-3.5 shrink-0 text-accent"
+                  fill="currentColor"
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                >
+                  <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+                </svg>
+                <span className="font-mono text-xs text-text-tertiary">
                   {lastUsage.prompt_tokens.toLocaleString()} prompt
                   {' + '}
                   {lastUsage.completion_tokens.toLocaleString()} completion
@@ -468,24 +736,13 @@ export default function PlaygroundPage() {
                   {lastUsage.total_tokens.toLocaleString()} total
                   {' · '}
                   {lastUsage.duration.toFixed(1)}s
-                </>
-              ) : (
-                <span className="opacity-0" aria-hidden="true">
-                  &nbsp;
                 </span>
-              )}
-            </span>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={handleClear}
-              disabled={chatHistory.length === 0}
-            >
-              Clear Chat
-            </Button>
+              </div>
+            )}
           </div>
         </div>
+
       </div>
-    </>
+    </div>
   )
 }

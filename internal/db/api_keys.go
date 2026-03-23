@@ -157,6 +157,9 @@ func (d *DB) ListAPIKeys(ctx context.Context, orgID, userID, teamID, cursor stri
 	args = append(args, orgID)
 	argN++
 
+	// Session keys are internal (login tokens) — never expose them in the API list.
+	conditions = append(conditions, "key_type != 'session_key'")
+
 	if !includeDeleted {
 		conditions = append(conditions, "deleted_at IS NULL")
 	}
