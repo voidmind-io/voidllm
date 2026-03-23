@@ -246,12 +246,7 @@ export default function AuditLogPage() {
   const events = data?.data ?? []
   const hasPrevious = cursors.length > 1
   const hasNext = data?.has_more ?? false
-
-  // Compute unique actors from current page
-  const uniqueActors = useMemo(() => {
-    const ids = new Set(events.map((e) => e.actor_id))
-    return ids.size
-  }, [events])
+  const uniqueActors = new Set(events.map((e) => e.actor_id)).size
 
   function handleNext() {
     if (data?.cursor) {

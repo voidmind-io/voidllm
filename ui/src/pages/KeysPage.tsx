@@ -828,20 +828,24 @@ export default function KeysPage() {
   const rotateKey = useRotateAPIKey(orgId)
   const { toast } = useToast()
 
-  const allKeys = keys?.data ?? []
-  const now = Date.now()
-  const sevenDaysMs = 7 * 24 * 60 * 60 * 1000
+  const allKeys = useMemo(() => keys?.data ?? [], [keys?.data])
 
-  const totalKeys = allKeys.length
-  const activeKeys = allKeys.filter((k) => {
-    if (!k.expires_at) return true
-    return new Date(k.expires_at).getTime() > now
-  }).length
-  const expiringSoon = allKeys.filter((k) => {
-    if (!k.expires_at) return false
-    const exp = new Date(k.expires_at).getTime()
-    return exp > now && exp - now <= sevenDaysMs
-  }).length
+  const [totalKeys, activeKeys, expiringSoon] = useMemo(() => {
+    // eslint-disable-next-line react-hooks/purity -- Date comparison is intentionally impure
+    const now = Date.now()
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000
+    const total = allKeys.length
+    const active = allKeys.filter((k) => {
+      if (!k.expires_at) return true
+      return new Date(k.expires_at).getTime() > now
+    }).length
+    const expiring = allKeys.filter((k) => {
+      if (!k.expires_at) return false
+      const exp = new Date(k.expires_at).getTime()
+      return exp > now && exp - now <= sevenDaysMs
+    }).length
+    return [total, active, expiring] as const
+  }, [allKeys])
 
   const columns: Column<APIKeyResponse>[] = [
     {
