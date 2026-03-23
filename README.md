@@ -8,6 +8,17 @@
 
 VoidLLM sits between your applications and LLM providers — self-hosted or managed — giving you organization-wide access control, usage tracking, and key management. One binary, sub-2ms overhead, zero knowledge of your prompts.
 
+![VoidLLM Dashboard](docs/screenshots/VoidLLM-Dashboard.jpg)
+
+<details>
+<summary>More screenshots</summary>
+
+![Usage Analytics](docs/screenshots/VoidLLM-Usage.jpg)
+![API Keys](docs/screenshots/VoidLLM-Keys.jpg)
+![Playground](docs/screenshots/VoidLLM-Playground.jpg)
+
+</details>
+
 > **Privacy by Design:** VoidLLM never stores, logs, or persists any prompt or response content. Not as a setting you can toggle — by architecture. The proxy is a zero-knowledge pass-through. Only metadata is tracked: who made the request, which model, how many tokens, how long it took. Your data stays yours. GDPR-compliant from day one.
 
 ---
