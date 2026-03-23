@@ -104,13 +104,13 @@ describe('CopyButton', () => {
         await Promise.resolve()
       })
 
-      expect(screen.getByText('Copied!')).toBeInTheDocument()
+      await waitFor(() => expect(screen.getByText('Copied!')).toBeInTheDocument())
 
       act(() => {
         vi.advanceTimersByTime(1999)
       })
 
-      expect(screen.getByText('Copied!')).toBeInTheDocument()
+      await waitFor(() => expect(screen.getByText('Copied!')).toBeInTheDocument())
     })
 
     it('shows a custom copiedLabel after click', async () => {
