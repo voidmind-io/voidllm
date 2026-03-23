@@ -22,7 +22,7 @@ jobs:
       matrix:
         language: [go, javascript-typescript]
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: github/codeql-action/init@480db559a14342288b67e54bd959dd52dc3ee68f # v3
         with:
