@@ -400,10 +400,8 @@ func (a *AnthropicAdapter) buildChunk(delta openAIChunkDelta, finishReason *stri
 
 // appendDataPrefix prepends "data: " to a JSON byte slice.
 func appendDataPrefix(b []byte) []byte {
-	result := make([]byte, len("data: ")+len(b))
-	copy(result, "data: ")
-	copy(result[len("data: "):], b)
-	return result
+	const prefix = "data: "
+	return append([]byte(prefix), b...)
 }
 
 // mapStopReason converts an Anthropic stop_reason string to the OpenAI
