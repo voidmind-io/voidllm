@@ -101,7 +101,8 @@ export function Dialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
-        className="bg-bg-secondary border border-border rounded-lg shadow-2xl max-w-lg w-full mx-4 p-6"
+        className="rounded-2xl shadow-2xl max-w-lg w-full mx-4 p-6 border-t border-accent/15"
+        style={{ background: 'rgba(25, 25, 31, 0.85)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}
         onKeyDown={handlePanelKeyDown}
       >
         <div className="flex items-center justify-between mb-4">
@@ -110,7 +111,7 @@ export function Dialog({
           </h2>
           <button
             onClick={onClose}
-            className="text-text-tertiary hover:text-text-primary transition-colors"
+            className="text-text-tertiary hover:text-text-primary transition-colors cursor-pointer"
             aria-label="Close"
           >
             <svg
