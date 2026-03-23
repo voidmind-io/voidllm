@@ -5,6 +5,7 @@ import type { Column } from '../components/ui/Table'
 import { Badge, type BadgeProps } from '../components/ui/Badge'
 import { Button } from '../components/ui/Button'
 import { Select } from '../components/ui/Select'
+import { StatCard } from '../components/ui/StatCard'
 import { TimeAgo } from '../components/ui/TimeAgo'
 import { UpgradePrompt } from '../components/ui/UpgradePrompt'
 import { useMe } from '../hooks/useMe'
@@ -63,6 +64,40 @@ const PAGE_SIZE_OPTIONS = [
   { value: '50', label: '50 / page' },
   { value: '100', label: '100 / page' },
 ]
+
+// ---------------------------------------------------------------------------
+// Icons
+// ---------------------------------------------------------------------------
+
+function IconList() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <line x1="8" y1="6" x2="21" y2="6" />
+      <line x1="8" y1="12" x2="21" y2="12" />
+      <line x1="8" y1="18" x2="21" y2="18" />
+      <line x1="3" y1="6" x2="3.01" y2="6" />
+      <line x1="3" y1="12" x2="3.01" y2="12" />
+      <line x1="3" y1="18" x2="3.01" y2="18" />
+    </svg>
+  )
+}
+
+function IconUser() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+      <circle cx="12" cy="7" r="4" />
+    </svg>
+  )
+}
+
+function IconActivity() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+    </svg>
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Badge helpers
@@ -212,6 +247,12 @@ export default function AuditLogPage() {
   const hasPrevious = cursors.length > 1
   const hasNext = data?.has_more ?? false
 
+  // Compute unique actors from current page
+  const uniqueActors = useMemo(() => {
+    const ids = new Set(events.map((e) => e.actor_id))
+    return ids.size
+  }, [events])
+
   function handleNext() {
     if (data?.cursor) {
       setCursors((prev) => [...prev, data.cursor!])
@@ -256,19 +297,46 @@ export default function AuditLogPage() {
         description="Full audit trail of admin actions across your organization"
       />
 
+      {/* Stat cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+        <StatCard
+          label="Total Events"
+          value={isDataLoading ? '—' : events.length}
+          icon={<IconList />}
+          iconColor="purple"
+        />
+        <StatCard
+          label="Unique Actors"
+          value={isDataLoading ? '—' : uniqueActors}
+          icon={<IconUser />}
+          iconColor="blue"
+        />
+        <StatCard
+          label="Active Filters"
+          value={activeFilterCount}
+          icon={<IconActivity />}
+          iconColor={activeFilterCount > 0 ? 'yellow' : 'purple'}
+        />
+      </div>
+
       {/* Filter bar */}
       <div className="flex flex-col sm:flex-row sm:items-end gap-4 mb-6">
-        {/* Time range pills */}
-        <div className="flex items-center gap-2">
+        {/* Time range segmented pills */}
+        <div className="flex items-center gap-1 p-1 rounded-lg bg-bg-tertiary">
           {TIME_RANGES.map((r) => (
-            <Button
+            <button
               key={r}
-              variant={range === r ? 'primary' : 'ghost'}
-              size="sm"
+              type="button"
               onClick={() => handleRangeChange(r)}
+              className={[
+                'px-3 py-1.5 rounded-md text-sm font-medium transition-colors',
+                range === r
+                  ? 'bg-bg-secondary text-text-primary shadow-sm'
+                  : 'text-text-tertiary hover:text-text-secondary',
+              ].join(' ')}
             >
               {RANGE_LABELS[r]}
-            </Button>
+            </button>
           ))}
         </div>
 

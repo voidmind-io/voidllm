@@ -23,6 +23,12 @@ const COST_MODEL_HEADERS = [
 const TIME_RANGES = ['7d', '30d', '90d'] as const
 type TimeRange = (typeof TIME_RANGES)[number]
 
+const RANGE_LABELS: Record<TimeRange, string> = {
+  '7d': 'Last 7 days',
+  '30d': 'Last 30 days',
+  '90d': 'Last 90 days',
+}
+
 const RANGE_DAYS: Record<TimeRange, number> = {
   '7d': 7,
   '30d': 30,
@@ -33,6 +39,55 @@ function getTimeRange(range: TimeRange): { from: string; to: string } {
   const now = new Date()
   const from = new Date(now.getTime() - RANGE_DAYS[range] * 86_400_000)
   return { from: from.toISOString(), to: now.toISOString() }
+}
+
+// ---------------------------------------------------------------------------
+// Icons
+// ---------------------------------------------------------------------------
+
+function IconDollar() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <line x1="12" y1="1" x2="12" y2="23" />
+      <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+    </svg>
+  )
+}
+
+function IconTrendingDown() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="23 18 13.5 8.5 8.5 13.5 1 6" />
+      <polyline points="17 18 23 18 23 12" />
+    </svg>
+  )
+}
+
+function IconCpu() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="4" y="4" width="16" height="16" rx="2" ry="2" />
+      <rect x="9" y="9" width="6" height="6" />
+      <line x1="9" y1="1" x2="9" y2="4" />
+      <line x1="15" y1="1" x2="15" y2="4" />
+      <line x1="9" y1="20" x2="9" y2="23" />
+      <line x1="15" y1="20" x2="15" y2="23" />
+      <line x1="20" y1="9" x2="23" y2="9" />
+      <line x1="20" y1="14" x2="23" y2="14" />
+      <line x1="1" y1="9" x2="4" y2="9" />
+      <line x1="1" y1="14" x2="4" y2="14" />
+    </svg>
+  )
+}
+
+function IconDownload() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" />
+      <line x1="12" y1="15" x2="12" y2="3" />
+    </svg>
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -236,21 +291,31 @@ export default function CostReportsPage() {
       />
 
       {/* Time range pills + export */}
-      <div className="flex items-center gap-2 mb-6">
-        {TIME_RANGES.map((r) => (
-          <Button
-            key={r}
-            variant={range === r ? 'primary' : 'ghost'}
-            size="sm"
-            onClick={() => setRange(r)}
-          >
-            {r}
-          </Button>
-        ))}
+      <div className="flex items-center gap-3 mb-6">
+        {/* Segmented pill container */}
+        <div className="flex items-center gap-1 p-1 rounded-lg bg-bg-tertiary">
+          {TIME_RANGES.map((r) => (
+            <button
+              key={r}
+              type="button"
+              onClick={() => setRange(r)}
+              className={[
+                'px-3 py-1.5 rounded-md text-sm font-medium transition-colors',
+                range === r
+                  ? 'bg-bg-secondary text-text-primary shadow-sm'
+                  : 'text-text-tertiary hover:text-text-secondary',
+              ].join(' ')}
+            >
+              {RANGE_LABELS[r]}
+            </button>
+          ))}
+        </div>
+
         <div className="sm:ml-auto flex gap-2">
           <Button
             variant="secondary"
             size="sm"
+            icon={<IconDownload />}
             onClick={() => exportData(modelRows as unknown as Record<string, unknown>[], COST_MODEL_HEADERS, `voidllm-cost-by-model-${range}`, 'csv')}
             disabled={modelRows.length === 0}
           >
@@ -259,6 +324,7 @@ export default function CostReportsPage() {
           <Button
             variant="secondary"
             size="sm"
+            icon={<IconDownload />}
             onClick={() => exportData(modelRows as unknown as Record<string, unknown>[], COST_MODEL_HEADERS, `voidllm-cost-by-model-${range}`, 'json')}
             disabled={modelRows.length === 0}
           >
@@ -271,21 +337,27 @@ export default function CostReportsPage() {
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-8">
         <StatCard
           label="Total Cost"
-          value={isModelLoading ? '...' : formatCost(totalCost)}
+          value={isModelLoading ? '—' : formatCost(totalCost)}
+          icon={<IconDollar />}
+          iconColor="purple"
         />
         <StatCard
           label="Avg Cost / Day"
-          value={isModelLoading ? '...' : formatCost(avgCostPerDay)}
+          value={isModelLoading ? '—' : formatCost(avgCostPerDay)}
+          icon={<IconTrendingDown />}
+          iconColor="blue"
         />
         <StatCard
           label="Top Model by Cost"
-          value={isModelLoading ? '...' : topModel}
+          value={isModelLoading ? '—' : topModel}
+          icon={<IconCpu />}
+          iconColor="yellow"
         />
       </div>
 
       {/* Cost by Model */}
       <div className="mb-8">
-        <h2 className="text-lg font-semibold text-text-primary mb-4">Cost by Model</h2>
+        <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wider mb-4">Cost by Model</h2>
         <Table<ModelCostRow>
           columns={modelColumns}
           data={modelRows}
@@ -297,7 +369,7 @@ export default function CostReportsPage() {
 
       {/* Daily Cost Trend */}
       <div>
-        <h2 className="text-lg font-semibold text-text-primary mb-4">Daily Cost Trend</h2>
+        <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wider mb-4">Daily Cost Trend</h2>
         <Table<DayCostRow>
           columns={dayColumns}
           data={dayRowsDesc}
