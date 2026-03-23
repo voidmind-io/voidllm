@@ -1,5 +1,9 @@
 # VoidLLM
 
+[![CI](https://github.com/voidmind-io/voidllm/actions/workflows/ci.yml/badge.svg)](https://github.com/voidmind-io/voidllm/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/voidmind-io/voidllm/badge)](https://securityscorecards.dev/viewer/?uri=github.com/voidmind-io/voidllm)
+[![License: BSL 1.1](https://img.shields.io/badge/License-BSL_1.1-blue.svg)](LICENSE)
+
 **A lightweight, privacy-first LLM proxy for teams that take control seriously.**
 
 VoidLLM sits between your applications and LLM providers — self-hosted or managed — giving you organization-wide access control, usage tracking, and key management. One binary, sub-2ms overhead, zero knowledge of your prompts.
