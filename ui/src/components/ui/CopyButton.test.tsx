@@ -96,21 +96,29 @@ describe('CopyButton', () => {
     })
 
     it('does not revert before the timeout elapses', async () => {
-      vi.useFakeTimers({ shouldAdvanceTime: true })
+      vi.useFakeTimers()
       render(<CopyButton text="hello" timeout={2000} />)
 
+      // fireEvent (not userEvent) because userEvent uses real timers internally
+      // Flush the clipboard promise so setCopied(true) fires
       await act(async () => {
         fireEvent.click(screen.getByRole('button'))
         await Promise.resolve()
+        await Promise.resolve()
       })
 
-      await waitFor(() => expect(screen.getByText('Copied!')).toBeInTheDocument())
+      expect(screen.getByText('Copied!')).toBeInTheDocument()
 
-      act(() => {
-        vi.advanceTimersByTime(1999)
-      })
+      // Advance to just before timeout — should still show "Copied!"
+      act(() => { vi.advanceTimersByTime(1999) })
+      expect(screen.getByText('Copied!')).toBeInTheDocument()
 
-      await waitFor(() => expect(screen.getByText('Copied!')).toBeInTheDocument())
+      // Advance past timeout — should revert to "Copy"
+      act(() => { vi.advanceTimersByTime(1) })
+      expect(screen.queryByText('Copied!')).not.toBeInTheDocument()
+      expect(screen.getByText('Copy')).toBeInTheDocument()
+
+      vi.useRealTimers()
     })
 
     it('shows a custom copiedLabel after click', async () => {
