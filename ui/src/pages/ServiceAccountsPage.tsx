@@ -8,6 +8,7 @@ import { Button } from '../components/ui/Button'
 import { Input } from '../components/ui/Input'
 import { Select } from '../components/ui/Select'
 import { TimeAgo } from '../components/ui/TimeAgo'
+import { StatCard } from '../components/ui/StatCard'
 import { useMe } from '../hooks/useMe'
 import {
   useServiceAccounts,
@@ -22,6 +23,138 @@ import type {
 import { useTeams } from '../hooks/useTeams'
 import { useToast } from '../hooks/useToast'
 import { formatDate } from '../lib/utils'
+
+// ---------------------------------------------------------------------------
+// Icons
+// ---------------------------------------------------------------------------
+
+function IconBot() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="3" y="11" width="18" height="10" rx="2" />
+      <circle cx="12" cy="5" r="2" />
+      <path d="M12 7v4" />
+      <line x1="8" y1="16" x2="8" y2="16" strokeWidth="2.5" />
+      <line x1="12" y1="16" x2="12" y2="16" strokeWidth="2.5" />
+      <line x1="16" y1="16" x2="16" y2="16" strokeWidth="2.5" />
+    </svg>
+  )
+}
+
+function IconBuilding() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="2" y="3" width="20" height="18" rx="2" />
+      <path d="M9 21V7" />
+      <path d="M15 21V7" />
+      <path d="M2 12h20" />
+    </svg>
+  )
+}
+
+function IconGroup() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+    </svg>
+  )
+}
+
+function IconPencil() {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+    </svg>
+  )
+}
+
+function IconTrash() {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="3 6 5 6 21 6" />
+      <path d="M19 6l-1 14H6L5 6" />
+      <path d="M10 11v6M14 11v6" />
+      <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+    </svg>
+  )
+}
+
+function IconBotLarge() {
+  return (
+    <svg
+      width="40"
+      height="40"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.25"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="3" y="11" width="18" height="10" rx="2" />
+      <circle cx="12" cy="5" r="2" />
+      <path d="M12 7v4" />
+      <line x1="8" y1="16" x2="8" y2="16" strokeWidth="2.5" />
+      <line x1="12" y1="16" x2="12" y2="16" strokeWidth="2.5" />
+      <line x1="16" y1="16" x2="16" y2="16" strokeWidth="2.5" />
+    </svg>
+  )
+}
 
 // ---------------------------------------------------------------------------
 // CreateServiceAccountDialog
@@ -109,33 +242,44 @@ function CreateServiceAccountDialog({ open, onClose, orgId }: CreateServiceAccou
 
   return (
     <Dialog open={open} onClose={handleClose} title="Create Service Account">
-      <form onSubmit={handleSubmit} className="space-y-4" noValidate>
-        <Input
-          label="Name"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="e.g. ci-deploy-bot"
-          error={nameError}
-          disabled={createServiceAccount.isPending}
-        />
-        <Select
-          label="Team"
-          options={teamOptions}
-          value={effectiveTeamId}
-          onChange={(val) => {
-            setTeamId(val)
-            if (val) setTeamError(undefined)
-          }}
-          placeholder={isOrgAdmin ? 'Org-scoped (no team)' : 'Select a team...'}
-          error={teamError}
-          disabled={createServiceAccount.isPending}
-        />
+      <form onSubmit={handleSubmit} className="space-y-5" noValidate>
+        <div className="space-y-1.5">
+          <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
+            Name
+          </p>
+          <Input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. ci-deploy-bot"
+            error={nameError}
+            disabled={createServiceAccount.isPending}
+          />
+        </div>
+
+        <div className="space-y-1.5">
+          <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
+            Team
+          </p>
+          <Select
+            options={teamOptions}
+            value={effectiveTeamId}
+            onChange={(val) => {
+              setTeamId(val)
+              if (val) setTeamError(undefined)
+            }}
+            placeholder={isOrgAdmin ? 'Org-scoped (no team)' : 'Select a team...'}
+            error={teamError}
+            disabled={createServiceAccount.isPending}
+          />
+        </div>
+
         {!isOrgAdmin && teamOptions.length === 0 && (
           <p className="text-xs text-text-tertiary">
             You are not a member of any team. Contact your org admin to be added to a team first.
           </p>
         )}
-        <div className="flex justify-end gap-2 pt-2">
+
+        <div className="flex justify-end gap-2 pt-1">
           <Button
             variant="secondary"
             onClick={handleClose}
@@ -206,21 +350,27 @@ function EditServiceAccountDialog({ open, onClose, sa, orgId }: EditServiceAccou
 
   return (
     <Dialog open={open} onClose={handleClose} title="Edit Service Account">
-      <form onSubmit={handleSubmit} className="space-y-4" noValidate>
-        <Input
-          label="Name"
-          value={name}
-          onChange={(e) => {
-            setName(e.target.value)
-            if (nameError) setNameError(undefined)
-          }}
-          error={nameError}
-          disabled={updateServiceAccount.isPending}
-        />
+      <form onSubmit={handleSubmit} className="space-y-5" noValidate>
+        <div className="space-y-1.5">
+          <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
+            Name
+          </p>
+          <Input
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value)
+              if (nameError) setNameError(undefined)
+            }}
+            error={nameError}
+            disabled={updateServiceAccount.isPending}
+          />
+        </div>
 
         <div className="grid grid-cols-2 gap-4">
-          <div className="flex flex-col gap-1">
-            <span className="text-xs font-medium text-text-secondary uppercase tracking-wider">Scope</span>
+          <div className="flex flex-col gap-1.5">
+            <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
+              Scope
+            </p>
             <div>
               {sa.team_id ? (
                 <Badge variant="info">Team</Badge>
@@ -229,18 +379,22 @@ function EditServiceAccountDialog({ open, onClose, sa, orgId }: EditServiceAccou
               )}
             </div>
           </div>
-          <div className="flex flex-col gap-1">
-            <span className="text-xs font-medium text-text-secondary uppercase tracking-wider">Keys</span>
+          <div className="flex flex-col gap-1.5">
+            <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
+              Keys
+            </p>
             <span className="text-sm text-text-primary">{sa.key_count}</span>
           </div>
         </div>
 
-        <div className="flex flex-col gap-1">
-          <span className="text-xs font-medium text-text-secondary uppercase tracking-wider">Created</span>
+        <div className="flex flex-col gap-1.5">
+          <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
+            Created
+          </p>
           <span className="text-sm text-text-tertiary">{formatDate(sa.created_at)}</span>
         </div>
 
-        <div className="flex justify-end gap-2 pt-2">
+        <div className="flex justify-end gap-2 pt-1">
           <Button
             variant="secondary"
             onClick={handleClose}
@@ -275,11 +429,17 @@ export default function ServiceAccountsPage() {
   const deleteServiceAccount = useDeleteServiceAccount(orgId)
   const { toast } = useToast()
 
+  const allSAs = serviceAccounts?.data ?? []
+  const orgScopedCount = allSAs.filter((sa) => !sa.team_id).length
+  const teamScopedCount = allSAs.filter((sa) => !!sa.team_id).length
+
   const columns: Column<ServiceAccountResponse>[] = [
     {
       key: 'name',
       header: 'Name',
-      render: (row) => <span className="text-text-primary">{row.name}</span>,
+      render: (row) => (
+        <span className="font-medium text-text-primary">{row.name}</span>
+      ),
     },
     {
       key: 'scope',
@@ -288,7 +448,7 @@ export default function ServiceAccountsPage() {
         row.team_id ? (
           <Badge variant="info">Team</Badge>
         ) : (
-          <Badge variant="default">Org</Badge>
+          <Badge variant="default">Organization</Badge>
         ),
     },
     {
@@ -308,23 +468,26 @@ export default function ServiceAccountsPage() {
       header: '',
       align: 'right',
       render: (row) => (
-        <div className="flex items-center justify-end gap-2">
+        <div className="flex items-center justify-end gap-1">
           <Button
             variant="ghost"
             size="sm"
             onClick={() => setEditSa(row)}
             disabled={deleteServiceAccount.isPending}
+            className="!px-1.5"
+            title="Edit"
           >
-            Edit
+            <IconPencil />
           </Button>
           <Button
             variant="ghost"
             size="sm"
             onClick={() => setDeleteId(row.id)}
-            className="text-error hover:text-error"
+            className="!px-1.5 text-error hover:text-error"
             disabled={deleteServiceAccount.isPending}
+            title="Delete"
           >
-            Delete
+            <IconTrash />
           </Button>
         </div>
       ),
@@ -348,6 +511,9 @@ export default function ServiceAccountsPage() {
     })
   }
 
+  const hasData = allSAs.length > 0
+  const showEmptyState = !isLoading && !hasData && !!orgId
+
   return (
     <>
       <PageHeader
@@ -358,29 +524,67 @@ export default function ServiceAccountsPage() {
         }
       />
 
-      <Table<ServiceAccountResponse>
-        columns={columns}
-        data={serviceAccounts?.data ?? []}
-        keyExtractor={(row) => row.id}
-        loading={isLoading && !!orgId}
-        emptyMessage="No service accounts found"
-        pagination={{
-          cursor: cursor ?? null,
-          hasMore: serviceAccounts?.has_more ?? false,
-          hasPrevious: prevCursors.length > 0,
-          onNext: () => {
-            if (serviceAccounts?.next_cursor) {
-              setPrevCursors((prev) => [...prev, cursor ?? ''])
-              setCursor(serviceAccounts.next_cursor)
-            }
-          },
-          onPrevious: () => {
-            const prev = prevCursors[prevCursors.length - 1]
-            setPrevCursors((p) => p.slice(0, -1))
-            setCursor(prev || undefined)
-          },
-        }}
-      />
+      <div className="grid grid-cols-3 gap-4 mb-6">
+        <StatCard
+          label="Total Service Accounts"
+          value={allSAs.length}
+          icon={<IconBot />}
+          iconColor="purple"
+        />
+        <StatCard
+          label="Org-Scoped"
+          value={orgScopedCount}
+          icon={<IconBuilding />}
+          iconColor="blue"
+        />
+        <StatCard
+          label="Team-Scoped"
+          value={teamScopedCount}
+          icon={<IconGroup />}
+          iconColor="green"
+        />
+      </div>
+
+      {showEmptyState ? (
+        <div className="flex flex-col items-center justify-center py-20 text-center">
+          <span className="text-text-tertiary mb-4">
+            <IconBotLarge />
+          </span>
+          <h3 className="text-base font-medium text-text-primary mb-1">
+            No service accounts yet
+          </h3>
+          <p className="text-sm text-text-tertiary mb-6">
+            Create a service account for CI/CD and automation
+          </p>
+          <Button onClick={() => setShowCreateDialog(true)}>
+            Create Service Account
+          </Button>
+        </div>
+      ) : (
+        <Table<ServiceAccountResponse>
+          columns={columns}
+          data={allSAs}
+          keyExtractor={(row) => row.id}
+          loading={isLoading && !!orgId}
+          emptyMessage="No service accounts found"
+          pagination={{
+            cursor: cursor ?? null,
+            hasMore: serviceAccounts?.has_more ?? false,
+            hasPrevious: prevCursors.length > 0,
+            onNext: () => {
+              if (serviceAccounts?.next_cursor) {
+                setPrevCursors((prev) => [...prev, cursor ?? ''])
+                setCursor(serviceAccounts.next_cursor)
+              }
+            },
+            onPrevious: () => {
+              const prev = prevCursors[prevCursors.length - 1]
+              setPrevCursors((p) => p.slice(0, -1))
+              setCursor(prev || undefined)
+            },
+          }}
+        />
+      )}
 
       <CreateServiceAccountDialog
         open={showCreateDialog}
