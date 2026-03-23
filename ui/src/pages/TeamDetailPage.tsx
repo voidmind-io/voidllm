@@ -26,7 +26,7 @@ export default function TeamDetailPage() {
     <>
       <PageHeader
         title={team?.name ?? 'Team'}
-        description="Manage team settings and access"
+        description={team?.slug ? `Slug: ${team.slug}` : 'Manage team settings and access'}
       />
       <Tabs tabs={tabs} />
       <Outlet />

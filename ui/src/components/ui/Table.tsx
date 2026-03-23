@@ -34,6 +34,8 @@ export interface TableProps<T> {
   compact?: boolean
   loading?: boolean
   emptyMessage?: string
+  /** Optional custom empty state node. Takes priority over emptyMessage when data is empty and not loading. */
+  emptyState?: React.ReactNode
   className?: string
 }
 
@@ -84,6 +86,7 @@ export function Table<T>({
   compact = false,
   loading = false,
   emptyMessage = 'No results found.',
+  emptyState,
   className,
 }: TableProps<T>) {
   const cellPadding = compact ? 'px-3 py-2' : 'px-4 py-3'
@@ -142,11 +145,14 @@ export function Table<T>({
             <SkeletonRows columns={columns.length} rows={5} cellPadding={cellPadding} />
           ) : data.length === 0 ? (
             <tr>
-              <td
-                colSpan={columns.length}
-                className="text-center text-text-tertiary text-sm py-12"
-              >
-                {emptyMessage}
+              <td colSpan={columns.length}>
+                {emptyState != null ? (
+                  emptyState
+                ) : (
+                  <div className="text-center text-text-tertiary text-sm py-12">
+                    {emptyMessage}
+                  </div>
+                )}
               </td>
             </tr>
           ) : (

@@ -115,14 +115,18 @@ function TeamSettingsForm({ team, orgId, canEdit }: TeamSettingsFormProps) {
   }
 
   return (
-    <form onSubmit={handleSubmit} noValidate className="p-6 space-y-6">
+    <form onSubmit={handleSubmit} noValidate className="space-y-6">
       {!canEdit && (
         <p className="text-sm text-text-secondary">
           Only team admins can modify team settings.
         </p>
       )}
 
-      <div className="space-y-4">
+      {/* Card 1: Basic Information */}
+      <div className="bg-bg-secondary rounded-xl border border-border p-6 space-y-4">
+        <h3 className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-4">
+          Basic Information
+        </h3>
         <Input
           label="Name"
           value={form.name}
@@ -143,15 +147,11 @@ function TeamSettingsForm({ team, orgId, canEdit }: TeamSettingsFormProps) {
         />
       </div>
 
-      <div>
-        <div className="flex items-center gap-3 mb-4">
-          <div className="h-px flex-1 bg-border" />
-          <span className="text-xs font-medium text-text-tertiary uppercase tracking-wider">
-            Limits
-          </span>
-          <div className="h-px flex-1 bg-border" />
-        </div>
-
+      {/* Card 2: Rate & Token Limits */}
+      <div className="bg-bg-secondary rounded-xl border border-border p-6 space-y-4">
+        <h3 className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-4">
+          Rate &amp; Token Limits
+        </h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <Input
             label="Daily Token Limit"
@@ -221,19 +221,18 @@ function TeamSettingsCard({ orgId, teamId, canEdit }: TeamSettingsCardProps) {
   const { data: team, isLoading } = useTeam(orgId, teamId)
 
   return (
-    <div className="max-w-2xl">
-      <div className="rounded-lg border border-border bg-bg-secondary">
-        <div className="px-6 py-4 border-b border-border">
-          <h2 className="text-sm font-semibold text-text-primary">Team</h2>
-        </div>
-
-        {isLoading || !team ? (
-          <div className="p-6 space-y-4">
-            <div className="h-4 w-32 rounded bg-bg-tertiary animate-pulse" />
+    <div className="max-w-3xl">
+      {isLoading || !team ? (
+        <div className="space-y-6">
+          {/* Basic Information skeleton */}
+          <div className="bg-bg-secondary rounded-xl border border-border p-6 space-y-4">
+            <div className="h-3 w-32 rounded bg-bg-tertiary animate-pulse" />
             <div className="h-9 w-full rounded bg-bg-tertiary animate-pulse" />
             <div className="h-9 w-full rounded bg-bg-tertiary animate-pulse" />
-            <div className="h-px bg-border" />
-            <div className="h-4 w-24 rounded bg-bg-tertiary animate-pulse" />
+          </div>
+          {/* Rate & Token Limits skeleton */}
+          <div className="bg-bg-secondary rounded-xl border border-border p-6 space-y-4">
+            <div className="h-3 w-40 rounded bg-bg-tertiary animate-pulse" />
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="h-9 rounded bg-bg-tertiary animate-pulse" />
               <div className="h-9 rounded bg-bg-tertiary animate-pulse" />
@@ -241,10 +240,10 @@ function TeamSettingsCard({ orgId, teamId, canEdit }: TeamSettingsCardProps) {
               <div className="h-9 rounded bg-bg-tertiary animate-pulse" />
             </div>
           </div>
-        ) : (
-          <TeamSettingsForm key={team.id} team={team} orgId={orgId} canEdit={canEdit} />
-        )}
-      </div>
+        </div>
+      ) : (
+        <TeamSettingsForm key={team.id} team={team} orgId={orgId} canEdit={canEdit} />
+      )}
     </div>
   )
 }
