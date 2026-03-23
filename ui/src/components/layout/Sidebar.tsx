@@ -251,7 +251,8 @@ export function Sidebar() {
   const queryClient = useQueryClient()
 
   const userRole = data?.role ?? 'member'
-  const hasFeature = (f: string): boolean => license?.features?.includes(f) ?? false
+  // Treat loading state as unlocked to avoid flicker — page-level guards enforce the real check
+  const hasFeature = (f: string): boolean => !license ? true : license.features.includes(f)
 
   const visibleGroups = useMemo(() => {
     const navigation = buildNavigation(hasFeature)
@@ -290,27 +291,36 @@ export function Sidebar() {
                   {group.label}
                 </div>
               )}
-              {group.items.map((item) => (
-                <NavLink
-                  key={item.path}
-                  to={item.path}
-                  end={item.end !== undefined ? item.end : item.path === '/'}
-                  className={({ isActive }) =>
-                    [
-                      'flex items-center gap-3 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200',
-                      isActive
-                        ? 'bg-accent/15 text-accent'
-                        : item.locked
-                          ? 'text-text-tertiary/40 hover:bg-bg-tertiary hover:text-text-tertiary'
+              {group.items.map((item) =>
+                item.locked ? (
+                  <NavLink
+                    key={item.path}
+                    to={item.path}
+                    className="flex items-center gap-3 px-3 py-2 rounded-lg text-sm opacity-50 hover:opacity-70 transition-opacity"
+                  >
+                    {item.icon}
+                    <span className="flex-1">{item.label}</span>
+                    <LockIcon />
+                  </NavLink>
+                ) : (
+                  <NavLink
+                    key={item.path}
+                    to={item.path}
+                    end={item.end !== undefined ? item.end : item.path === '/'}
+                    className={({ isActive }) =>
+                      [
+                        'flex items-center gap-3 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200',
+                        isActive
+                          ? 'bg-accent/15 text-accent'
                           : 'text-text-secondary hover:bg-bg-tertiary hover:text-text-primary',
-                    ].join(' ')
-                  }
-                >
-                  {item.icon}
-                  <span className="flex-1">{item.label}</span>
-                  {item.locked && <LockIcon />}
-                </NavLink>
-              ))}
+                      ].join(' ')
+                    }
+                  >
+                    {item.icon}
+                    <span className="flex-1">{item.label}</span>
+                  </NavLink>
+                )
+              )}
             </div>
           ))}
       </nav>

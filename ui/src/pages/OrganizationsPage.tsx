@@ -55,7 +55,7 @@ function CreateOrgDialog({ open, onClose }: CreateOrgDialogProps) {
     onClose()
   }
 
-  async function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent | React.MouseEvent) {
     e.preventDefault()
 
     let valid = true
@@ -126,7 +126,7 @@ function CreateOrgDialog({ open, onClose }: CreateOrgDialogProps) {
           >
             Cancel
           </Button>
-          <Button type="submit" loading={createOrg.isPending}>
+          <Button onClick={handleSubmit} loading={createOrg.isPending}>
             Create Organization
           </Button>
         </div>

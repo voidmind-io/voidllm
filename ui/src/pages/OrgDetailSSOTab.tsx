@@ -7,7 +7,9 @@ import { Toggle } from '../components/ui/Toggle'
 import { Select } from '../components/ui/Select'
 import { Badge } from '../components/ui/Badge'
 import { ConfirmDialog } from '../components/ui/Dialog'
+import { UpgradePrompt } from '../components/ui/UpgradePrompt'
 import { useToast } from '../hooks/useToast'
+import { useLicense } from '../hooks/useLicense'
 import {
   useOrgSSO,
   useGlobalSSO,
@@ -577,8 +579,18 @@ export default function OrgDetailSSOTab() {
   const { orgId = '' } = useParams<{ orgId: string }>()
   const [editMode, setEditMode] = useState(false)
 
+  const { data: license } = useLicense()
   const orgSSO = useOrgSSO(orgId)
   const globalSSO = useGlobalSSO()
+
+  if (license && !license.features.includes('sso_oidc')) {
+    return (
+      <UpgradePrompt
+        title="SSO Configuration"
+        description="SSO / OIDC integration requires an Enterprise license."
+      />
+    )
+  }
 
   const hasOrgConfig = orgSSO.data !== undefined && !orgSSO.isError
   const showEdit = editMode || hasOrgConfig

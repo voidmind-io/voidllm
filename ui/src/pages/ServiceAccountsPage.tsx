@@ -66,7 +66,7 @@ function CreateServiceAccountDialog({ open, onClose, orgId }: CreateServiceAccou
     onClose()
   }
 
-  async function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent | React.MouseEvent) {
     e.preventDefault()
 
     const trimmedName = name.trim()
@@ -143,7 +143,7 @@ function CreateServiceAccountDialog({ open, onClose, orgId }: CreateServiceAccou
           >
             Cancel
           </Button>
-          <Button type="submit" loading={createServiceAccount.isPending}>
+          <Button onClick={handleSubmit} loading={createServiceAccount.isPending}>
             Create Service Account
           </Button>
         </div>
@@ -178,7 +178,7 @@ function EditServiceAccountDialog({ open, onClose, sa, orgId }: EditServiceAccou
     onClose()
   }
 
-  function handleSubmit(e: React.FormEvent) {
+  function handleSubmit(e: React.FormEvent | React.MouseEvent) {
     e.preventDefault()
     const trimmed = name.trim()
     if (!trimmed) {
@@ -248,7 +248,7 @@ function EditServiceAccountDialog({ open, onClose, sa, orgId }: EditServiceAccou
           >
             Cancel
           </Button>
-          <Button type="submit" loading={updateServiceAccount.isPending} disabled={!isDirty}>
+          <Button onClick={handleSubmit} loading={updateServiceAccount.isPending} disabled={!isDirty}>
             Save
           </Button>
         </div>

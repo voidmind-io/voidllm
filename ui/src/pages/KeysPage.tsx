@@ -414,7 +414,7 @@ function CreateKeyDialog({ open, onClose, onCreated, orgId }: CreateKeyDialogPro
           >
             Cancel
           </Button>
-          <Button type="submit" loading={createKey.isPending}>
+          <Button onClick={handleSubmit} loading={createKey.isPending}>
             Create Key
           </Button>
         </div>
@@ -630,7 +630,7 @@ function EditKeyDialog({ apiKey, onClose, orgId }: EditKeyDialogProps) {
           <Button variant="secondary" onClick={onClose} disabled={updateKey.isPending}>
             Cancel
           </Button>
-          <Button type="submit" loading={updateKey.isPending}>
+          <Button onClick={handleSubmit} loading={updateKey.isPending}>
             Save Changes
           </Button>
         </div>

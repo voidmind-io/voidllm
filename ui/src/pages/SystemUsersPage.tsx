@@ -47,7 +47,7 @@ function CreateUserDialog({ open, onClose }: CreateUserDialogProps) {
     onClose()
   }
 
-  async function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent | React.MouseEvent) {
     e.preventDefault()
 
     let valid = true
@@ -149,7 +149,7 @@ function CreateUserDialog({ open, onClose }: CreateUserDialogProps) {
           >
             Cancel
           </Button>
-          <Button type="submit" loading={createUser.isPending}>
+          <Button onClick={handleSubmit} loading={createUser.isPending}>
             Create User
           </Button>
         </div>

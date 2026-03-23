@@ -54,7 +54,7 @@ function CreateTeamDialog({ open, onClose, orgId }: CreateTeamDialogProps) {
     onClose()
   }
 
-  function handleSubmit(e: React.FormEvent) {
+  function handleSubmit(e: React.FormEvent | React.MouseEvent) {
     e.preventDefault()
 
     let valid = true
@@ -125,7 +125,7 @@ function CreateTeamDialog({ open, onClose, orgId }: CreateTeamDialogProps) {
           >
             Cancel
           </Button>
-          <Button type="submit" loading={createTeam.isPending}>
+          <Button onClick={handleSubmit} loading={createTeam.isPending}>
             Create Team
           </Button>
         </div>

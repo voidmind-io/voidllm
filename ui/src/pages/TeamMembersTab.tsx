@@ -160,7 +160,7 @@ function AddMemberDialog({
     return true
   }
 
-  function handleSubmit(e: React.FormEvent) {
+  function handleSubmit(e: React.FormEvent | React.MouseEvent) {
     e.preventDefault()
     if (!validate()) return
 
@@ -208,7 +208,7 @@ function AddMemberDialog({
           <Button variant="secondary" onClick={handleClose} disabled={addMember.isPending}>
             Cancel
           </Button>
-          <Button type="submit" loading={addMember.isPending}>
+          <Button onClick={handleSubmit} loading={addMember.isPending}>
             Add Member
           </Button>
         </div>

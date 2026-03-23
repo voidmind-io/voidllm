@@ -147,7 +147,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     return Object.keys(next).length === 0
   }
 
-  function handleSubmit(e: React.FormEvent) {
+  function handleSubmit(e: React.FormEvent | React.MouseEvent) {
     e.preventDefault()
     if (!validate()) return
 
@@ -320,7 +320,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
           >
             Cancel
           </Button>
-          <Button type="submit" loading={createModel.isPending}>
+          <Button onClick={handleSubmit} loading={createModel.isPending}>
             Add Model
           </Button>
         </div>
@@ -362,7 +362,7 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
 
   const isAzure = provider === 'azure'
 
-  function handleSubmit(e: React.FormEvent) {
+  function handleSubmit(e: React.FormEvent | React.MouseEvent) {
     e.preventDefault()
 
     const params: UpdateModelParams = {}
@@ -539,7 +539,7 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
           <Button variant="secondary" onClick={onClose} disabled={updateModel.isPending}>
             Cancel
           </Button>
-          <Button type="submit" loading={updateModel.isPending}>
+          <Button onClick={handleSubmit} loading={updateModel.isPending}>
             Save Changes
           </Button>
         </div>

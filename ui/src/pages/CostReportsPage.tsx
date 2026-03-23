@@ -4,7 +4,9 @@ import { StatCard } from '../components/ui/StatCard'
 import { Table } from '../components/ui/Table'
 import type { Column } from '../components/ui/Table'
 import { Button } from '../components/ui/Button'
+import { UpgradePrompt } from '../components/ui/UpgradePrompt'
 import { useMe } from '../hooks/useMe'
+import { useLicense } from '../hooks/useLicense'
 import { useUsage } from '../hooks/useUsage'
 import type { UsageDataPoint } from '../hooks/useUsage'
 import { formatNumber, formatCost } from '../lib/utils'
@@ -167,15 +169,14 @@ const dayColumns: Column<DayCostRow>[] = [
 export default function CostReportsPage() {
   const [range, setRange] = useState<TimeRange>('30d')
   const { data: me } = useMe()
+  const { data: license } = useLicense()
   const orgId = me?.org_id ?? ''
 
+  const featureEnabled = !license || license.features.includes('cost_reports')
   const { from, to } = useMemo(() => getTimeRange(range), [range])
 
   const { data: modelUsage, isLoading: modelLoading } = useUsage(orgId, from, to, 'model')
   const { data: dayUsage, isLoading: dayLoading } = useUsage(orgId, from, to, 'day')
-
-  const isModelLoading = modelLoading && !!orgId
-  const isDayLoading = dayLoading && !!orgId
 
   // Compute totals and model rows
   const { totalCost, modelRows, avgCostPerDay, topModel } = useMemo(() => {
@@ -197,7 +198,6 @@ export default function CostReportsPage() {
   // Compute day rows with change vs prior day
   const dayRows: DayCostRow[] = useMemo(() => {
     const data = dayUsage?.data ?? []
-    // Sort ascending by date
     const sorted = [...data].sort((a, b) => a.group_key.localeCompare(b.group_key))
     return sorted.map((d, i) => {
       const prior = i > 0 ? sorted[i - 1].cost_estimate : null
@@ -213,10 +213,20 @@ export default function CostReportsPage() {
     })
   }, [dayUsage])
 
-  // Reverse for display (most recent first)
   const dayRowsDesc = useMemo(() => [...dayRows].reverse(), [dayRows])
-
   const modelColumns = useMemo(() => buildModelColumns(totalCost), [totalCost])
+
+  if (!featureEnabled) {
+    return (
+      <UpgradePrompt
+        title="Cost Reports"
+        description="Cost reports and budget alerts require a Pro or Enterprise license."
+      />
+    )
+  }
+
+  const isModelLoading = modelLoading && !!orgId
+  const isDayLoading = dayLoading && !!orgId
 
   return (
     <>

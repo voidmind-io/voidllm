@@ -1,6 +1,6 @@
 [build]
   cmd = "go build -o ./tmp/voidllm ./cmd/voidllm"
-  bin = "./tmp/voidllm"
+  entrypoint = "./tmp/voidllm"
   include_ext = ["go", "yaml"]
   exclude_dir = ["ui", "tmp", "vendor", "docs", "enterprise"]
   delay = 200

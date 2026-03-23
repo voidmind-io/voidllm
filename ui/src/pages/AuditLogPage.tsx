@@ -6,7 +6,9 @@ import { Badge, type BadgeProps } from '../components/ui/Badge'
 import { Button } from '../components/ui/Button'
 import { Select } from '../components/ui/Select'
 import { TimeAgo } from '../components/ui/TimeAgo'
+import { UpgradePrompt } from '../components/ui/UpgradePrompt'
 import { useMe } from '../hooks/useMe'
+import { useLicense } from '../hooks/useLicense'
 import { useAuditLog } from '../hooks/useAuditLog'
 import type { AuditEvent } from '../hooks/useAuditLog'
 
@@ -182,6 +184,7 @@ export default function AuditLogPage() {
   const currentCursor = cursors[cursors.length - 1]
 
   const { data: me } = useMe()
+  const { data: license } = useLicense()
   const orgId = me?.org_id ?? ''
 
   const { from, to } = useMemo(() => getTimeRange(range), [range])
@@ -195,6 +198,15 @@ export default function AuditLogPage() {
     limit: pageSize,
     cursor: currentCursor,
   })
+
+  if (license && !license.features.includes('audit_logs')) {
+    return (
+      <UpgradePrompt
+        title="Audit Log"
+        description="Audit logging requires an Enterprise license."
+      />
+    )
+  }
 
   const events = data?.data ?? []
   const hasPrevious = cursors.length > 1

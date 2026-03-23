@@ -112,7 +112,7 @@ function InviteUserDialog({ open, onClose, orgId }: InviteUserDialogProps) {
     return true
   }
 
-  function handleSubmit(e: React.FormEvent) {
+  function handleSubmit(e: React.FormEvent | React.MouseEvent) {
     e.preventDefault()
     if (!validate()) return
 
@@ -193,7 +193,7 @@ function InviteUserDialog({ open, onClose, orgId }: InviteUserDialogProps) {
           <Button variant="secondary" onClick={handleClose} disabled={createInvite.isPending}>
             Cancel
           </Button>
-          <Button type="submit" loading={createInvite.isPending}>
+          <Button onClick={handleSubmit} loading={createInvite.isPending}>
             Send Invite
           </Button>
         </div>

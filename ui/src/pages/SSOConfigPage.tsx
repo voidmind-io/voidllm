@@ -1,7 +1,9 @@
 import { Link, Navigate } from 'react-router-dom'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Badge } from '../components/ui/Badge'
+import { UpgradePrompt } from '../components/ui/UpgradePrompt'
 import { useMe } from '../hooks/useMe'
+import { useLicense } from '../hooks/useLicense'
 import { useGlobalSSO } from '../hooks/useOrgSSO'
 import { useOrgs } from '../hooks/useOrgs'
 
@@ -198,9 +200,19 @@ function OrgSSOLinksCard() {
 
 export default function SSOConfigPage() {
   const { data: me, isLoading } = useMe()
+  const { data: license } = useLicense()
 
   // While loading, render nothing to avoid a flash redirect
   if (isLoading) return null
+
+  if (license && !license.features.includes('sso_oidc')) {
+    return (
+      <UpgradePrompt
+        title="SSO Configuration"
+        description="SSO / OIDC integration requires an Enterprise license."
+      />
+    )
+  }
 
   // org_admin (non-system-admin): redirect to their org's SSO tab
   if (me && !me.is_system_admin && me.org_id) {
