@@ -29,4 +29,3 @@ VOLUME ["/data"]
 EXPOSE 8080 8443
 USER voidllm
 ENTRYPOINT ["voidllm"]
-CMD ["--config", "/etc/voidllm/voidllm.yaml"]
