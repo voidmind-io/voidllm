@@ -122,7 +122,7 @@ func TestInterpolateEnv(t *testing.T) {
 			}
 
 			path := writeTemp(t, "voidllm.yaml", modelWithAPIKey(tc.expr))
-			cfg, err := config.Load(path)
+			cfg, _, err := config.Load(path)
 			if err != nil {
 				t.Fatalf("Load() unexpected error: %v", err)
 			}
@@ -158,7 +158,7 @@ models:
     base_url: "${SCHEME_PART}://${HOST_PART}"
 `
 	path := writeTemp(t, "voidllm.yaml", yaml)
-	cfg, err := config.Load(path)
+	cfg, _, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestSetDefaults(t *testing.T) {
 	// Load a config that sets nothing except the required fields so that
 	// every default-filling branch is exercised.
 	path := writeTemp(t, "voidllm.yaml", minimalValidYAML())
-	cfg, err := config.Load(path)
+	cfg, _, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestSetDefaults_DropOnFullNilIsTrue(t *testing.T) {
 	t.Parallel()
 
 	path := writeTemp(t, "voidllm.yaml", minimalValidYAML())
-	cfg, err := config.Load(path)
+	cfg, _, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestSetDefaults_TokenCountingNilIsEnabled(t *testing.T) {
 	t.Parallel()
 
 	path := writeTemp(t, "voidllm.yaml", minimalValidYAML())
-	cfg, err := config.Load(path)
+	cfg, _, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
@@ -260,7 +260,7 @@ settings:
     drop_on_full: false
 `
 	path := writeTemp(t, "voidllm.yaml", yaml)
-	cfg, err := config.Load(path)
+	cfg, _, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
@@ -713,7 +713,7 @@ models:
 			t.Parallel()
 
 			path := writeTemp(t, "voidllm.yaml", tc.yaml)
-			_, err := config.Load(path)
+			_, _, err := config.Load(path)
 
 			if tc.wantErr {
 				if err == nil {
@@ -757,7 +757,7 @@ models:
     base_url: ""
 `
 	path := writeTemp(t, "voidllm.yaml", yaml)
-	_, err := config.Load(path)
+	_, _, err := config.Load(path)
 	if err == nil {
 		t.Fatal("Load() expected error, got nil")
 	}
@@ -790,7 +790,7 @@ func TestLoad_ExplicitPath(t *testing.T) {
 	t.Parallel()
 
 	path := writeTemp(t, "voidllm.yaml", minimalValidYAML())
-	cfg, err := config.Load(path)
+	cfg, _, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load(%q) unexpected error: %v", path, err)
 	}
@@ -802,7 +802,7 @@ func TestLoad_ExplicitPath(t *testing.T) {
 func TestLoad_NonexistentExplicitPath(t *testing.T) {
 	t.Parallel()
 
-	_, err := config.Load("/nonexistent/path/voidllm.yaml")
+	_, _, err := config.Load("/nonexistent/path/voidllm.yaml")
 	if err == nil {
 		t.Fatal("Load() expected error for nonexistent path, got nil")
 	}
@@ -813,7 +813,7 @@ func TestLoad_VoidllmConfigEnvVar(t *testing.T) {
 	path := writeTemp(t, "custom.yaml", minimalValidYAML())
 	t.Setenv("VOIDLLM_CONFIG", path)
 
-	cfg, err := config.Load("")
+	cfg, _, err := config.Load("")
 	if err != nil {
 		t.Fatalf("Load(\"\") with VOIDLLM_CONFIG set: unexpected error: %v", err)
 	}
@@ -850,7 +850,7 @@ func TestLoad_NoPathNoEnvVarNoFile(t *testing.T) {
 	// t.Setenv and os.Chdir require sequential execution; no t.Parallel() here.
 	isolateFromFilesystem(t)
 
-	_, err := config.Load("")
+	_, _, err := config.Load("")
 	if err == nil {
 		t.Fatal("Load(\"\") with no encryption key: expected validation error, got nil")
 	}
@@ -867,7 +867,7 @@ func TestLoad_FallbackToDefaultsWithEncryptionKey(t *testing.T) {
 	isolateFromFilesystem(t)
 	t.Setenv("VOIDLLM_ENCRYPTION_KEY", "test-encryption-key-32chars-long!")
 
-	cfg, err := config.Load("")
+	cfg, _, err := config.Load("")
 	if err != nil {
 		t.Fatalf("Load(\"\") with VOIDLLM_ENCRYPTION_KEY set: unexpected error: %v", err)
 	}
@@ -891,7 +891,7 @@ func TestLoad_FallbackToDefaultsPicksUpAdminKey(t *testing.T) {
 	t.Setenv("VOIDLLM_ENCRYPTION_KEY", "test-encryption-key-32chars-long!")
 	t.Setenv("VOIDLLM_ADMIN_KEY", "vl_sa_testsecretadminkey")
 
-	cfg, err := config.Load("")
+	cfg, _, err := config.Load("")
 	if err != nil {
 		t.Fatalf("Load(\"\") with both env keys set: unexpected error: %v", err)
 	}
@@ -948,7 +948,7 @@ models:
       - fast
 `
 	path := writeTemp(t, "voidllm.yaml", yaml)
-	cfg, err := config.Load(path)
+	cfg, _, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}

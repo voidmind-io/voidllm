@@ -38,7 +38,7 @@ func main() {
 
 	// Load configuration. Errors here use fmt.Fprintf because the logger has
 	// not yet been initialized.
-	cfg, err := config.Load(*configPath)
+	cfg, fromDefaults, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "voidllm: failed to load config: %v\n", err)
 		os.Exit(1)
@@ -54,6 +54,10 @@ func main() {
 	// so that any code calling slog.Default() gets request correlation for free.
 	log := slog.New(logger.NewRequestIDHandler(logger.New(cfg.Logging, os.Stdout).Handler(), apierror.RequestIDFromGoCtx))
 	slog.SetDefault(log)
+
+	if fromDefaults {
+		log.Info("no config file found, using environment variables and built-in defaults")
+	}
 
 	if *devMode {
 		log.Warn("========================================")
@@ -73,6 +77,8 @@ func main() {
 		log.Error("server start failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+
+	application.PrintBootstrapCredentials()
 
 	application.WaitForShutdown(context.Background())
 }

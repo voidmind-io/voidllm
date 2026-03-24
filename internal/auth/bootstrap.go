@@ -19,21 +19,33 @@ import (
 	"github.com/voidmind-io/voidllm/pkg/keygen"
 )
 
+// BootstrapResult holds the plaintext credentials generated during a successful
+// bootstrap. These values must be presented to the operator exactly once and
+// are never persisted or logged through structured logging.
+type BootstrapResult struct {
+	// APIKey is the plaintext API key for the initial system-admin user.
+	APIKey string
+	// Email is the email address of the initial system-admin user.
+	Email string
+	// Password is the plaintext password for the initial system-admin user.
+	Password string
+}
+
 // Bootstrap performs first-time setup when the database is empty.
 // If cfg.AdminKey is non-empty and no API keys exist in the database, it
 // creates a default organization, system admin user with a random password,
-// and an API key. The generated API key and password are written to stderr so
-// the operator can copy them for initial setup.
-// If the database already has keys, or cfg.AdminKey is empty, this is a no-op.
+// and an API key. The returned BootstrapResult holds the plaintext credentials
+// that the caller must present to the operator; it is nil when bootstrap is
+// skipped (database already has keys or cfg.AdminKey is empty).
 func Bootstrap(ctx context.Context, sqlDB *sql.DB, dialect db.Dialect,
 	keyCache *cache.Cache[string, KeyInfo], cfg config.SettingsConfig,
-	hmacSecret []byte, log *slog.Logger) error {
+	hmacSecret []byte, log *slog.Logger) (*BootstrapResult, error) {
 	if cfg.AdminKey == "" {
-		return nil
+		return nil, nil
 	}
 
 	if len(cfg.AdminKey) < 32 {
-		return errors.New("admin key must be at least 32 characters")
+		return nil, errors.New("admin key must be at least 32 characters")
 	}
 
 	orgName := cfg.Bootstrap.OrgName
@@ -42,37 +54,37 @@ func Bootstrap(ctx context.Context, sqlDB *sql.DB, dialect db.Dialect,
 
 	orgID, err := uuid.NewV7()
 	if err != nil {
-		return fmt.Errorf("bootstrap: generate org id: %w", err)
+		return nil, fmt.Errorf("bootstrap: generate org id: %w", err)
 	}
 
 	userID, err := uuid.NewV7()
 	if err != nil {
-		return fmt.Errorf("bootstrap: generate user id: %w", err)
+		return nil, fmt.Errorf("bootstrap: generate user id: %w", err)
 	}
 
 	membershipID, err := uuid.NewV7()
 	if err != nil {
-		return fmt.Errorf("bootstrap: generate membership id: %w", err)
+		return nil, fmt.Errorf("bootstrap: generate membership id: %w", err)
 	}
 
 	keyID, err := uuid.NewV7()
 	if err != nil {
-		return fmt.Errorf("bootstrap: generate key id: %w", err)
+		return nil, fmt.Errorf("bootstrap: generate key id: %w", err)
 	}
 
 	password, err := generatePassword(16)
 	if err != nil {
-		return fmt.Errorf("bootstrap: %w", err)
+		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
 
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return fmt.Errorf("bootstrap: hash password: %w", err)
+		return nil, fmt.Errorf("bootstrap: hash password: %w", err)
 	}
 
 	plaintextKey, err := keygen.Generate(keygen.KeyTypeUser)
 	if err != nil {
-		return fmt.Errorf("bootstrap: generate api key: %w", err)
+		return nil, fmt.Errorf("bootstrap: generate api key: %w", err)
 	}
 
 	keyHash := keygen.Hash(plaintextKey, hmacSecret)
@@ -80,7 +92,7 @@ func Bootstrap(ctx context.Context, sqlDB *sql.DB, dialect db.Dialect,
 
 	tx, err := sqlDB.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("bootstrap: begin transaction: %w", err)
+		return nil, fmt.Errorf("bootstrap: begin transaction: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after successful Commit
 
@@ -88,12 +100,12 @@ func Bootstrap(ctx context.Context, sqlDB *sql.DB, dialect db.Dialect,
 	row := tx.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM api_keys WHERE deleted_at IS NULL")
 	if err = row.Scan(&count); err != nil {
-		return fmt.Errorf("bootstrap: count api_keys: %w", err)
+		return nil, fmt.Errorf("bootstrap: count api_keys: %w", err)
 	}
 
 	if count > 0 {
 		log.Warn("VOIDLLM_ADMIN_KEY is set but database already has keys, ignoring")
-		return nil
+		return nil, nil
 	}
 
 	insertOrg := "INSERT INTO organizations (id, name, slug, created_at, updated_at) VALUES (" +
@@ -101,7 +113,7 @@ func Bootstrap(ctx context.Context, sqlDB *sql.DB, dialect db.Dialect,
 		dialect.Placeholder(2) + ", " +
 		dialect.Placeholder(3) + ", CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 	if _, err = tx.ExecContext(ctx, insertOrg, orgID.String(), orgName, orgSlug); err != nil {
-		return fmt.Errorf("bootstrap: insert organization: %w", err)
+		return nil, fmt.Errorf("bootstrap: insert organization: %w", err)
 	}
 
 	insertUser := "INSERT INTO users (id, email, display_name, password_hash, auth_provider, is_system_admin, created_at, updated_at) VALUES (" +
@@ -119,7 +131,7 @@ func Bootstrap(ctx context.Context, sqlDB *sql.DB, dialect db.Dialect,
 		"local",
 		1,
 	); err != nil {
-		return fmt.Errorf("bootstrap: insert user: %w", err)
+		return nil, fmt.Errorf("bootstrap: insert user: %w", err)
 	}
 
 	insertMembership := "INSERT INTO org_memberships (id, org_id, user_id, role, created_at) VALUES (" +
@@ -133,7 +145,7 @@ func Bootstrap(ctx context.Context, sqlDB *sql.DB, dialect db.Dialect,
 		userID.String(),
 		RoleOrgAdmin,
 	); err != nil {
-		return fmt.Errorf("bootstrap: insert org membership: %w", err)
+		return nil, fmt.Errorf("bootstrap: insert org membership: %w", err)
 	}
 
 	insertKey := "INSERT INTO api_keys (id, key_hash, key_hint, key_type, name, org_id, user_id, created_by, created_at, updated_at) VALUES (" +
@@ -155,11 +167,11 @@ func Bootstrap(ctx context.Context, sqlDB *sql.DB, dialect db.Dialect,
 		userID.String(),
 		userID.String(),
 	); err != nil {
-		return fmt.Errorf("bootstrap: insert api key: %w", err)
+		return nil, fmt.Errorf("bootstrap: insert api key: %w", err)
 	}
 
 	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("bootstrap: commit transaction: %w", err)
+		return nil, fmt.Errorf("bootstrap: commit transaction: %w", err)
 	}
 
 	keyCache.Set(keyHash, KeyInfo{
@@ -173,24 +185,14 @@ func Bootstrap(ctx context.Context, sqlDB *sql.DB, dialect db.Dialect,
 
 	os.Unsetenv("VOIDLLM_ADMIN_KEY")
 
-	// Intentional use of fmt.Fprintln instead of slog: the bootstrap plaintext
-	// key and password must be shown to the operator on stderr but must NOT
-	// go through structured logging where they could be captured by log
-	// aggregation systems (ELK, Datadog, CloudWatch).
-	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "========================================")
-	fmt.Fprintln(os.Stderr, " BOOTSTRAP COMPLETE — COPY THESE NOW")
-	fmt.Fprintln(os.Stderr, "========================================")
-	fmt.Fprintf(os.Stderr, "  API Key:    %s\n", plaintextKey)
-	fmt.Fprintf(os.Stderr, "  Email:      %s\n", adminEmail)
-	fmt.Fprintf(os.Stderr, "  Password:   %s\n", password)
-	fmt.Fprintln(os.Stderr, "========================================")
-	fmt.Fprintln(os.Stderr, "")
-
 	log.Warn("bootstrap complete, default organization and system admin created",
 		slog.String("key_hint", keyHint))
 
-	return nil
+	return &BootstrapResult{
+		APIKey:   plaintextKey,
+		Email:    adminEmail,
+		Password: password,
+	}, nil
 }
 
 // generatePassword creates a random alphanumeric password of the given length.

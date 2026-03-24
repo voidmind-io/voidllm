@@ -48,13 +48,14 @@ import (
 // Application is the top-level VoidLLM server lifecycle coordinator. It owns
 // every long-lived dependency and orchestrates startup, signal handling, and
 // phased graceful shutdown. All fields are unexported; callers interact only
-// through New, Start, and WaitForShutdown.
+// through New, Start, PrintBootstrapCredentials, and WaitForShutdown.
 type Application struct {
-	cfg           *config.Config
-	log           *slog.Logger
-	devMode       bool
-	licHolder     *license.Holder
-	rawLicenseKey string
+	cfg             *config.Config
+	log             *slog.Logger
+	devMode         bool
+	licHolder       *license.Holder
+	rawLicenseKey   string
+	bootstrapResult *auth.BootstrapResult
 
 	database   *db.DB
 	encKey     []byte
@@ -286,7 +287,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// active API keys into the in-memory cache for hot-path lookups.
 	keyCache := cache.New[string, auth.KeyInfo]()
 
-	if err := auth.Bootstrap(ctx, database.SQL(), database.Dialect(), keyCache, cfg.Settings, hmacSecret, log); err != nil {
+	bootstrapResult, err := auth.Bootstrap(ctx, database.SQL(), database.Dialect(), keyCache, cfg.Settings, hmacSecret, log)
+	if err != nil {
 		return nil, fmt.Errorf("bootstrap auth: %w", err)
 	}
 
@@ -510,11 +512,12 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 
 	success = true
 	return &Application{
-		cfg:           cfg,
-		log:           log,
-		devMode:       devMode,
-		licHolder:     licHolder,
-		rawLicenseKey: licenseKey,
+		cfg:             cfg,
+		log:             log,
+		devMode:         devMode,
+		licHolder:       licHolder,
+		rawLicenseKey:   licenseKey,
+		bootstrapResult: bootstrapResult,
 		database:      database,
 		encKey:        encKey,
 		hmacSecret:    hmacSecret,
@@ -735,6 +738,31 @@ func (a *Application) WaitForShutdown(ctx context.Context) {
 	a.cleanup(ctx)
 
 	a.log.LogAttrs(ctx, slog.LevelInfo, "shutdown complete")
+}
+
+// PrintBootstrapCredentials writes the bootstrap credentials to stderr when a
+// bootstrap was performed during startup. It must be called after Start so that
+// the Fiber server banner has already been printed, preventing interleaving.
+// If no bootstrap occurred this is a no-op.
+//
+// Intentional use of fmt.Fprintln instead of slog: the plaintext key and
+// password must be shown to the operator on stderr exactly once but must NOT
+// go through structured logging where they could be captured by log aggregation
+// systems (ELK, Datadog, CloudWatch).
+func (a *Application) PrintBootstrapCredentials() {
+	if a.bootstrapResult == nil {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "========================================")
+	fmt.Fprintln(os.Stderr, " BOOTSTRAP COMPLETE — COPY THESE NOW")
+	fmt.Fprintln(os.Stderr, "========================================")
+	fmt.Fprintf(os.Stderr, "  API Key:    %s\n", a.bootstrapResult.APIKey)
+	fmt.Fprintf(os.Stderr, "  Email:      %s\n", a.bootstrapResult.Email)
+	fmt.Fprintf(os.Stderr, "  Password:   %s\n", a.bootstrapResult.Password)
+	fmt.Fprintln(os.Stderr, "========================================")
+	fmt.Fprintln(os.Stderr, "")
+	a.bootstrapResult = nil
 }
 
 // cleanup tears down resources in reverse startup order: Redis pub/sub,

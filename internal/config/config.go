@@ -334,26 +334,31 @@ func (t TokenCountingConfig) IsEnabled() bool {
 // Load reads the configuration file at path, applies environment variable
 // interpolation, unmarshals the YAML, applies defaults, and validates the result.
 // If path is empty, Load calls findConfigFile to locate the file automatically.
-func Load(path string) (*Config, error) {
+// The second return value is true when no config file was found and defaults
+// were used; callers should log this after their logger is initialised.
+func Load(path string) (*Config, bool, error) {
 	if path == "" {
 		var err error
 		path, err = findConfigFile()
 		if err != nil {
-			slog.Info("no config file found, using environment variables and built-in defaults")
-			return loadDefaults()
+			cfg, defErr := loadDefaults()
+			if defErr != nil {
+				return nil, false, defErr
+			}
+			return cfg, true, nil
 		}
 	}
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("config: read file %q: %w", path, err)
+		return nil, false, fmt.Errorf("config: read file %q: %w", path, err)
 	}
 
 	raw = interpolateEnv(raw)
 
 	var cfg Config
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
-		return nil, fmt.Errorf("config: unmarshal yaml: %w", err)
+		return nil, false, fmt.Errorf("config: unmarshal yaml: %w", err)
 	}
 
 	cfg.setDefaults()
@@ -364,16 +369,16 @@ func Load(path string) (*Config, error) {
 	if cfg.Settings.LicenseFile != "" && cfg.Settings.License == "" {
 		licenseBytes, readErr := os.ReadFile(cfg.Settings.LicenseFile)
 		if readErr != nil {
-			return nil, fmt.Errorf("config: read license_file %q: %w", cfg.Settings.LicenseFile, readErr)
+			return nil, false, fmt.Errorf("config: read license_file %q: %w", cfg.Settings.LicenseFile, readErr)
 		}
 		cfg.Settings.License = strings.TrimSpace(string(licenseBytes))
 	}
 
 	if err := cfg.validate(); err != nil {
-		return nil, fmt.Errorf("config: %w", err)
+		return nil, false, fmt.Errorf("config: %w", err)
 	}
 
-	return &cfg, nil
+	return &cfg, false, nil
 }
 
 // findConfigFile returns the path to the configuration file by checking, in order:

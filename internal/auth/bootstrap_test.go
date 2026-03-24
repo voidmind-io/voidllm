@@ -81,7 +81,7 @@ func TestBootstrap_EmptyAdminKey(t *testing.T) {
 	sqlDB := setupBootstrapDB(t, t.Name())
 	keyCache := cache.New[string, KeyInfo]()
 
-	err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
+	_, err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
 		keyCache, defaultBootstrapCfg(""), bootstrapSecret, discardLogger())
 	if err != nil {
 		t.Fatalf("Bootstrap() with empty key returned error: %v", err)
@@ -122,7 +122,7 @@ func TestBootstrap_AdminKeyTooShort(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
+			_, err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
 				keyCache, defaultBootstrapCfg(tc.key), bootstrapSecret, discardLogger())
 			if err == nil {
 				t.Fatal("Bootstrap() returned nil, want error")
@@ -148,7 +148,7 @@ func TestBootstrap_DBAlreadyHasKeys(t *testing.T) {
 	log := discardLogger()
 
 	// First call creates everything.
-	if err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
+	if _, err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
 		keyCache, cfg, bootstrapSecret, log); err != nil {
 		t.Fatalf("first Bootstrap() call: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestBootstrap_DBAlreadyHasKeys(t *testing.T) {
 	keys := countRows(t, sqlDB, "api_keys")
 
 	// Second call should be a no-op.
-	if err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
+	if _, err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
 		keyCache, cfg, bootstrapSecret, log); err != nil {
 		t.Fatalf("second Bootstrap() call: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestBootstrap_CreatesEntities(t *testing.T) {
 	keyCache := cache.New[string, KeyInfo]()
 	cfg := defaultBootstrapCfg(strings.Repeat("c", 32))
 
-	if err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
+	if _, err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
 		keyCache, cfg, bootstrapSecret, discardLogger()); err != nil {
 		t.Fatalf("Bootstrap(): %v", err)
 	}
@@ -264,7 +264,7 @@ func TestBootstrap_KeyInCache(t *testing.T) {
 	keyCache := cache.New[string, KeyInfo]()
 	cfg := defaultBootstrapCfg(strings.Repeat("d", 32))
 
-	if err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
+	if _, err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
 		keyCache, cfg, bootstrapSecret, discardLogger()); err != nil {
 		t.Fatalf("Bootstrap(): %v", err)
 	}
@@ -314,7 +314,7 @@ func TestBootstrap_Idempotent(t *testing.T) {
 	log := discardLogger()
 
 	for i := range 2 {
-		if err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
+		if _, err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
 			keyCache, cfg, bootstrapSecret, log); err != nil {
 			t.Fatalf("Bootstrap() call %d: %v", i+1, err)
 		}
@@ -340,7 +340,7 @@ func TestBootstrap_CacheOrgUserIDsMatchDB(t *testing.T) {
 	keyCache := cache.New[string, KeyInfo]()
 	cfg := defaultBootstrapCfg(strings.Repeat("f", 32))
 
-	if err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
+	if _, err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
 		keyCache, cfg, bootstrapSecret, discardLogger()); err != nil {
 		t.Fatalf("Bootstrap(): %v", err)
 	}
@@ -377,7 +377,7 @@ func TestBootstrap_ExactlyOneCacheEntry(t *testing.T) {
 	keyCache := cache.New[string, KeyInfo]()
 	cfg := defaultBootstrapCfg(strings.Repeat("g", 32))
 
-	if err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
+	if _, err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
 		keyCache, cfg, bootstrapSecret, discardLogger()); err != nil {
 		t.Fatalf("Bootstrap(): %v", err)
 	}
@@ -397,7 +397,7 @@ func TestBootstrap_KeyHintFormat(t *testing.T) {
 	keyCache := cache.New[string, KeyInfo]()
 	cfg := defaultBootstrapCfg(strings.Repeat("h", 32))
 
-	if err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
+	if _, err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
 		keyCache, cfg, bootstrapSecret, discardLogger()); err != nil {
 		t.Fatalf("Bootstrap(): %v", err)
 	}
@@ -435,7 +435,7 @@ func TestBootstrap_CustomOrgAndEmail(t *testing.T) {
 		},
 	}
 
-	if err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
+	if _, err := Bootstrap(context.Background(), sqlDB, db.SQLiteDialect{},
 		keyCache, cfg, bootstrapSecret, discardLogger()); err != nil {
 		t.Fatalf("Bootstrap(): %v", err)
 	}
