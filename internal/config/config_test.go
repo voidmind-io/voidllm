@@ -822,26 +822,87 @@ func TestLoad_VoidllmConfigEnvVar(t *testing.T) {
 	}
 }
 
-func TestLoad_NoPathNoEnvVarNoFile(t *testing.T) {
-	// t.Setenv and os.Chdir require sequential execution; no t.Parallel() here.
-
-	// Ensure VOIDLLM_CONFIG is not set and no ./voidllm.yaml exists in the
-	// current working directory. We change to a fresh temp dir for this test.
+// isolateFromFilesystem changes into a fresh temp directory so that no
+// ./voidllm.yaml is present, clears VOIDLLM_CONFIG, and also clears the two
+// env-based secrets so each sub-test starts from a known baseline.
+// It restores everything via t.Cleanup.
+func isolateFromFilesystem(t *testing.T) {
+	t.Helper()
 	dir := t.TempDir()
 	original, err := os.Getwd()
 	if err != nil {
-		t.Fatalf("Getwd: %v", err)
+		t.Fatalf("isolateFromFilesystem: Getwd: %v", err)
 	}
 	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("Chdir: %v", err)
+		t.Fatalf("isolateFromFilesystem: Chdir: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(original) })
-
 	t.Setenv("VOIDLLM_CONFIG", "")
+	t.Setenv("VOIDLLM_ENCRYPTION_KEY", "")
+	t.Setenv("VOIDLLM_ADMIN_KEY", "")
+}
 
-	_, err = config.Load("")
+// TestLoad_NoPathNoEnvVarNoFile tests the new loadDefaults() fallback path.
+// When no config file is found Load("") now calls loadDefaults(), which reads
+// secrets from environment variables and runs validate(). Without an encryption
+// key the validation error must mention "settings.encryption_key".
+func TestLoad_NoPathNoEnvVarNoFile(t *testing.T) {
+	// t.Setenv and os.Chdir require sequential execution; no t.Parallel() here.
+	isolateFromFilesystem(t)
+
+	_, err := config.Load("")
 	if err == nil {
-		t.Fatal("Load(\"\") expected error when no config file found, got nil")
+		t.Fatal("Load(\"\") with no encryption key: expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "settings.encryption_key") {
+		t.Errorf("Load(\"\") error = %q, want it to mention %q", err.Error(), "settings.encryption_key")
+	}
+}
+
+// TestLoad_FallbackToDefaultsWithEncryptionKey verifies that Load("") succeeds
+// and returns a fully-defaulted Config (proxy port 8080) when no config file
+// exists but VOIDLLM_ENCRYPTION_KEY is present in the environment.
+func TestLoad_FallbackToDefaultsWithEncryptionKey(t *testing.T) {
+	// t.Setenv and os.Chdir require sequential execution; no t.Parallel() here.
+	isolateFromFilesystem(t)
+	t.Setenv("VOIDLLM_ENCRYPTION_KEY", "test-encryption-key-32chars-long!")
+
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\") with VOIDLLM_ENCRYPTION_KEY set: unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("Load(\"\") returned nil config")
+	}
+	if cfg.Server.Proxy.Port != 8080 {
+		t.Errorf("Server.Proxy.Port = %d, want 8080", cfg.Server.Proxy.Port)
+	}
+	if cfg.Settings.EncryptionKey != "test-encryption-key-32chars-long!" {
+		t.Errorf("Settings.EncryptionKey = %q, want %q", cfg.Settings.EncryptionKey, "test-encryption-key-32chars-long!")
+	}
+}
+
+// TestLoad_FallbackToDefaultsPicksUpAdminKey verifies that Load("") populates
+// both Settings.EncryptionKey and Settings.AdminKey from the environment when
+// no config file is present.
+func TestLoad_FallbackToDefaultsPicksUpAdminKey(t *testing.T) {
+	// t.Setenv and os.Chdir require sequential execution; no t.Parallel() here.
+	isolateFromFilesystem(t)
+	t.Setenv("VOIDLLM_ENCRYPTION_KEY", "test-encryption-key-32chars-long!")
+	t.Setenv("VOIDLLM_ADMIN_KEY", "vl_sa_testsecretadminkey")
+
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\") with both env keys set: unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("Load(\"\") returned nil config")
+	}
+	if cfg.Settings.EncryptionKey != "test-encryption-key-32chars-long!" {
+		t.Errorf("Settings.EncryptionKey = %q, want %q", cfg.Settings.EncryptionKey, "test-encryption-key-32chars-long!")
+	}
+	if cfg.Settings.AdminKey != "vl_sa_testsecretadminkey" {
+		t.Errorf("Settings.AdminKey = %q, want %q", cfg.Settings.AdminKey, "vl_sa_testsecretadminkey")
 	}
 }
 

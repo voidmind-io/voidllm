@@ -337,7 +337,8 @@ func Load(path string) (*Config, error) {
 		var err error
 		path, err = findConfigFile()
 		if err != nil {
-			return nil, fmt.Errorf("config: locate config file: %w", err)
+			slog.Info("no config file found, using environment variables and built-in defaults")
+			return loadDefaults()
 		}
 	}
 
@@ -393,6 +394,21 @@ func findConfigFile() (string, error) {
 	}
 
 	return "", fmt.Errorf("no config file found; set VOIDLLM_CONFIG or place voidllm.yaml in the current directory")
+}
+
+// loadDefaults returns a Config populated entirely from environment
+// variables and built-in defaults. It is used when no configuration
+// file is found.
+func loadDefaults() (*Config, error) {
+	var cfg Config
+	cfg.Settings.AdminKey = os.Getenv("VOIDLLM_ADMIN_KEY")
+	cfg.Settings.EncryptionKey = os.Getenv("VOIDLLM_ENCRYPTION_KEY")
+	cfg.Settings.License = os.Getenv("VOIDLLM_LICENSE")
+	cfg.setDefaults()
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	return &cfg, nil
 }
 
 // setDefaults populates zero-value fields with their documented defaults.
