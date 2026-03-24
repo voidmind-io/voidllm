@@ -480,6 +480,7 @@ interface EditModelDialogProps {
 function EditModelDialog({ model, onClose }: EditModelDialogProps) {
   const [name, setName] = useState(model.name)
   const [provider, setProvider] = useState(model.provider)
+  const [type, setType] = useState(model.type || 'chat')
   const [baseUrl, setBaseUrl] = useState(model.base_url)
   const [apiKey, setApiKey] = useState('')
   const [aliases, setAliases] = useState((model.aliases ?? []).join(', '))
@@ -508,6 +509,7 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
 
     if (name.trim() !== model.name) params.name = name.trim()
     if (provider !== model.provider) params.provider = provider
+    if (type !== (model.type || 'chat')) params.type = type
     if (baseUrl.trim() !== model.base_url) params.base_url = baseUrl.trim()
     if (apiKey.trim()) params.api_key = apiKey.trim()
 
@@ -596,6 +598,13 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
           options={PROVIDER_OPTIONS}
           value={provider}
           onChange={setProvider}
+          disabled={updateModel.isPending}
+        />
+        <Select
+          label="Type"
+          options={MODEL_TYPE_OPTIONS}
+          value={type}
+          onChange={setType}
           disabled={updateModel.isPending}
         />
         <Input
