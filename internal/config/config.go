@@ -406,6 +406,7 @@ func loadDefaults() (*Config, error) {
 	cfg.Settings.AdminKey = os.Getenv("VOIDLLM_ADMIN_KEY")
 	cfg.Settings.EncryptionKey = os.Getenv("VOIDLLM_ENCRYPTION_KEY")
 	cfg.Settings.License = os.Getenv("VOIDLLM_LICENSE")
+	cfg.Database.DSN = "/data/voidllm.db"
 	cfg.setDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
