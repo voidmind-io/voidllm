@@ -12,13 +12,15 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 )
 
-// ErrKeyLength is returned when a decoded key is not exactly 32 bytes.
+// ErrKeyLength is kept for backward compatibility. It is no longer returned
+// by ParseKey but may be used by callers that construct keys manually.
 var ErrKeyLength = errors.New("key must be exactly 32 bytes (AES-256)")
 
 // ErrCiphertextTooShort is returned when the ciphertext is shorter than the
@@ -26,17 +28,21 @@ var ErrKeyLength = errors.New("key must be exactly 32 bytes (AES-256)")
 // GCM message.
 var ErrCiphertextTooShort = errors.New("ciphertext too short")
 
-// ParseKey decodes a standard base64-encoded string into a 32-byte AES-256
-// key. It returns ErrKeyLength if the decoded value is not exactly 32 bytes.
-func ParseKey(base64Key string) ([]byte, error) {
-	key, err := base64.StdEncoding.DecodeString(base64Key)
-	if err != nil {
-		return nil, fmt.Errorf("ParseKey: decode base64: %w", err)
+// ParseKey returns a 32-byte AES-256 key from raw. If raw is a valid standard
+// base64 string that decodes to exactly 32 bytes it is used as-is (backward
+// compatible). Otherwise the key is derived from raw via SHA-256, which
+// accepts any string of at least 16 characters (e.g. Railway secret values).
+func ParseKey(raw string) ([]byte, error) {
+	// Try base64 first — backward compatible with existing keys.
+	if key, err := base64.StdEncoding.DecodeString(raw); err == nil && len(key) == 32 {
+		return key, nil
 	}
-	if len(key) != 32 {
-		return nil, fmt.Errorf("ParseKey: %w", ErrKeyLength)
+	// Fall back to SHA-256 key derivation for arbitrary strings.
+	if len(raw) < 16 {
+		return nil, fmt.Errorf("ParseKey: key must be at least 16 characters")
 	}
-	return key, nil
+	h := sha256.Sum256([]byte(raw))
+	return h[:], nil
 }
 
 // ZeroKey overwrites key material in memory with zeros. Callers should

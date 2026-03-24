@@ -229,31 +229,35 @@ func TestParseKey(t *testing.T) {
 	shortKey := base64.StdEncoding.EncodeToString(make([]byte, 16))
 
 	tests := []struct {
-		name      string
-		input     string
-		wantErr   error
-		wantBytes int // expected length of returned key, 0 means don't check
+		name         string
+		input        string
+		wantErr      error
+		wantBytes    int  // expected length of returned key, 0 means don't check
+		wantExactKey bool // true only for the base64 case that must round-trip to testKey()
 	}{
 		{
-			name:      "valid 32-byte base64 key",
-			input:     testKeyBase64(),
+			name:         "valid 32-byte base64 key",
+			input:        testKeyBase64(),
+			wantErr:      nil,
+			wantBytes:    32,
+			wantExactKey: true,
+		},
+		{
+			name:      "non-base64 string derives 32-byte key via SHA-256",
+			input:     "not-valid-base64!!!",
 			wantErr:   nil,
 			wantBytes: 32,
 		},
 		{
-			name:    "invalid base64 string",
-			input:   "not-valid-base64!!!",
-			wantErr: nil, // any error is acceptable; no sentinel defined for bad base64
+			name:      "base64-encoded 16-byte value derives 32-byte key via SHA-256",
+			input:     shortKey,
+			wantErr:   nil,
+			wantBytes: 32,
 		},
 		{
-			name:    "wrong key length (16 bytes)",
-			input:   shortKey,
-			wantErr: crypto.ErrKeyLength,
-		},
-		{
-			name:    "empty string",
+			name:    "empty string is rejected",
 			input:   "",
-			wantErr: crypto.ErrKeyLength,
+			wantErr: nil, // non-nil error expected; no sentinel defined
 		},
 	}
 
@@ -288,7 +292,7 @@ func TestParseKey(t *testing.T) {
 			if len(got) != tc.wantBytes {
 				t.Errorf("ParseKey() returned %d bytes, want %d", len(got), tc.wantBytes)
 			}
-			if !bytes.Equal(got, testKey()) {
+			if tc.wantExactKey && !bytes.Equal(got, testKey()) {
 				t.Errorf("ParseKey() returned wrong key bytes")
 			}
 		})

@@ -52,9 +52,9 @@ Open `http://localhost:8080` — log in, create keys, start proxying.
 
 ### One-Click Deploy
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https://github.com/voidmind-io/voidllm)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/qs9gWQ)
 
-Set `VOIDLLM_ENCRYPTION_KEY` in Railway's environment variables. VoidLLM starts with sensible defaults — add models through the UI after deploy.
+Keys are auto-generated. Open the URL Railway gives you, log in, and start adding models.
 
 ```bash
 # Your apps just point here instead of the provider
