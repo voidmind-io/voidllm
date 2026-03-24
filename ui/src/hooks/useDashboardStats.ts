@@ -18,6 +18,9 @@ export interface DashboardStats {
   tokens_24h: number
   cost_estimate_24h: number
   budget_warnings?: BudgetWarning[]
+  models_healthy: number
+  models_unhealthy: number
+  models_degraded: number
 }
 
 export function useDashboardStats() {

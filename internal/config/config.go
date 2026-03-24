@@ -237,6 +237,25 @@ func (s SSOConfig) LogValue() slog.Value {
 	)
 }
 
+// HealthCheckConfig holds configuration for the upstream model health monitoring subsystem.
+type HealthCheckConfig struct {
+	// Health configures the lightweight GET / reachability probe.
+	Health HealthProbeConfig `yaml:"health"`
+	// Models configures the GET /models API availability probe.
+	Models HealthProbeConfig `yaml:"models"`
+	// Functional configures the POST /chat/completions end-to-end probe.
+	Functional HealthProbeConfig `yaml:"functional"`
+}
+
+// HealthProbeConfig holds the enable flag and polling interval for a single
+// health probe level.
+type HealthProbeConfig struct {
+	// Enabled controls whether this probe level is active.
+	Enabled bool `yaml:"enabled"`
+	// Interval is how often the probe is executed for each registered model.
+	Interval time.Duration `yaml:"interval"`
+}
+
 // SettingsConfig holds application-level settings.
 type SettingsConfig struct {
 	AdminKey      string          `yaml:"admin_key" json:"-"`
@@ -254,6 +273,7 @@ type SettingsConfig struct {
 	SSO           SSOConfig       `yaml:"sso"`
 	TokenCounting TokenCountingConfig `yaml:"token_counting"`
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
+	HealthCheck   HealthCheckConfig    `yaml:"health_check"`
 	// SoftLimitThreshold uses *float64 so that an explicit 0.0 can be
 	// distinguished from the zero value after unmarshalling. Use
 	// GetSoftLimitThreshold to read the value.
@@ -494,6 +514,29 @@ func (c *Config) setDefaults() {
 	}
 	if c.Settings.SSO.GroupClaim == "" {
 		c.Settings.SSO.GroupClaim = "groups"
+	}
+
+	// Health check — only set interval defaults when the probe is explicitly
+	// enabled; never auto-enable a probe that the user has not opted into.
+	if c.Settings.HealthCheck.Health.Enabled && c.Settings.HealthCheck.Health.Interval == 0 {
+		c.Settings.HealthCheck.Health.Interval = 30 * time.Second
+	}
+	if c.Settings.HealthCheck.Models.Enabled && c.Settings.HealthCheck.Models.Interval == 0 {
+		c.Settings.HealthCheck.Models.Interval = 60 * time.Second
+	}
+	if c.Settings.HealthCheck.Functional.Enabled && c.Settings.HealthCheck.Functional.Interval == 0 {
+		c.Settings.HealthCheck.Functional.Interval = 5 * time.Minute
+	}
+
+	// Enforce minimum polling intervals to prevent accidental DoS of upstreams.
+	if c.Settings.HealthCheck.Health.Enabled && c.Settings.HealthCheck.Health.Interval < 10*time.Second {
+		c.Settings.HealthCheck.Health.Interval = 10 * time.Second
+	}
+	if c.Settings.HealthCheck.Models.Enabled && c.Settings.HealthCheck.Models.Interval < 10*time.Second {
+		c.Settings.HealthCheck.Models.Interval = 10 * time.Second
+	}
+	if c.Settings.HealthCheck.Functional.Enabled && c.Settings.HealthCheck.Functional.Interval < 60*time.Second {
+		c.Settings.HealthCheck.Functional.Interval = 60 * time.Second
 	}
 
 	// Logging
