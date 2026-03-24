@@ -20,6 +20,8 @@ var ErrModelNotFound = errors.New("model not found")
 type Model struct {
 	Name             string
 	Provider         string // "vllm" | "openai" | "anthropic" | "azure" | "ollama" | "custom"
+	// "completion", "image", "audio_transcription", or "tts". Defaults to "chat".
+	Type             string
 	BaseURL          string
 	APIKey           string // upstream provider's API key (plaintext, in-memory)
 	Aliases          []string
@@ -86,9 +88,15 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 			}
 		}
 
+		modelType := mc.Type
+		if modelType == "" {
+			modelType = "chat"
+		}
+
 		m := &Model{
 			Name:             mc.Name,
 			Provider:         mc.Provider,
+			Type:             modelType,
 			BaseURL:          mc.BaseURL,
 			APIKey:           mc.APIKey,
 			Aliases:          aliases,
@@ -165,6 +173,7 @@ func (r *Registry) List() []Model {
 type ModelInfo struct {
 	Name             string
 	Provider         string
+	Type             string `json:"type"`
 	Aliases          []string
 	MaxContextTokens int
 }
@@ -183,6 +192,7 @@ func (r *Registry) ListInfo() []ModelInfo {
 		result[i] = ModelInfo{
 			Name:             m.Name,
 			Provider:         m.Provider,
+			Type:             m.Type,
 			Aliases:          aliases,
 			MaxContextTokens: m.MaxContextTokens,
 		}
@@ -210,6 +220,7 @@ func (r *Registry) AddModel(m Model) {
 	entry := &Model{
 		Name:             m.Name,
 		Provider:         m.Provider,
+		Type:             m.Type,
 		BaseURL:          m.BaseURL,
 		APIKey:           m.APIKey,
 		Aliases:          aliases,

@@ -14,7 +14,7 @@ import (
 
 // modelSelectColumns is the ordered column list used in all models SELECT queries.
 // It must match the scan order in scanModel exactly.
-const modelSelectColumns = "id, name, provider, base_url, api_key_encrypted, " +
+const modelSelectColumns = "id, name, provider, model_type, base_url, api_key_encrypted, " +
 	"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 	"azure_deployment, azure_api_version, " +
 	"is_active, source, created_by, created_at, updated_at, deleted_at, aliases, timeout"
@@ -25,6 +25,8 @@ type Model struct {
 	ID               string
 	Name             string
 	Provider         string
+	// "completion", "image", "audio_transcription", or "tts". Defaults to "chat".
+	ModelType        string
 	BaseURL          string
 	APIKeyEncrypted  *string
 	MaxContextTokens int
@@ -50,6 +52,7 @@ type Model struct {
 type CreateModelParams struct {
 	Name             string
 	Provider         string
+	ModelType        *string
 	BaseURL          string
 	APIKeyEncrypted  *string
 	MaxContextTokens int
@@ -73,6 +76,7 @@ type CreateModelParams struct {
 type UpdateModelParams struct {
 	Name             *string
 	Provider         *string
+	ModelType        *string
 	BaseURL          *string
 	APIKeyEncrypted  *string
 	MaxContextTokens *int
@@ -96,17 +100,22 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 		return nil, fmt.Errorf("create model: generate id: %w", err)
 	}
 
+	modelType := "chat"
+	if params.ModelType != nil && *params.ModelType != "" {
+		modelType = *params.ModelType
+	}
+
 	p := d.dialect.Placeholder
 	insertQuery := "INSERT INTO models " +
-		"(id, name, provider, base_url, api_key_encrypted, " +
+		"(id, name, provider, model_type, base_url, api_key_encrypted, " +
 		"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 		"azure_deployment, azure_api_version, " +
 		"is_active, source, created_by, aliases, timeout, created_at, updated_at) " +
 		"VALUES (" +
-		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " +
-		p(6) + ", " + p(7) + ", " + p(8) + ", " +
-		p(9) + ", " + p(10) + ", " +
-		"1, " + p(11) + ", " + p(12) + ", " + p(13) + ", " + p(14) + ", " +
+		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
+		p(7) + ", " + p(8) + ", " + p(9) + ", " +
+		p(10) + ", " + p(11) + ", " +
+		"1, " + p(12) + ", " + p(13) + ", " + p(14) + ", " + p(15) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + modelSelectColumns +
@@ -118,6 +127,7 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 			id.String(),
 			params.Name,
 			params.Provider,
+			modelType,
 			params.BaseURL,
 			params.APIKeyEncrypted,
 			params.MaxContextTokens,
@@ -240,6 +250,11 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 	if params.Provider != nil {
 		setClauses = append(setClauses, "provider = "+p(argN))
 		args = append(args, *params.Provider)
+		argN++
+	}
+	if params.ModelType != nil {
+		setClauses = append(setClauses, "model_type = "+p(argN))
+		args = append(args, *params.ModelType)
 		argN++
 	}
 	if params.BaseURL != nil {
@@ -430,7 +445,7 @@ func scanModel(scanner interface{ Scan(...any) error }) (*Model, error) {
 	var m Model
 	var isActiveInt int
 	err := scanner.Scan(
-		&m.ID, &m.Name, &m.Provider, &m.BaseURL, &m.APIKeyEncrypted,
+		&m.ID, &m.Name, &m.Provider, &m.ModelType, &m.BaseURL, &m.APIKeyEncrypted,
 		&m.MaxContextTokens, &m.InputPricePer1M, &m.OutputPricePer1M,
 		&m.AzureDeployment, &m.AzureAPIVersion,
 		&isActiveInt, &m.Source, &m.CreatedBy,
@@ -479,9 +494,14 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 		if errors.Is(err, ErrNotFound) {
 			// Model is not in the DB — create it with source="yaml".
 			aliases := strings.Join(m.Aliases, ",")
+			modelType := m.Type
+			if modelType == "" {
+				modelType = "chat"
+			}
 			created, createErr := d.CreateModel(ctx, CreateModelParams{
 				Name:             m.Name,
 				Provider:         m.Provider,
+				ModelType:        &modelType,
 				BaseURL:          m.BaseURL,
 				MaxContextTokens: m.MaxContextTokens,
 				InputPricePer1M:  m.Pricing.InputPer1M,
@@ -521,6 +541,10 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 		aliases := strings.Join(m.Aliases, ",")
 		name := m.Name
 		provider := m.Provider
+		modelType := m.Type
+		if modelType == "" {
+			modelType = "chat"
+		}
 		baseURL := m.BaseURL
 		maxCtx := m.MaxContextTokens
 		inputPrice := m.Pricing.InputPer1M
@@ -532,6 +556,7 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 		params := UpdateModelParams{
 			Name:             &name,
 			Provider:         &provider,
+			ModelType:        &modelType,
 			BaseURL:          &baseURL,
 			MaxContextTokens: &maxCtx,
 			InputPricePer1M:  &inputPrice,

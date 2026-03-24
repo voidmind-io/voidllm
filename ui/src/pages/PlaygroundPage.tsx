@@ -11,8 +11,13 @@ import apiClient from '../api/client'
 import { LOCAL_STORAGE_KEY } from '../lib/constants'
 import { cn } from '../lib/utils'
 
+interface AvailableModel {
+  name: string
+  type: string
+}
+
 interface AvailableModelsResponse {
-  models: string[]
+  models: AvailableModel[]
 }
 
 interface ChatMessage {
@@ -130,10 +135,14 @@ export default function PlaygroundPage() {
     queryFn: () => apiClient<AvailableModelsResponse>('/me/available-models'),
   })
 
-  // Auto-select the first model when the list loads
+  // Auto-select the first chat/completion model when the list loads
   useEffect(() => {
     if (modelsData?.models && modelsData.models.length > 0 && model === '') {
-      setModel(modelsData.models[0])
+      const chatModels = modelsData.models.filter(
+        (m) => m.type === 'chat' || m.type === 'completion',
+      )
+      const first = chatModels[0]
+      if (first) setModel(first.name)
     }
   }, [modelsData, model])
 
@@ -142,9 +151,13 @@ export default function PlaygroundPage() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chatHistory, loading])
 
-  const modelOptions: SelectOption[] = (modelsData?.models ?? []).map((m) => ({
-    value: m,
-    label: m,
+  const chatModels = (modelsData?.models ?? []).filter(
+    (m) => m.type === 'chat' || m.type === 'completion',
+  )
+
+  const modelOptions: SelectOption[] = chatModels.map((m) => ({
+    value: m.name,
+    label: m.name,
   }))
 
   async function handleSend() {

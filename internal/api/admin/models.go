@@ -28,6 +28,7 @@ import (
 type createModelRequest struct {
 	Name             string   `json:"name"`
 	Provider         string   `json:"provider"`
+	Type             string   `json:"type"`
 	BaseURL          string   `json:"base_url"`
 	APIKey           string   `json:"api_key,omitempty"`
 	MaxContextTokens int      `json:"max_context_tokens"`
@@ -48,6 +49,7 @@ type createModelRequest struct {
 type updateModelRequest struct {
 	Name             *string   `json:"name"`
 	Provider         *string   `json:"provider"`
+	Type             *string   `json:"type"`
 	BaseURL          *string   `json:"base_url"`
 	APIKey           *string   `json:"api_key"`
 	MaxContextTokens *int      `json:"max_context_tokens"`
@@ -69,6 +71,7 @@ type modelResponse struct {
 	ID               string   `json:"id"`
 	Name             string   `json:"name"`
 	Provider         string   `json:"provider"`
+	Type             string   `json:"type"`
 	BaseURL          string   `json:"base_url"`
 	MaxContextTokens int      `json:"max_context_tokens"`
 	InputPricePer1M  float64  `json:"input_price_per_1m"`
@@ -92,6 +95,17 @@ type paginatedModelsResponse struct {
 	Cursor  string          `json:"next_cursor,omitempty"`
 }
 
+// validModelTypes is the canonical set of supported model type values.
+var validModelTypes = map[string]bool{
+	"chat":                true,
+	"embedding":           true,
+	"reranking":           true,
+	"completion":          true,
+	"image":               true,
+	"audio_transcription": true,
+	"tts":                 true,
+}
+
 // testClient is the shared HTTP client used by TestModelConnection.
 // Redirects are disabled to prevent redirect-based SSRF bypass; the caller
 // receives the first response as-is regardless of its Location header.
@@ -108,10 +122,15 @@ func modelToResponse(m *db.Model) modelResponse {
 	if m.Aliases != "" {
 		aliases = strings.Split(m.Aliases, ",")
 	}
+	modelType := m.ModelType
+	if modelType == "" {
+		modelType = "chat"
+	}
 	return modelResponse{
 		ID:               m.ID,
 		Name:             m.Name,
 		Provider:         m.Provider,
+		Type:             modelType,
 		BaseURL:          m.BaseURL,
 		MaxContextTokens: m.MaxContextTokens,
 		InputPricePer1M:  m.InputPricePer1M,
@@ -140,9 +159,14 @@ func dbModelToProxy(m *db.Model, apiKeyPlaintext string) proxy.Model {
 			timeout = d
 		}
 	}
+	modelType := m.ModelType
+	if modelType == "" {
+		modelType = "chat"
+	}
 	return proxy.Model{
 		Name:             m.Name,
 		Provider:         m.Provider,
+		Type:             modelType,
 		BaseURL:          m.BaseURL,
 		APIKey:           apiKeyPlaintext,
 		Aliases:          aliases,
@@ -268,6 +292,9 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 			return apierror.BadRequest(c, "timeout must be a valid Go duration string (e.g. \"30s\", \"2m\")")
 		}
 	}
+	if req.Type != "" && !validModelTypes[req.Type] {
+		return apierror.BadRequest(c, "type must be one of: chat, embedding, reranking, completion, image, audio_transcription, tts")
+	}
 
 	aliasStr, aliasMsg := h.validateAndJoinAliases(ctx, req.Aliases, "")
 	if aliasMsg != "" {
@@ -280,10 +307,12 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		createdBy = &keyInfo.UserID
 	}
 
+	reqType := req.Type
 	// Insert without the API key so we have the model ID available as AAD.
 	m, err := h.DB.CreateModel(ctx, db.CreateModelParams{
 		Name:             req.Name,
 		Provider:         req.Provider,
+		ModelType:        &reqType,
 		BaseURL:          req.BaseURL,
 		APIKeyEncrypted:  nil,
 		MaxContextTokens: req.MaxContextTokens,
@@ -457,10 +486,14 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 			return apierror.BadRequest(c, "timeout must be a valid Go duration string (e.g. \"30s\", \"2m\")")
 		}
 	}
+	if req.Type != nil && !validModelTypes[*req.Type] {
+		return apierror.BadRequest(c, "type must be one of: chat, embedding, reranking, completion, image, audio_transcription, tts")
+	}
 
 	params := db.UpdateModelParams{
 		Name:             req.Name,
 		Provider:         req.Provider,
+		ModelType:        req.Type,
 		BaseURL:          req.BaseURL,
 		MaxContextTokens: req.MaxContextTokens,
 		InputPricePer1M:  req.InputPricePer1M,

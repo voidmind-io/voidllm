@@ -184,18 +184,24 @@ func (h *Handler) Login(c fiber.Ctx) error {
 	})
 }
 
+// availableModel is a single model entry in the available-models response.
+type availableModel struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
 // availableModelsResponse is the JSON body returned by AvailableModels.
 type availableModelsResponse struct {
-	Models []string `json:"models"`
+	Models []availableModel `json:"models"`
 }
 
 // AvailableModels handles GET /api/v1/me/available-models.
-// It returns the list of model names accessible to the current key's scope,
+// It returns the list of models accessible to the current key's scope,
 // respecting the org → team → key access hierarchy enforced by the access cache.
 // Any authenticated key may call this endpoint — no additional role is required.
 //
 // @Summary      List models available to the authenticated key
-// @Description  Returns model names accessible to the caller's org, team, and key scope.
+// @Description  Returns models accessible to the caller's org, team, and key scope.
 // @Tags         auth
 // @Produce      json
 // @Success      200  {object}  availableModelsResponse
@@ -210,14 +216,18 @@ func (h *Handler) AvailableModels(c fiber.Ctx) error {
 
 	allModels := h.Registry.ListInfo()
 
-	names := make([]string, 0, len(allModels))
+	models := make([]availableModel, 0, len(allModels))
 	for _, m := range allModels {
 		if h.AccessCache == nil || h.AccessCache.Check(keyInfo.OrgID, keyInfo.TeamID, keyInfo.ID, m.Name) {
-			names = append(names, m.Name)
+			modelType := m.Type
+			if modelType == "" {
+				modelType = "chat"
+			}
+			models = append(models, availableModel{Name: m.Name, Type: modelType})
 		}
 	}
 
-	return c.JSON(availableModelsResponse{Models: names})
+	return c.JSON(availableModelsResponse{Models: models})
 }
 
 // Me returns the authenticated user's profile.

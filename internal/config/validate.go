@@ -9,6 +9,19 @@ import (
 	"github.com/voidmind-io/voidllm/internal/provider"
 )
 
+// validModelTypes is the set of accepted model type values in the YAML config.
+// An empty string is also valid and resolves to "chat" at sync time.
+var validModelTypes = map[string]bool{
+	"":                   true,
+	"chat":               true,
+	"embedding":          true,
+	"reranking":          true,
+	"completion":         true,
+	"image":              true,
+	"audio_transcription": true,
+	"tts":                true,
+}
+
 // validate checks all fields in the configuration for correctness. All
 // validation errors are collected and returned as a single joined error so
 // the caller can see every problem at once.
@@ -91,6 +104,10 @@ func (c *Config) validate() error {
 
 		if !provider.ValidProviders[m.Provider] {
 			errs = append(errs, fmt.Errorf("%s.provider: must be one of %v, got %q", prefix, provider.Names(), m.Provider))
+		}
+
+		if !validModelTypes[m.Type] {
+			errs = append(errs, fmt.Errorf("%s.type: must be one of chat, embedding, reranking, completion, image, audio_transcription, tts; got %q", prefix, m.Type))
 		}
 
 		if m.BaseURL == "" {
