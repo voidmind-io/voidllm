@@ -47,6 +47,36 @@ const PROVIDER_OPTIONS = [
   { value: 'custom', label: 'Custom' },
 ]
 
+const MODEL_TYPE_OPTIONS = [
+  { value: 'chat', label: 'Chat' },
+  { value: 'embedding', label: 'Embedding' },
+  { value: 'reranking', label: 'Reranking' },
+  { value: 'completion', label: 'Completion' },
+  { value: 'image', label: 'Image Generation' },
+  { value: 'audio_transcription', label: 'Audio Transcription' },
+  { value: 'tts', label: 'Text to Speech' },
+]
+
+const typeLabels: Record<string, string> = {
+  chat: 'Chat',
+  embedding: 'Embedding',
+  reranking: 'Reranking',
+  completion: 'Completion',
+  image: 'Image',
+  audio_transcription: 'Audio',
+  tts: 'TTS',
+}
+
+const typeBadgeVariant: Record<string, 'default' | 'info' | 'muted' | 'success' | 'warning'> = {
+  chat: 'default',
+  embedding: 'info',
+  reranking: 'info',
+  completion: 'muted',
+  image: 'success',
+  audio_transcription: 'warning',
+  tts: 'warning',
+}
+
 const BASE_URL_PLACEHOLDERS: Record<string, string> = {
   openai: 'https://api.openai.com/v1',
   anthropic: 'https://api.anthropic.com',
@@ -169,6 +199,7 @@ interface FormErrors {
 
 function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const [name, setName] = useState('')
+  const [type, setType] = useState('chat')
   const [provider, setProvider] = useState('openai')
   const [baseUrl, setBaseUrl] = useState('')
   const [apiKey, setApiKey] = useState('')
@@ -188,6 +219,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
 
   function handleClose() {
     setName('')
+    setType('chat')
     setProvider('openai')
     setBaseUrl('')
     setApiKey('')
@@ -252,6 +284,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
 
     const params: CreateModelParams = {
       name: name.trim(),
+      type,
       provider,
       base_url: baseUrl.trim(),
     }
@@ -308,6 +341,13 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
           onChange={(e) => setName(e.target.value)}
           placeholder="e.g. gpt-4o"
           error={errors.name}
+          disabled={createModel.isPending}
+        />
+        <Select
+          label="Type"
+          options={MODEL_TYPE_OPTIONS}
+          value={type}
+          onChange={setType}
           disabled={createModel.isPending}
         />
         <Select
@@ -440,6 +480,7 @@ interface EditModelDialogProps {
 function EditModelDialog({ model, onClose }: EditModelDialogProps) {
   const [name, setName] = useState(model.name)
   const [provider, setProvider] = useState(model.provider)
+  const [type, setType] = useState(model.type || 'chat')
   const [baseUrl, setBaseUrl] = useState(model.base_url)
   const [apiKey, setApiKey] = useState('')
   const [aliases, setAliases] = useState((model.aliases ?? []).join(', '))
@@ -468,6 +509,7 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
 
     if (name.trim() !== model.name) params.name = name.trim()
     if (provider !== model.provider) params.provider = provider
+    if (type !== (model.type || 'chat')) params.type = type
     if (baseUrl.trim() !== model.base_url) params.base_url = baseUrl.trim()
     if (apiKey.trim()) params.api_key = apiKey.trim()
 
@@ -556,6 +598,13 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
           options={PROVIDER_OPTIONS}
           value={provider}
           onChange={setProvider}
+          disabled={updateModel.isPending}
+        />
+        <Select
+          label="Type"
+          options={MODEL_TYPE_OPTIONS}
+          value={type}
+          onChange={setType}
           disabled={updateModel.isPending}
         />
         <Input
@@ -694,6 +743,15 @@ export default function ModelsPage() {
           </Badge>
         )
       },
+    },
+    {
+      key: 'type',
+      header: 'Type',
+      render: (row) => (
+        <Badge variant={typeBadgeVariant[row.type] ?? 'muted'}>
+          {typeLabels[row.type] ?? row.type ?? 'Chat'}
+        </Badge>
+      ),
     },
     {
       key: 'health',

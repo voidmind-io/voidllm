@@ -316,10 +316,25 @@ func probeModels(ctx context.Context, client *http.Client, m proxy.Model) (int64
 	return latencyMs, nil
 }
 
-// probeFunctional performs a minimal POST /chat/completions request with a
+// probeFunctional dispatches to the appropriate functional probe based on the
+// model's type. Image, audio_transcription, and tts models are skipped because
+// they are too expensive or require special binary input to probe meaningfully.
+func probeFunctional(ctx context.Context, client *http.Client, m proxy.Model) (int64, error) {
+	switch m.Type {
+	case "embedding":
+		return probeEmbedding(ctx, client, m)
+	case "reranking", "image", "audio_transcription", "tts":
+		// Skip — incompatible endpoint or too expensive to probe.
+		return 0, nil
+	default: // "chat", "completion", ""
+		return probeFunctionalChat(ctx, client, m)
+	}
+}
+
+// probeFunctionalChat performs a minimal POST /chat/completions request with a
 // single-token max to verify end-to-end functionality of the upstream model.
 // For Azure models the deployment name is used as the model identifier.
-func probeFunctional(ctx context.Context, client *http.Client, m proxy.Model) (int64, error) {
+func probeFunctionalChat(ctx context.Context, client *http.Client, m proxy.Model) (int64, error) {
 	rawURL := strings.TrimRight(m.BaseURL, "/") + "/chat/completions"
 
 	upstreamModel := m.Name
@@ -331,6 +346,43 @@ func probeFunctional(ctx context.Context, client *http.Client, m proxy.Model) (i
 		"model":      upstreamModel,
 		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
 		"max_tokens": 1,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, fmt.Errorf("marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
+	if err != nil {
+		return 0, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	setAuthHeaders(req, m)
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	latencyMs := time.Since(start).Milliseconds()
+	if err != nil {
+		return 0, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("http %d", resp.StatusCode)
+	}
+	return latencyMs, nil
+}
+
+// probeEmbedding performs a minimal POST /embeddings request with a single
+// short input string to verify end-to-end functionality of an embedding model.
+func probeEmbedding(ctx context.Context, client *http.Client, m proxy.Model) (int64, error) {
+	rawURL := strings.TrimRight(m.BaseURL, "/") + "/embeddings"
+
+	payload := map[string]any{
+		"model": m.Name,
+		"input": "test",
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

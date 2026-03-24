@@ -248,9 +248,14 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 					)
 				}
 			}
+			modelType := m.ModelType
+			if modelType == "" {
+				modelType = "chat"
+			}
 			registry.AddModel(proxy.Model{
 				Name:             m.Name,
 				Provider:         m.Provider,
+				Type:             modelType,
 				BaseURL:          m.BaseURL,
 				APIKey:           apiKey,
 				Aliases:          aliases,

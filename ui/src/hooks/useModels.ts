@@ -4,6 +4,7 @@ import apiClient from '../api/client'
 export interface ModelResponse {
   id: string
   name: string
+  type: string
   provider: string
   base_url: string
   max_context_tokens: number
@@ -27,6 +28,7 @@ interface PaginatedModels {
 
 export interface CreateModelParams {
   name: string
+  type: string
   provider: string
   base_url: string
   api_key?: string
@@ -41,6 +43,7 @@ export interface CreateModelParams {
 
 export interface UpdateModelParams {
   name?: string
+  type?: string
   provider?: string
   base_url?: string
   api_key?: string
