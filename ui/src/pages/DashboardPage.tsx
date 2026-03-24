@@ -14,6 +14,8 @@ import { useTopModels } from '../hooks/useTopModels'
 import type { UsageDataPoint } from '../hooks/useTopModels'
 import { useUsage } from '../hooks/useUsage'
 import { useOrg } from '../hooks/useOrg'
+import { useModelHealth } from '../hooks/useModelHealth'
+import type { ModelHealthInfo } from '../hooks/useModelHealth'
 import { formatTokens, formatCost, formatNumber } from '../lib/utils'
 
 // ---------------------------------------------------------------------------
@@ -126,17 +128,18 @@ function TimeRangePills({
 // ---------------------------------------------------------------------------
 
 function PerfBadge({ ms }: { ms: number }) {
-  if (ms < 500) {
+  if (ms <= 0) return null
+  if (ms < 100) {
     return (
       <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-success/10 text-success">
         Fast
       </span>
     )
   }
-  if (ms < 2000) {
+  if (ms < 500) {
     return (
       <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-warning/10 text-warning">
-        Moderate
+        Normal
       </span>
     )
   }
@@ -148,10 +151,32 @@ function PerfBadge({ ms }: { ms: number }) {
 }
 
 // ---------------------------------------------------------------------------
-// MiniTable column definitions
+// MiniTable column definitions — uses health check latency (server ping)
+// instead of avg request duration which is misleading for streaming.
 // ---------------------------------------------------------------------------
 
-const performanceColumns: MiniTableColumn<UsageDataPoint>[] = [
+interface PerfRow {
+  group_key: string
+  health_latency_ms: number
+  tps: number
+}
+
+function buildPerfRows(topModels: UsageDataPoint[], healthData: ModelHealthInfo[]): PerfRow[] {
+  const healthMap = new Map(healthData.map((h) => [h.name, h]))
+  return topModels.map((m) => {
+    const h = healthMap.get(m.group_key)
+    const tps = m.total_requests > 0 && m.avg_duration_ms > 0
+      ? Math.round((m.total_tokens / m.total_requests) / (m.avg_duration_ms / 1000))
+      : 0
+    return {
+      group_key: m.group_key,
+      health_latency_ms: h?.latency_ms ?? 0,
+      tps,
+    }
+  })
+}
+
+const performanceColumns: MiniTableColumn<PerfRow>[] = [
   {
     key: 'model',
     header: 'Model',
@@ -161,23 +186,26 @@ const performanceColumns: MiniTableColumn<UsageDataPoint>[] = [
   },
   {
     key: 'latency',
-    header: 'Avg Latency',
+    header: 'Latency',
     align: 'right',
     render: (row) => (
       <div className="flex items-center justify-end gap-2">
-        <span className="text-text-secondary tabular-nums">{Math.round(row.avg_duration_ms)}ms</span>
-        <PerfBadge ms={row.avg_duration_ms} />
+        <span className="text-text-secondary tabular-nums">
+          {row.health_latency_ms > 0 ? `${row.health_latency_ms}ms` : '—'}
+        </span>
+        <PerfBadge ms={row.health_latency_ms} />
       </div>
     ),
   },
   {
-    key: 'tpr',
-    header: 'Tokens/Req',
+    key: 'tps',
+    header: 'Throughput',
     align: 'right',
-    render: (row) => {
-      const tpr = row.total_requests > 0 ? Math.round(row.total_tokens / row.total_requests) : 0
-      return <span className="text-text-secondary tabular-nums">{formatNumber(tpr)}</span>
-    },
+    render: (row) => (
+      <span className="text-text-secondary tabular-nums">
+        {row.tps > 0 ? `${formatNumber(row.tps)} tok/s` : '—'}
+      </span>
+    ),
   },
 ]
 
@@ -220,6 +248,35 @@ function IconKey() {
   )
 }
 
+function IconHeartPulse() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z" />
+      <path d="M3.22 12H9.5l1.5-3 2 4.5 1.5-3h5.27" />
+    </svg>
+  )
+}
+
+function IconAlertTriangle() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" />
+      <line x1="12" y1="9" x2="12" y2="13" />
+      <line x1="12" y1="17" x2="12.01" y2="17" />
+    </svg>
+  )
+}
+
+function IconXCircle() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10" />
+      <line x1="15" y1="9" x2="9" y2="15" />
+      <line x1="9" y1="9" x2="15" y2="15" />
+    </svg>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // DashboardPage
 // ---------------------------------------------------------------------------
@@ -241,6 +298,13 @@ export default function DashboardPage() {
   const { data: topModels, isLoading: modelsLoading } = useTopModels(
     orgId,
     canViewOrgUsage,
+  )
+  const { data: modelHealth } = useModelHealth()
+
+  // Performance rows combining usage data with health check latency
+  const perfRows = useMemo(
+    () => buildPerfRows(topModels?.data ?? [], modelHealth?.models ?? []),
+    [topModels?.data, modelHealth?.models],
   )
 
   // Time-series data for the area chart
@@ -346,6 +410,36 @@ export default function DashboardPage() {
             iconColor="pink"
           />
         </div>
+
+        {/* Model Health summary — only shown when at least one model has health data */}
+        {!statsLoading &&
+          (stats?.models_healthy ?? 0) + (stats?.models_degraded ?? 0) + (stats?.models_unhealthy ?? 0) > 0 && (
+            <div>
+              <h2 className="text-sm font-medium text-text-tertiary uppercase tracking-wider mb-3">
+                Model Health
+              </h2>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <StatCard
+                  label="Healthy"
+                  value={stats?.models_healthy ?? 0}
+                  icon={<IconHeartPulse />}
+                  iconColor="green"
+                />
+                <StatCard
+                  label="Degraded"
+                  value={stats?.models_degraded ?? 0}
+                  icon={<IconAlertTriangle />}
+                  iconColor="yellow"
+                />
+                <StatCard
+                  label="Unhealthy"
+                  value={stats?.models_unhealthy ?? 0}
+                  icon={<IconXCircle />}
+                  iconColor="red"
+                />
+              </div>
+            </div>
+          )}
 
         {/* Token budget section */}
         {me?.org_id != null && !statsLoading && (
@@ -462,10 +556,10 @@ export default function DashboardPage() {
                     <div key={i} className="h-8 bg-bg-tertiary rounded animate-pulse" />
                   ))}
                 </div>
-              ) : (topModels?.data?.length ?? 0) > 0 ? (
-                <MiniTable<UsageDataPoint>
+              ) : perfRows.length > 0 ? (
+                <MiniTable<PerfRow>
                   columns={performanceColumns}
-                  data={topModels?.data ?? []}
+                  data={perfRows}
                 />
               ) : (
                 <p className="text-sm text-text-tertiary">No model data available</p>

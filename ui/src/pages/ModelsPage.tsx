@@ -17,6 +17,8 @@ import {
   useToggleModel,
 } from '../hooks/useModels'
 import type { ModelResponse, CreateModelParams, UpdateModelParams } from '../hooks/useModels'
+import { useModelHealth } from '../hooks/useModelHealth'
+import type { ModelHealthInfo } from '../hooks/useModelHealth'
 import { useToast } from '../hooks/useToast'
 import { providerBadgeVariant, isKnownProvider } from '../lib/providers'
 import type { ProviderKey } from '../lib/providers'
@@ -104,6 +106,49 @@ function IconTrash() {
       <path d="M14 11v6" />
       <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
     </svg>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// HealthBadge
+// ---------------------------------------------------------------------------
+
+const healthConfig: Record<
+  ModelHealthInfo['status'],
+  { dotClass: string; label: string }
+> = {
+  healthy:   { dotClass: 'bg-success',         label: 'Healthy' },
+  degraded:  { dotClass: 'bg-warning',          label: 'Degraded' },
+  unhealthy: { dotClass: 'bg-error',            label: 'Unhealthy' },
+  unknown:   { dotClass: 'bg-text-tertiary',    label: 'Unknown' },
+}
+
+interface HealthBadgeProps {
+  info: ModelHealthInfo | undefined
+}
+
+function HealthBadge({ info }: HealthBadgeProps) {
+  if (info === undefined) {
+    return (
+      <div className="flex items-center gap-1.5">
+        <span className="w-2 h-2 rounded-full bg-text-tertiary opacity-40 shrink-0" aria-hidden="true" />
+        <span className="text-text-tertiary text-sm">Unknown</span>
+      </div>
+    )
+  }
+
+  const { dotClass, label } = healthConfig[info.status]
+
+  return (
+    <div className="flex items-center gap-2">
+      <div className="flex items-center gap-1.5">
+        <span className={cn('w-2 h-2 rounded-full shrink-0', dotClass)} aria-hidden="true" />
+        <span className="text-text-secondary text-sm">{label}</span>
+      </div>
+      {info.latency_ms > 0 && (
+        <span className="text-text-tertiary text-xs tabular-nums">{info.latency_ms}ms</span>
+      )}
+    </div>
   )
 }
 
@@ -612,6 +657,7 @@ export default function ModelsPage() {
   const [deleteModelId, setDeleteModelId] = useState<string | null>(null)
 
   const { data: models, isLoading } = useModels()
+  const { data: healthData } = useModelHealth()
   const deleteModel = useDeleteModel()
   const toggleModel = useToggleModel()
   const { toast } = useToast()
@@ -619,6 +665,15 @@ export default function ModelsPage() {
   const allModels = models?.data ?? []
   const activeCount = allModels.filter((m) => m.is_active).length
   const inactiveCount = allModels.length - activeCount
+
+  // Build O(1) lookup: model name → health info
+  const healthByName = React.useMemo(() => {
+    const map = new Map<string, ModelHealthInfo>()
+    for (const h of healthData?.models ?? []) {
+      map.set(h.name, h)
+    }
+    return map
+  }, [healthData])
 
   const columns: Column<ModelResponse>[] = [
     {
@@ -639,6 +694,11 @@ export default function ModelsPage() {
           </Badge>
         )
       },
+    },
+    {
+      key: 'health',
+      header: 'Health',
+      render: (row) => <HealthBadge info={healthByName.get(row.name)} />,
     },
     {
       key: 'aliases',

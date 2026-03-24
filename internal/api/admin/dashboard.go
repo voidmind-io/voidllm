@@ -34,6 +34,15 @@ type dashboardStatsResponse struct {
 	Tokens24h       int64           `json:"tokens_24h"`
 	CostEstimate24h float64         `json:"cost_estimate_24h"`
 	BudgetWarnings  []budgetWarning `json:"budget_warnings,omitempty"`
+	// ModelsHealthy is the count of registered models whose current health
+	// status is "healthy". Zero when health monitoring is not enabled.
+	ModelsHealthy int `json:"models_healthy"`
+	// ModelsUnhealthy is the count of registered models whose current health
+	// status is "unhealthy". Zero when health monitoring is not enabled.
+	ModelsUnhealthy int `json:"models_unhealthy"`
+	// ModelsDegraded is the count of registered models whose current health
+	// status is "degraded". Zero when health monitoring is not enabled.
+	ModelsDegraded int `json:"models_degraded"`
 }
 
 // DashboardStats handles GET /api/v1/dashboard/stats.
@@ -220,6 +229,19 @@ func (h *Handler) DashboardStats(c fiber.Ctx) error {
 					Usage:       monthlyUsage,
 					PercentUsed: pct,
 				})
+			}
+		}
+	}
+
+	if h.HealthChecker != nil {
+		for _, mh := range h.HealthChecker.GetAllHealth() {
+			switch mh.Status {
+			case "healthy":
+				resp.ModelsHealthy++
+			case "unhealthy":
+				resp.ModelsUnhealthy++
+			case "degraded":
+				resp.ModelsDegraded++
 			}
 		}
 	}

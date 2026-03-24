@@ -32,6 +32,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/config"
 	"github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/docs"
+	"github.com/voidmind-io/voidllm/internal/health"
 	"github.com/voidmind-io/voidllm/internal/license"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	voidotel "github.com/voidmind-io/voidllm/internal/otel"
@@ -64,10 +65,11 @@ type Application struct {
 	accessCache *proxy.ModelAccessCache
 	aliasCache  *proxy.AliasCache
 
-	rateLimiter  ratelimit.Checker
-	tokenCounter *ratelimit.TokenCounter
-	usageLogger  *usage.Logger
-	auditLogger  *audit.Logger
+	rateLimiter    ratelimit.Checker
+	tokenCounter   *ratelimit.TokenCounter
+	usageLogger    *usage.Logger
+	auditLogger    *audit.Logger
+	healthChecker  *health.Checker
 
 	shutdownState *shutdown.State
 	proxyHandler  *proxy.ProxyHandler
@@ -453,6 +455,19 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		}
 	}
 
+	// Build the health checker when at least one probe level is enabled.
+	var healthChecker *health.Checker
+	hcCfg := cfg.Settings.HealthCheck
+	if hcCfg.Health.Enabled || hcCfg.Models.Enabled || hcCfg.Functional.Enabled {
+		healthChecker = health.NewChecker(registry, hcCfg, log)
+	}
+	if hcCfg.Functional.Enabled {
+		log.LogAttrs(ctx, slog.LevelWarn,
+			"functional health probe enabled — sends billable requests to upstream providers",
+			slog.Duration("interval", hcCfg.Functional.Interval),
+		)
+	}
+
 	proxyHandler := proxy.NewProxyHandler(registry, log)
 	proxyHandler.AccessCache = accessCache
 	proxyHandler.AliasCache = aliasCache
@@ -481,6 +496,12 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		SSOProvider:   ssoProvider,
 		SSOConfig:     cfg.Settings.SSO,
 	}
+	// Only assign the health checker when it was actually created — a typed nil
+	// (*health.Checker)(nil) satisfies the interface but is NOT == nil when
+	// checked as ModelHealthProvider, causing nil-pointer panics.
+	if healthChecker != nil {
+		adminHandler.HealthChecker = healthChecker
+	}
 
 	success = true
 	return &Application{
@@ -500,6 +521,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		tokenCounter:  tokenCounter,
 		usageLogger:   usageLogger,
 		auditLogger:   auditLogger,
+		healthChecker: healthChecker,
 		shutdownState: shutdownState,
 		proxyHandler:  proxyHandler,
 		adminHandler:  adminHandler,
@@ -559,6 +581,11 @@ func (a *Application) Start() error {
 	// TTL-keyed counters that self-expire, so no eviction goroutine is needed.
 	if memRL, ok := a.rateLimiter.(*ratelimit.RateLimiter); ok {
 		a.stopFuncs = append(a.stopFuncs, startTicker(5*time.Minute, memRL.EvictStale))
+	}
+
+	// Start upstream model health monitoring when at least one probe is enabled.
+	if a.healthChecker != nil {
+		a.stopFuncs = append(a.stopFuncs, a.healthChecker.Start())
 	}
 
 	// Start heartbeat if a license key was configured, even if it has expired.

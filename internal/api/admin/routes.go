@@ -101,8 +101,9 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 	// Models — global resources managed by system admins only.
 	// An org_admin in a multi-org deployment must not be able to add or modify
 	// models that are visible to all organisations.
-	// test-connection is registered before /:model_id so Fiber does not treat
-	// "test-connection" as a model_id parameter value.
+	// Static sub-paths (health, test-connection) are registered before
+	// /:model_id so Fiber does not treat them as model_id parameter values.
+	api.Get("/models/health", auth.RequireRole(auth.RoleMember), handler.GetModelHealth)
 	api.Post("/models/test-connection", auth.RequireRole(auth.RoleSystemAdmin), handler.TestModelConnection)
 	api.Post("/models", auth.RequireRole(auth.RoleSystemAdmin), handler.CreateModel)
 	api.Get("/models", auth.RequireRole(auth.RoleSystemAdmin), handler.ListModels)

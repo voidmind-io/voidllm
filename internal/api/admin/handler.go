@@ -14,11 +14,19 @@ import (
 	"github.com/voidmind-io/voidllm/internal/cache"
 	"github.com/voidmind-io/voidllm/internal/config"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/health"
 	"github.com/voidmind-io/voidllm/internal/license"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 	"github.com/voidmind-io/voidllm/internal/sso"
 )
+
+// ModelHealthProvider provides upstream model health status for the admin API.
+// It is implemented by *health.Checker and may be nil when health monitoring
+// is not enabled.
+type ModelHealthProvider interface {
+	GetAllHealth() []health.ModelHealth
+}
 
 // Handler holds shared dependencies for all admin API handlers.
 type Handler struct {
@@ -38,6 +46,9 @@ type Handler struct {
 	SSOProvider *sso.Provider
 	// SSOConfig holds the SSO configuration passed from the application config.
 	SSOConfig config.SSOConfig
+	// HealthChecker provides upstream model health status. Nil when health
+	// monitoring is not enabled.
+	HealthChecker ModelHealthProvider
 }
 
 // swaggerErrorResponse is the standard API error envelope used in OpenAPI docs.

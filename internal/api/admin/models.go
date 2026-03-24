@@ -673,6 +673,26 @@ func (h *Handler) DeactivateModel(c fiber.Ctx) error {
 	return c.JSON(modelToResponse(m))
 }
 
+// GetModelHealth handles GET /api/v1/models/health.
+// It returns the most recent health probe results for all registered models.
+// When health monitoring is not enabled, an empty list is returned.
+//
+// @Summary      Get upstream model health
+// @Description  Returns the latest health check results for all registered models. Requires member role or above.
+// @Tags         models
+// @Produce      json
+// @Success      200  {object}  map[string]any
+// @Failure      401  {object}  swaggerErrorResponse
+// @Failure      403  {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /models/health [get]
+func (h *Handler) GetModelHealth(c fiber.Ctx) error {
+	if h.HealthChecker == nil {
+		return c.JSON(fiber.Map{"models": []any{}})
+	}
+	return c.JSON(fiber.Map{"models": h.HealthChecker.GetAllHealth()})
+}
+
 // testConnectionRequest is the JSON body accepted by TestModelConnection.
 type testConnectionRequest struct {
 	Provider string `json:"provider"`

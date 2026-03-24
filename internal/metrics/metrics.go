@@ -84,6 +84,31 @@ var CacheSize = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Number of entries in each in-memory cache.",
 }, []string{"cache"})
 
+// ModelHealthStatus tracks the current health status of each upstream model as
+// a gauge value: 1 = healthy, 0.5 = degraded, 0 = unhealthy or unknown.
+// The "status" label carries the string status ("healthy", "degraded",
+// "unhealthy", "unknown") alongside the numeric value for easy querying.
+var ModelHealthStatus = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Namespace: "voidllm",
+		Name:      "model_health_status",
+		Help:      "Current health status of upstream models (1=healthy, 0.5=degraded, 0=unhealthy).",
+	},
+	[]string{"model", "status"},
+)
+
+// ModelHealthLatencySeconds tracks the most recently observed health check
+// round-trip latency in seconds, labelled by model name. Updated after each
+// successful probe cycle.
+var ModelHealthLatencySeconds = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Namespace: "voidllm",
+		Name:      "model_health_latency_seconds",
+		Help:      "Last health check latency in seconds per model.",
+	},
+	[]string{"model"},
+)
+
 // RegisterDBCollectors registers database connection pool metrics against the
 // default Prometheus registry. The gauges are implemented as GaugeFuncs that
 // read live values from sql.DB.Stats() on each scrape, so they always reflect
