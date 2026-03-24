@@ -50,12 +50,6 @@ docker run -p 8080:8080 \
 
 Open `http://localhost:8080` — log in, create keys, start proxying.
 
-### One-Click Deploy
-
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/qs9gWQ)
-
-Keys are auto-generated. Open the URL Railway gives you, log in, and start adding models.
-
 ```bash
 # Your apps just point here instead of the provider
 curl http://localhost:8080/v1/chat/completions \
