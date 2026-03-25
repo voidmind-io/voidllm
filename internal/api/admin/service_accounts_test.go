@@ -79,8 +79,8 @@ func TestCreateServiceAccount(t *testing.T) {
 	tests := []struct {
 		name       string
 		role       string
-		sameOrg    bool   // key OrgID == target org
-		withUserID bool   // populate UserID in key cache entry
+		sameOrg    bool // key OrgID == target org
+		withUserID bool // populate UserID in key cache entry
 		body       any
 		wantStatus int
 		wantField  string

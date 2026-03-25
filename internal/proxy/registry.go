@@ -18,8 +18,8 @@ var ErrModelNotFound = errors.New("model not found")
 
 // Model holds a fully resolved model configuration ready for proxying.
 type Model struct {
-	Name             string
-	Provider         string // "vllm" | "openai" | "anthropic" | "azure" | "ollama" | "custom"
+	Name     string
+	Provider string // "vllm" | "openai" | "anthropic" | "azure" | "ollama" | "custom"
 	// "completion", "image", "audio_transcription", or "tts". Defaults to "chat".
 	Type             string
 	BaseURL          string

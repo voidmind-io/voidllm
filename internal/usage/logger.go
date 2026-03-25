@@ -30,7 +30,7 @@ type Logger struct {
 	interval     time.Duration
 	dropOnFull   bool
 	done         chan struct{}
-	stopped      chan struct{} // closed by run() when it exits
+	stopped      chan struct{}           // closed by run() when it exits
 	tokenCounter *ratelimit.TokenCounter // nil disables in-memory token counting
 }
 

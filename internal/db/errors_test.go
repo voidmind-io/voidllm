@@ -15,12 +15,12 @@ func TestTranslateError(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		err         error
+		name         string
+		err          error
 		wantNotFound bool
 		wantConflict bool
-		wantSame    bool // result == input (unchanged)
-		wantNil     bool
+		wantSame     bool // result == input (unchanged)
+		wantNil      bool
 	}{
 		{
 			name:         "sql.ErrNoRows maps to ErrNotFound",
@@ -34,8 +34,8 @@ func TestTranslateError(t *testing.T) {
 			wantNotFound: true,
 		},
 		{
-			name:    "io.EOF returned unchanged",
-			err:     io.EOF,
+			name:     "io.EOF returned unchanged",
+			err:      io.EOF,
 			wantSame: true,
 		},
 		{

@@ -66,11 +66,11 @@ type Application struct {
 	accessCache *proxy.ModelAccessCache
 	aliasCache  *proxy.AliasCache
 
-	rateLimiter    ratelimit.Checker
-	tokenCounter   *ratelimit.TokenCounter
-	usageLogger    *usage.Logger
-	auditLogger    *audit.Logger
-	healthChecker  *health.Checker
+	rateLimiter   ratelimit.Checker
+	tokenCounter  *ratelimit.TokenCounter
+	usageLogger   *usage.Logger
+	auditLogger   *audit.Logger
+	healthChecker *health.Checker
 
 	shutdownState *shutdown.State
 	proxyHandler  *proxy.ProxyHandler
@@ -518,24 +518,24 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		licHolder:       licHolder,
 		rawLicenseKey:   licenseKey,
 		bootstrapResult: bootstrapResult,
-		database:      database,
-		encKey:        encKey,
-		hmacSecret:    hmacSecret,
-		registry:      registry,
-		keyCache:      keyCache,
-		accessCache:   accessCache,
-		aliasCache:    aliasCache,
-		rateLimiter:   rateLimiter,
-		tokenCounter:  tokenCounter,
-		usageLogger:   usageLogger,
-		auditLogger:   auditLogger,
-		healthChecker: healthChecker,
-		shutdownState: shutdownState,
-		proxyHandler:  proxyHandler,
-		adminHandler:  adminHandler,
-		redisClient:   redisClient,
-		redisCancel:   redisCancel,
-		otelShutdown:  otelShutdownFn,
+		database:        database,
+		encKey:          encKey,
+		hmacSecret:      hmacSecret,
+		registry:        registry,
+		keyCache:        keyCache,
+		accessCache:     accessCache,
+		aliasCache:      aliasCache,
+		rateLimiter:     rateLimiter,
+		tokenCounter:    tokenCounter,
+		usageLogger:     usageLogger,
+		auditLogger:     auditLogger,
+		healthChecker:   healthChecker,
+		shutdownState:   shutdownState,
+		proxyHandler:    proxyHandler,
+		adminHandler:    adminHandler,
+		redisClient:     redisClient,
+		redisCancel:     redisCancel,
+		otelShutdown:    otelShutdownFn,
 	}, nil
 }
 

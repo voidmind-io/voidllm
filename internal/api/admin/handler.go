@@ -54,6 +54,7 @@ type Handler struct {
 // swaggerErrorResponse is the standard API error envelope used in OpenAPI docs.
 // It is an alias for apierror.SwaggerResponse kept here for Swagger annotation compatibility.
 // The alias is referenced only in swagger @Failure comments (invisible to staticcheck).
+//
 //lint:ignore U1000 referenced in swagger @Failure annotations which staticcheck cannot see
 type swaggerErrorResponse = apierror.SwaggerResponse
 

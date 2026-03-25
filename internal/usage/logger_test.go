@@ -184,15 +184,15 @@ func TestLog_AllFieldsStored(t *testing.T) {
 	)
 
 	var (
-		keyID, keyType, orgID string
-		teamID, userID, saID  sql.NullString
-		modelName             string
+		keyID, keyType, orgID     string
+		teamID, userID, saID      sql.NullString
+		modelName                 string
 		prompt, completion, total int
-		costEstimate          sql.NullFloat64
-		durationMS            int
-		ttftMS                sql.NullInt64
-		tokensPerSec          sql.NullFloat64
-		statusCode            int
+		costEstimate              sql.NullFloat64
+		durationMS                int
+		ttftMS                    sql.NullInt64
+		tokensPerSec              sql.NullFloat64
+		statusCode                int
 	)
 
 	if err := row.Scan(
@@ -281,10 +281,10 @@ func TestLog_NullableFields(t *testing.T) {
 		{
 			name: "empty optional fields stored as NULL",
 			event: Event{
-				KeyID:     "k1",
-				KeyType:   "team_key",
-				OrgID:     "o1",
-				ModelName: "m1",
+				KeyID:      "k1",
+				KeyType:    "team_key",
+				OrgID:      "o1",
+				ModelName:  "m1",
 				StatusCode: 200,
 				// TeamID, UserID, ServiceAccountID: zero value → NULL
 				// CostEstimate, TTFT_MS, TokensPerSecond: nil → NULL
@@ -592,15 +592,15 @@ func TestLog_TokenCounterUpdatedBeforeFlush(t *testing.T) {
 	defer l.Stop()
 
 	ev := Event{
-		KeyID:        "tc-key",
-		KeyType:      "user_key",
-		OrgID:        "tc-org",
-		TeamID:       "tc-team",
-		ModelName:    "test-model",
-		PromptTokens: 60,
+		KeyID:            "tc-key",
+		KeyType:          "user_key",
+		OrgID:            "tc-org",
+		TeamID:           "tc-team",
+		ModelName:        "test-model",
+		PromptTokens:     60,
 		CompletionTokens: 40,
-		TotalTokens:  100,
-		StatusCode:   200,
+		TotalTokens:      100,
+		StatusCode:       200,
 	}
 
 	// DB has no rows yet — the flush interval is 30 s so the event is still queued.

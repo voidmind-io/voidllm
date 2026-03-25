@@ -64,9 +64,9 @@ func TestEffectiveLimits(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name                  string
+		name                             string
 		keyLimits, teamLimits, orgLimits Limits
-		want                  Limits
+		want                             Limits
 	}{
 		{
 			name:       "all zeros means unlimited across all fields",
@@ -153,28 +153,28 @@ func TestEffectiveLimits(t *testing.T) {
 			},
 		},
 		{
-			name: "mix: key daily=1000 team daily=0 unlimited org daily=500, effective=500",
+			name:       "mix: key daily=1000 team daily=0 unlimited org daily=500, effective=500",
 			keyLimits:  Limits{DailyTokenLimit: 1000},
 			teamLimits: Limits{DailyTokenLimit: 0},
 			orgLimits:  Limits{DailyTokenLimit: 500},
 			want:       Limits{DailyTokenLimit: 500},
 		},
 		{
-			name: "mix: key daily=300 team daily=0 unlimited org daily=500, key wins",
+			name:       "mix: key daily=300 team daily=0 unlimited org daily=500, key wins",
 			keyLimits:  Limits{DailyTokenLimit: 300},
 			teamLimits: Limits{DailyTokenLimit: 0},
 			orgLimits:  Limits{DailyTokenLimit: 500},
 			want:       Limits{DailyTokenLimit: 300},
 		},
 		{
-			name: "key and team both restrict RPD, smaller wins",
+			name:       "key and team both restrict RPD, smaller wins",
 			keyLimits:  Limits{RequestsPerDay: 50},
 			teamLimits: Limits{RequestsPerDay: 80},
 			orgLimits:  Limits{},
 			want:       Limits{RequestsPerDay: 50},
 		},
 		{
-			name: "monthly token limit: org most restrictive",
+			name:       "monthly token limit: org most restrictive",
 			keyLimits:  Limits{MonthlyTokenLimit: 100000},
 			teamLimits: Limits{MonthlyTokenLimit: 50000},
 			orgLimits:  Limits{MonthlyTokenLimit: 25000},

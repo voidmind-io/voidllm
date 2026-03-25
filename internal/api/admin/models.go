@@ -26,16 +26,16 @@ import (
 
 // createModelRequest is the JSON body accepted by CreateModel.
 type createModelRequest struct {
-	Name             string   `json:"name"`
-	Provider         string   `json:"provider"`
-	Type             string   `json:"type"`
-	BaseURL          string   `json:"base_url"`
-	APIKey           string   `json:"api_key,omitempty"`
-	MaxContextTokens int      `json:"max_context_tokens"`
-	InputPricePer1M  float64  `json:"input_price_per_1m"`
-	OutputPricePer1M float64  `json:"output_price_per_1m"`
-	AzureDeployment  string   `json:"azure_deployment,omitempty"`
-	AzureAPIVersion  string   `json:"azure_api_version,omitempty"`
+	Name             string  `json:"name"`
+	Provider         string  `json:"provider"`
+	Type             string  `json:"type"`
+	BaseURL          string  `json:"base_url"`
+	APIKey           string  `json:"api_key,omitempty"`
+	MaxContextTokens int     `json:"max_context_tokens"`
+	InputPricePer1M  float64 `json:"input_price_per_1m"`
+	OutputPricePer1M float64 `json:"output_price_per_1m"`
+	AzureDeployment  string  `json:"azure_deployment,omitempty"`
+	AzureAPIVersion  string  `json:"azure_api_version,omitempty"`
 	// Aliases are optional short names that resolve to this model in proxy requests.
 	Aliases []string `json:"aliases"`
 	// Timeout is the per-model upstream timeout as a Go duration string (e.g. "30s",
@@ -47,16 +47,16 @@ type createModelRequest struct {
 // updateModelRequest is the JSON body accepted by UpdateModel.
 // All fields are optional; a nil pointer means the field is left unchanged.
 type updateModelRequest struct {
-	Name             *string   `json:"name"`
-	Provider         *string   `json:"provider"`
-	Type             *string   `json:"type"`
-	BaseURL          *string   `json:"base_url"`
-	APIKey           *string   `json:"api_key"`
-	MaxContextTokens *int      `json:"max_context_tokens"`
-	InputPricePer1M  *float64  `json:"input_price_per_1m"`
-	OutputPricePer1M *float64  `json:"output_price_per_1m"`
-	AzureDeployment  *string   `json:"azure_deployment"`
-	AzureAPIVersion  *string   `json:"azure_api_version"`
+	Name             *string  `json:"name"`
+	Provider         *string  `json:"provider"`
+	Type             *string  `json:"type"`
+	BaseURL          *string  `json:"base_url"`
+	APIKey           *string  `json:"api_key"`
+	MaxContextTokens *int     `json:"max_context_tokens"`
+	InputPricePer1M  *float64 `json:"input_price_per_1m"`
+	OutputPricePer1M *float64 `json:"output_price_per_1m"`
+	AzureDeployment  *string  `json:"azure_deployment"`
+	AzureAPIVersion  *string  `json:"azure_api_version"`
 	// Aliases, when non-nil, replaces the full set of aliases for the model.
 	// Pass an empty slice to remove all aliases.
 	Aliases *[]string `json:"aliases"`

@@ -57,23 +57,23 @@ type License interface {
 // when key verification fails. It never grants enterprise features.
 type communityLicense struct{}
 
-func (communityLicense) Edition() Edition          { return EditionCommunity }
-func (communityLicense) Valid() bool               { return true }
-func (communityLicense) ExpiresAt() time.Time      { return time.Time{} }
-func (communityLicense) HasFeature(string) bool    { return false }
-func (communityLicense) Features() []string        { return []string{} }
-func (communityLicense) MaxOrgs() int              { return CommunityMaxOrgs }
-func (communityLicense) MaxTeams() int             { return CommunityMaxTeams }
-func (communityLicense) CustomerID() string        { return "" }
+func (communityLicense) Edition() Edition       { return EditionCommunity }
+func (communityLicense) Valid() bool            { return true }
+func (communityLicense) ExpiresAt() time.Time   { return time.Time{} }
+func (communityLicense) HasFeature(string) bool { return false }
+func (communityLicense) Features() []string     { return []string{} }
+func (communityLicense) MaxOrgs() int           { return CommunityMaxOrgs }
+func (communityLicense) MaxTeams() int          { return CommunityMaxTeams }
+func (communityLicense) CustomerID() string     { return "" }
 
 // enterpriseLicense is constructed from a successfully verified JWT.
 type enterpriseLicense struct {
-	features   map[string]struct{}
+	features    map[string]struct{}
 	featureList []string
-	expiresAt  time.Time
-	maxOrgs    int
-	maxTeams   int
-	customerID string
+	expiresAt   time.Time
+	maxOrgs     int
+	maxTeams    int
+	customerID  string
 }
 
 func (l *enterpriseLicense) Edition() Edition     { return EditionEnterprise }
@@ -97,16 +97,16 @@ func (l *enterpriseLicense) Features() []string {
 	return out
 }
 
-func (l *enterpriseLicense) MaxOrgs() int      { return l.maxOrgs }
-func (l *enterpriseLicense) MaxTeams() int     { return l.maxTeams }
+func (l *enterpriseLicense) MaxOrgs() int       { return l.maxOrgs }
+func (l *enterpriseLicense) MaxTeams() int      { return l.maxTeams }
 func (l *enterpriseLicense) CustomerID() string { return l.customerID }
 
 // devLicense is granted when VOIDLLM_ENTERPRISE_DEV is set. It enables all
 // features with no expiry and must not be used in production builds.
 type devLicense struct{}
 
-func (devLicense) Edition() Edition { return EditionDev }
-func (devLicense) Valid() bool      { return true }
+func (devLicense) Edition() Edition     { return EditionDev }
+func (devLicense) Valid() bool          { return true }
 func (devLicense) ExpiresAt() time.Time { return time.Time{} }
 
 func (devLicense) HasFeature(string) bool { return true }
@@ -122,6 +122,6 @@ func (devLicense) Features() []string {
 	}
 }
 
-func (devLicense) MaxOrgs() int      { return -1 }
-func (devLicense) MaxTeams() int     { return -1 }
+func (devLicense) MaxOrgs() int       { return -1 }
+func (devLicense) MaxTeams() int      { return -1 }
 func (devLicense) CustomerID() string { return "" }

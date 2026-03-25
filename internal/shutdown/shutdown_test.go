@@ -32,9 +32,9 @@ func TestTrackStartDone(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		starts     int
-		dones      int
+		name         string
+		starts       int
+		dones        int
 		wantInFlight int64
 	}{
 		{

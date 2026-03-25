@@ -10,11 +10,11 @@ func TestGetAdapter(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name         string
-		provider     string
-		wantNil      bool
+		name          string
+		provider      string
+		wantNil       bool
 		wantAnthropic bool
-		wantAzure    bool
+		wantAzure     bool
 	}{
 		{
 			name:          "anthropic returns AnthropicAdapter",

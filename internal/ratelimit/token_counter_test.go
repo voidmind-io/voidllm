@@ -390,9 +390,9 @@ func TestTokenCounter_ConcurrentAdd(t *testing.T) {
 	t.Parallel()
 
 	const (
-		goroutines  = 100
-		tokensEach  = 10
-		wantTotal   = goroutines * tokensEach
+		goroutines = 100
+		tokensEach = 10
+		wantTotal  = goroutines * tokensEach
 	)
 
 	tc := NewTokenCounter()

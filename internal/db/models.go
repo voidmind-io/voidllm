@@ -22,9 +22,9 @@ const modelSelectColumns = "id, name, provider, model_type, base_url, api_key_en
 // Model represents a model record in the database.
 // This is the storage layer representation; see proxy.Model for the in-memory registry type.
 type Model struct {
-	ID               string
-	Name             string
-	Provider         string
+	ID       string
+	Name     string
+	Provider string
 	// "completion", "image", "audio_transcription", or "tts". Defaults to "chat".
 	ModelType        string
 	BaseURL          string
@@ -584,4 +584,3 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 	}
 	return nil
 }
-

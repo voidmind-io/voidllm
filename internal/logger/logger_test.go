@@ -27,9 +27,9 @@ func TestNew_Format(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		format      string
-		wantJSON    bool
+		name     string
+		format   string
+		wantJSON bool
 	}{
 		{
 			name:     "json format produces valid JSON",
@@ -81,10 +81,10 @@ func TestNew_Level(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name          string
-		configLevel   string
-		writeLevel    slog.Level
-		wantOutput    bool
+		name        string
+		configLevel string
+		writeLevel  slog.Level
+		wantOutput  bool
 	}{
 		// debug level: debug messages should appear
 		{

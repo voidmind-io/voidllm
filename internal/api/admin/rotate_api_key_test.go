@@ -704,8 +704,8 @@ func TestRotateAPIKey_KeyTypeVariants(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		setupKey  func(t *testing.T, database *db.DB, org *db.Org, user *db.User, team *db.Team, callerID string) (keyID string)
+		name       string
+		setupKey   func(t *testing.T, database *db.DB, org *db.Org, user *db.User, team *db.Team, callerID string) (keyID string)
 		wantPrefix string
 	}{
 		{

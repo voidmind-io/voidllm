@@ -11,11 +11,11 @@ func TestGenerate(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		keyType     string
-		wantPrefix  string
-		wantLen     int
-		wantErr     bool
+		name       string
+		keyType    string
+		wantPrefix string
+		wantLen    int
+		wantErr    bool
 	}{
 		{
 			name:       "user key has correct prefix and length",
@@ -101,13 +101,13 @@ func TestHash(t *testing.T) {
 	fixedSecret := []byte("aaaabbbbccccddddeeeeffffgggghhhh") // 32 bytes
 
 	tests := []struct {
-		name      string
-		key       string
-		secret    []byte
+		name          string
+		key           string
+		secret        []byte
 		compareKey    string
 		compareSecret []byte
-		wantMatch bool
-		wantHexLen int
+		wantMatch     bool
+		wantHexLen    int
 	}{
 		{
 			name:          "same key and secret produce same hash",

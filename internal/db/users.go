@@ -21,14 +21,14 @@ const userSelectColumns = "id, email, display_name, auth_provider, is_system_adm
 // PasswordHash and ExternalID are not included; they are internal fields
 // that must never appear in API responses.
 type User struct {
-	ID             string
-	Email          string
-	DisplayName    string
-	AuthProvider   string
-	IsSystemAdmin  bool
-	CreatedAt      string
-	UpdatedAt      string
-	DeletedAt      *string
+	ID            string
+	Email         string
+	DisplayName   string
+	AuthProvider  string
+	IsSystemAdmin bool
+	CreatedAt     string
+	UpdatedAt     string
+	DeletedAt     *string
 }
 
 // CreateUserParams holds the input for creating a user.

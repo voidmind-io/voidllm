@@ -36,15 +36,15 @@ import (
 // with the upstream API key, and streams responses without buffering.
 type ProxyHandler struct {
 	Registry          *Registry
-	AccessCache       *ModelAccessCache           // in-memory model access control; nil disables access checks
-	AliasCache        *AliasCache                 // in-memory scoped alias resolution; nil disables alias lookup
-	CircuitBreakers   *circuitbreaker.Registry    // per-model circuit breaker registry; nil disables circuit breaking
+	AccessCache       *ModelAccessCache        // in-memory model access control; nil disables access checks
+	AliasCache        *AliasCache              // in-memory scoped alias resolution; nil disables alias lookup
+	CircuitBreakers   *circuitbreaker.Registry // per-model circuit breaker registry; nil disables circuit breaking
 	HTTPClient        *http.Client
-	UsageLogger       *usage.Logger               // nil disables usage logging
-	RateLimiter       ratelimit.Checker            // nil disables rate limiting
-	TokenCounter      *ratelimit.TokenCounter      // nil disables token budget enforcement
-	ShutdownState     *shutdown.State              // nil disables in-flight tracking and graceful drain
-	Tracer            trace.Tracer                 // nil disables distributed tracing
+	UsageLogger       *usage.Logger           // nil disables usage logging
+	RateLimiter       ratelimit.Checker       // nil disables rate limiting
+	TokenCounter      *ratelimit.TokenCounter // nil disables token budget enforcement
+	ShutdownState     *shutdown.State         // nil disables in-flight tracking and graceful drain
+	Tracer            trace.Tracer            // nil disables distributed tracing
 	Log               *slog.Logger
 	MaxRequestBody    int           // maximum allowed request body size in bytes
 	MaxResponseBody   int           // maximum allowed non-streaming response body size in bytes
@@ -65,8 +65,8 @@ func NewProxyHandler(registry *Registry, log *slog.Logger) *ProxyHandler {
 			ResponseHeaderTimeout: 600 * time.Second, // wait up to 10min for upstream to start responding
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
-			ForceAttemptHTTP2:  true, // enables HTTP/2 on custom Transport
-			DisableCompression: true, // prevents gzip-encoded SSE streams
+			ForceAttemptHTTP2:     true, // enables HTTP/2 on custom Transport
+			DisableCompression:    true, // prevents gzip-encoded SSE streams
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -97,8 +97,8 @@ var errResponseSent = errors.New("response sent")
 // are the fallback limits used when ProxyHandler fields are zero (e.g. in
 // tests that do not configure limits).
 const (
-	defaultMaxRequestBody    = 20 * 1024 * 1024 // 20 MB
-	defaultMaxResponseBody   = 50 * 1024 * 1024 // 50 MB
+	defaultMaxRequestBody    = 20 * 1024 * 1024  // 20 MB
+	defaultMaxResponseBody   = 50 * 1024 * 1024  // 50 MB
 	defaultMaxStreamDuration = 300 * time.Second // 5 minutes
 )
 

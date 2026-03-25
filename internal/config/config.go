@@ -90,8 +90,8 @@ type RedisConfig struct {
 
 // ModelConfig defines a single model entry in the static model registry.
 type ModelConfig struct {
-	Name             string        `yaml:"name"`
-	Provider         string        `yaml:"provider"`
+	Name     string `yaml:"name"`
+	Provider string `yaml:"provider"`
 	// "completion", "image", "audio_transcription", or "tts". Defaults to "chat".
 	Type             string        `yaml:"type"`
 	BaseURL          string        `yaml:"base_url"`
@@ -260,22 +260,22 @@ type HealthProbeConfig struct {
 
 // SettingsConfig holds application-level settings.
 type SettingsConfig struct {
-	AdminKey      string          `yaml:"admin_key" json:"-"`
-	EncryptionKey string          `yaml:"encryption_key" json:"-"`
-	License       string          `yaml:"license" json:"-"`
+	AdminKey      string `yaml:"admin_key" json:"-"`
+	EncryptionKey string `yaml:"encryption_key" json:"-"`
+	License       string `yaml:"license" json:"-"`
 	// LicenseFile is the path to a file containing a VoidLLM enterprise
 	// license JWT. When set and License is empty, the file contents are read
 	// at startup and used as the license key. ${ENV_VAR} interpolation is
 	// applied to this field before the file is read.
-	LicenseFile    string          `yaml:"license_file" json:"-"`
-	Bootstrap     BootstrapConfig `yaml:"bootstrap"`
-	Usage         UsageConfig     `yaml:"usage"`
-	Audit         AuditConfig     `yaml:"audit"`
-	OTel          OTelConfig      `yaml:"otel"`
-	SSO           SSOConfig       `yaml:"sso"`
-	TokenCounting TokenCountingConfig `yaml:"token_counting"`
+	LicenseFile    string               `yaml:"license_file" json:"-"`
+	Bootstrap      BootstrapConfig      `yaml:"bootstrap"`
+	Usage          UsageConfig          `yaml:"usage"`
+	Audit          AuditConfig          `yaml:"audit"`
+	OTel           OTelConfig           `yaml:"otel"`
+	SSO            SSOConfig            `yaml:"sso"`
+	TokenCounting  TokenCountingConfig  `yaml:"token_counting"`
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
-	HealthCheck   HealthCheckConfig    `yaml:"health_check"`
+	HealthCheck    HealthCheckConfig    `yaml:"health_check"`
 	// SoftLimitThreshold uses *float64 so that an explicit 0.0 can be
 	// distinguished from the zero value after unmarshalling. Use
 	// GetSoftLimitThreshold to read the value.

@@ -55,4 +55,3 @@ func RequireRole(required string) fiber.Handler {
 		return c.Next()
 	}
 }
-

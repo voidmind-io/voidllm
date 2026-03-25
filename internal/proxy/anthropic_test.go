@@ -216,7 +216,7 @@ func TestAnthropicTransformResponse(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name           string
+		name string
 		// inputJSON is a raw Anthropic Messages API response body.
 		inputJSON      string
 		wantID         string
@@ -240,23 +240,23 @@ func TestAnthropicTransformResponse(t *testing.T) {
 			wantTotal:      15,
 		},
 		{
-			name:      "stop_reason end_turn maps to finish_reason stop",
-			inputJSON: `{"id":"msg_02","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
+			name:       "stop_reason end_turn maps to finish_reason stop",
+			inputJSON:  `{"id":"msg_02","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
 			wantFinish: "stop",
 		},
 		{
-			name:      "stop_reason max_tokens maps to finish_reason length",
-			inputJSON: `{"id":"msg_03","content":[{"type":"text","text":"truncated"}],"stop_reason":"max_tokens","usage":{"input_tokens":1,"output_tokens":1}}`,
+			name:       "stop_reason max_tokens maps to finish_reason length",
+			inputJSON:  `{"id":"msg_03","content":[{"type":"text","text":"truncated"}],"stop_reason":"max_tokens","usage":{"input_tokens":1,"output_tokens":1}}`,
 			wantFinish: "length",
 		},
 		{
-			name:      "stop_reason stop_sequence maps to finish_reason stop",
-			inputJSON: `{"id":"msg_04","content":[{"type":"text","text":"ended"}],"stop_reason":"stop_sequence","usage":{"input_tokens":1,"output_tokens":1}}`,
+			name:       "stop_reason stop_sequence maps to finish_reason stop",
+			inputJSON:  `{"id":"msg_04","content":[{"type":"text","text":"ended"}],"stop_reason":"stop_sequence","usage":{"input_tokens":1,"output_tokens":1}}`,
 			wantFinish: "stop",
 		},
 		{
-			name:      "null stop_reason maps to finish_reason stop",
-			inputJSON: `{"id":"msg_05","content":[{"type":"text","text":"hi"}],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":1}}`,
+			name:       "null stop_reason maps to finish_reason stop",
+			inputJSON:  `{"id":"msg_05","content":[{"type":"text","text":"hi"}],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":1}}`,
 			wantFinish: "stop",
 		},
 		{
@@ -277,9 +277,9 @@ func TestAnthropicTransformResponse(t *testing.T) {
 			wantContent: "answer",
 		},
 		{
-			name:    "invalid JSON returns error",
+			name:      "invalid JSON returns error",
 			inputJSON: "not-json",
-			wantErr: true,
+			wantErr:   true,
 		},
 	}
 
@@ -417,8 +417,8 @@ func TestAnthropicTransformStreamLine(t *testing.T) {
 			},
 		},
 		{
-			name: "content_block_delta with non-text_delta type is dropped",
-			line: `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}`,
+			name:    "content_block_delta with non-text_delta type is dropped",
+			line:    `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}`,
 			wantNil: true,
 		},
 		{

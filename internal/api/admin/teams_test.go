@@ -202,12 +202,12 @@ func TestCreateTeam_ResponseFields(t *testing.T) {
 
 	req := httptest.NewRequest("POST", teamURL(org.ID),
 		bodyJSON(t, map[string]any{
-			"name":               "Fields Team",
-			"slug":               "fields-team",
-			"daily_token_limit":  int64(1000),
+			"name":                "Fields Team",
+			"slug":                "fields-team",
+			"daily_token_limit":   int64(1000),
 			"monthly_token_limit": int64(30000),
 			"requests_per_minute": 60,
-			"requests_per_day":   1440,
+			"requests_per_day":    1440,
 		}))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+testKey)

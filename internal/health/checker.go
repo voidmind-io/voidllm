@@ -26,7 +26,7 @@ import (
 type probeLevel int
 
 const (
-	levelHealth     probeLevel = iota
+	levelHealth probeLevel = iota
 	levelModels
 	levelFunctional
 )

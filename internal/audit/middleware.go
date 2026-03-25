@@ -229,4 +229,3 @@ func buildDescription(body []byte) string {
 	}
 	return string(out)
 }
-

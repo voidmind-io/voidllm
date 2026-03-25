@@ -19,9 +19,9 @@ type setLicenseRequest struct {
 // setLicenseResponse is the JSON body returned by SetLicense on success.
 type setLicenseResponse struct {
 	// Status is always "saved" on a successful activation.
-	Status  string        `json:"status"`
+	Status string `json:"status"`
 	// Message is a human-readable confirmation of the activation.
-	Message string        `json:"message"`
+	Message string `json:"message"`
 	// License contains the parsed details of the accepted license.
 	License licenseDetail `json:"license"`
 }
@@ -30,9 +30,9 @@ type setLicenseResponse struct {
 // successfully validated license JWT.
 type licenseDetail struct {
 	// Plan is the human-readable tier label embedded in the JWT (e.g. "enterprise").
-	Plan      string     `json:"plan"`
+	Plan string `json:"plan"`
 	// Features lists the feature names enabled by the license.
-	Features  []string   `json:"features"`
+	Features []string `json:"features"`
 	// ExpiresAt is the RFC 3339 expiry timestamp, or null for perpetual licenses.
 	ExpiresAt *time.Time `json:"expires_at"`
 }

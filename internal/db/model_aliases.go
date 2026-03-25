@@ -17,7 +17,7 @@ type ModelAlias struct {
 	ID        string
 	Alias     string
 	ModelName string
-	ScopeType string  // "org" or "team"
+	ScopeType string // "org" or "team"
 	OrgID     string
 	TeamID    *string
 	CreatedBy string

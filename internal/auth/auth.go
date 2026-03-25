@@ -115,4 +115,3 @@ func extractBearerToken(header string) string {
 	}
 	return token
 }
-

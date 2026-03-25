@@ -68,7 +68,7 @@ func TestRequestIDMiddleware_RejectsInvalidID(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
+		name        string
 		headerValue string
 	}{
 		{name: "non-UUID string", headerValue: "not-a-uuid"},

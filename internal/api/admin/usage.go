@@ -32,7 +32,7 @@ type usageDataPoint struct {
 
 // validGroupBy is the set of accepted group_by values for usage endpoints.
 var validGroupBy = map[string]bool{
-	"":     true,
+	"":      true,
 	"org":   true,
 	"model": true,
 	"team":  true,
@@ -45,7 +45,7 @@ var validGroupBy = map[string]bool{
 // validGroupByOrg is the subset of group_by values accepted by the org-scoped
 // usage endpoints. The "org" dimension is only valid for system-wide queries.
 var validGroupByOrg = map[string]bool{
-	"":     true,
+	"":      true,
 	"model": true,
 	"team":  true,
 	"key":   true,

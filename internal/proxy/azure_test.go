@@ -97,10 +97,10 @@ func TestAzureSetHeaders(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		model       Model
-		initialAuth string
-		wantAPIKey  string // expected "api-key" value ("" means absent)
+		name         string
+		model        Model
+		initialAuth  string
+		wantAPIKey   string // expected "api-key" value ("" means absent)
 		wantAuthGone bool
 	}{
 		{

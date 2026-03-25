@@ -560,11 +560,11 @@ func TestGetUserPasswordHash(t *testing.T) {
 	const testPassword = "testpassword123"
 
 	tests := []struct {
-		name      string
-		setup     func(t *testing.T, d *DB) string // returns email to look up
-		wantErr   error
+		name        string
+		setup       func(t *testing.T, d *DB) string // returns email to look up
+		wantErr     error
 		errContains string // non-empty: check error message contains this substring
-		checkHash func(t *testing.T, userID, hash string, d *DB)
+		checkHash   func(t *testing.T, userID, hash string, d *DB)
 	}{
 		{
 			name: "valid user returns userID and hash",

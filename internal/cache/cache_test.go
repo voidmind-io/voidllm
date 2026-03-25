@@ -356,8 +356,8 @@ func TestConcurrencyLoadAll(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			m := map[string]string{
-				"k1": "v1",
-				"k2": "v2",
+				"k1":                      "v1",
+				"k2":                      "v2",
 				string(rune('a' + id%26)): "x",
 			}
 			c.LoadAll(m)

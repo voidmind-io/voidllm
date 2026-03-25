@@ -288,7 +288,7 @@ func TestCheckRate_ConcurrentCASCorrectness(t *testing.T) {
 	noLimits := Limits{}
 
 	var (
-		wg       sync.WaitGroup
+		wg        sync.WaitGroup
 		successes atomic.Int64
 		failures  atomic.Int64
 	)

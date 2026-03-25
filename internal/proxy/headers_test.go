@@ -28,9 +28,9 @@ func TestSetUpstreamHeaders_AllowlistedHeadersForwarded(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		headerKey  string
-		headerVal  string
+		name          string
+		headerKey     string
+		headerVal     string
 		wantForwarded bool
 	}{
 		{name: "Content-Type forwarded", headerKey: "Content-Type", headerVal: "application/json", wantForwarded: true},
@@ -285,7 +285,7 @@ func TestCopyResponseHeaders_HopByHopNotForwarded(t *testing.T) {
 
 			upstream, _ := upstreamCapture(t, http.StatusOK, `{}`, map[string]string{
 				"Content-Type": "application/json",
-				tc.headerKey:  tc.headerVal,
+				tc.headerKey:   tc.headerVal,
 			})
 
 			handler := testProxyHandler(t, upstream.URL)
@@ -327,7 +327,7 @@ func TestCopyResponseHeaders_XRateLimitForwarded(t *testing.T) {
 
 			upstream, _ := upstreamCapture(t, http.StatusOK, `{}`, map[string]string{
 				"Content-Type": "application/json",
-				tc.headerKey:  tc.headerVal,
+				tc.headerKey:   tc.headerVal,
 			})
 
 			handler := testProxyHandler(t, upstream.URL)

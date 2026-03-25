@@ -12,14 +12,14 @@ import (
 // validModelTypes is the set of accepted model type values in the YAML config.
 // An empty string is also valid and resolves to "chat" at sync time.
 var validModelTypes = map[string]bool{
-	"":                   true,
-	"chat":               true,
-	"embedding":          true,
-	"reranking":          true,
-	"completion":         true,
-	"image":              true,
+	"":                    true,
+	"chat":                true,
+	"embedding":           true,
+	"reranking":           true,
+	"completion":          true,
+	"image":               true,
 	"audio_transcription": true,
-	"tts":                true,
+	"tts":                 true,
 }
 
 // validate checks all fields in the configuration for correctness. All
