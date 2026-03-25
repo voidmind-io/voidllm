@@ -39,6 +39,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/proxy"
 	"github.com/voidmind-io/voidllm/internal/ratelimit"
 	voidredis "github.com/voidmind-io/voidllm/internal/redis"
+	"github.com/voidmind-io/voidllm/internal/router"
 	"github.com/voidmind-io/voidllm/internal/shutdown"
 	"github.com/voidmind-io/voidllm/internal/sso"
 	"github.com/voidmind-io/voidllm/internal/usage"
@@ -253,6 +254,38 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			if modelType == "" {
 				modelType = "chat"
 			}
+
+			// Load per-deployment endpoints for load-balanced models.
+			dbDeps, depsErr := database.ListActiveDeployments(loadCtx, m.ID)
+			if depsErr != nil {
+				return fmt.Errorf("list active deployments for model %s: %w", m.Name, depsErr)
+			}
+			deployments := make([]proxy.Deployment, 0, len(dbDeps))
+			for _, dep := range dbDeps {
+				var depAPIKey string
+				if dep.APIKeyEncrypted != nil {
+					var decErr error
+					depAPIKey, decErr = crypto.DecryptString(*dep.APIKeyEncrypted, encKey, deploymentAAD(dep.ID))
+					if decErr != nil {
+						log.LogAttrs(loadCtx, slog.LevelError, "failed to decrypt deployment api key",
+							slog.String("model", m.Name),
+							slog.String("deployment", dep.Name),
+							slog.String("error", decErr.Error()),
+						)
+					}
+				}
+				deployments = append(deployments, proxy.Deployment{
+					Name:            dep.Name,
+					Provider:        dep.Provider,
+					BaseURL:         dep.BaseURL,
+					APIKey:          depAPIKey,
+					AzureDeployment: dep.AzureDeployment,
+					AzureAPIVersion: dep.AzureAPIVersion,
+					Weight:          dep.Weight,
+					Priority:        dep.Priority,
+				})
+			}
+
 			registry.AddModel(proxy.Model{
 				Name:             m.Name,
 				Provider:         m.Provider,
@@ -265,6 +298,9 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 				AzureDeployment:  m.AzureDeployment,
 				AzureAPIVersion:  m.AzureAPIVersion,
 				Timeout:          timeout,
+				Strategy:         m.Strategy,
+				MaxRetries:       m.MaxRetries,
+				Deployments:      deployments,
 			})
 		}
 		return nil
@@ -475,10 +511,16 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		)
 	}
 
+	// Create the deployment router for load balancing. Both dependencies are
+	// optional: healthChecker may be nil when health probes are disabled, and
+	// cbRegistry may be nil when circuit breaking is disabled.
+	modelRouter := router.NewRouter(healthChecker, cbRegistry)
+
 	proxyHandler := proxy.NewProxyHandler(registry, log)
 	proxyHandler.AccessCache = accessCache
 	proxyHandler.AliasCache = aliasCache
 	proxyHandler.CircuitBreakers = cbRegistry
+	proxyHandler.Router = modelRouter
 	proxyHandler.UsageLogger = usageLogger
 	proxyHandler.RateLimiter = rateLimiter
 	proxyHandler.TokenCounter = tokenCounter
@@ -763,6 +805,14 @@ func (a *Application) PrintBootstrapCredentials() {
 	fmt.Fprintln(os.Stderr, "========================================")
 	fmt.Fprintln(os.Stderr, "")
 	a.bootstrapResult = nil
+}
+
+// deploymentAAD returns the additional authenticated data used when encrypting
+// or decrypting a deployment API key. The AAD binds the ciphertext to the
+// specific deployment row so that a ciphertext from one row cannot be replayed
+// against a different row.
+func deploymentAAD(id string) []byte {
+	return []byte("deployment:" + id)
 }
 
 // cleanup tears down resources in reverse startup order: Redis pub/sub,

@@ -88,6 +88,41 @@ type RedisConfig struct {
 	KeyPrefix string `yaml:"key_prefix"`
 }
 
+// DeploymentConfig defines a single deployment endpoint within a multi-deployment model.
+// When a ModelConfig has one or more deployments, the proxy selects among them using
+// the strategy defined on the parent ModelConfig.
+type DeploymentConfig struct {
+	// Name is a unique identifier for this deployment within the model (required).
+	Name string `yaml:"name"`
+	// Provider is the upstream provider for this deployment (required).
+	Provider string `yaml:"provider"`
+	// BaseURL is the base URL for this deployment's API endpoint (required).
+	BaseURL string `yaml:"base_url"`
+	// APIKey is the API key for this deployment. Redacted in logs.
+	APIKey string `yaml:"api_key" json:"-"`
+	// AzureDeployment is the Azure deployment name. Required when provider is "azure".
+	AzureDeployment string `yaml:"azure_deployment"`
+	// AzureAPIVersion is the Azure API version string used in request URLs.
+	AzureAPIVersion string `yaml:"azure_api_version"`
+	// Weight is the relative routing weight for the "weighted" strategy.
+	// A value of 0 means this deployment is only used as a fallback when all
+	// weighted deployments are unavailable.
+	Weight int `yaml:"weight"`
+	// Priority is the preference rank for the "priority" strategy. Lower
+	// values indicate higher priority.
+	Priority int `yaml:"priority"`
+}
+
+// LogValue implements slog.LogValuer to prevent API keys from appearing in logs.
+func (d DeploymentConfig) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("name", d.Name),
+		slog.String("provider", d.Provider),
+		slog.String("base_url", d.BaseURL),
+		slog.String("api_key", "[REDACTED]"),
+	)
+}
+
 // ModelConfig defines a single model entry in the static model registry.
 type ModelConfig struct {
 	Name     string `yaml:"name"`
@@ -105,6 +140,16 @@ type ModelConfig struct {
 	// "2m"). When non-empty it overrides the global stream/response timeout for
 	// this model. Zero or empty means use the global default.
 	Timeout string `yaml:"timeout"`
+	// Strategy is the deployment selection strategy used when Deployments is
+	// non-empty. Valid values: round-robin, least-latency, weighted, priority.
+	Strategy string `yaml:"strategy"`
+	// MaxRetries is the number of times the proxy will retry a failed upstream
+	// request across the available deployments. Must be >= 0.
+	MaxRetries int `yaml:"max_retries"`
+	// Deployments is the list of backend endpoints for this model. When set,
+	// the model-level Provider and BaseURL fields are ignored in favour of the
+	// per-deployment values, and Strategy must be set.
+	Deployments []DeploymentConfig `yaml:"deployments"`
 }
 
 // LogValue implements slog.LogValuer to prevent API keys from appearing in logs.

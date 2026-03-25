@@ -42,6 +42,13 @@ type createModelRequest struct {
 	// "2m"). When non-empty it overrides the global stream/response timeout for
 	// this model. Omit or pass an empty string to use the global default.
 	Timeout string `json:"timeout,omitempty"`
+	// Strategy is the load balancing strategy used when multiple deployments are
+	// configured. Valid values: "round-robin", "weighted", "priority". Omit or
+	// pass an empty string for single-deployment (legacy) mode.
+	Strategy string `json:"strategy,omitempty"`
+	// MaxRetries is the maximum number of deployments to attempt before returning
+	// an error. 0 means try all available deployments.
+	MaxRetries int `json:"max_retries,omitempty"`
 }
 
 // updateModelRequest is the JSON body accepted by UpdateModel.
@@ -63,6 +70,11 @@ type updateModelRequest struct {
 	// Timeout, when non-nil, replaces the per-model timeout. Pass a pointer to
 	// an empty string to clear the timeout and revert to the global default.
 	Timeout *string `json:"timeout"`
+	// Strategy, when non-nil, replaces the load balancing strategy. Pass a
+	// pointer to an empty string to revert to single-deployment mode.
+	Strategy *string `json:"strategy"`
+	// MaxRetries, when non-nil, replaces the maximum deployment retry count.
+	MaxRetries *int `json:"max_retries"`
 }
 
 // modelResponse is the JSON representation of a model returned by the API.
@@ -83,9 +95,18 @@ type modelResponse struct {
 	Aliases          []string `json:"aliases"`
 	// Timeout is the per-model upstream timeout (e.g. "30s", "2m").
 	// An empty string means the global default is used.
-	Timeout   string `json:"timeout,omitempty"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
+	Timeout string `json:"timeout,omitempty"`
+	// Strategy is the load balancing strategy used when multiple deployments
+	// are configured (e.g. "round-robin", "weighted", "priority"). An empty
+	// string means single-deployment (legacy) mode.
+	Strategy string `json:"strategy,omitempty"`
+	// MaxRetries is the maximum number of deployments to attempt before
+	// returning an error. 0 means try all available deployments.
+	MaxRetries int `json:"max_retries,omitempty"`
+	// Deployments is populated only by GetModel — list responses omit it.
+	Deployments []deploymentResponse `json:"deployments,omitempty"`
+	CreatedAt   string               `json:"created_at"`
+	UpdatedAt   string               `json:"updated_at"`
 }
 
 // paginatedModelsResponse wraps a page of models with pagination metadata.
@@ -141,6 +162,8 @@ func modelToResponse(m *db.Model) modelResponse {
 		Source:           m.Source,
 		Aliases:          aliases,
 		Timeout:          m.Timeout,
+		Strategy:         m.Strategy,
+		MaxRetries:       m.MaxRetries,
 		CreatedAt:        m.CreatedAt,
 		UpdatedAt:        m.UpdatedAt,
 	}
@@ -295,6 +318,16 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 	if req.Type != "" && !validModelTypes[req.Type] {
 		return apierror.BadRequest(c, "type must be one of: chat, embedding, reranking, completion, image, audio_transcription, tts")
 	}
+	if req.Strategy != "" {
+		validStrategies := map[string]bool{
+			"round-robin": true, "least-latency": true,
+			"weighted": true, "priority": true,
+		}
+		if !validStrategies[req.Strategy] {
+			return apierror.Send(c, fiber.StatusBadRequest, "invalid_strategy",
+				"strategy must be one of: round-robin, least-latency, weighted, priority")
+		}
+	}
 
 	aliasStr, aliasMsg := h.validateAndJoinAliases(ctx, req.Aliases, "")
 	if aliasMsg != "" {
@@ -324,6 +357,8 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		CreatedBy:        createdBy,
 		Aliases:          aliasStr,
 		Timeout:          req.Timeout,
+		Strategy:         &req.Strategy,
+		MaxRetries:       &req.MaxRetries,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
@@ -425,18 +460,31 @@ func (h *Handler) ListModels(c fiber.Ctx) error {
 // @Security     BearerAuth
 // @Router       /models/{model_id} [get]
 func (h *Handler) GetModel(c fiber.Ctx) error {
+	ctx := c.Context()
 	modelID := c.Params("model_id")
 
-	m, err := h.DB.GetModel(c.Context(), modelID)
+	m, err := h.DB.GetModel(ctx, modelID)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "model not found")
 		}
-		h.Log.ErrorContext(c.Context(), "get model", slog.String("error", err.Error()))
+		h.Log.ErrorContext(ctx, "get model", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to get model")
 	}
 
-	return c.JSON(modelToResponse(m))
+	resp := modelToResponse(m)
+
+	deps, err := h.DB.ListDeployments(ctx, modelID)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "get model: list deployments", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to get model deployments")
+	}
+	resp.Deployments = make([]deploymentResponse, len(deps))
+	for i := range deps {
+		resp.Deployments[i] = deploymentToResponse(&deps[i])
+	}
+
+	return c.JSON(resp)
 }
 
 // UpdateModel handles PATCH /api/v1/models/:model_id.
@@ -489,6 +537,16 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 	if req.Type != nil && !validModelTypes[*req.Type] {
 		return apierror.BadRequest(c, "type must be one of: chat, embedding, reranking, completion, image, audio_transcription, tts")
 	}
+	if req.Strategy != nil && *req.Strategy != "" {
+		validStrategies := map[string]bool{
+			"round-robin": true, "least-latency": true,
+			"weighted": true, "priority": true,
+		}
+		if !validStrategies[*req.Strategy] {
+			return apierror.Send(c, fiber.StatusBadRequest, "invalid_strategy",
+				"strategy must be one of: round-robin, least-latency, weighted, priority")
+		}
+	}
 
 	params := db.UpdateModelParams{
 		Name:             req.Name,
@@ -501,6 +559,8 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		AzureDeployment:  req.AzureDeployment,
 		AzureAPIVersion:  req.AzureAPIVersion,
 		Timeout:          req.Timeout,
+		Strategy:         req.Strategy,
+		MaxRetries:       req.MaxRetries,
 	}
 
 	if req.Aliases != nil {

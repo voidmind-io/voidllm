@@ -17,7 +17,8 @@ import (
 const modelSelectColumns = "id, name, provider, model_type, base_url, api_key_encrypted, " +
 	"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 	"azure_deployment, azure_api_version, " +
-	"is_active, source, created_by, created_at, updated_at, deleted_at, aliases, timeout"
+	"is_active, source, created_by, created_at, updated_at, deleted_at, aliases, timeout, " +
+	"strategy, max_retries"
 
 // Model represents a model record in the database.
 // This is the storage layer representation; see proxy.Model for the in-memory registry type.
@@ -46,6 +47,13 @@ type Model struct {
 	// Timeout is the per-model upstream timeout as a duration string (e.g. "30s", "2m").
 	// An empty string means use the global default.
 	Timeout string
+	// Strategy is the load balancing strategy used when multiple deployments are
+	// configured. Valid values: "round-robin", "weighted", "priority". An empty
+	// string means single-deployment (legacy) mode.
+	Strategy string
+	// MaxRetries is the maximum number of deployments to attempt before returning
+	// an error to the caller. 0 means try all available deployments.
+	MaxRetries int
 }
 
 // CreateModelParams holds the input for creating a model.
@@ -69,6 +77,11 @@ type CreateModelParams struct {
 	// Timeout is the per-model upstream timeout as a duration string (e.g. "30s", "2m").
 	// Pass an empty string to use the global default.
 	Timeout string
+	// Strategy is the load balancing strategy. Pass an empty string for
+	// single-deployment (legacy) mode.
+	Strategy *string
+	// MaxRetries is the maximum number of deployments to attempt. 0 means try all.
+	MaxRetries *int
 }
 
 // UpdateModelParams holds optional fields for updating a model.
@@ -90,6 +103,11 @@ type UpdateModelParams struct {
 	// Timeout, when non-nil, replaces the stored timeout duration string.
 	// Set to a pointer to an empty string to clear the per-model timeout.
 	Timeout *string
+	// Strategy, when non-nil, replaces the stored load balancing strategy.
+	// Set to a pointer to an empty string to revert to single-deployment mode.
+	Strategy *string
+	// MaxRetries, when non-nil, replaces the stored retry count.
+	MaxRetries *int
 }
 
 // CreateModel inserts a new model and returns the persisted record.
@@ -105,17 +123,27 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 		modelType = *params.ModelType
 	}
 
+	strategy := ""
+	if params.Strategy != nil {
+		strategy = *params.Strategy
+	}
+	maxRetries := 0
+	if params.MaxRetries != nil {
+		maxRetries = *params.MaxRetries
+	}
+
 	p := d.dialect.Placeholder
 	insertQuery := "INSERT INTO models " +
 		"(id, name, provider, model_type, base_url, api_key_encrypted, " +
 		"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 		"azure_deployment, azure_api_version, " +
-		"is_active, source, created_by, aliases, timeout, created_at, updated_at) " +
+		"is_active, source, created_by, aliases, timeout, strategy, max_retries, " +
+		"created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
 		p(7) + ", " + p(8) + ", " + p(9) + ", " +
 		p(10) + ", " + p(11) + ", " +
-		"1, " + p(12) + ", " + p(13) + ", " + p(14) + ", " + p(15) + ", " +
+		"1, " + p(12) + ", " + p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + modelSelectColumns +
@@ -139,6 +167,8 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 			params.CreatedBy,
 			params.Aliases,
 			params.Timeout,
+			strategy,
+			maxRetries,
 		)
 		if execErr != nil {
 			return translateError(execErr)
@@ -302,6 +332,16 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 		args = append(args, *params.Timeout)
 		argN++
 	}
+	if params.Strategy != nil {
+		setClauses = append(setClauses, "strategy = "+p(argN))
+		args = append(args, *params.Strategy)
+		argN++
+	}
+	if params.MaxRetries != nil {
+		setClauses = append(setClauses, "max_retries = "+p(argN))
+		args = append(args, *params.MaxRetries)
+		argN++
+	}
 
 	if len(setClauses) == 0 {
 		return d.GetModel(ctx, id)
@@ -450,6 +490,7 @@ func scanModel(scanner interface{ Scan(...any) error }) (*Model, error) {
 		&m.AzureDeployment, &m.AzureAPIVersion,
 		&isActiveInt, &m.Source, &m.CreatedBy,
 		&m.CreatedAt, &m.UpdatedAt, &m.DeletedAt, &m.Aliases, &m.Timeout,
+		&m.Strategy, &m.MaxRetries,
 	)
 	if err != nil {
 		return nil, err
@@ -498,6 +539,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 			if modelType == "" {
 				modelType = "chat"
 			}
+			strategy := m.Strategy
+			maxRetries := m.MaxRetries
 			created, createErr := d.CreateModel(ctx, CreateModelParams{
 				Name:             m.Name,
 				Provider:         m.Provider,
@@ -511,6 +554,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 				Source:           "yaml",
 				Aliases:          aliases,
 				Timeout:          m.Timeout,
+				Strategy:         &strategy,
+				MaxRetries:       &maxRetries,
 			})
 			if createErr != nil {
 				return fmt.Errorf("sync yaml models: create %s: %w", m.Name, createErr)
@@ -528,6 +573,11 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 				}); updateErr != nil {
 					return fmt.Errorf("sync yaml models: set key for %s: %w", m.Name, updateErr)
 				}
+			}
+
+			// Sync deployments for the newly created model.
+			if syncErr := d.syncYAMLDeployments(ctx, created.ID, m.Deployments, encKey); syncErr != nil {
+				return fmt.Errorf("sync yaml models: deployments for %s: %w", m.Name, syncErr)
 			}
 			continue
 		}
@@ -552,6 +602,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 		azureDeploy := m.AzureDeployment
 		azureVersion := m.AzureAPIVersion
 		timeout := m.Timeout
+		strategy := m.Strategy
+		maxRetries := m.MaxRetries
 
 		params := UpdateModelParams{
 			Name:             &name,
@@ -565,6 +617,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 			AzureAPIVersion:  &azureVersion,
 			Aliases:          &aliases,
 			Timeout:          &timeout,
+			Strategy:         &strategy,
+			MaxRetries:       &maxRetries,
 		}
 
 		if m.APIKey != "" {
@@ -573,14 +627,129 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 				return fmt.Errorf("sync yaml models: encrypt key for %s: %w", m.Name, encErr)
 			}
 			params.APIKeyEncrypted = &enc
-		} else if existing.APIKeyEncrypted != nil {
-			empty := ""
-			params.APIKeyEncrypted = &empty
 		}
 
 		if _, updateErr := d.UpdateModel(ctx, existing.ID, params); updateErr != nil {
 			return fmt.Errorf("sync yaml models: update %s: %w", m.Name, updateErr)
 		}
+
+		// Sync deployments for the existing model.
+		if syncErr := d.syncYAMLDeployments(ctx, existing.ID, m.Deployments, encKey); syncErr != nil {
+			return fmt.Errorf("sync yaml models: deployments for %s: %w", m.Name, syncErr)
+		}
 	}
 	return nil
+}
+
+// syncYAMLDeployments reconciles the deployments stored in the DB for a model
+// against the list declared in the YAML configuration. It creates deployments
+// that do not yet exist (matched by name), updates those that have changed, and
+// soft-deletes those that are no longer present in the YAML. API keys are
+// encrypted using AES-256-GCM before being written; the deployment's own ID is
+// used as additional authenticated data.
+func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []config.DeploymentConfig, encKey []byte) error {
+	dbDeps, err := d.ListDeployments(ctx, modelID)
+	if err != nil {
+		return fmt.Errorf("list deployments: %w", err)
+	}
+
+	// Index existing DB deployments by name for O(1) lookup.
+	byName := make(map[string]Deployment, len(dbDeps))
+	for _, dep := range dbDeps {
+		byName[dep.Name] = dep
+	}
+
+	// Track which DB deployment names are present in the YAML config so we can
+	// soft-delete the remainder afterwards.
+	seen := make(map[string]bool, len(cfgDeps))
+
+	for _, cd := range cfgDeps {
+		seen[cd.Name] = true
+
+		existing, exists := byName[cd.Name]
+		if !exists {
+			// Deployment is new — create it. Encrypt the API key after creation
+			// so we have the generated ID available as AAD.
+			weight := cd.Weight
+			if weight < 1 {
+				weight = 1
+			}
+			created, createErr := d.CreateDeployment(ctx, CreateDeploymentParams{
+				ModelID:         modelID,
+				Name:            cd.Name,
+				Provider:        cd.Provider,
+				BaseURL:         cd.BaseURL,
+				AzureDeployment: cd.AzureDeployment,
+				AzureAPIVersion: cd.AzureAPIVersion,
+				Weight:          weight,
+				Priority:        cd.Priority,
+			})
+			if createErr != nil {
+				return fmt.Errorf("create deployment %s: %w", cd.Name, createErr)
+			}
+			if cd.APIKey != "" {
+				enc, encErr := crypto.EncryptString(cd.APIKey, encKey, deploymentAAD(created.ID))
+				if encErr != nil {
+					return fmt.Errorf("encrypt api key for deployment %s: %w", cd.Name, encErr)
+				}
+				if _, updateErr := d.UpdateDeployment(ctx, created.ID, UpdateDeploymentParams{
+					APIKeyEncrypted: &enc,
+				}); updateErr != nil {
+					return fmt.Errorf("set api key for deployment %s: %w", cd.Name, updateErr)
+				}
+			}
+			continue
+		}
+
+		// Deployment exists — build an update with the current YAML values.
+		provider := cd.Provider
+		baseURL := cd.BaseURL
+		azureDeploy := cd.AzureDeployment
+		azureVersion := cd.AzureAPIVersion
+		weight := cd.Weight
+		if weight < 1 {
+			weight = 1
+		}
+		priority := cd.Priority
+
+		updateParams := UpdateDeploymentParams{
+			Provider:        &provider,
+			BaseURL:         &baseURL,
+			AzureDeployment: &azureDeploy,
+			AzureAPIVersion: &azureVersion,
+			Weight:          &weight,
+			Priority:        &priority,
+		}
+
+		if cd.APIKey != "" {
+			enc, encErr := crypto.EncryptString(cd.APIKey, encKey, deploymentAAD(existing.ID))
+			if encErr != nil {
+				return fmt.Errorf("encrypt api key for deployment %s: %w", cd.Name, encErr)
+			}
+			updateParams.APIKeyEncrypted = &enc
+		}
+
+		if _, updateErr := d.UpdateDeployment(ctx, existing.ID, updateParams); updateErr != nil {
+			return fmt.Errorf("update deployment %s: %w", cd.Name, updateErr)
+		}
+	}
+
+	// Soft-delete DB deployments no longer present in the YAML config.
+	for _, dep := range dbDeps {
+		if !seen[dep.Name] {
+			if deleteErr := d.DeleteDeployment(ctx, dep.ID); deleteErr != nil {
+				return fmt.Errorf("delete removed deployment %s: %w", dep.Name, deleteErr)
+			}
+		}
+	}
+
+	return nil
+}
+
+// deploymentAAD returns the additional authenticated data used when encrypting
+// or decrypting a deployment API key. The AAD binds the ciphertext to the
+// specific deployment row so that a ciphertext from one row cannot be replayed
+// against a different row.
+func deploymentAAD(id string) []byte {
+	return []byte("deployment:" + id)
 }

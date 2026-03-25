@@ -31,6 +31,13 @@ import (
 	"github.com/voidmind-io/voidllm/internal/usage"
 )
 
+// DeploymentPicker selects an ordered list of deployment candidates for a model.
+// router.Router implements this interface; the indirection avoids an import
+// cycle between the proxy and router packages (router already imports proxy).
+type DeploymentPicker interface {
+	Pick(model Model) []Deployment
+}
+
 // ProxyHandler forwards OpenAI-compatible requests to upstream LLM providers.
 // It resolves model names via the Registry, rewrites the Authorization header
 // with the upstream API key, and streams responses without buffering.
@@ -39,6 +46,7 @@ type ProxyHandler struct {
 	AccessCache       *ModelAccessCache        // in-memory model access control; nil disables access checks
 	AliasCache        *AliasCache              // in-memory scoped alias resolution; nil disables alias lookup
 	CircuitBreakers   *circuitbreaker.Registry // per-model circuit breaker registry; nil disables circuit breaking
+	Router            DeploymentPicker         // deployment selector; nil falls back to single-deployment behavior
 	HTTPClient        *http.Client
 	UsageLogger       *usage.Logger           // nil disables usage logging
 	RateLimiter       ratelimit.Checker       // nil disables rate limiting
@@ -199,78 +207,23 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		)
 	}
 
-	// Circuit breaker check: reject immediately when the upstream for this
-	// model is in the open state. breaker is nil when circuit breaking is
-	// disabled (CircuitBreakers == nil), in which case all downstream
-	// RecordSuccess / RecordFailure calls are guarded by the nil check.
-	var breaker *circuitbreaker.Breaker
-	if p.CircuitBreakers != nil {
-		breaker = p.CircuitBreakers.Get(model.Name)
-		if !breaker.Allow() {
-			metrics.CircuitBreakerRejectionsTotal.WithLabelValues(model.Name).Inc()
-			return apierror.Send(c, fiber.StatusServiceUnavailable,
-				"circuit_open", "upstream temporarily unavailable")
-		}
-	}
-
-	req, cancelUpstream, adapter, err := p.buildUpstreamRequest(c, model, body, envelope)
-	if err != nil {
-		if errors.Is(err, errResponseSent) {
-			return nil
-		}
-		return err
-	}
-
-	// upstream span measures time-to-first-byte from the upstream provider.
-	// Do() returns once response headers arrive, so the span captures the
-	// connection + header phase only — not the streaming body read.
-	var resp *http.Response
-	if p.Tracer != nil {
-		_, upstreamSpan := p.Tracer.Start(req.Context(), "proxy.upstream",
-			trace.WithAttributes(
-				attribute.String("http.request.method", req.Method),
-				attribute.String("url.full", req.URL.String()),
-			),
-		)
-		otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
-		resp, err = p.HTTPClient.Do(req)
-		if err != nil {
-			upstreamSpan.RecordError(err)
-			upstreamSpan.SetStatus(codes.Error, err.Error())
-		} else {
-			upstreamSpan.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
-		}
-		upstreamSpan.End()
+	// Build the ordered list of deployment candidates. When Router is nil or
+	// the model has no multi-deployment configuration, synthesize a single
+	// candidate from the model's own fields so the retry loop is uniform.
+	var candidates []Deployment
+	if p.Router != nil && len(model.Deployments) > 0 {
+		candidates = p.Router.Pick(model)
 	} else {
-		resp, err = p.HTTPClient.Do(req)
+		candidates = []Deployment{{
+			Name:            model.Name,
+			Provider:        model.Provider,
+			BaseURL:         model.BaseURL,
+			APIKey:          model.APIKey,
+			AzureDeployment: model.AzureDeployment,
+			AzureAPIVersion: model.AzureAPIVersion,
+			Weight:          1,
+		}}
 	}
-	if err != nil {
-		cancelUpstream()
-		if breaker != nil {
-			breaker.RecordFailure()
-		}
-		metrics.UpstreamErrorsTotal.WithLabelValues(model.Name, model.Provider).Inc()
-		p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream request failed",
-			slog.String("model", model.Name),
-			slog.String("provider", model.Provider),
-			slog.String("error", err.Error()),
-		)
-		return apierror.Send(c, fiber.StatusBadGateway, "upstream_unavailable", "upstream provider is unavailable")
-	}
-
-	// For non-streaming responses the outcome is known immediately: record it
-	// before the body is read. For streaming responses the upstream connection
-	// stays open while the client reads chunks, so we defer the record to the
-	// end of the stream goroutine where the real outcome is known.
-	if breaker != nil && !isStreamingResponse(resp) {
-		if resp.StatusCode >= 500 {
-			breaker.RecordFailure()
-		} else {
-			breaker.RecordSuccess()
-		}
-	}
-
-	metrics.UpstreamRequestsTotal.WithLabelValues(model.Name, model.Provider, strconv.Itoa(resp.StatusCode)).Inc()
 
 	// Per-model timeout overrides the global stream duration limit when set.
 	effectiveStreamDur := maxStreamDur
@@ -278,7 +231,159 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		effectiveStreamDur = model.Timeout
 	}
 
+	// req and cancelUpstream are set on the last successful buildUpstreamRequest
+	// call. They are used below after the loop exits to route into the response
+	// handlers. Both are nil if every candidate was skipped or failed during
+	// request construction.
+	var (
+		req            *http.Request
+		cancelUpstream context.CancelFunc
+		adapter        Adapter
+		resp           *http.Response
+		lastErr        error
+		usedDep        Deployment
+	)
+
+	for i, dep := range candidates {
+		depKey := deploymentKey(model.Name, dep.Name)
+
+		// Per-deployment circuit breaker check. The router's filterAvailable
+		// already excludes open breakers when Router is non-nil, so we only
+		// guard the synthesized single-candidate ourselves when Router is nil.
+		if p.CircuitBreakers != nil && p.Router == nil {
+			breaker := p.CircuitBreakers.Get(depKey)
+			if !breaker.Allow() {
+				metrics.CircuitBreakerRejectionsTotal.WithLabelValues(depKey).Inc()
+				// Continue to the next candidate; if this is the only one,
+				// the loop exits and we return the service-unavailable error
+				// below.
+				continue
+			}
+		}
+
+		// Overlay the deployment's endpoint fields onto a copy of the resolved
+		// model so buildUpstreamRequest uses the correct provider/URL/key.
+		m := model
+		applyDeployment(&m, dep)
+
+		var buildErr error
+		req, cancelUpstream, adapter, buildErr = p.buildUpstreamRequest(c, m, body, envelope)
+		if buildErr != nil {
+			if errors.Is(buildErr, errResponseSent) {
+				return nil
+			}
+			return buildErr
+		}
+
+		// Send the request to the upstream. The upstream span measures
+		// time-to-first-byte; Do() returns once response headers arrive.
+		var doErr error
+		if p.Tracer != nil {
+			_, upstreamSpan := p.Tracer.Start(req.Context(), "proxy.upstream",
+				trace.WithAttributes(
+					attribute.String("http.request.method", req.Method),
+					attribute.String("url.full", req.URL.String()),
+				),
+			)
+			otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
+			resp, doErr = p.HTTPClient.Do(req)
+			if doErr != nil {
+				upstreamSpan.RecordError(doErr)
+				upstreamSpan.SetStatus(codes.Error, doErr.Error())
+			} else {
+				upstreamSpan.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
+			}
+			upstreamSpan.End()
+		} else {
+			resp, doErr = p.HTTPClient.Do(req)
+		}
+
+		if doErr != nil {
+			// Connection-level error: transport failure, DNS, timeout.
+			cancelUpstream()
+			if p.CircuitBreakers != nil {
+				p.CircuitBreakers.Get(depKey).RecordFailure()
+			}
+			metrics.UpstreamErrorsTotal.WithLabelValues(m.Name, m.Provider).Inc()
+			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream request failed, retrying next deployment",
+				slog.String("model", m.Name),
+				slog.String("deployment", dep.Name),
+				slog.String("provider", m.Provider),
+				slog.Int("candidate", i),
+				slog.String("error", doErr.Error()),
+			)
+			lastErr = doErr
+			req = nil
+			cancelUpstream = nil
+			resp = nil
+			metrics.RoutingRetriesTotal.WithLabelValues(model.Name, model.Strategy).Inc()
+			continue
+		}
+
+		metrics.UpstreamRequestsTotal.WithLabelValues(m.Name, m.Provider, strconv.Itoa(resp.StatusCode)).Inc()
+
+		if isRetryable(resp.StatusCode) && i < len(candidates)-1 {
+			// 5xx response from upstream — try the next deployment. Drain
+			// and close the body before moving on so the connection is
+			// returned to the pool.
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			cancelUpstream()
+			if p.CircuitBreakers != nil {
+				p.CircuitBreakers.Get(depKey).RecordFailure()
+			}
+			metrics.UpstreamErrorsTotal.WithLabelValues(m.Name, m.Provider).Inc()
+			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream returned retryable error, retrying next deployment",
+				slog.String("model", m.Name),
+				slog.String("deployment", dep.Name),
+				slog.String("provider", m.Provider),
+				slog.Int("candidate", i),
+				slog.Int("status", resp.StatusCode),
+			)
+			lastErr = errors.New("upstream returned " + strconv.Itoa(resp.StatusCode))
+			req = nil
+			cancelUpstream = nil
+			resp = nil
+			metrics.RoutingRetriesTotal.WithLabelValues(model.Name, model.Strategy).Inc()
+			continue
+		}
+
+		// Success or non-retryable status (4xx, or last retryable with no
+		// more candidates). Record circuit breaker outcome for non-streaming
+		// responses immediately; streaming outcome is recorded inside the
+		// goroutine once the stream completes.
+		if p.CircuitBreakers != nil && !isStreamingResponse(resp) {
+			breaker := p.CircuitBreakers.Get(depKey)
+			if resp.StatusCode >= 500 {
+				breaker.RecordFailure()
+			} else {
+				breaker.RecordSuccess()
+			}
+		}
+
+		usedDep = dep
+		model = m // use the deployment-overlaid model for response handling
+		break
+	}
+
+	// All candidates were exhausted without a usable response.
+	if resp == nil {
+		if lastErr != nil {
+			return apierror.Send(c, fiber.StatusBadGateway, "upstream_unavailable", "upstream provider is unavailable")
+		}
+		// Every candidate was blocked by its circuit breaker.
+		metrics.CircuitBreakerRejectionsTotal.WithLabelValues(model.Name).Inc()
+		return apierror.Send(c, fiber.StatusServiceUnavailable,
+			"circuit_open", "upstream temporarily unavailable")
+	}
+
+	_ = usedDep // deployment name available for future usage event enrichment
+
 	if isStreamingResponse(resp) {
+		var breaker *circuitbreaker.Breaker
+		if p.CircuitBreakers != nil {
+			breaker = p.CircuitBreakers.Get(deploymentKey(model.Name, usedDep.Name))
+		}
 		return p.handleStreamingResponse(c, resp, cancelUpstream, model,
 			keyInfo, adapter, startTime, requestID, effectiveStreamDur, trackDone, breaker)
 	}
@@ -807,6 +912,40 @@ func (p *ProxyHandler) logUsageEvent(keyInfo *auth.KeyInfo, model Model, ui Usag
 
 	metrics.TokensTotal.WithLabelValues(model.Name, "prompt").Add(float64(ui.PromptTokens))
 	metrics.TokensTotal.WithLabelValues(model.Name, "completion").Add(float64(ui.CompletionTokens))
+}
+
+// deploymentKey returns the circuit breaker / health-checker lookup key for a
+// deployment. It mirrors router.DeploymentKey; the duplication avoids the
+// import cycle that arises from proxy ↔ router mutual imports.
+func deploymentKey(modelName, deploymentName string) string {
+	if deploymentName == modelName {
+		return modelName
+	}
+	return modelName + "/" + deploymentName
+}
+
+// applyDeployment overlays the endpoint fields from dep onto model in-place.
+// It is safe to call on a copy returned by resolveModel because that copy has
+// its own backing arrays and no pointer aliasing with the registry's internal
+// state.
+func applyDeployment(model *Model, dep Deployment) {
+	model.Provider = dep.Provider
+	model.BaseURL = dep.BaseURL
+	model.APIKey = dep.APIKey
+	model.AzureDeployment = dep.AzureDeployment
+	model.AzureAPIVersion = dep.AzureAPIVersion
+}
+
+// isRetryable reports whether an HTTP status code from an upstream response
+// should cause the proxy to attempt the next deployment candidate. 5xx errors
+// indicate a server-side problem that a different backend may not share.
+// 4xx errors are client errors that will recur regardless of which deployment
+// is used, so they are not retried.
+func isRetryable(statusCode int) bool {
+	return statusCode == http.StatusInternalServerError ||
+		statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout
 }
 
 // extractUsage parses token counts from a non-streaming OpenAI-format response

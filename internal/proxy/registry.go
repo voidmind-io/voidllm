@@ -16,6 +16,30 @@ import (
 // ErrModelNotFound is returned when a model name or alias cannot be resolved.
 var ErrModelNotFound = errors.New("model not found")
 
+// Deployment holds endpoint-specific configuration for one deployment
+// within a multi-deployment model.
+type Deployment struct {
+	Name            string
+	Provider        string
+	BaseURL         string
+	APIKey          string
+	AzureDeployment string
+	AzureAPIVersion string
+	Weight          int
+	Priority        int
+}
+
+// LogValue implements slog.LogValuer to prevent the upstream API key from
+// appearing in structured log output.
+func (d Deployment) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("name", d.Name),
+		slog.String("provider", d.Provider),
+		slog.String("base_url", d.BaseURL),
+		slog.String("api_key", "[REDACTED]"),
+	)
+}
+
 // Model holds a fully resolved model configuration ready for proxying.
 type Model struct {
 	Name     string
@@ -33,6 +57,16 @@ type Model struct {
 	// global MaxStreamDuration and the context deadline used for non-streaming
 	// requests. Zero means use the global default.
 	Timeout time.Duration
+	// Strategy is the deployment selection strategy used when Deployments is
+	// non-empty. Valid values: round-robin, least-latency, weighted, priority.
+	Strategy string
+	// MaxRetries is the number of times the proxy will retry a failed upstream
+	// request across the available deployments. Must be >= 0.
+	MaxRetries int
+	// Deployments is the list of backend endpoints for this model. When
+	// non-empty, the model-level Provider, BaseURL, and APIKey are ignored
+	// in favour of the per-deployment values.
+	Deployments []Deployment
 }
 
 // LogValue implements slog.LogValuer to prevent the upstream API key from
@@ -93,6 +127,20 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 			modelType = "chat"
 		}
 
+		deployments := make([]Deployment, len(mc.Deployments))
+		for i, d := range mc.Deployments {
+			deployments[i] = Deployment{
+				Name:            d.Name,
+				Provider:        d.Provider,
+				BaseURL:         d.BaseURL,
+				APIKey:          d.APIKey,
+				AzureDeployment: d.AzureDeployment,
+				AzureAPIVersion: d.AzureAPIVersion,
+				Weight:          d.Weight,
+				Priority:        d.Priority,
+			}
+		}
+
 		m := &Model{
 			Name:             mc.Name,
 			Provider:         mc.Provider,
@@ -105,6 +153,9 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 			AzureDeployment:  mc.AzureDeployment,
 			AzureAPIVersion:  mc.AzureAPIVersion,
 			Timeout:          timeout,
+			Strategy:         mc.Strategy,
+			MaxRetries:       mc.MaxRetries,
+			Deployments:      deployments,
 		}
 		r.models[mc.Name] = m
 	}
@@ -137,17 +188,10 @@ func (r *Registry) Resolve(nameOrAlias string) (Model, error) {
 	defer r.mu.RUnlock()
 
 	if m, ok := r.models[nameOrAlias]; ok {
-		result := *m
-		result.Aliases = make([]string, len(m.Aliases))
-		copy(result.Aliases, m.Aliases)
-		return result, nil
+		return copyModel(m), nil
 	}
 	if canonical, ok := r.aliases[nameOrAlias]; ok {
-		m := r.models[canonical]
-		result := *m
-		result.Aliases = make([]string, len(m.Aliases))
-		copy(result.Aliases, m.Aliases)
-		return result, nil
+		return copyModel(r.models[canonical]), nil
 	}
 	return Model{}, fmt.Errorf("resolve %q: %w", nameOrAlias, ErrModelNotFound)
 }
@@ -161,21 +205,25 @@ func (r *Registry) List() []Model {
 
 	result := make([]Model, len(r.sorted))
 	for i, m := range r.sorted {
-		result[i] = *m
-		result[i].Aliases = make([]string, len(m.Aliases))
-		copy(result[i].Aliases, m.Aliases)
+		result[i] = copyModel(m)
 	}
 	return result
 }
 
 // ModelInfo holds model metadata safe for external exposure.
-// It omits sensitive fields like APIKey and BaseURL.
+// It omits sensitive fields like APIKey and BaseURL. Deployment details
+// (including API keys and endpoint URLs) are never included.
 type ModelInfo struct {
 	Name             string
 	Provider         string
 	Type             string `json:"type"`
 	Aliases          []string
 	MaxContextTokens int
+	// Strategy is the deployment selection strategy. Empty for single-deployment models.
+	Strategy string `json:"strategy,omitempty"`
+	// DeploymentCount is the number of configured deployments. Zero for
+	// single-deployment models.
+	DeploymentCount int `json:"deployment_count,omitempty"`
 }
 
 // ListInfo returns metadata for all registered models, omitting sensitive fields.
@@ -195,6 +243,8 @@ func (r *Registry) ListInfo() []ModelInfo {
 			Type:             m.Type,
 			Aliases:          aliases,
 			MaxContextTokens: m.MaxContextTokens,
+			Strategy:         m.Strategy,
+			DeploymentCount:  len(m.Deployments),
 		}
 	}
 	return result
@@ -217,6 +267,9 @@ func (r *Registry) AddModel(m Model) {
 	aliases := make([]string, len(m.Aliases))
 	copy(aliases, m.Aliases)
 
+	deployments := make([]Deployment, len(m.Deployments))
+	copy(deployments, m.Deployments)
+
 	entry := &Model{
 		Name:             m.Name,
 		Provider:         m.Provider,
@@ -229,6 +282,9 @@ func (r *Registry) AddModel(m Model) {
 		AzureDeployment:  m.AzureDeployment,
 		AzureAPIVersion:  m.AzureAPIVersion,
 		Timeout:          m.Timeout,
+		Strategy:         m.Strategy,
+		MaxRetries:       m.MaxRetries,
+		Deployments:      deployments,
 	}
 	r.models[m.Name] = entry
 
@@ -256,6 +312,17 @@ func (r *Registry) RemoveModel(name string) {
 	delete(r.models, name)
 
 	r.rebuildSorted()
+}
+
+// copyModel returns a deep copy of m so callers cannot mutate the registry's
+// internal state. Slices (Aliases, Deployments) are copied into new backing arrays.
+func copyModel(m *Model) Model {
+	result := *m
+	result.Aliases = make([]string, len(m.Aliases))
+	copy(result.Aliases, m.Aliases)
+	result.Deployments = make([]Deployment, len(m.Deployments))
+	copy(result.Deployments, m.Deployments)
+	return result
 }
 
 // rebuildSorted rebuilds the pre-sorted slice of model pointers from the models map.

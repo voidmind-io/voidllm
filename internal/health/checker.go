@@ -34,6 +34,23 @@ const (
 // probeTimeout is the per-request context deadline for all probe types.
 const probeTimeout = 10 * time.Second
 
+// probeTarget holds the endpoint-specific fields needed to execute a single
+// probe. For single-deployment models key equals the model name; for
+// multi-deployment models key is "modelName/deploymentName".
+type probeTarget struct {
+	// key is the sync.Map key and the Prometheus label value. It equals
+	// modelName for single-deployment models or "modelName/deploymentName"
+	// for each deployment within a multi-deployment model.
+	key             string
+	modelName       string
+	provider        string
+	baseURL         string
+	apiKey          string
+	modelType       string
+	azureDeployment string
+	azureAPIVersion string
+}
+
 // ModelHealth holds the most recent health state for a single upstream model.
 type ModelHealth struct {
 	// ModelName is the canonical registry name of the model.
@@ -66,7 +83,7 @@ type ModelHealth struct {
 // are safe for concurrent use.
 type Checker struct {
 	registry *proxy.Registry
-	results  sync.Map // map[string]*ModelHealth — keyed by model name, replaced atomically
+	results  sync.Map // map[string]*ModelHealth — keyed by probeTarget.key, replaced atomically
 	cfg      config.HealthCheckConfig
 	client   *http.Client
 	log      *slog.Logger
@@ -92,31 +109,30 @@ func NewChecker(registry *proxy.Registry, cfg config.HealthCheckConfig, log *slo
 	}
 }
 
-// GetHealth returns the most recent health state for the model identified by
-// name. It returns nil and false when the model has not yet been probed or
-// does not exist in the registry. The returned pointer is safe to read without
-// further synchronization — stored values are never mutated after being placed
-// in the map.
-func (c *Checker) GetHealth(modelName string) (*ModelHealth, bool) {
-	v, ok := c.results.Load(modelName)
+// GetHealth returns the most recent health state for the given key. For
+// single-deployment models key is the model name; for a specific deployment
+// within a multi-deployment model key is "modelName/deploymentName". It
+// returns nil and false when the target has not yet been probed.
+// The returned pointer is safe to read without further synchronization —
+// stored values are never mutated after being placed in the map.
+func (c *Checker) GetHealth(key string) (*ModelHealth, bool) {
+	v, ok := c.results.Load(key)
 	if !ok {
 		return nil, false
 	}
 	return v.(*ModelHealth), true
 }
 
-// GetAllHealth returns a snapshot of health state for every model that has
-// been probed at least once. The returned slice follows the registry ordering
-// (sorted by name).
+// GetAllHealth returns a snapshot of health state for every probe target that
+// has been probed at least once. For models with multiple deployments each
+// deployment appears as a separate entry. The returned slice is unordered.
 func (c *Checker) GetAllHealth() []ModelHealth {
-	models := c.registry.List()
-	result := make([]ModelHealth, 0, len(models))
-	for _, m := range models {
-		if v, ok := c.results.Load(m.Name); ok {
-			mh := v.(*ModelHealth)
-			result = append(result, *mh)
-		}
-	}
+	var result []ModelHealth
+	c.results.Range(func(_, v any) bool {
+		mh := v.(*ModelHealth)
+		result = append(result, *mh)
+		return true
+	})
 	return result
 }
 
@@ -154,24 +170,68 @@ func (c *Checker) Start() func() {
 	}
 }
 
-// runAll executes the probe identified by level for every model in the registry.
+// deploymentKey returns the sync.Map and Prometheus label key for a probe
+// target. It mirrors router.DeploymentKey to avoid an import cycle: health
+// imports proxy, router imports health, so health must not import router.
+// For single-deployment models the key is the model name. For a deployment
+// within a multi-deployment model the key is "modelName/deploymentName".
+func deploymentKey(modelName, deploymentName string) string {
+	if deploymentName == modelName {
+		return modelName
+	}
+	return modelName + "/" + deploymentName
+}
+
+// runAll executes the probe identified by level for every probe target derived
+// from the registry. Single-deployment models produce one target keyed by the
+// model name; multi-deployment models produce one target per deployment keyed
+// by "modelName/deploymentName".
 func (c *Checker) runAll(level probeLevel) {
 	models := c.registry.List()
 	for _, m := range models {
-		c.runOne(m, level)
+		if len(m.Deployments) == 0 {
+			// Single-deployment: probe using model-level fields.
+			t := probeTarget{
+				key:             m.Name,
+				modelName:       m.Name,
+				provider:        m.Provider,
+				baseURL:         m.BaseURL,
+				apiKey:          m.APIKey,
+				modelType:       m.Type,
+				azureDeployment: m.AzureDeployment,
+				azureAPIVersion: m.AzureAPIVersion,
+			}
+			c.runOne(t, level)
+			continue
+		}
+		// Multi-deployment: one goroutine per deployment.
+		for _, d := range m.Deployments {
+			t := probeTarget{
+				key:             deploymentKey(m.Name, d.Name),
+				modelName:       m.Name,
+				provider:        d.Provider,
+				baseURL:         d.BaseURL,
+				apiKey:          d.APIKey,
+				modelType:       m.Type,
+				azureDeployment: d.AzureDeployment,
+				azureAPIVersion: d.AzureAPIVersion,
+			}
+			c.runOne(t, level)
+		}
 	}
 }
 
-// runOne executes a single probe for model m at the given level and atomically
-// replaces the stored ModelHealth using copy-on-write to avoid data races.
-func (c *Checker) runOne(m proxy.Model, level probeLevel) {
+// runOne executes a single probe for the given target at the given level and
+// atomically replaces the stored ModelHealth using copy-on-write to avoid data
+// races.
+func (c *Checker) runOne(t probeTarget, level probeLevel) {
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 
-	latencyMs, err := execProbe(ctx, c.client, m, level)
+	latencyMs, err := execProbe(ctx, c.client, t, level)
 
 	// Load existing or create a zero value to copy from.
-	existing, _ := c.results.LoadOrStore(m.Name, &ModelHealth{ModelName: m.Name, Status: "unknown"})
+	existing, _ := c.results.LoadOrStore(t.key, &ModelHealth{ModelName: t.key, Status: "unknown"})
 	old := existing.(*ModelHealth)
 
 	// Copy-on-write: mutate the copy, then store atomically. This eliminates
@@ -187,7 +247,7 @@ func (c *Checker) runOne(m proxy.Model, level probeLevel) {
 	} else {
 		updated.LastError = sanitizeError(err)
 		c.log.LogAttrs(ctx, slog.LevelDebug, "health probe failed",
-			slog.String("model", m.Name),
+			slog.String("key", t.key),
 			slog.String("error", updated.LastError),
 		)
 	}
@@ -205,20 +265,20 @@ func (c *Checker) runOne(m proxy.Model, level probeLevel) {
 	}
 
 	updated.Status = deriveStatus(&updated)
-	c.results.Store(m.Name, &updated)
+	c.results.Store(t.key, &updated)
 
-	updateMetrics(m.Name, &updated)
+	updateMetrics(t.key, &updated)
 }
 
 // execProbe dispatches to the appropriate probe function for the given level.
-func execProbe(ctx context.Context, client *http.Client, m proxy.Model, level probeLevel) (int64, error) {
+func execProbe(ctx context.Context, client *http.Client, t probeTarget, level probeLevel) (int64, error) {
 	switch level {
 	case levelHealth:
-		return probeHealth(ctx, client, m)
+		return probeHealth(ctx, client, t)
 	case levelModels:
-		return probeModels(ctx, client, m)
+		return probeModels(ctx, client, t)
 	case levelFunctional:
-		return probeFunctional(ctx, client, m)
+		return probeFunctional(ctx, client, t)
 	default:
 		return 0, fmt.Errorf("unknown probe level %d", level)
 	}
@@ -260,18 +320,18 @@ func serverRoot(baseURL string) string {
 	return u.Scheme + "://" + u.Host
 }
 
-// probeHealth performs a GET to the model's server root. Any HTTP response —
+// probeHealth performs a GET to the target's server root. Any HTTP response —
 // even 4xx or 5xx — is treated as success because receiving a response means
 // the server is reachable. Only connection-level errors (refused, timeout,
 // DNS failure) indicate an unhealthy host.
-func probeHealth(ctx context.Context, client *http.Client, m proxy.Model) (int64, error) {
-	rawURL := serverRoot(m.BaseURL)
+func probeHealth(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
+	rawURL := serverRoot(t.baseURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return 0, err
 	}
 
-	setAuthHeaders(req, m)
+	setAuthHeaders(req, t)
 
 	start := time.Now()
 	resp, err := client.Do(req)
@@ -291,15 +351,15 @@ func probeHealth(ctx context.Context, client *http.Client, m proxy.Model) (int64
 
 // probeModels performs a GET to <base_url>/models and returns success on any
 // 2xx HTTP response.
-func probeModels(ctx context.Context, client *http.Client, m proxy.Model) (int64, error) {
-	rawURL := strings.TrimRight(m.BaseURL, "/") + "/models"
+func probeModels(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
+	rawURL := strings.TrimRight(t.baseURL, "/") + "/models"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return 0, fmt.Errorf("build request: %w", err)
 	}
 
-	setAuthHeaders(req, m)
+	setAuthHeaders(req, t)
 
 	start := time.Now()
 	resp, err := client.Do(req)
@@ -317,29 +377,30 @@ func probeModels(ctx context.Context, client *http.Client, m proxy.Model) (int64
 }
 
 // probeFunctional dispatches to the appropriate functional probe based on the
-// model's type. Image, audio_transcription, and tts models are skipped because
-// they are too expensive or require special binary input to probe meaningfully.
-func probeFunctional(ctx context.Context, client *http.Client, m proxy.Model) (int64, error) {
-	switch m.Type {
+// target's model type. Image, audio_transcription, and tts models are skipped
+// because they are too expensive or require special binary input to probe
+// meaningfully.
+func probeFunctional(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
+	switch t.modelType {
 	case "embedding":
-		return probeEmbedding(ctx, client, m)
+		return probeEmbedding(ctx, client, t)
 	case "reranking", "image", "audio_transcription", "tts":
 		// Skip — incompatible endpoint or too expensive to probe.
 		return 0, nil
 	default: // "chat", "completion", ""
-		return probeFunctionalChat(ctx, client, m)
+		return probeFunctionalChat(ctx, client, t)
 	}
 }
 
 // probeFunctionalChat performs a minimal POST /chat/completions request with a
 // single-token max to verify end-to-end functionality of the upstream model.
-// For Azure models the deployment name is used as the model identifier.
-func probeFunctionalChat(ctx context.Context, client *http.Client, m proxy.Model) (int64, error) {
-	rawURL := strings.TrimRight(m.BaseURL, "/") + "/chat/completions"
+// For Azure targets the deployment name is used as the model identifier.
+func probeFunctionalChat(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
+	rawURL := strings.TrimRight(t.baseURL, "/") + "/chat/completions"
 
-	upstreamModel := m.Name
-	if m.Provider == "azure" && m.AzureDeployment != "" {
-		upstreamModel = m.AzureDeployment
+	upstreamModel := t.modelName
+	if t.provider == "azure" && t.azureDeployment != "" {
+		upstreamModel = t.azureDeployment
 	}
 
 	payload := map[string]any{
@@ -358,7 +419,7 @@ func probeFunctionalChat(ctx context.Context, client *http.Client, m proxy.Model
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	setAuthHeaders(req, m)
+	setAuthHeaders(req, t)
 
 	start := time.Now()
 	resp, err := client.Do(req)
@@ -377,11 +438,11 @@ func probeFunctionalChat(ctx context.Context, client *http.Client, m proxy.Model
 
 // probeEmbedding performs a minimal POST /embeddings request with a single
 // short input string to verify end-to-end functionality of an embedding model.
-func probeEmbedding(ctx context.Context, client *http.Client, m proxy.Model) (int64, error) {
-	rawURL := strings.TrimRight(m.BaseURL, "/") + "/embeddings"
+func probeEmbedding(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
+	rawURL := strings.TrimRight(t.baseURL, "/") + "/embeddings"
 
 	payload := map[string]any{
-		"model": m.Name,
+		"model": t.modelName,
 		"input": "test",
 	}
 	body, err := json.Marshal(payload)
@@ -395,7 +456,7 @@ func probeEmbedding(ctx context.Context, client *http.Client, m proxy.Model) (in
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	setAuthHeaders(req, m)
+	setAuthHeaders(req, t)
 
 	start := time.Now()
 	resp, err := client.Do(req)
@@ -413,17 +474,17 @@ func probeEmbedding(ctx context.Context, client *http.Client, m proxy.Model) (in
 }
 
 // setAuthHeaders adds the appropriate authentication headers to req based on
-// the model's provider. Anthropic uses the x-api-key header scheme; all other
+// the target's provider. Anthropic uses the x-api-key header scheme; all other
 // providers use Bearer token authorization.
-func setAuthHeaders(req *http.Request, m proxy.Model) {
-	if m.APIKey == "" {
+func setAuthHeaders(req *http.Request, t probeTarget) {
+	if t.apiKey == "" {
 		return
 	}
-	if m.Provider == "anthropic" {
-		req.Header.Set("x-api-key", m.APIKey)
+	if t.provider == "anthropic" {
+		req.Header.Set("x-api-key", t.apiKey)
 		req.Header.Set("anthropic-version", "2023-06-01")
 	} else {
-		req.Header.Set("Authorization", "Bearer "+m.APIKey)
+		req.Header.Set("Authorization", "Bearer "+t.apiKey)
 	}
 }
 
@@ -444,13 +505,13 @@ func deriveStatus(h *ModelHealth) string {
 	return "unknown"
 }
 
-// updateMetrics refreshes the Prometheus gauges for the given model after a
+// updateMetrics refreshes the Prometheus gauges for the given key after a
 // probe cycle completes. All status label values are reset to zero before
 // setting the current status to avoid stale time series.
-func updateMetrics(modelName string, mh *ModelHealth) {
+func updateMetrics(key string, mh *ModelHealth) {
 	// Reset all status labels to avoid stale series from previous status values.
 	for _, s := range []string{"healthy", "degraded", "unhealthy", "unknown"} {
-		metrics.ModelHealthStatus.WithLabelValues(modelName, s).Set(0)
+		metrics.ModelHealthStatus.WithLabelValues(key, s).Set(0)
 	}
 
 	var val float64
@@ -462,10 +523,10 @@ func updateMetrics(modelName string, mh *ModelHealth) {
 	default: // "unhealthy" or "unknown"
 		val = 0
 	}
-	metrics.ModelHealthStatus.WithLabelValues(modelName, mh.Status).Set(val)
+	metrics.ModelHealthStatus.WithLabelValues(key, mh.Status).Set(val)
 
 	if mh.LatencyMs > 0 {
-		metrics.ModelHealthLatencySeconds.WithLabelValues(modelName).Set(float64(mh.LatencyMs) / 1000)
+		metrics.ModelHealthLatencySeconds.WithLabelValues(key).Set(float64(mh.LatencyMs) / 1000)
 	}
 }
 

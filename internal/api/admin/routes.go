@@ -113,6 +113,12 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 	api.Patch("/models/:model_id/activate", auth.RequireRole(auth.RoleSystemAdmin), handler.ActivateModel)
 	api.Patch("/models/:model_id/deactivate", auth.RequireRole(auth.RoleSystemAdmin), handler.DeactivateModel)
 
+	// Model Deployments — sub-resources of a model, managed by system admins.
+	api.Post("/models/:model_id/deployments", auth.RequireRole(auth.RoleSystemAdmin), handler.createDeployment)
+	api.Get("/models/:model_id/deployments", auth.RequireRole(auth.RoleSystemAdmin), handler.listDeployments)
+	api.Patch("/models/:model_id/deployments/:deployment_id", auth.RequireRole(auth.RoleSystemAdmin), handler.updateDeployment)
+	api.Delete("/models/:model_id/deployments/:deployment_id", auth.RequireRole(auth.RoleSystemAdmin), handler.deleteDeployment)
+
 	// Model Access Control
 	api.Get("/orgs/:org_id/model-access", auth.RequireRole(auth.RoleOrgAdmin), handler.GetOrgModelAccess)
 	api.Put("/orgs/:org_id/model-access", auth.RequireRole(auth.RoleOrgAdmin), handler.SetOrgModelAccess)
