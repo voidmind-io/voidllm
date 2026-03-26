@@ -1041,40 +1041,6 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
         )}
 
         <Input
-          label="Max Context Tokens"
-          type="number"
-          value={maxContextTokens}
-          onChange={(e) => setMaxContextTokens(e.target.value)}
-          placeholder="e.g. 128000"
-          disabled={isPending}
-        />
-        <div className="grid grid-cols-2 gap-4">
-          <Input
-            label="Input Price per 1M tokens"
-            type="number"
-            value={inputPricePer1m}
-            onChange={(e) => setInputPricePer1m(e.target.value)}
-            placeholder="e.g. 2.50"
-            disabled={isPending}
-          />
-          <Input
-            label="Output Price per 1M tokens"
-            type="number"
-            value={outputPricePer1m}
-            onChange={(e) => setOutputPricePer1m(e.target.value)}
-            placeholder="e.g. 10.00"
-            disabled={isPending}
-          />
-        </div>
-        <Input
-          label="Timeout"
-          value={timeout}
-          onChange={(e) => setTimeout(e.target.value)}
-          placeholder="e.g. 30s, 2m, 5m"
-          description="Per-model upstream timeout. Empty = use global default."
-          disabled={isPending}
-        />
-        <Input
           label="Aliases"
           value={aliases}
           onChange={(e) => setAliases(e.target.value)}
@@ -1082,6 +1048,61 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
           description="Comma-separated. Must be globally unique."
           disabled={isPending}
         />
+
+        <details className="group">
+          <summary className="flex items-center justify-between cursor-pointer list-none select-none py-2">
+            <span className="text-xs font-medium tracking-wider uppercase text-text-tertiary">
+              Advanced Settings
+            </span>
+            <svg
+              className="h-3.5 w-3.5 text-text-tertiary transition-transform duration-200 group-open:rotate-180"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={2}
+              aria-hidden="true"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+            </svg>
+          </summary>
+          <div className="space-y-4 pt-2">
+            <Input
+              label="Max Context Tokens"
+              type="number"
+              value={maxContextTokens}
+              onChange={(e) => setMaxContextTokens(e.target.value)}
+              placeholder="e.g. 128000"
+              disabled={isPending}
+            />
+            <div className="grid grid-cols-2 gap-4">
+              <Input
+                label="Input Price per 1M tokens"
+                type="number"
+                value={inputPricePer1m}
+                onChange={(e) => setInputPricePer1m(e.target.value)}
+                placeholder="e.g. 2.50"
+                disabled={isPending}
+              />
+              <Input
+                label="Output Price per 1M tokens"
+                type="number"
+                value={outputPricePer1m}
+                onChange={(e) => setOutputPricePer1m(e.target.value)}
+                placeholder="e.g. 10.00"
+                disabled={isPending}
+              />
+            </div>
+            <Input
+              label="Timeout"
+              value={timeout}
+              onChange={(e) => setTimeout(e.target.value)}
+              placeholder="e.g. 30s, 2m, 5m"
+              description="Per-model upstream timeout. Empty = use global default."
+              disabled={isPending}
+            />
+          </div>
+        </details>
+
         <div className="flex justify-end gap-2 pt-2">
           <Button
             variant="secondary"
@@ -1498,6 +1519,18 @@ export default function ModelsPage() {
         if (row.source !== 'api') return null
         return (
           <div className="flex items-center justify-end gap-1">
+            {!row.deployments?.length && row.strategy && (
+              <button
+                type="button"
+                onClick={() => setEditDeployment({ modelId: row.id, deployment: null })}
+                title="Add deployment"
+                className="p-1.5 rounded-md text-text-tertiary hover:text-accent hover:bg-accent/10 transition-colors"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+                </svg>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setEditModel(row)}
@@ -1607,7 +1640,7 @@ export default function ModelsPage() {
           })
         }}
         renderExpandedRow={(row) => {
-          if (!row.deployments?.length && row.source !== 'api') return null
+          if (!row.deployments?.length) return null
           const isApi = row.source === 'api'
           return (
             <div className="py-3" style={{ paddingLeft: 'calc(2rem + 1rem + 1rem)' }}>

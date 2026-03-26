@@ -101,7 +101,7 @@ export function Dialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
-        className="rounded-2xl shadow-2xl max-w-lg w-full mx-4 p-6 border-t border-accent/15"
+        className="rounded-2xl shadow-2xl max-w-xl w-full mx-4 p-6 border-t border-accent/15 max-h-[90vh] flex flex-col"
         style={{ background: 'rgba(25, 25, 31, 0.85)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}
         onKeyDown={handlePanelKeyDown}
       >
@@ -130,7 +130,10 @@ export function Dialog({
           </button>
         </div>
 
-        <div className={cn(className)}>{children}</div>
+        <div
+          className={cn('flex-1 overflow-y-auto', className)}
+          style={{ scrollbarWidth: 'thin', scrollbarColor: 'rgba(255,255,255,0.15) transparent' }}
+        >{children}</div>
 
         {footer != null && <div className="mt-6">{footer}</div>}
       </div>
