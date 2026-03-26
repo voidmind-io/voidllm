@@ -16,7 +16,7 @@ import {
   useDeleteModel,
   useToggleModel,
 } from '../hooks/useModels'
-import type { ModelResponse, CreateModelParams, UpdateModelParams } from '../hooks/useModels'
+import type { ModelResponse, DeploymentResponse, CreateModelParams, UpdateModelParams } from '../hooks/useModels'
 import { useModelHealth } from '../hooks/useModelHealth'
 import type { ModelHealthInfo } from '../hooks/useModelHealth'
 import { useToast } from '../hooks/useToast'
@@ -704,6 +704,7 @@ export default function ModelsPage() {
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [editModel, setEditModel] = useState<ModelResponse | null>(null)
   const [deleteModelId, setDeleteModelId] = useState<string | null>(null)
+  const [expandedModels, setExpandedModels] = useState<Set<string>>(new Set())
 
   const { data: models, isLoading } = useModels()
   const { data: healthData } = useModelHealth()
@@ -736,6 +737,15 @@ export default function ModelsPage() {
       key: 'provider',
       header: 'Provider',
       render: (row) => {
+        const depCount = row.deployments?.length ?? 0
+        if (depCount > 0) {
+          return (
+            <div className="flex items-center gap-2">
+              <Badge variant="info">{depCount} deployments</Badge>
+              {row.strategy && <Badge variant="muted">{row.strategy}</Badge>}
+            </div>
+          )
+        }
         const key = isKnownProvider(row.provider) ? row.provider : 'custom'
         return (
           <Badge variant={providerBadgeVariant[key]}>
@@ -756,7 +766,32 @@ export default function ModelsPage() {
     {
       key: 'health',
       header: 'Health',
-      render: (row) => <HealthBadge info={healthByName.get(row.name)} />,
+      render: (row) => {
+        if (row.deployments?.length) {
+          const depHealths = row.deployments
+            .map((d) => healthByName.get(`${row.name}/${d.name}`))
+            .filter((h): h is ModelHealthInfo => h != null)
+          if (depHealths.length === 0) return <HealthBadge info={undefined} />
+          const allUnhealthy = depHealths.every((h) => h.status === 'unhealthy')
+          const allHealthy = depHealths.every((h) => h.status === 'healthy')
+          const allUnknown = depHealths.every((h) => h.status === 'unknown')
+          const status = allUnknown ? 'unknown' : allUnhealthy ? 'unhealthy' : allHealthy ? 'healthy' : 'degraded'
+          const avgLatency = Math.round(
+            depHealths.reduce((sum, h) => sum + (h.latency_ms ?? 0), 0) / depHealths.length,
+          )
+          const syntheticInfo: ModelHealthInfo = {
+            name: row.name,
+            status,
+            latency_ms: avgLatency,
+            last_check: '',
+            health_ok: null,
+            models_ok: null,
+            functional_ok: null,
+          }
+          return <HealthBadge info={syntheticInfo} />
+        }
+        return <HealthBadge info={healthByName.get(row.name)} />
+      },
     },
     {
       key: 'aliases',
@@ -819,7 +854,7 @@ export default function ModelsPage() {
           disabled={toggleModel.isPending && toggleModel.variables?.modelId === row.id}
           size="sm"
         />
-      ),
+        ),
     },
     {
       key: 'actions',
@@ -908,6 +943,58 @@ export default function ModelsPage() {
         keyExtractor={(row) => row.id}
         loading={isLoading}
         emptyMessage="No models configured"
+        expandedKeys={expandedModels}
+        onToggleExpand={(key) => {
+          setExpandedModels((prev) => {
+            const next = new Set(prev)
+            if (next.has(key)) next.delete(key)
+            else next.add(key)
+            return next
+          })
+        }}
+        renderExpandedRow={(row) => {
+          if (!row.deployments?.length) return null
+          return (
+            <div className="py-3" style={{ paddingLeft: 'calc(2rem + 1rem + 1rem)' }}>
+              <table className="min-w-full">
+                <thead>
+                  <tr className="border-b border-border/40">
+                    <th className="px-3 py-2 text-[10px] font-medium text-text-tertiary uppercase tracking-wider text-left">Deployment</th>
+                    <th className="px-3 py-2 text-[10px] font-medium text-text-tertiary uppercase tracking-wider text-left">Provider</th>
+                    <th className="px-3 py-2 text-[10px] font-medium text-text-tertiary uppercase tracking-wider text-left">Health</th>
+                    <th className="px-3 py-2 text-[10px] font-medium text-text-tertiary uppercase tracking-wider text-left">Base URL</th>
+                    <th className="px-3 py-2 text-[10px] font-medium text-text-tertiary uppercase tracking-wider text-left">Weight</th>
+                    <th className="px-3 py-2 text-[10px] font-medium text-text-tertiary uppercase tracking-wider text-left">Priority</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {row.deployments.map((dep: DeploymentResponse) => (
+                    <tr key={dep.id} className="border-b border-border/20 last:border-b-0">
+                      <td className="px-3 py-2 text-sm">
+                        <span className="font-mono text-text-secondary">{dep.name}</span>
+                      </td>
+                      <td className="px-3 py-2 text-sm">
+                        <Badge
+                          variant={providerBadgeVariant[dep.provider as keyof typeof providerBadgeVariant] ?? 'muted'}
+                        >
+                          {providerLabels[dep.provider as keyof typeof providerLabels] ?? dep.provider}
+                        </Badge>
+                      </td>
+                      <td className="px-3 py-2 text-sm">
+                        <HealthBadge info={healthByName.get(`${row.name}/${dep.name}`)} />
+                      </td>
+                      <td className="px-3 py-2 text-sm">
+                        <span className="text-xs text-text-tertiary font-mono">{dep.base_url}</span>
+                      </td>
+                      <td className="px-3 py-2 text-sm text-text-secondary">{dep.weight}</td>
+                      <td className="px-3 py-2 text-sm text-text-secondary">{dep.priority}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        }}
       />
 
       <CreateModelDialog

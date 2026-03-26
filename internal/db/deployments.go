@@ -309,6 +309,45 @@ func (d *DB) DeleteDeployment(ctx context.Context, id string) error {
 	return nil
 }
 
+// ListDeploymentsByModelIDs returns all active non-deleted deployments for the
+// given model IDs, grouped by model ID.
+func (d *DB) ListDeploymentsByModelIDs(ctx context.Context, modelIDs []string) (map[string][]Deployment, error) {
+	if len(modelIDs) == 0 {
+		return nil, nil
+	}
+
+	// Build placeholder string: ?,?,? or $1,$2,$3
+	placeholders := make([]string, len(modelIDs))
+	args := make([]any, len(modelIDs))
+	for i, id := range modelIDs {
+		placeholders[i] = d.dialect.Placeholder(i + 1)
+		args[i] = id
+	}
+
+	query := "SELECT " + deploymentSelectColumns +
+		" FROM model_deployments WHERE model_id IN (" + strings.Join(placeholders, ",") + ")" +
+		" AND deleted_at IS NULL ORDER BY priority ASC, id ASC"
+
+	rows, err := d.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("ListDeploymentsByModelIDs: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string][]Deployment)
+	for rows.Next() {
+		dep, scanErr := scanDeployment(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("ListDeploymentsByModelIDs scan: %w", scanErr)
+		}
+		result[dep.ModelID] = append(result[dep.ModelID], *dep)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListDeploymentsByModelIDs rows: %w", err)
+	}
+	return result, nil
+}
+
 // scanDeployment scans a single deployment row. The scanner may be a *sql.Row
 // (from QueryRowContext) or *sql.Rows (from QueryContext); both satisfy the interface.
 func scanDeployment(scanner interface{ Scan(...any) error }) (*Deployment, error) {

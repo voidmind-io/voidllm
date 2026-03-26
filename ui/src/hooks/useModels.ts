@@ -1,6 +1,21 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import apiClient from '../api/client'
 
+export interface DeploymentResponse {
+  id: string
+  model_id: string
+  name: string
+  provider: string
+  base_url: string
+  azure_deployment?: string
+  azure_api_version?: string
+  weight: number
+  priority: number
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
 export interface ModelResponse {
   id: string
   name: string
@@ -18,6 +33,9 @@ export interface ModelResponse {
   aliases: string[]
   created_at: string
   updated_at: string
+  strategy?: string
+  max_retries?: number
+  deployments?: DeploymentResponse[]
 }
 
 interface PaginatedModels {

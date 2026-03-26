@@ -103,7 +103,7 @@ type modelResponse struct {
 	// MaxRetries is the maximum number of deployments to attempt before
 	// returning an error. 0 means try all available deployments.
 	MaxRetries int `json:"max_retries,omitempty"`
-	// Deployments is populated only by GetModel — list responses omit it.
+	// Deployments contains the model's deployment entries when present.
 	Deployments []deploymentResponse `json:"deployments,omitempty"`
 	CreatedAt   string               `json:"created_at"`
 	UpdatedAt   string               `json:"updated_at"`
@@ -431,12 +431,28 @@ func (h *Handler) ListModels(c fiber.Ctx) error {
 		models = models[:p.Limit]
 	}
 
+	modelIDs := make([]string, len(models))
+	for i := range models {
+		modelIDs[i] = models[i].ID
+	}
+	depsByModel, depsErr := h.DB.ListDeploymentsByModelIDs(c.Context(), modelIDs)
+	if depsErr != nil {
+		h.Log.ErrorContext(c.Context(), "list models: fetch deployments",
+			slog.String("error", depsErr.Error()))
+	}
+
 	resp := paginatedModelsResponse{
 		Data:    make([]modelResponse, len(models)),
 		HasMore: hasMore,
 	}
 	for i := range models {
 		resp.Data[i] = modelToResponse(&models[i])
+		if deps := depsByModel[models[i].ID]; len(deps) > 0 {
+			resp.Data[i].Deployments = make([]deploymentResponse, len(deps))
+			for j := range deps {
+				resp.Data[i].Deployments[j] = deploymentToResponse(&deps[j])
+			}
+		}
 	}
 	if hasMore && len(models) > 0 {
 		resp.Cursor = models[len(models)-1].ID
