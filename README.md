@@ -7,9 +7,9 @@
 [![Go](https://img.shields.io/github/go-mod/go-version/voidmind-io/voidllm)](go.mod)
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL_1.1-blue.svg)](LICENSE)
 
-**A lightweight, privacy-first LLM proxy for teams that take control seriously.**
+**A privacy-first LLM proxy and AI gateway for teams that take control seriously.**
 
-VoidLLM sits between your applications and LLM providers — self-hosted or managed — giving you organization-wide access control, usage tracking, and key management. One binary, sub-2ms overhead, zero knowledge of your prompts.
+VoidLLM is a self-hosted LLM proxy that sits between your applications and LLM providers — OpenAI, Anthropic, Azure, Ollama, vLLM, or any custom endpoint. It gives you organization-wide access control, API key management, usage tracking, rate limiting, and multi-deployment load balancing. One Go binary, sub-2ms proxy overhead, zero knowledge of your prompts.
 
 ![VoidLLM Dashboard](docs/screenshots/VoidLLM-Dashboard.jpg)
 
@@ -22,19 +22,20 @@ VoidLLM sits between your applications and LLM providers — self-hosted or mana
 
 </details>
 
-> **Privacy by Design:** VoidLLM never stores, logs, or persists any prompt or response content. Not as a setting you can toggle — by architecture. The proxy is a zero-knowledge pass-through. Only metadata is tracked: who made the request, which model, how many tokens, how long it took. Your data stays yours. GDPR-compliant from day one.
+> **Privacy-First by Design:** VoidLLM is a zero-knowledge LLM proxy — it never stores, logs, or persists any prompt or response content. Not as a setting you can toggle — by architecture. Only metadata is tracked: who made the request, which model, how many tokens, how long it took. Your data stays yours. GDPR-compliant from day one.
 
 ---
 
 ## Why VoidLLM?
 
-| Problem | VoidLLM Solution |
+| Problem | How VoidLLM solves it |
 |---|---|
-| Teams share raw API keys in Slack | Virtual keys with org/team/user scoping |
+| Teams share raw API keys in Slack | Virtual keys with org/team/user scoping and RBAC |
 | No visibility into who's spending what | Per-key, per-team, per-org usage tracking + cost estimation |
-| One runaway script burns the monthly budget | Rate limits + token budgets at every level |
-| Switching providers means changing every app | Model aliases — clients call `default`, you route it anywhere |
-| Existing proxies log your prompts | Zero-knowledge architecture — content never touches disk |
+| One runaway script burns the monthly budget | Rate limits + token budgets enforced by the proxy at every level |
+| Switching providers means changing every app | Model aliases — clients call `default`, the proxy routes it anywhere |
+| Provider goes down, everything breaks | Multi-deployment load balancing with automatic failover |
+| Existing proxies log your prompts | Zero-knowledge proxy architecture — content never touches disk |
 
 ## Quick Start
 
@@ -43,53 +44,55 @@ VoidLLM sits between your applications and LLM providers — self-hosted or mana
 export VOIDLLM_ADMIN_KEY=$(openssl rand -base64 32)
 export VOIDLLM_ENCRYPTION_KEY=$(openssl rand -base64 32)
 
-# Start with Docker
+# Start the LLM proxy with Docker
 docker run -p 8080:8080 \
   -e VOIDLLM_ADMIN_KEY -e VOIDLLM_ENCRYPTION_KEY \
   -v $(pwd)/voidllm.yaml:/etc/voidllm/voidllm.yaml:ro \
   -v voidllm_data:/data \
-  voidllm:latest
+  ghcr.io/voidmind-io/voidllm:latest
 ```
 
-Open `http://localhost:8080` — log in, create keys, start proxying.
+Open `http://localhost:8080` — log in, create API keys, start proxying.
 
 ```bash
-# Your apps just point here instead of the provider
+# Your apps just point at the proxy instead of the provider
 curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer vl_uk_..." \
   -H "Content-Type: application/json" \
   -d '{"model":"default","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Any OpenAI SDK works out of the box — just change the base URL.
+Any OpenAI-compatible SDK works out of the box — just change the base URL to your VoidLLM proxy.
 
 ## Features
 
-### For Everyone (Community, free)
+### LLM Proxy — Community (free)
 
 - **OpenAI-compatible proxy** — `/v1/chat/completions`, embeddings, images, audio
-- **Provider adapters** — Anthropic, Azure OpenAI, Ollama, vLLM, OpenAI, any custom endpoint
-- **Full Web UI** — dashboard, playground, key management, teams, models, usage, settings
+- **Multi-provider routing** — Anthropic, Azure OpenAI, Ollama, vLLM, OpenAI, any custom endpoint
+- **Load balancing** — multi-deployment models with round-robin, least-latency, weighted, or priority routing
+- **Automatic failover** — retry on 5xx/timeout, per-deployment circuit breakers, health-aware routing
+- **Full Web UI** — dashboard, playground, API key management, teams, models, usage, settings
 - **Org → Team → User → Key hierarchy** with RBAC (system_admin, org_admin, team_admin, member)
 - **Rate limiting** — requests per minute/day, most-restrictive-wins across org/team/key
-- **Token budgets** — daily/monthly limits, enforced in real-time
-- **Usage tracking** — tokens, cost, duration, TTFT — async, never blocks
-- **Model aliases** — clients call `default`, you decide where it goes
+- **Token budgets** — daily/monthly limits, enforced in real-time by the proxy
+- **Usage tracking** — tokens, cost, duration, TTFT — async, never blocks the proxy
+- **Model aliases** — clients call `default`, you decide where the proxy routes it
 - **Per-model timeouts** and **circuit breakers** for upstream resilience
-- **14 Prometheus metrics** — proxy latency, tokens, active streams, cache, DB pool
-- **Streaming (SSE)** — transparent pass-through with per-chunk usage extraction
+- **Prometheus metrics** — proxy latency, tokens, active streams, routing retries, health status
+- **Streaming (SSE)** — transparent proxy pass-through with per-chunk usage extraction
 - **SQLite or PostgreSQL** — zero-dep default or production-grade
 - **Helm chart** — production-ready Kubernetes deployment
 - **Graceful shutdown** — phased drain, in-flight request tracking, K8s-ready
 
-### For Teams (Pro, $299/mo)
+### Pro ($299/mo)
 
 - Cost reports with model breakdown and daily trends
 - Usage export (CSV)
 - Extended data retention
 - Priority email support
 
-### For Enterprises (Enterprise, $799/mo)
+### Enterprise ($799/mo)
 
 - **SSO / OIDC** — Google, Azure AD, Okta, Keycloak, any OIDC provider
 - **Per-org SSO config** — each organization gets its own Identity Provider
@@ -97,7 +100,7 @@ Any OpenAI SDK works out of the box — just change the base URL.
 - **Group sync** — OIDC groups → VoidLLM teams
 - **Audit logs** — every admin action logged, filterable API + UI
 - **OpenTelemetry tracing** — OTLP/gRPC export to Jaeger, Tempo, Datadog
-- **Request ID correlation** — trace a single request across logs, usage, audit, upstream
+- **Request ID correlation** — trace a single request across the proxy, logs, usage, audit, upstream
 - Dedicated Slack support
 
 Flat pricing — no per-user fees, no per-request charges. Self-hosted on your infrastructure.
@@ -108,7 +111,7 @@ Flat pricing — no per-user fees, no per-request charges. Self-hosted on your i
 
 - **[Configuration Reference](docs/configuration.md)** — all YAML settings with examples
 - **[Deployment Guide](docs/deployment.md)** — Docker, Helm, Kubernetes, PostgreSQL, Redis
-- **[API Reference](docs/api.md)** — all endpoints, request/response formats
+- **[API Reference](docs/api.md)** — all proxy and admin API endpoints
 - **[Enterprise Guide](docs/enterprise.md)** — SSO setup, license activation, audit logs, OTel
 
 ## Configuration
@@ -119,6 +122,7 @@ server:
     port: 8080
 
 models:
+  # Single endpoint
   - name: dolphin-mistral
     provider: ollama
     base_url: http://localhost:11434/v1
@@ -128,11 +132,22 @@ models:
       input_per_1m: 0.15
       output_per_1m: 0.60
 
-  - name: claude-sonnet
-    provider: anthropic
-    base_url: https://api.anthropic.com
-    api_key: ${ANTHROPIC_KEY}
-    timeout: 5m
+  # Load balanced — multiple deployments with failover
+  - name: gpt-4o
+    strategy: round-robin
+    aliases: [smart]
+    deployments:
+      - name: azure-east
+        provider: azure
+        base_url: https://eastus.openai.azure.com
+        api_key: ${AZURE_EAST_KEY}
+        azure_deployment: gpt-4o
+        priority: 1
+      - name: openai-fallback
+        provider: openai
+        base_url: https://api.openai.com/v1
+        api_key: ${OPENAI_KEY}
+        priority: 2
 
 settings:
   admin_key: ${VOIDLLM_ADMIN_KEY}
@@ -177,13 +192,14 @@ go run ./cmd/voidllm --config voidllm.yaml
 
 ## Privacy
 
-This is not a feature toggle. It's an architectural decision.
+This is not a feature toggle. It's an architectural decision that makes VoidLLM a privacy-first LLM proxy.
 
 - **No request body** in logs, DB, or any persistent storage
 - **No response body** in logs, DB, or any persistent storage
 - **No prompt caching** — content passes through memory only
 - **Usage events** contain only: who (key/org/team), what (model), how much (tokens/cost)
 - There is no `enable_content_logging` option. It doesn't exist.
+- **GDPR-compliant** by architecture, not by configuration
 
 ## CLI Tools
 
