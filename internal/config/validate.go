@@ -22,6 +22,14 @@ var validModelTypes = map[string]bool{
 	"tts":                 true,
 }
 
+// validStrategies is the set of accepted multi-deployment routing strategies.
+var validStrategies = map[string]bool{
+	"round-robin":   true,
+	"least-latency": true,
+	"weighted":      true,
+	"priority":      true,
+}
+
 // validate checks all fields in the configuration for correctness. All
 // validation errors are collected and returned as a single joined error so
 // the caller can see every problem at once.
@@ -102,22 +110,74 @@ func (c *Config) validate() error {
 			seenNames[m.Name] = true
 		}
 
-		if !provider.ValidProviders[m.Provider] {
-			errs = append(errs, fmt.Errorf("%s.provider: must be one of %v, got %q", prefix, provider.Names(), m.Provider))
-		}
-
 		if !validModelTypes[m.Type] {
 			errs = append(errs, fmt.Errorf("%s.type: must be one of chat, embedding, reranking, completion, image, audio_transcription, tts; got %q", prefix, m.Type))
 		}
 
-		if m.BaseURL == "" {
-			errs = append(errs, fmt.Errorf("%s.base_url: must not be empty", prefix))
-		} else if !strings.HasPrefix(m.BaseURL, "http://") && !strings.HasPrefix(m.BaseURL, "https://") {
-			errs = append(errs, fmt.Errorf("%s.base_url: must start with http:// or https://", prefix))
+		if m.MaxRetries < 0 {
+			errs = append(errs, fmt.Errorf("%s.max_retries: must be >= 0, got %d", prefix, m.MaxRetries))
 		}
 
-		if m.Provider == "azure" && m.AzureDeployment == "" {
-			errs = append(errs, fmt.Errorf("%s.azure_deployment: must not be empty for azure provider", prefix))
+		if len(m.Deployments) == 0 {
+			// Single-deployment model: provider, base_url, and azure checks apply directly.
+			if !provider.ValidProviders[m.Provider] {
+				errs = append(errs, fmt.Errorf("%s.provider: must be one of %v, got %q", prefix, provider.Names(), m.Provider))
+			}
+
+			if m.BaseURL == "" {
+				errs = append(errs, fmt.Errorf("%s.base_url: must not be empty", prefix))
+			} else if !strings.HasPrefix(m.BaseURL, "http://") && !strings.HasPrefix(m.BaseURL, "https://") {
+				errs = append(errs, fmt.Errorf("%s.base_url: must start with http:// or https://", prefix))
+			}
+
+			if m.Provider == "azure" && m.AzureDeployment == "" {
+				errs = append(errs, fmt.Errorf("%s.azure_deployment: must not be empty for azure provider", prefix))
+			}
+
+			if m.Strategy != "" {
+				errs = append(errs, fmt.Errorf("%s.strategy: must be empty when deployments is not set", prefix))
+			}
+		} else {
+			// Multi-deployment model: strategy is required; per-deployment fields are validated below.
+			if !validStrategies[m.Strategy] {
+				errs = append(errs, fmt.Errorf("%s.strategy: must be one of round-robin, least-latency, weighted, priority; got %q", prefix, m.Strategy))
+			}
+
+			seenDeploymentNames := make(map[string]bool)
+			for j, d := range m.Deployments {
+				dprefix := fmt.Sprintf("%s.deployments[%d]", prefix, j)
+
+				if d.Name == "" {
+					errs = append(errs, fmt.Errorf("%s.name: must not be empty", dprefix))
+				} else {
+					if seenDeploymentNames[d.Name] {
+						errs = append(errs, fmt.Errorf("%s.name: duplicate deployment name %q within model %q", dprefix, d.Name, m.Name))
+					}
+					seenDeploymentNames[d.Name] = true
+				}
+
+				if !provider.ValidProviders[d.Provider] {
+					errs = append(errs, fmt.Errorf("%s.provider: must be one of %v, got %q", dprefix, provider.Names(), d.Provider))
+				}
+
+				if d.BaseURL == "" {
+					errs = append(errs, fmt.Errorf("%s.base_url: must not be empty", dprefix))
+				} else if !strings.HasPrefix(d.BaseURL, "http://") && !strings.HasPrefix(d.BaseURL, "https://") {
+					errs = append(errs, fmt.Errorf("%s.base_url: must start with http:// or https://", dprefix))
+				}
+
+				if d.Provider == "azure" && d.AzureDeployment == "" {
+					errs = append(errs, fmt.Errorf("%s.azure_deployment: must not be empty for azure provider", dprefix))
+				}
+
+				if d.Weight < 0 {
+					errs = append(errs, fmt.Errorf("%s.weight: must be >= 0, got %d", dprefix, d.Weight))
+				}
+
+				if d.Priority < 0 {
+					errs = append(errs, fmt.Errorf("%s.priority: must be >= 0, got %d", dprefix, d.Priority))
+				}
+			}
 		}
 
 		for _, alias := range m.Aliases {

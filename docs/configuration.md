@@ -76,6 +76,61 @@ models:
 Models can also be created via the Admin API and stored in the database.
 DB models take precedence over YAML models on name collision.
 
+## Load Balancing
+
+Models can have multiple deployments for redundancy and load distribution. VoidLLM routes requests across deployments and automatically falls back on failure.
+
+```yaml
+models:
+  - name: gpt-4o
+    strategy: round-robin        # round-robin, least-latency, weighted, priority
+    max_retries: 2               # Default: number of deployments - 1
+    aliases: [smart]
+    max_context_tokens: 128000
+    pricing:
+      input_per_1m: 2.50
+      output_per_1m: 10.00
+    deployments:
+      - name: azure-east
+        provider: azure
+        base_url: https://eastus.openai.azure.com
+        api_key: ${AZURE_EAST_KEY}
+        azure_deployment: gpt-4o
+        weight: 2                # For weighted strategy
+        priority: 1              # For priority strategy (lower = higher)
+      - name: azure-west
+        provider: azure
+        base_url: https://westus.openai.azure.com
+        api_key: ${AZURE_WEST_KEY}
+        azure_deployment: gpt-4o
+        weight: 1
+        priority: 2
+      - name: openai-fallback
+        provider: openai
+        base_url: https://api.openai.com/v1
+        api_key: ${OPENAI_KEY}
+        weight: 1
+        priority: 3
+```
+
+**Strategies:**
+
+| Strategy | Behavior |
+|---|---|
+| `round-robin` | Rotate through healthy deployments (default) |
+| `least-latency` | Route to deployment with lowest measured latency |
+| `weighted` | Random selection weighted by `weight` field |
+| `priority` | Ordered fallback — try lowest priority number first |
+
+**Retry behavior:**
+- 5xx, timeout, connection refused → automatic retry to next deployment
+- 4xx → return error immediately (client error, retrying won't help)
+- Once streaming has started → no retry (committed to the deployment)
+
+**Health integration:** The health checker probes each deployment independently. Unhealthy deployments are skipped during routing. If all deployments are unhealthy, VoidLLM tries all of them as a last resort.
+
+**Circuit breakers:** Each deployment has its own circuit breaker. After repeated failures a deployment is temporarily removed from rotation and automatically recovers.
+
 ## Settings
 
 ```yaml

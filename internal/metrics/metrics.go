@@ -109,6 +109,16 @@ var ModelHealthLatencySeconds = promauto.NewGaugeVec(
 	[]string{"model"},
 )
 
+// RoutingRetriesTotal counts the number of retry attempts during
+// multi-deployment load balancing, partitioned by model name and routing
+// strategy. It is incremented each time the proxy abandons a failing
+// deployment candidate and moves on to the next one in the ordered list.
+var RoutingRetriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "voidllm",
+	Name:      "routing_retries_total",
+	Help:      "Number of upstream retry attempts during load-balanced routing.",
+}, []string{"model", "strategy"})
+
 // RegisterDBCollectors registers database connection pool metrics against the
 // default Prometheus registry. The gauges are implemented as GaugeFuncs that
 // read live values from sql.DB.Stats() on each scrape, so they always reflect

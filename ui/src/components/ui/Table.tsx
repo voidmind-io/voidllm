@@ -34,9 +34,14 @@ export interface TableProps<T> {
   compact?: boolean
   loading?: boolean
   emptyMessage?: string
-  /** Optional custom empty state node. Takes priority over emptyMessage when data is empty and not loading. */
   emptyState?: React.ReactNode
   className?: string
+  /** Render expanded content below a row. Return null for non-expandable rows. */
+  renderExpandedRow?: (row: T) => React.ReactNode
+  /** Set of keys (from keyExtractor) that are currently expanded. */
+  expandedKeys?: Set<string>
+  /** Called when a row's expand/collapse state is toggled. */
+  onToggleExpand?: (key: string) => void
 }
 
 function SortIndicator({ column, sort }: { column: string; sort?: SortState }) {
@@ -76,6 +81,25 @@ const alignClass: Record<NonNullable<Column<unknown>['align']>, string> = {
   right: 'text-right',
 }
 
+function ChevronIcon({ expanded }: { expanded: boolean }) {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      className={cn('transition-transform duration-150', expanded && 'rotate-90')}
+    >
+      <polyline points="9 18 15 12 9 6" />
+    </svg>
+  )
+}
+
 export function Table<T>({
   columns,
   data,
@@ -88,14 +112,22 @@ export function Table<T>({
   emptyMessage = 'No results found.',
   emptyState,
   className,
+  renderExpandedRow,
+  expandedKeys,
+  onToggleExpand,
 }: TableProps<T>) {
   const cellPadding = compact ? 'px-3 py-2' : 'px-4 py-3'
+  const hasExpand = renderExpandedRow != null
+  const totalCols = hasExpand ? columns.length + 1 : columns.length
 
   return (
     <div className={cn('overflow-x-auto rounded-lg border border-border', className)}>
       <table className="min-w-full">
         <thead>
           <tr className="bg-bg-tertiary/50 border-b border-border">
+            {hasExpand && (
+              <th scope="col" className="w-8 px-2" aria-label="Expand" />
+            )}
             {columns.map((col) => {
               const isSortable = col.sortable === true && onSort != null
               return (
@@ -142,10 +174,10 @@ export function Table<T>({
         </thead>
         <tbody>
           {loading ? (
-            <SkeletonRows columns={columns.length} rows={5} cellPadding={cellPadding} />
+            <SkeletonRows columns={totalCols} rows={5} cellPadding={cellPadding} />
           ) : data.length === 0 ? (
             <tr>
-              <td colSpan={columns.length}>
+              <td colSpan={totalCols}>
                 {emptyState != null ? (
                   emptyState
                 ) : (
@@ -156,29 +188,61 @@ export function Table<T>({
               </td>
             </tr>
           ) : (
-            data.map((row, rowIndex) => (
-              <tr
-                key={keyExtractor(row)}
-                className={cn(
-                  'hover:bg-bg-tertiary/30 transition-colors',
-                  rowIndex < data.length - 1 && 'border-b border-border',
-                )}
-              >
-                {columns.map((col) => (
-                  <td
-                    key={col.key}
+            data.map((row, rowIndex) => {
+              const key = keyExtractor(row)
+              const expandedContent = hasExpand ? renderExpandedRow!(row) : null
+              const isExpandable = expandedContent != null
+              const isExpanded = isExpandable && (expandedKeys?.has(key) ?? false)
+              const isLastRow = rowIndex === data.length - 1
+              const showRowBorder = !isLastRow || isExpanded
+
+              return (
+                <React.Fragment key={key}>
+                  <tr
                     className={cn(
-                      cellPadding,
-                      'text-sm',
-                      col.align != null && alignClass[col.align],
-                      col.width,
+                      'hover:bg-bg-tertiary/30 transition-colors',
+                      showRowBorder && 'border-b border-border',
                     )}
                   >
-                    {col.render(row)}
-                  </td>
-                ))}
-              </tr>
-            ))
+                    {hasExpand && (
+                      <td className="w-8 px-2">
+                        {isExpandable ? (
+                          <button
+                            type="button"
+                            onClick={() => onToggleExpand?.(key)}
+                            className="flex items-center justify-center w-6 h-6 rounded text-text-tertiary hover:text-text-primary hover:bg-bg-tertiary transition-colors"
+                            aria-label={isExpanded ? 'Collapse row' : 'Expand row'}
+                            aria-expanded={isExpanded}
+                          >
+                            <ChevronIcon expanded={isExpanded} />
+                          </button>
+                        ) : null}
+                      </td>
+                    )}
+                    {columns.map((col) => (
+                      <td
+                        key={col.key}
+                        className={cn(
+                          cellPadding,
+                          'text-sm',
+                          col.align != null && alignClass[col.align],
+                          col.width,
+                        )}
+                      >
+                        {col.render(row)}
+                      </td>
+                    ))}
+                  </tr>
+                  {isExpanded && (
+                    <tr className={cn(!isLastRow && 'border-b border-border')}>
+                      <td colSpan={totalCols} className="p-0 bg-bg-secondary/30">
+                        {expandedContent}
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              )
+            })
           )}
         </tbody>
       </table>
