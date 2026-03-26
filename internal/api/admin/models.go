@@ -301,14 +301,18 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 	if req.Name == "" {
 		return apierror.BadRequest(c, "name is required")
 	}
-	if req.Provider == "" {
-		return apierror.BadRequest(c, "provider is required")
+	// provider and base_url are required only in single-endpoint mode (no strategy).
+	// When a strategy is set the endpoints live on the model's deployments.
+	if req.Strategy == "" {
+		if req.Provider == "" {
+			return apierror.BadRequest(c, "provider is required")
+		}
+		if req.BaseURL == "" {
+			return apierror.BadRequest(c, "base_url is required")
+		}
 	}
-	if !provider.ValidProviders[req.Provider] {
+	if req.Provider != "" && !provider.ValidProviders[req.Provider] {
 		return apierror.BadRequest(c, "provider must be one of: "+strings.Join(provider.Names(), ", "))
-	}
-	if req.BaseURL == "" {
-		return apierror.BadRequest(c, "base_url is required")
 	}
 	if req.Timeout != "" {
 		if _, err := time.ParseDuration(req.Timeout); err != nil {
@@ -542,8 +546,28 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		return apierror.BadRequest(c, "invalid request body")
 	}
 
-	if req.Provider != nil && !provider.ValidProviders[*req.Provider] {
+	// Determine the effective strategy after this update so we know whether
+	// provider/base_url are required. If strategy is being cleared (pointer to
+	// empty string) we stay in single-endpoint mode; if it is being set we enter
+	// deployment mode; otherwise the existing value governs.
+	effectiveStrategy := existing.Strategy
+	if req.Strategy != nil {
+		effectiveStrategy = *req.Strategy
+	}
+
+	if req.Provider != nil && *req.Provider != "" && !provider.ValidProviders[*req.Provider] {
 		return apierror.BadRequest(c, "provider must be one of: "+strings.Join(provider.Names(), ", "))
+	}
+	// In single-endpoint mode, explicitly setting provider or base_url to an
+	// empty string is not meaningful. In deployment mode it is fine — the
+	// endpoints live on the deployments, not the model row.
+	if effectiveStrategy == "" {
+		if req.Provider != nil && *req.Provider == "" {
+			return apierror.BadRequest(c, "provider must not be empty in single-endpoint mode")
+		}
+		if req.BaseURL != nil && *req.BaseURL == "" {
+			return apierror.BadRequest(c, "base_url must not be empty in single-endpoint mode")
+		}
 	}
 	if req.Timeout != nil && *req.Timeout != "" {
 		if _, err := time.ParseDuration(*req.Timeout); err != nil {

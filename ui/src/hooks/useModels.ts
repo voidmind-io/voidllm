@@ -47,8 +47,8 @@ interface PaginatedModels {
 export interface CreateModelParams {
   name: string
   type: string
-  provider: string
-  base_url: string
+  provider?: string
+  base_url?: string
   api_key?: string
   max_context_tokens?: number
   input_price_per_1m?: number
@@ -57,6 +57,30 @@ export interface CreateModelParams {
   azure_api_version?: string
   timeout?: string
   aliases?: string[]
+  strategy?: string
+  max_retries?: number
+}
+
+export interface CreateDeploymentParams {
+  name: string
+  provider: string
+  base_url: string
+  api_key?: string
+  azure_deployment?: string
+  azure_api_version?: string
+  weight?: number
+  priority?: number
+}
+
+export interface UpdateDeploymentParams {
+  name?: string
+  provider?: string
+  base_url?: string
+  api_key?: string
+  azure_deployment?: string
+  azure_api_version?: string
+  weight?: number
+  priority?: number
 }
 
 export interface UpdateModelParams {
@@ -128,6 +152,47 @@ export function useToggleModel() {
     mutationFn: ({ modelId, activate }: { modelId: string; activate: boolean }) =>
       apiClient<ModelResponse>(`/models/${modelId}/${activate ? 'activate' : 'deactivate'}`, {
         method: 'PATCH',
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+    },
+  })
+}
+
+export function useCreateDeployment() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ modelId, params }: { modelId: string; params: CreateDeploymentParams }) =>
+      apiClient<DeploymentResponse>(`/models/${modelId}/deployments`, {
+        method: 'POST',
+        body: JSON.stringify(params),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+    },
+  })
+}
+
+export function useUpdateDeployment() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ modelId, deploymentId, params }: { modelId: string; deploymentId: string; params: UpdateDeploymentParams }) =>
+      apiClient<DeploymentResponse>(`/models/${modelId}/deployments/${deploymentId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(params),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+    },
+  })
+}
+
+export function useDeleteDeployment() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ modelId, deploymentId }: { modelId: string; deploymentId: string }) =>
+      apiClient<void>(`/models/${modelId}/deployments/${deploymentId}`, {
+        method: 'DELETE',
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['models'] })
