@@ -54,6 +54,12 @@ docker run -p 8080:8080 \
 
 Open `http://localhost:8080` — log in, create API keys, start proxying.
 
+### One-Click Deploy
+
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/wild-pure?referralCode=fw9l7c)
+
+Keys are auto-generated. Open the URL Railway gives you and start adding models.
+
 ```bash
 # Your apps just point at the proxy instead of the provider
 curl http://localhost:8080/v1/chat/completions \
