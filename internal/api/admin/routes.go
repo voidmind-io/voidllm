@@ -168,13 +168,24 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 		api.Get("/mcp/:alias", handler.HandleMCPProxySSE)
 	}
 
-	// MCP Servers — global resources, system admin only.
+	// MCP Servers — global resources (system_admin only for write; handler checks
+	// scope permissions for shared read/mutate routes).
 	// Static sub-paths (:server_id/test) are registered before /:server_id
 	// so Fiber does not treat "test" as a server_id parameter value.
 	api.Post("/mcp-servers", auth.RequireRole(auth.RoleSystemAdmin), handler.CreateMCPServer)
 	api.Get("/mcp-servers", auth.RequireRole(auth.RoleSystemAdmin), handler.ListMCPServers)
-	api.Get("/mcp-servers/:server_id", auth.RequireRole(auth.RoleSystemAdmin), handler.GetMCPServer)
-	api.Patch("/mcp-servers/:server_id", auth.RequireRole(auth.RoleSystemAdmin), handler.UpdateMCPServer)
-	api.Delete("/mcp-servers/:server_id", auth.RequireRole(auth.RoleSystemAdmin), handler.DeleteMCPServer)
-	api.Post("/mcp-servers/:server_id/test", auth.RequireRole(auth.RoleSystemAdmin), handler.TestMCPServerConnection)
+
+	// Org-scoped MCP Servers.
+	api.Post("/orgs/:org_id/mcp-servers", auth.RequireRole(auth.RoleOrgAdmin), handler.CreateOrgMCPServer)
+	api.Get("/orgs/:org_id/mcp-servers", auth.RequireRole(auth.RoleMember), handler.ListOrgMCPServers)
+
+	// Team-scoped MCP Servers.
+	api.Post("/orgs/:org_id/teams/:team_id/mcp-servers", auth.RequireRole(auth.RoleTeamAdmin), handler.CreateTeamMCPServer)
+	api.Get("/orgs/:org_id/teams/:team_id/mcp-servers", auth.RequireRole(auth.RoleMember), handler.ListTeamMCPServers)
+
+	// Shared MCP server operations — handler enforces scope-based ownership.
+	api.Get("/mcp-servers/:server_id", auth.RequireRole(auth.RoleMember), handler.GetMCPServer)
+	api.Patch("/mcp-servers/:server_id", auth.RequireRole(auth.RoleMember), handler.UpdateMCPServer)
+	api.Delete("/mcp-servers/:server_id", auth.RequireRole(auth.RoleMember), handler.DeleteMCPServer)
+	api.Post("/mcp-servers/:server_id/test", auth.RequireRole(auth.RoleMember), handler.TestMCPServerConnection)
 }

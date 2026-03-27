@@ -61,6 +61,47 @@ func setupMCPServersTestApp(t *testing.T, dsn string) (*fiber.App, *db.DB, *cach
 	return app, database, keyCache
 }
 
+// setupMCPServersTestAppAllowPrivate is identical to setupMCPServersTestApp but
+// sets MCPAllowPrivateURLs = true on the handler. Use this only in tests that
+// connect to loopback httptest servers and need the SSRF dialer disabled.
+func setupMCPServersTestAppAllowPrivate(t *testing.T, dsn string) (*db.DB, *cache.Cache[string, auth.KeyInfo], *fiber.App) {
+	t.Helper()
+
+	ctx := context.Background()
+	database, err := db.Open(ctx, config.DatabaseConfig{
+		Driver:          "sqlite",
+		DSN:             dsn,
+		MaxOpenConns:    1,
+		MaxIdleConns:    1,
+		ConnMaxLifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("open test DB: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	keyCache := cache.New[string, auth.KeyInfo]()
+
+	handler := &admin.Handler{
+		DB:                  database,
+		HMACSecret:          testHMACSecret,
+		EncryptionKey:       testEncryptionKey,
+		KeyCache:            keyCache,
+		License:             license.NewHolder(license.Verify("", true)),
+		Log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MCPAllowPrivateURLs: true,
+	}
+
+	app := fiber.New()
+	admin.RegisterRoutes(app, handler, keyCache, testHMACSecret, nil)
+
+	return database, keyCache, app
+}
+
 // mcpServerRequest sends an HTTP request to the MCP servers API.
 func mcpServerRequest(t *testing.T, app *fiber.App, method, url, key string, body any) *http.Response {
 	t.Helper()
@@ -160,6 +201,13 @@ func TestCreateMCPServer_API(t *testing.T) {
 	}
 	if got["is_active"] != true {
 		t.Errorf("is_active = %v, want true", got["is_active"])
+	}
+	// Global server must have scope = "global" and no org_id or team_id.
+	if got["scope"] != "global" {
+		t.Errorf("scope = %v, want %q", got["scope"], "global")
+	}
+	if got["org_id"] != nil {
+		t.Errorf("org_id = %v, want nil for global server", got["org_id"])
 	}
 }
 
@@ -268,6 +316,138 @@ func TestCreateMCPServer_API_AuthTokenNotInResponse(t *testing.T) {
 	}
 }
 
+// ---- POST /api/v1/orgs/:org_id/mcp-servers (org-scoped) --------------------
+
+func TestCreateOrgMCPServer_API(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestCreateOrgMCPServer_API?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	org := mustCreateOrg(t, database, "Org ABC", "org-abc")
+	key := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+	body := map[string]any{
+		"name":      "Org Tool",
+		"alias":     "org-tool",
+		"url":       "https://org-tool.example.com",
+		"auth_type": "none",
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodPost, "/api/v1/orgs/"+org.ID+"/mcp-servers", key, body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusCreated {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 201; body: %s", resp.StatusCode, raw)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+
+	if got["scope"] != "org" {
+		t.Errorf("scope = %v, want %q", got["scope"], "org")
+	}
+	if got["org_id"] != org.ID {
+		t.Errorf("org_id = %v, want %q", got["org_id"], org.ID)
+	}
+	if got["team_id"] != nil {
+		t.Errorf("team_id = %v, want nil", got["team_id"])
+	}
+}
+
+func TestCreateOrgMCPServer_API_RequiresOrgAdmin(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestCreateOrgMCPServer_RBAC?mode=memory&cache=private"
+	app, _, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleMember, "org-xyz")
+
+	body := map[string]any{
+		"name":      "Test",
+		"alias":     "test-rbac",
+		"url":       "https://test-rbac.example.com",
+		"auth_type": "none",
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodPost, "/api/v1/orgs/org-xyz/mcp-servers", key, body)
+	resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusForbidden {
+		t.Errorf("status = %d, want 403 for member creating org-scoped server", resp.StatusCode)
+	}
+}
+
+// ---- GET /api/v1/orgs/:org_id/mcp-servers (org-scoped list) ----------------
+
+func TestListOrgMCPServers_API(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestListOrgMCPServers_API?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+
+	org := mustCreateOrg(t, database, "List Org", "list-org-mcp")
+	otherOrg := mustCreateOrg(t, database, "Other Org", "other-org-mcp")
+	memberKey := addTestKey(t, keyCache, auth.RoleMember, org.ID)
+
+	// Create a global server and an org-scoped server; both should appear.
+	_, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Global",
+		Alias:    "global-list",
+		URL:      "https://global.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create global server: %v", err)
+	}
+
+	_, err = database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Org Scoped",
+		Alias:    "org-scoped-list",
+		URL:      "https://org-scoped.example.com",
+		AuthType: "none",
+		OrgID:    &org.ID,
+	})
+	if err != nil {
+		t.Fatalf("create org-scoped server: %v", err)
+	}
+
+	_, err = database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Other Org Server",
+		Alias:    "other-org-list",
+		URL:      "https://other-org.example.com",
+		AuthType: "none",
+		OrgID:    &otherOrg.ID,
+	})
+	if err != nil {
+		t.Fatalf("create other-org server: %v", err)
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodGet, "/api/v1/orgs/"+org.ID+"/mcp-servers", memberKey, nil)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	list := decodeMCPServerList(t, resp.Body)
+
+	aliases := make(map[string]bool, len(list))
+	for _, s := range list {
+		aliases[s["alias"].(string)] = true
+	}
+
+	if !aliases["global-list"] {
+		t.Error("ListOrgMCPServers missing global server")
+	}
+	if !aliases["org-scoped-list"] {
+		t.Error("ListOrgMCPServers missing org-scoped server")
+	}
+	if aliases["other-org-list"] {
+		t.Error("ListOrgMCPServers returned server from different org")
+	}
+}
+
 // ---- GET /api/v1/mcp-servers -----------------------------------------------
 
 func TestListMCPServers_API(t *testing.T) {
@@ -301,6 +481,10 @@ func TestListMCPServers_API(t *testing.T) {
 	for _, s := range list {
 		if _, ok := s["auth_token"]; ok {
 			t.Error("auth_token present in list response, want it excluded")
+		}
+		// Global list must only contain global servers.
+		if s["scope"] != "global" {
+			t.Errorf("ListMCPServers returned non-global server: scope = %v", s["scope"])
 		}
 	}
 }
@@ -348,6 +532,50 @@ func TestGetMCPServer_API(t *testing.T) {
 			t.Errorf("status = %d, want 404", resp.StatusCode)
 		}
 	})
+}
+
+// Member role gets 404 (server not found in their scope) not 403.
+func TestGetMCPServer_API_MemberGets404ForNonExistent(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestGetMCPServer_API_Member?mode=memory&cache=private"
+	app, _, keyCache := setupMCPServersTestApp(t, dsn)
+	memberKey := addTestKey(t, keyCache, auth.RoleMember, "org-member-get")
+
+	resp := mcpServerRequest(t, app, http.MethodGet,
+		"/api/v1/mcp-servers/00000000-0000-0000-0000-000000000000", memberKey, nil)
+	resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusNotFound {
+		t.Errorf("status = %d, want 404 for member reading non-existent server", resp.StatusCode)
+	}
+}
+
+// Member role gets 403 when trying to access a global server (scope: system_admin only).
+func TestGetMCPServer_API_MemberForbiddenForGlobalServer(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestGetMCPServer_API_MemberForbidden?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	memberKey := addTestKey(t, keyCache, auth.RoleMember, "org-member-forbidden")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Global Server",
+		Alias:    "global-server",
+		URL:      "https://global-server.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create global server: %v", err)
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodGet,
+		"/api/v1/mcp-servers/"+s.ID, memberKey, nil)
+	resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusForbidden {
+		t.Errorf("status = %d, want 403 for member reading global server", resp.StatusCode)
+	}
 }
 
 // ---- PATCH /api/v1/mcp-servers/:server_id ----------------------------------
@@ -415,6 +643,66 @@ func TestUpdateMCPServer_API(t *testing.T) {
 	})
 }
 
+// Org admin can update an org-scoped server in their own org.
+func TestUpdateMCPServer_API_OrgAdminCanUpdateOrgScoped(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestUpdateMCPServer_OrgAdmin?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+
+	org := mustCreateOrg(t, database, "Update Org", "update-org-mcp")
+	orgAdminKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Org Server",
+		Alias:    "org-update-server",
+		URL:      "https://org-update.example.com",
+		AuthType: "none",
+		OrgID:    &org.ID,
+	})
+	if err != nil {
+		t.Fatalf("create org-scoped server: %v", err)
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodPatch,
+		"/api/v1/mcp-servers/"+s.ID, orgAdminKey,
+		map[string]any{"name": "Updated Org Server"})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+}
+
+// Org admin gets 403 when trying to update a global server.
+func TestUpdateMCPServer_API_OrgAdminForbiddenForGlobal(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestUpdateMCPServer_OrgAdminForbidden?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	orgAdminKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, "org-forbidden")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Global Server",
+		Alias:    "global-forbidden",
+		URL:      "https://global-forbidden.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create global server: %v", err)
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodPatch,
+		"/api/v1/mcp-servers/"+s.ID, orgAdminKey,
+		map[string]any{"name": "Should Fail"})
+	resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusForbidden {
+		t.Errorf("status = %d, want 403 for org admin patching global server", resp.StatusCode)
+	}
+}
+
 // ---- DELETE /api/v1/mcp-servers/:server_id ---------------------------------
 
 func TestDeleteMCPServer_API(t *testing.T) {
@@ -465,12 +753,15 @@ func TestTestMCPServerConnection_API(t *testing.T) {
 	t.Cleanup(upstream.Close)
 
 	dsn := "file:TestTestMCPServerConnection_API?mode=memory&cache=private"
-	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	// Build the app with MCPAllowPrivateURLs=true so the SSRF-safe dialer
+	// permits connections to the loopback httptest server. This mirrors a
+	// self-hosted deployment where private URLs are explicitly allowed.
+	database, keyCache, app := setupMCPServersTestAppAllowPrivate(t, dsn)
 	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-test-conn")
 
 	// Insert directly into the DB to bypass SSRF URL validation — the test
-	// server is a localhost httptest server which is intentionally blocked by
-	// the admin API but valid in the test environment.
+	// server is a localhost httptest server which is only reachable because
+	// MCPAllowPrivateURLs is set to true for this test.
 	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
 		Name:     "Test Upstream",
 		Alias:    "test-upstream",
@@ -520,7 +811,9 @@ func TestTestMCPServerConnection_API_NotFound(t *testing.T) {
 
 // ---- RBAC -------------------------------------------------------------------
 
-func TestMCPServers_RBAC_NonSystemAdmin(t *testing.T) {
+// TestMCPServers_RBAC_GlobalWrite verifies that only system_admin can create
+// or list global (unscoped) MCP servers.
+func TestMCPServers_RBAC_GlobalWrite(t *testing.T) {
 	t.Parallel()
 
 	roles := []string{auth.RoleMember, auth.RoleTeamAdmin, auth.RoleOrgAdmin}
@@ -530,10 +823,11 @@ func TestMCPServers_RBAC_NonSystemAdmin(t *testing.T) {
 		t.Run("role="+role, func(t *testing.T) {
 			t.Parallel()
 
-			dsn := fmt.Sprintf("file:TestMCPServers_RBAC_%s?mode=memory&cache=private", role)
+			dsn := fmt.Sprintf("file:TestMCPServers_RBAC_GlobalWrite_%s?mode=memory&cache=private", role)
 			app, _, keyCache := setupMCPServersTestApp(t, dsn)
 			key := addTestKey(t, keyCache, role, "org-rbac")
 
+			// POST and GET on the global endpoint require system_admin.
 			endpoints := []struct {
 				method string
 				url    string
@@ -542,10 +836,6 @@ func TestMCPServers_RBAC_NonSystemAdmin(t *testing.T) {
 				{http.MethodPost, "/api/v1/mcp-servers",
 					map[string]any{"name": "X", "alias": "x", "url": "https://x.example.com", "auth_type": "none"}},
 				{http.MethodGet, "/api/v1/mcp-servers", nil},
-				{http.MethodGet, "/api/v1/mcp-servers/some-id", nil},
-				{http.MethodPatch, "/api/v1/mcp-servers/some-id", map[string]any{"name": "Y"}},
-				{http.MethodDelete, "/api/v1/mcp-servers/some-id", nil},
-				{http.MethodPost, "/api/v1/mcp-servers/some-id/test", nil},
 			}
 
 			for _, ep := range endpoints {
@@ -557,5 +847,37 @@ func TestMCPServers_RBAC_NonSystemAdmin(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestMCPServers_RBAC_SharedRoutes verifies that members can reach the shared
+// PATCH/DELETE/test routes but receive 404 (not found) rather than 403 when
+// the server does not exist (because the scope check comes after the DB lookup).
+func TestMCPServers_RBAC_SharedRoutes_NotFound(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestMCPServers_RBAC_SharedRoutes?mode=memory&cache=private"
+	app, _, keyCache := setupMCPServersTestApp(t, dsn)
+	memberKey := addTestKey(t, keyCache, auth.RoleMember, "org-shared-rbac")
+
+	// All shared routes return 404 for a non-existent server_id, not 403.
+	endpoints := []struct {
+		method string
+		url    string
+		body   any
+	}{
+		{http.MethodGet, "/api/v1/mcp-servers/some-id", nil},
+		{http.MethodPatch, "/api/v1/mcp-servers/some-id", map[string]any{"name": "Y"}},
+		{http.MethodDelete, "/api/v1/mcp-servers/some-id", nil},
+		{http.MethodPost, "/api/v1/mcp-servers/some-id/test", nil},
+	}
+
+	for _, ep := range endpoints {
+		resp := mcpServerRequest(t, app, ep.method, ep.url, memberKey, ep.body)
+		resp.Body.Close()
+		if resp.StatusCode != fiber.StatusNotFound {
+			t.Errorf("%s %s with member role: status = %d, want 404",
+				ep.method, ep.url, resp.StatusCode)
+		}
 	}
 }

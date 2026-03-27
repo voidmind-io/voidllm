@@ -6,9 +6,51 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"syscall"
 	"time"
 )
+
+// cloudMetadataIP is the well-known link-local address used by cloud provider
+// instance metadata services (AWS, GCP, Azure, DigitalOcean, etc.).
+var cloudMetadataIP = net.ParseIP("169.254.169.254")
+
+// newSSRFSafeTransport returns an http.Transport that, when allowPrivate is
+// false, refuses TCP connections to loopback, private, link-local, and cloud
+// metadata addresses at dial time. This defends against DNS rebinding attacks:
+// even if a hostname resolved to a public IP at registration time, a malicious
+// DNS update cannot redirect traffic to an internal address at call time.
+// When allowPrivate is true the transport is unrestricted (for self-hosted
+// vLLM deployments on private networks).
+func newSSRFSafeTransport(allowPrivate bool) *http.Transport {
+	dialer := &net.Dialer{}
+	if !allowPrivate {
+		dialer.Control = func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				// address is already a bare host when no port is present; use as-is.
+				host = address
+			}
+			ip := net.ParseIP(host)
+			if ip == nil {
+				// Not an IP address — DNS was already resolved by the dialer;
+				// if we reach here with a hostname it is safe to pass through.
+				return nil
+			}
+			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+				return fmt.Errorf("connection to internal address blocked: %s", host)
+			}
+			if ip.Equal(cloudMetadataIP) {
+				return fmt.Errorf("connection to cloud metadata service blocked: %s", host)
+			}
+			return nil
+		}
+	}
+	return &http.Transport{
+		DialContext: dialer.DialContext,
+	}
+}
 
 // HTTPTransport proxies JSON-RPC requests to a remote MCP server over HTTP.
 // It is not safe to use concurrently with Close.
@@ -25,14 +67,19 @@ type HTTPTransport struct {
 // authType must be one of "none", "bearer", or "header".
 // When authType is "bearer", authToken is sent as a Bearer token.
 // When authType is "header", authToken is sent under the authHeader header name.
-func NewHTTPTransport(endpoint, authType, authHeader, authToken string, timeout time.Duration) *HTTPTransport {
+// When allowPrivate is false, the underlying TCP dialer refuses connections to
+// loopback, private-range, link-local, and cloud metadata addresses, preventing
+// DNS rebinding SSRF attacks even after the URL has been registered.
+func NewHTTPTransport(endpoint, authType, authHeader, authToken string, timeout time.Duration, allowPrivate bool) *HTTPTransport {
+	t := newSSRFSafeTransport(allowPrivate)
 	return &HTTPTransport{
 		endpoint:   endpoint,
 		authType:   authType,
 		authHeader: authHeader,
 		authToken:  authToken,
 		client: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: t,
 			// Never follow redirects — the remote MCP server should not redirect
 			// POST requests and doing so could silently drop the request body.
 			CheckRedirect: func(*http.Request, []*http.Request) error {

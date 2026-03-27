@@ -11,7 +11,7 @@ import (
 // mcpServerSelectColumns is the ordered column list used in all mcp_servers SELECT queries.
 // It must match the scan order in scanMCPServer exactly.
 const mcpServerSelectColumns = "id, name, alias, url, auth_type, auth_header, " +
-	"auth_token_enc, is_active, created_by, created_at, updated_at, deleted_at"
+	"auth_token_enc, org_id, team_id, is_active, created_by, created_at, updated_at, deleted_at"
 
 // MCPServer represents an external MCP server record in the database.
 type MCPServer struct {
@@ -22,6 +22,8 @@ type MCPServer struct {
 	AuthType     string  // "none", "bearer", or "header"
 	AuthHeader   string  // header name used when AuthType is "header"
 	AuthTokenEnc *string // AES-256-GCM encrypted token; nil when AuthType is "none"
+	OrgID        *string // nil for global servers
+	TeamID       *string // nil for global or org-scoped servers
 	IsActive     bool
 	CreatedBy    *string
 	CreatedAt    string
@@ -37,6 +39,8 @@ type CreateMCPServerParams struct {
 	AuthType     string
 	AuthHeader   string
 	AuthTokenEnc *string
+	OrgID        *string // nil for global servers
+	TeamID       *string // nil for global or org-scoped servers
 	CreatedBy    string
 }
 
@@ -52,7 +56,7 @@ type UpdateMCPServerParams struct {
 }
 
 // CreateMCPServer inserts a new MCP server record and returns the persisted row.
-// It returns ErrConflict if a server with the same alias already exists.
+// It returns ErrConflict if a server with the same (org_id, team_id, alias) combination already exists.
 func (d *DB) CreateMCPServer(ctx context.Context, params CreateMCPServerParams) (*MCPServer, error) {
 	id, err := uuid.NewV7()
 	if err != nil {
@@ -62,11 +66,12 @@ func (d *DB) CreateMCPServer(ctx context.Context, params CreateMCPServerParams) 
 	p := d.dialect.Placeholder
 	insertQuery := "INSERT INTO mcp_servers " +
 		"(id, name, alias, url, auth_type, auth_header, auth_token_enc, " +
-		"is_active, created_by, created_at, updated_at) " +
+		"org_id, team_id, is_active, created_by, created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " +
 		p(6) + ", " + p(7) + ", " +
-		"1, " + p(8) + ", " +
+		p(8) + ", " + p(9) + ", " +
+		"1, " + p(10) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + mcpServerSelectColumns +
@@ -87,6 +92,8 @@ func (d *DB) CreateMCPServer(ctx context.Context, params CreateMCPServerParams) 
 			params.AuthType,
 			params.AuthHeader,
 			params.AuthTokenEnc,
+			params.OrgID,
+			params.TeamID,
 			createdBy,
 		)
 		if execErr != nil {
@@ -118,11 +125,17 @@ func (d *DB) GetMCPServer(ctx context.Context, id string) (*MCPServer, error) {
 	return server, nil
 }
 
-// GetMCPServerByAlias retrieves an active, enabled MCP server by its alias.
-// It returns ErrNotFound if the server does not exist, has been soft-deleted, or is inactive.
+// GetMCPServerByAlias retrieves a global active MCP server (org_id IS NULL,
+// team_id IS NULL) by its alias. It returns ErrNotFound if no such server
+// exists, has been soft-deleted, or is inactive.
+//
+// Use GetMCPServerByAliasScoped for scope-aware resolution in the proxy path.
 func (d *DB) GetMCPServerByAlias(ctx context.Context, alias string) (*MCPServer, error) {
+	p := d.dialect.Placeholder
 	query := "SELECT " + mcpServerSelectColumns +
-		" FROM mcp_servers WHERE alias = " + d.dialect.Placeholder(1) + " AND is_active = 1 AND deleted_at IS NULL"
+		" FROM mcp_servers WHERE alias = " + p(1) +
+		" AND is_active = 1 AND deleted_at IS NULL" +
+		" AND org_id IS NULL AND team_id IS NULL"
 
 	row := d.sql.QueryRowContext(ctx, query, alias)
 	server, err := scanMCPServer(row)
@@ -132,10 +145,54 @@ func (d *DB) GetMCPServerByAlias(ctx context.Context, alias string) (*MCPServer,
 	return server, nil
 }
 
-// ListMCPServers returns all active, non-deleted MCP servers ordered by alias ascending.
+// GetMCPServerByAliasScoped resolves an active MCP server by alias using
+// scope priority: team-scoped (highest) → org-scoped → global (lowest).
+// orgID and teamID may each be empty string to indicate absence of that scope.
+// It returns ErrNotFound if no matching server exists.
+func (d *DB) GetMCPServerByAliasScoped(ctx context.Context, alias, orgID, teamID string) (*MCPServer, error) {
+	p := d.dialect.Placeholder
+	query := "SELECT " + mcpServerSelectColumns +
+		" FROM mcp_servers" +
+		" WHERE alias = " + p(1) + " AND deleted_at IS NULL AND is_active = 1" +
+		" AND (" +
+		"(team_id = " + p(2) + " AND org_id = " + p(3) + ")" +
+		" OR (team_id IS NULL AND org_id = " + p(4) + ")" +
+		" OR (team_id IS NULL AND org_id IS NULL)" +
+		")" +
+		" ORDER BY" +
+		" CASE WHEN team_id IS NOT NULL THEN 1" +
+		"      WHEN org_id IS NOT NULL THEN 2" +
+		"      ELSE 3" +
+		" END" +
+		" LIMIT 1"
+
+	// Use empty string args for nullable IDs; the SQL comparisons handle IS NULL
+	// separately, so non-empty teamID/orgID only match their respective clauses.
+	var teamArg, orgArg any
+	if teamID != "" {
+		teamArg = teamID
+	}
+	if orgID != "" {
+		orgArg = orgID
+	}
+
+	row := d.sql.QueryRowContext(ctx, query, alias, teamArg, orgArg, orgArg)
+	server, err := scanMCPServer(row)
+	if err != nil {
+		return nil, fmt.Errorf("get mcp server by alias scoped %q: %w", alias, translateError(err))
+	}
+	return server, nil
+}
+
+// ListMCPServers returns all active, non-deleted global MCP servers
+// (org_id IS NULL, team_id IS NULL) ordered by alias ascending.
+// Intended for system_admin use only.
 func (d *DB) ListMCPServers(ctx context.Context) ([]MCPServer, error) {
 	query := "SELECT " + mcpServerSelectColumns +
-		" FROM mcp_servers WHERE is_active = 1 AND deleted_at IS NULL ORDER BY alias ASC"
+		" FROM mcp_servers" +
+		" WHERE is_active = 1 AND deleted_at IS NULL" +
+		" AND org_id IS NULL AND team_id IS NULL" +
+		" ORDER BY alias ASC"
 
 	rows, err := d.sql.QueryContext(ctx, query)
 	if err != nil {
@@ -158,11 +215,80 @@ func (d *DB) ListMCPServers(ctx context.Context) ([]MCPServer, error) {
 	return servers, nil
 }
 
+// ListMCPServersByOrg returns all active, non-deleted MCP servers visible to
+// the given org: org-scoped servers for that org plus all global servers.
+// Results are ordered by alias ascending.
+func (d *DB) ListMCPServersByOrg(ctx context.Context, orgID string) ([]MCPServer, error) {
+	p := d.dialect.Placeholder
+	query := "SELECT " + mcpServerSelectColumns +
+		" FROM mcp_servers" +
+		" WHERE deleted_at IS NULL AND is_active = 1" +
+		" AND (org_id = " + p(1) + " OR org_id IS NULL)" +
+		" AND team_id IS NULL" +
+		" ORDER BY alias ASC"
+
+	rows, err := d.sql.QueryContext(ctx, query, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("list mcp servers by org query: %w", err)
+	}
+	defer rows.Close()
+
+	var servers []MCPServer
+	for rows.Next() {
+		s, scanErr := scanMCPServer(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("list mcp servers by org scan: %w", scanErr)
+		}
+		servers = append(servers, *s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list mcp servers by org rows: %w", err)
+	}
+
+	return servers, nil
+}
+
+// ListMCPServersByTeam returns all active, non-deleted MCP servers visible to
+// the given team: team-scoped, org-scoped (for the team's org), and global.
+// Results are ordered by alias ascending.
+func (d *DB) ListMCPServersByTeam(ctx context.Context, teamID, orgID string) ([]MCPServer, error) {
+	p := d.dialect.Placeholder
+	query := "SELECT " + mcpServerSelectColumns +
+		" FROM mcp_servers" +
+		" WHERE deleted_at IS NULL AND is_active = 1" +
+		" AND (" +
+		"(team_id = " + p(1) + " AND org_id = " + p(2) + ")" +
+		" OR (team_id IS NULL AND org_id = " + p(3) + ")" +
+		" OR (team_id IS NULL AND org_id IS NULL)" +
+		")" +
+		" ORDER BY alias ASC"
+
+	rows, err := d.sql.QueryContext(ctx, query, teamID, orgID, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("list mcp servers by team query: %w", err)
+	}
+	defer rows.Close()
+
+	var servers []MCPServer
+	for rows.Next() {
+		s, scanErr := scanMCPServer(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("list mcp servers by team scan: %w", scanErr)
+		}
+		servers = append(servers, *s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list mcp servers by team rows: %w", err)
+	}
+
+	return servers, nil
+}
+
 // UpdateMCPServer applies a partial update to an active MCP server.
 // Only non-nil fields in params are written. If all fields are nil the record
 // is returned unchanged without issuing an UPDATE.
 // It returns ErrNotFound if the server does not exist or has been soft-deleted,
-// and ErrConflict if the new alias collides with an existing server.
+// and ErrConflict if the new alias collides with an existing server in the same scope.
 func (d *DB) UpdateMCPServer(ctx context.Context, id string, params UpdateMCPServerParams) (*MCPServer, error) {
 	p := d.dialect.Placeholder
 	argN := 1
@@ -269,7 +395,7 @@ func scanMCPServer(scanner interface{ Scan(...any) error }) (*MCPServer, error) 
 	var isActiveInt int
 	err := scanner.Scan(
 		&s.ID, &s.Name, &s.Alias, &s.URL, &s.AuthType, &s.AuthHeader,
-		&s.AuthTokenEnc, &isActiveInt, &s.CreatedBy,
+		&s.AuthTokenEnc, &s.OrgID, &s.TeamID, &isActiveInt, &s.CreatedBy,
 		&s.CreatedAt, &s.UpdatedAt, &s.DeletedAt,
 	)
 	if err != nil {

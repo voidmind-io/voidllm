@@ -33,7 +33,13 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 		return h.HandleMCP(c)
 	}
 
-	server, err := h.DB.GetMCPServerByAlias(c.Context(), alias)
+	ki := auth.KeyInfoFromCtx(c)
+	if ki == nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(
+			mcp.NewErrorResponse(nil, mcp.CodeInvalidRequest, "missing authentication"))
+	}
+
+	server, err := h.DB.GetMCPServerByAliasScoped(c.Context(), alias, ki.OrgID, ki.TeamID)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(
@@ -51,22 +57,22 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 			mcp.NewErrorResponse(nil, mcp.CodeInternalError, "MCP server is disabled"))
 	}
 
-	ki := auth.KeyInfoFromCtx(c)
-	if ki == nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(
-			mcp.NewErrorResponse(nil, mcp.CodeInvalidRequest, "missing authentication"))
-	}
-
-	allowed, accessErr := h.DB.CheckMCPAccess(c.Context(), ki.OrgID, ki.TeamID, ki.ID, server.ID)
-	if accessErr != nil {
-		h.Log.ErrorContext(c.Context(), "mcp proxy: check access",
-			slog.String("error", accessErr.Error()))
-		return c.Status(fiber.StatusInternalServerError).JSON(
-			mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
-	}
-	if !allowed {
-		return c.Status(fiber.StatusForbidden).JSON(
-			mcp.NewErrorResponse(nil, mcp.CodeInvalidRequest, "access denied to MCP server"))
+	// Global servers (org_id IS NULL, team_id IS NULL) require explicit access
+	// control via the org/team/key MCP access tables. Org- and team-scoped
+	// servers are implicitly accessible to members of that scope — their
+	// visibility is already enforced by GetMCPServerByAliasScoped.
+	if server.OrgID == nil && server.TeamID == nil {
+		allowed, accessErr := h.DB.CheckMCPAccess(c.Context(), ki.OrgID, ki.TeamID, ki.ID, server.ID)
+		if accessErr != nil {
+			h.Log.ErrorContext(c.Context(), "mcp proxy: check access",
+				slog.String("error", accessErr.Error()))
+			return c.Status(fiber.StatusInternalServerError).JSON(
+				mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
+		}
+		if !allowed {
+			return c.Status(fiber.StatusForbidden).JSON(
+				mcp.NewErrorResponse(nil, mcp.CodeInvalidRequest, "access denied to MCP server"))
+		}
 	}
 
 	var authToken string
@@ -86,7 +92,7 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
-	transport := mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout)
+	transport := mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
 	defer transport.Close()
 
 	body := append([]byte{}, c.Body()...)

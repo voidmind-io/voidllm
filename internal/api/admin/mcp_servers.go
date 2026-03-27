@@ -1,13 +1,10 @@
 package admin
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -17,6 +14,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/pkg/crypto"
 )
 
@@ -44,15 +42,18 @@ type updateMCPServerRequest struct {
 // mcpServerResponse is the JSON representation of an MCP server returned by the API.
 // The auth token is never included in the response — it is write-only.
 type mcpServerResponse struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Alias      string `json:"alias"`
-	URL        string `json:"url"`
-	AuthType   string `json:"auth_type"`
-	AuthHeader string `json:"auth_header,omitempty"`
-	IsActive   bool   `json:"is_active"`
-	CreatedAt  string `json:"created_at"`
-	UpdatedAt  string `json:"updated_at"`
+	ID         string  `json:"id"`
+	Name       string  `json:"name"`
+	Alias      string  `json:"alias"`
+	URL        string  `json:"url"`
+	AuthType   string  `json:"auth_type"`
+	AuthHeader string  `json:"auth_header,omitempty"`
+	IsActive   bool    `json:"is_active"`
+	Scope      string  `json:"scope"` // "global", "org", or "team"
+	OrgID      *string `json:"org_id,omitempty"`
+	TeamID     *string `json:"team_id,omitempty"`
+	CreatedAt  string  `json:"created_at"`
+	UpdatedAt  string  `json:"updated_at"`
 }
 
 // testMCPServerResponse is the JSON response from TestMCPServerConnection.
@@ -132,18 +133,20 @@ func validateMCPServerURL(rawURL string, allowPrivate bool) error {
 	return nil
 }
 
-// mcpTestClient is the shared HTTP client used by TestMCPServerConnection.
-// Redirects are disabled to prevent redirect-based SSRF bypass; the caller
-// receives the first response regardless of its Location header.
-var mcpTestClient = &http.Client{
-	Timeout: 10 * time.Second,
-	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+// mcpTestTimeout is the per-request deadline used by TestMCPServerConnection.
+const mcpTestTimeout = 10 * time.Second
 
 // mcpServerToResponse converts a db.MCPServer to its API wire representation.
+// The scope field is derived from the OrgID and TeamID fields: a server with
+// a non-nil TeamID has scope "team", non-nil OrgID has scope "org", and
+// both nil yields scope "global".
 func mcpServerToResponse(s *db.MCPServer) mcpServerResponse {
+	scope := "global"
+	if s.TeamID != nil {
+		scope = "team"
+	} else if s.OrgID != nil {
+		scope = "org"
+	}
 	return mcpServerResponse{
 		ID:         s.ID,
 		Name:       s.Name,
@@ -152,6 +155,9 @@ func mcpServerToResponse(s *db.MCPServer) mcpServerResponse {
 		AuthType:   s.AuthType,
 		AuthHeader: s.AuthHeader,
 		IsActive:   s.IsActive,
+		Scope:      scope,
+		OrgID:      s.OrgID,
+		TeamID:     s.TeamID,
 		CreatedAt:  s.CreatedAt,
 		UpdatedAt:  s.UpdatedAt,
 	}
@@ -182,11 +188,130 @@ func (h *Handler) decryptMCPAuthToken(s *db.MCPServer) (string, error) {
 	return plaintext, nil
 }
 
+// validateAndNormalizeMCPServerRequest validates the common fields of a create
+// request and returns the normalized auth type plus whether validation passed.
+// When ok is false the HTTP 400 response has already been written; the caller
+// must return nil to Fiber without further processing.
+func validateAndNormalizeMCPServerRequest(c fiber.Ctx, req *createMCPServerRequest, allowPrivate bool) (authType string, ok bool) {
+	fail := func(msg string) (string, bool) {
+		_ = apierror.BadRequest(c, msg)
+		return "", false
+	}
+
+	if req.Name == "" {
+		return fail("name is required")
+	}
+	if req.Alias == "" {
+		return fail("alias is required")
+	}
+	if req.URL == "" {
+		return fail("url is required")
+	}
+	if err := validateMCPServerURL(req.URL, allowPrivate); err != nil {
+		return fail(err.Error())
+	}
+	if msg := validateMCPAlias(req.Alias); msg != "" {
+		return fail(msg)
+	}
+
+	at := req.AuthType
+	if at == "" {
+		at = "none"
+	}
+	if !validMCPAuthTypes[at] {
+		return fail("auth_type must be one of: none, bearer, header")
+	}
+	if at == "header" && req.AuthHeader == "" {
+		return fail(`auth_header is required when auth_type is "header"`)
+	}
+	if at == "header" && blockedHeaders[strings.ToLower(req.AuthHeader)] {
+		_ = apierror.Send(c, fiber.StatusBadRequest, "invalid_auth_header",
+			"auth_header cannot override structural HTTP headers")
+		return "", false
+	}
+	return at, true
+}
+
+// createMCPServerWithToken inserts the server record (without auth token) and
+// then, if a plaintext auth token was provided, encrypts it using the server ID
+// as AAD and writes it back. Returns the final persisted server.
+// On conflict it returns a wrapped db.ErrConflict; on other DB errors it logs
+// and returns the error unwrapped. Callers are responsible for translating
+// errors to HTTP responses.
+func (h *Handler) createMCPServerWithToken(c fiber.Ctx, params db.CreateMCPServerParams, authToken string) (*db.MCPServer, error) {
+	ctx := c.Context()
+
+	s, err := h.DB.CreateMCPServer(ctx, params)
+	if err != nil {
+		if !errors.Is(err, db.ErrConflict) {
+			h.Log.ErrorContext(ctx, "create mcp server: db insert", slog.String("error", err.Error()))
+		}
+		return nil, err
+	}
+
+	if authToken != "" {
+		enc, encErr := crypto.EncryptString(authToken, h.EncryptionKey, mcpServerAAD(s.ID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "create mcp server: encrypt auth token", slog.String("error", encErr.Error()))
+			return nil, encErr
+		}
+		s, err = h.DB.UpdateMCPServer(ctx, s.ID, db.UpdateMCPServerParams{AuthTokenEnc: &enc})
+		if err != nil {
+			h.Log.ErrorContext(ctx, "create mcp server: store encrypted token", slog.String("error", err.Error()))
+			return nil, err
+		}
+	}
+
+	return s, nil
+}
+
+// checkMCPServerScopePermission verifies that the caller has sufficient RBAC
+// privilege to mutate a server based on its scope. It writes the appropriate
+// 403 response and returns an error when access is denied.
+func checkMCPServerScopePermission(c fiber.Ctx, server *db.MCPServer, ki *auth.KeyInfo) error {
+	if ki == nil {
+		return apierror.Forbidden(c, "authentication required")
+	}
+
+	if server.TeamID != nil {
+		// Team-scoped: team_admin or higher, and the caller must belong to the same org.
+		if ki.Role != auth.RoleTeamAdmin && ki.Role != auth.RoleOrgAdmin && ki.Role != auth.RoleSystemAdmin {
+			return apierror.Forbidden(c, "team_admin role required to modify this server")
+		}
+		if ki.Role != auth.RoleSystemAdmin && *server.OrgID != ki.OrgID {
+			return apierror.Forbidden(c, "access denied: server belongs to a different organization")
+		}
+		// Team admins are scoped to their own team — they must not mutate servers
+		// belonging to sibling teams within the same org.
+		if ki.Role == auth.RoleTeamAdmin && ki.TeamID != *server.TeamID {
+			return apierror.Forbidden(c, "access denied: server belongs to a different team")
+		}
+		return nil
+	}
+
+	if server.OrgID != nil {
+		// Org-scoped: org_admin or higher, and the caller must belong to the same org.
+		if ki.Role != auth.RoleOrgAdmin && ki.Role != auth.RoleSystemAdmin {
+			return apierror.Forbidden(c, "org_admin role required to modify this server")
+		}
+		if ki.Role != auth.RoleSystemAdmin && *server.OrgID != ki.OrgID {
+			return apierror.Forbidden(c, "access denied: server belongs to a different organization")
+		}
+		return nil
+	}
+
+	// Global: system_admin only.
+	if ki.Role != auth.RoleSystemAdmin {
+		return apierror.Forbidden(c, "system_admin role required to modify global servers")
+	}
+	return nil
+}
+
 // CreateMCPServer handles POST /api/v1/mcp-servers.
-// It persists a new MCP server to the database, encrypting the auth token at rest.
+// It persists a new global MCP server (org_id = NULL, team_id = NULL).
 //
-// @Summary      Create an MCP server
-// @Description  Persists a new MCP server. The auth token is encrypted at rest and never returned. Requires system admin.
+// @Summary      Create a global MCP server
+// @Description  Persists a new global MCP server. The auth token is encrypted at rest and never returned. Requires system admin.
 // @Tags         mcp-servers
 // @Accept       json
 // @Produce      json
@@ -206,42 +331,14 @@ func (h *Handler) decryptMCPAuthToken(s *db.MCPServer) (string, error) {
 // the encrypted value via UpdateMCPServer. This two-step approach ensures the
 // AAD is bound to the immutable ID rather than any mutable field.
 func (h *Handler) CreateMCPServer(c fiber.Ctx) error {
-	ctx := c.Context()
-
 	var req createMCPServerRequest
 	if err := c.Bind().JSON(&req); err != nil {
 		return apierror.BadRequest(c, "invalid request body")
 	}
 
-	if req.Name == "" {
-		return apierror.BadRequest(c, "name is required")
-	}
-	if req.Alias == "" {
-		return apierror.BadRequest(c, "alias is required")
-	}
-	if req.URL == "" {
-		return apierror.BadRequest(c, "url is required")
-	}
-	if err := validateMCPServerURL(req.URL, h.MCPAllowPrivateURLs); err != nil {
-		return apierror.BadRequest(c, err.Error())
-	}
-	if msg := validateMCPAlias(req.Alias); msg != "" {
-		return apierror.BadRequest(c, msg)
-	}
-
-	authType := req.AuthType
-	if authType == "" {
-		authType = "none"
-	}
-	if !validMCPAuthTypes[authType] {
-		return apierror.BadRequest(c, "auth_type must be one of: none, bearer, header")
-	}
-	if authType == "header" && req.AuthHeader == "" {
-		return apierror.BadRequest(c, `auth_header is required when auth_type is "header"`)
-	}
-	if authType == "header" && blockedHeaders[strings.ToLower(req.AuthHeader)] {
-		return apierror.Send(c, fiber.StatusBadRequest, "invalid_auth_header",
-			"auth_header cannot override structural HTTP headers")
+	authType, ok := validateAndNormalizeMCPServerRequest(c, &req, h.MCPAllowPrivateURLs)
+	if !ok {
+		return nil
 	}
 
 	keyInfo := auth.KeyInfoFromCtx(c)
@@ -250,46 +347,154 @@ func (h *Handler) CreateMCPServer(c fiber.Ctx) error {
 		createdBy = keyInfo.UserID
 	}
 
-	// Insert without the auth token first to obtain the stable server ID for AAD.
-	s, err := h.DB.CreateMCPServer(ctx, db.CreateMCPServerParams{
+	s, err := h.createMCPServerWithToken(c, db.CreateMCPServerParams{
 		Name:         req.Name,
 		Alias:        req.Alias,
 		URL:          req.URL,
 		AuthType:     authType,
 		AuthHeader:   req.AuthHeader,
 		AuthTokenEnc: nil,
+		OrgID:        nil,
+		TeamID:       nil,
 		CreatedBy:    createdBy,
-	})
+	}, req.AuthToken)
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "an MCP server with this alias already exists")
 		}
-		h.Log.ErrorContext(ctx, "create mcp server: db insert", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to create MCP server")
 	}
 
-	// Encrypt the auth token using the immutable server ID as AAD and persist it.
-	if req.AuthToken != "" {
-		enc, encErr := crypto.EncryptString(req.AuthToken, h.EncryptionKey, mcpServerAAD(s.ID))
-		if encErr != nil {
-			h.Log.ErrorContext(ctx, "create mcp server: encrypt auth token", slog.String("error", encErr.Error()))
-			return apierror.InternalError(c, "failed to encrypt auth token")
+	return c.Status(fiber.StatusCreated).JSON(mcpServerToResponse(s))
+}
+
+// CreateOrgMCPServer handles POST /api/v1/orgs/:org_id/mcp-servers.
+// It persists a new org-scoped MCP server (org_id = URL param, team_id = NULL).
+//
+// @Summary      Create an org-scoped MCP server
+// @Description  Persists a new MCP server scoped to the given organization. Requires org admin.
+// @Tags         mcp-servers
+// @Accept       json
+// @Produce      json
+// @Param        org_id  path      string                  true  "Organization ID"
+// @Param        body    body      createMCPServerRequest  true  "MCP server parameters"
+// @Success      201     {object}  mcpServerResponse
+// @Failure      400     {object}  swaggerErrorResponse
+// @Failure      401     {object}  swaggerErrorResponse
+// @Failure      403     {object}  swaggerErrorResponse
+// @Failure      409     {object}  swaggerErrorResponse
+// @Failure      500     {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /orgs/{org_id}/mcp-servers [post]
+func (h *Handler) CreateOrgMCPServer(c fiber.Ctx) error {
+	orgID := c.Params("org_id")
+
+	keyInfo, ok := requireOrgAdmin(c, orgID)
+	if !ok {
+		return nil
+	}
+
+	var req createMCPServerRequest
+	if err := c.Bind().JSON(&req); err != nil {
+		return apierror.BadRequest(c, "invalid request body")
+	}
+
+	authType, authOK := validateAndNormalizeMCPServerRequest(c, &req, h.MCPAllowPrivateURLs)
+	if !authOK {
+		return nil
+	}
+
+	createdBy := keyInfo.UserID
+
+	s, err := h.createMCPServerWithToken(c, db.CreateMCPServerParams{
+		Name:         req.Name,
+		Alias:        req.Alias,
+		URL:          req.URL,
+		AuthType:     authType,
+		AuthHeader:   req.AuthHeader,
+		AuthTokenEnc: nil,
+		OrgID:        &orgID,
+		TeamID:       nil,
+		CreatedBy:    createdBy,
+	}, req.AuthToken)
+	if err != nil {
+		if errors.Is(err, db.ErrConflict) {
+			return apierror.Conflict(c, "an MCP server with this alias already exists")
 		}
-		s, err = h.DB.UpdateMCPServer(ctx, s.ID, db.UpdateMCPServerParams{AuthTokenEnc: &enc})
-		if err != nil {
-			h.Log.ErrorContext(ctx, "create mcp server: store encrypted token", slog.String("error", err.Error()))
-			return apierror.InternalError(c, "failed to store auth token")
+		return apierror.InternalError(c, "failed to create MCP server")
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(mcpServerToResponse(s))
+}
+
+// CreateTeamMCPServer handles POST /api/v1/orgs/:org_id/teams/:team_id/mcp-servers.
+// It persists a new team-scoped MCP server (org_id and team_id from URL params).
+// The team is validated to belong to the given organization.
+//
+// @Summary      Create a team-scoped MCP server
+// @Description  Persists a new MCP server scoped to the given team within an organization. Requires team admin.
+// @Tags         mcp-servers
+// @Accept       json
+// @Produce      json
+// @Param        org_id   path      string                  true  "Organization ID"
+// @Param        team_id  path      string                  true  "Team ID"
+// @Param        body     body      createMCPServerRequest  true  "MCP server parameters"
+// @Success      201      {object}  mcpServerResponse
+// @Failure      400      {object}  swaggerErrorResponse
+// @Failure      401      {object}  swaggerErrorResponse
+// @Failure      403      {object}  swaggerErrorResponse
+// @Failure      404      {object}  swaggerErrorResponse
+// @Failure      409      {object}  swaggerErrorResponse
+// @Failure      500      {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /orgs/{org_id}/teams/{team_id}/mcp-servers [post]
+func (h *Handler) CreateTeamMCPServer(c fiber.Ctx) error {
+	// requireTeamAccess validates org membership, fetches and verifies the team
+	// belongs to the org, and enforces team membership for non-org-admins.
+	keyInfo, team, ok := h.requireTeamAccess(c)
+	if !ok {
+		return nil
+	}
+	orgID := team.OrgID
+	teamID := team.ID
+
+	var req createMCPServerRequest
+	if err := c.Bind().JSON(&req); err != nil {
+		return apierror.BadRequest(c, "invalid request body")
+	}
+
+	authType, authOK := validateAndNormalizeMCPServerRequest(c, &req, h.MCPAllowPrivateURLs)
+	if !authOK {
+		return nil
+	}
+
+	s, createErr := h.createMCPServerWithToken(c, db.CreateMCPServerParams{
+		Name:         req.Name,
+		Alias:        req.Alias,
+		URL:          req.URL,
+		AuthType:     authType,
+		AuthHeader:   req.AuthHeader,
+		AuthTokenEnc: nil,
+		OrgID:        &orgID,
+		TeamID:       &teamID,
+		CreatedBy:    keyInfo.UserID,
+	}, req.AuthToken)
+	if createErr != nil {
+		if errors.Is(createErr, db.ErrConflict) {
+			return apierror.Conflict(c, "an MCP server with this alias already exists")
 		}
+		return apierror.InternalError(c, "failed to create MCP server")
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(mcpServerToResponse(s))
 }
 
 // ListMCPServers handles GET /api/v1/mcp-servers.
-// It returns all active, non-deleted MCP servers ordered by alias ascending.
+// It returns all active, non-deleted global MCP servers ordered by alias ascending.
+// Intended for system_admin use only.
 //
-// @Summary      List MCP servers
-// @Description  Returns all active MCP servers ordered by alias. Requires system admin.
+// @Summary      List global MCP servers
+// @Description  Returns all active global MCP servers ordered by alias. Requires system admin.
 // @Tags         mcp-servers
 // @Produce      json
 // @Success      200  {array}   mcpServerResponse
@@ -314,10 +519,88 @@ func (h *Handler) ListMCPServers(c fiber.Ctx) error {
 	return c.JSON(resp)
 }
 
+// ListOrgMCPServers handles GET /api/v1/orgs/:org_id/mcp-servers.
+// It returns org-scoped and global MCP servers visible to the given organization.
+//
+// @Summary      List org-scoped MCP servers
+// @Description  Returns org-scoped and global MCP servers visible to the given organization, ordered by alias.
+// @Tags         mcp-servers
+// @Produce      json
+// @Param        org_id  path      string  true  "Organization ID"
+// @Success      200     {array}   mcpServerResponse
+// @Failure      401     {object}  swaggerErrorResponse
+// @Failure      403     {object}  swaggerErrorResponse
+// @Failure      500     {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /orgs/{org_id}/mcp-servers [get]
+func (h *Handler) ListOrgMCPServers(c fiber.Ctx) error {
+	ctx := c.Context()
+	orgID := c.Params("org_id")
+
+	if _, ok := requireOrgAccess(c, orgID); !ok {
+		return nil
+	}
+
+	servers, err := h.DB.ListMCPServersByOrg(ctx, orgID)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "list org mcp servers", slog.String("org_id", orgID), slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to list MCP servers")
+	}
+
+	resp := make([]mcpServerResponse, len(servers))
+	for i := range servers {
+		resp[i] = mcpServerToResponse(&servers[i])
+	}
+	return c.JSON(resp)
+}
+
+// ListTeamMCPServers handles GET /api/v1/orgs/:org_id/teams/:team_id/mcp-servers.
+// It returns team-scoped, org-scoped, and global MCP servers visible to the given team.
+//
+// @Summary      List team-scoped MCP servers
+// @Description  Returns team-scoped, org-scoped, and global MCP servers visible to the given team, ordered by alias.
+// @Tags         mcp-servers
+// @Produce      json
+// @Param        org_id   path      string  true  "Organization ID"
+// @Param        team_id  path      string  true  "Team ID"
+// @Success      200      {array}   mcpServerResponse
+// @Failure      401      {object}  swaggerErrorResponse
+// @Failure      403      {object}  swaggerErrorResponse
+// @Failure      500      {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /orgs/{org_id}/teams/{team_id}/mcp-servers [get]
+func (h *Handler) ListTeamMCPServers(c fiber.Ctx) error {
+	// requireTeamAccess validates org membership, fetches and verifies the team
+	// belongs to the org, and enforces team membership for non-org-admins.
+	_, team, ok := h.requireTeamAccess(c)
+	if !ok {
+		return nil
+	}
+	orgID := team.OrgID
+	teamID := team.ID
+
+	ctx := c.Context()
+	servers, err := h.DB.ListMCPServersByTeam(ctx, teamID, orgID)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "list team mcp servers",
+			slog.String("org_id", orgID),
+			slog.String("team_id", teamID),
+			slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to list MCP servers")
+	}
+
+	resp := make([]mcpServerResponse, len(servers))
+	for i := range servers {
+		resp[i] = mcpServerToResponse(&servers[i])
+	}
+	return c.JSON(resp)
+}
+
 // GetMCPServer handles GET /api/v1/mcp-servers/:server_id.
+// Access is granted if the caller has sufficient role for the server's scope.
 //
 // @Summary      Get an MCP server
-// @Description  Returns a single MCP server by ID. Requires system admin.
+// @Description  Returns a single MCP server by ID. Access is scope-checked against the caller's role.
 // @Tags         mcp-servers
 // @Produce      json
 // @Param        server_id  path      string  true  "MCP server ID"
@@ -341,14 +624,20 @@ func (h *Handler) GetMCPServer(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to get MCP server")
 	}
 
+	ki := auth.KeyInfoFromCtx(c)
+	if permErr := checkMCPServerScopePermission(c, s, ki); permErr != nil {
+		return permErr
+	}
+
 	return c.JSON(mcpServerToResponse(s))
 }
 
 // UpdateMCPServer handles PATCH /api/v1/mcp-servers/:server_id.
 // Only non-nil fields in the request body are applied; omitted fields are unchanged.
+// The scope permission is checked after fetching the server.
 //
 // @Summary      Update an MCP server
-// @Description  Partially updates an MCP server. Requires system admin.
+// @Description  Partially updates an MCP server. Access is scope-checked against the caller's role.
 // @Tags         mcp-servers
 // @Accept       json
 // @Produce      json
@@ -366,6 +655,20 @@ func (h *Handler) GetMCPServer(c fiber.Ctx) error {
 func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 	ctx := c.Context()
 	id := c.Params("server_id")
+
+	existing, err := h.DB.GetMCPServer(ctx, id)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return apierror.NotFound(c, "MCP server not found")
+		}
+		h.Log.ErrorContext(ctx, "update mcp server: get server", slog.String("id", id), slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to get MCP server")
+	}
+
+	ki := auth.KeyInfoFromCtx(c)
+	if permErr := checkMCPServerScopePermission(c, existing, ki); permErr != nil {
+		return permErr
+	}
 
 	var req updateMCPServerRequest
 	if err := c.Bind().JSON(&req); err != nil {
@@ -425,9 +728,10 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 
 // DeleteMCPServer handles DELETE /api/v1/mcp-servers/:server_id.
 // The deletion is a soft-delete; the record is retained with deleted_at set.
+// The scope permission is checked after fetching the server.
 //
 // @Summary      Delete an MCP server
-// @Description  Soft-deletes an MCP server. Requires system admin.
+// @Description  Soft-deletes an MCP server. Access is scope-checked against the caller's role.
 // @Tags         mcp-servers
 // @Param        server_id  path  string  true  "MCP server ID"
 // @Success      204
@@ -440,6 +744,20 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 func (h *Handler) DeleteMCPServer(c fiber.Ctx) error {
 	ctx := c.Context()
 	id := c.Params("server_id")
+
+	existing, err := h.DB.GetMCPServer(ctx, id)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return apierror.NotFound(c, "MCP server not found")
+		}
+		h.Log.ErrorContext(ctx, "delete mcp server: get server", slog.String("id", id), slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to get MCP server")
+	}
+
+	ki := auth.KeyInfoFromCtx(c)
+	if permErr := checkMCPServerScopePermission(c, existing, ki); permErr != nil {
+		return permErr
+	}
 
 	if err := h.DB.DeleteMCPServer(ctx, id); err != nil {
 		if errors.Is(err, db.ErrNotFound) {
@@ -455,9 +773,10 @@ func (h *Handler) DeleteMCPServer(c fiber.Ctx) error {
 // TestMCPServerConnection handles POST /api/v1/mcp-servers/:server_id/test.
 // It sends a tools/list JSON-RPC request to the MCP server and reports the
 // number of available tools on success, or an error message on failure.
+// The scope permission is checked after fetching the server.
 //
 // @Summary      Test an MCP server connection
-// @Description  Sends a tools/list request to the MCP server and reports available tool count. Requires system admin.
+// @Description  Sends a tools/list request to the MCP server and reports available tool count. Access is scope-checked against the caller's role.
 // @Tags         mcp-servers
 // @Produce      json
 // @Param        server_id  path      string  true  "MCP server ID"
@@ -481,6 +800,11 @@ func (h *Handler) TestMCPServerConnection(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to get MCP server")
 	}
 
+	ki := auth.KeyInfoFromCtx(c)
+	if permErr := checkMCPServerScopePermission(c, s, ki); permErr != nil {
+		return permErr
+	}
+
 	token, err := h.decryptMCPAuthToken(s)
 	if err != nil {
 		h.Log.ErrorContext(ctx, "test mcp server: decrypt token", slog.String("id", id), slog.String("error", err.Error()))
@@ -488,73 +812,21 @@ func (h *Handler) TestMCPServerConnection(c fiber.Ctx) error {
 	}
 
 	// Send a tools/list JSON-RPC 2.0 request to probe the MCP server.
-	const probeBody = `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
-	httpReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, strings.NewReader(probeBody))
-	if reqErr != nil {
+	// NewHTTPTransport with h.MCPAllowPrivateURLs applies the same SSRF-safe
+	// dialer used by the live proxy path, guarding against DNS rebinding even
+	// when the URL appeared safe at registration time.
+	transport := mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, token, mcpTestTimeout, h.MCPAllowPrivateURLs)
+	defer transport.Close()
+
+	tools, probeErr := transport.ListTools(ctx)
+	if probeErr != nil {
 		return c.JSON(testMCPServerResponse{
 			Success: false,
-			Error:   fmt.Sprintf("failed to build request: %s", reqErr.Error()),
+			Error:   probeErr.Error(),
 		})
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	switch s.AuthType {
-	case "bearer":
-		if token != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+token)
-		}
-	case "header":
-		if s.AuthHeader != "" && token != "" {
-			httpReq.Header.Set(s.AuthHeader, token)
-		}
-	}
-
-	httpResp, doErr := mcpTestClient.Do(httpReq)
-	if doErr != nil {
-		return c.JSON(testMCPServerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("connection failed: %s", doErr.Error()),
-		})
-	}
-	defer httpResp.Body.Close()
-
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return c.JSON(testMCPServerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("server returned HTTP %d", httpResp.StatusCode),
-		})
-	}
-
-	var rpcResp struct {
-		Result *struct {
-			Tools []struct {
-				Name string `json:"name"`
-			} `json:"tools"`
-		} `json:"result"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if decErr := json.NewDecoder(io.LimitReader(httpResp.Body, 10<<20)).Decode(&rpcResp); decErr != nil {
-		return c.JSON(testMCPServerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("failed to decode response: %s", decErr.Error()),
-		})
-	}
-
-	if rpcResp.Error != nil {
-		return c.JSON(testMCPServerResponse{
-			Success: false,
-			Error:   rpcResp.Error.Message,
-		})
-	}
-
-	toolCount := 0
-	if rpcResp.Result != nil {
-		toolCount = len(rpcResp.Result.Tools)
 	}
 	return c.JSON(testMCPServerResponse{
 		Success: true,
-		Tools:   toolCount,
+		Tools:   len(tools),
 	})
 }

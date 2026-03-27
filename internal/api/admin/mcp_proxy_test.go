@@ -52,14 +52,15 @@ func setupMCPProxyApp(t *testing.T, dsn string) (*fiber.App, *db.DB, *cache.Cach
 	mcp.RegisterVoidLLMTools(mcpServer, mcpTestDeps())
 
 	handler := &admin.Handler{
-		DB:             database,
-		HMACSecret:     testHMACSecret,
-		EncryptionKey:  testEncryptionKey,
-		KeyCache:       keyCache,
-		License:        license.NewHolder(license.Verify("", true)),
-		Log:            noopLogger(t),
-		MCPServer:      mcpServer,
-		MCPCallTimeout: 5 * time.Second,
+		DB:                  database,
+		HMACSecret:          testHMACSecret,
+		EncryptionKey:       testEncryptionKey,
+		KeyCache:            keyCache,
+		License:             license.NewHolder(license.Verify("", true)),
+		Log:                 noopLogger(t),
+		MCPServer:           mcpServer,
+		MCPCallTimeout:      5 * time.Second,
+		MCPAllowPrivateURLs: true, // tests use loopback httptest servers
 	}
 
 	app := fiber.New()
@@ -378,15 +379,16 @@ func TestMCPProxy_LoggerCalled(t *testing.T) {
 	logger := &mockMCPLogger{}
 
 	handler := &admin.Handler{
-		DB:             database,
-		HMACSecret:     testHMACSecret,
-		EncryptionKey:  testEncryptionKey,
-		KeyCache:       keyCache,
-		License:        license.NewHolder(license.Verify("", true)),
-		Log:            noopLogger(t),
-		MCPServer:      mcpServer,
-		MCPCallTimeout: 5 * time.Second,
-		MCPLogger:      logger,
+		DB:                  database,
+		HMACSecret:          testHMACSecret,
+		EncryptionKey:       testEncryptionKey,
+		KeyCache:            keyCache,
+		License:             license.NewHolder(license.Verify("", true)),
+		Log:                 noopLogger(t),
+		MCPServer:           mcpServer,
+		MCPCallTimeout:      5 * time.Second,
+		MCPLogger:           logger,
+		MCPAllowPrivateURLs: true, // test uses a loopback httptest server
 	}
 
 	app := fiber.New()

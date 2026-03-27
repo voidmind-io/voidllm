@@ -18,17 +18,28 @@
 CREATE TABLE mcp_servers (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
-    alias           TEXT NOT NULL UNIQUE,
+    alias           TEXT NOT NULL,
     url             TEXT NOT NULL,
     auth_type       TEXT NOT NULL DEFAULT 'none',       -- 'none' | 'header' | 'bearer'
     auth_header     TEXT NOT NULL DEFAULT '',           -- header name, e.g. 'Authorization'
     auth_token_enc  TEXT,                               -- AES-256-GCM encrypted token, NULL if auth_type='none'
-    is_active       INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
-    created_by      TEXT REFERENCES users(id),          -- NULL for system/yaml-sourced entries
+    org_id          TEXT REFERENCES organizations(id),  -- NULL for global servers
+    team_id         TEXT REFERENCES teams(id),          -- NULL for global/org-scoped servers
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    created_by      TEXT,                               -- NULL for system/yaml-sourced entries
     created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    deleted_at      TEXT
+    deleted_at      TEXT,
+    CHECK (is_active IN (0, 1))
 );
+
+-- Scope-aware alias uniqueness: (org_id, team_id, alias) must be unique within
+-- active (non-deleted) rows. NULL is mapped to '' via coalesce so that multiple
+-- NULLs compare as equal (SQLite's NULL != NULL semantics would otherwise allow
+-- unbounded duplicates). Soft-deleted rows are excluded from the constraint.
+CREATE UNIQUE INDEX idx_mcp_servers_alias_scope
+    ON mcp_servers (coalesce(org_id, ''), coalesce(team_id, ''), alias)
+    WHERE deleted_at IS NULL;
 
 -- Admin UI: list active servers quickly
 CREATE INDEX idx_mcp_servers_active

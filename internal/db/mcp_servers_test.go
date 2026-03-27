@@ -18,7 +18,7 @@ func mustCreateMCPServer(t *testing.T, d *DB, params CreateMCPServerParams) *MCP
 
 // defaultMCPParams returns a minimal valid CreateMCPServerParams for the given alias.
 // CreatedBy is intentionally left empty (maps to NULL) so that no users row is
-// required — the FK is nullable.
+// required — the FK is nullable. OrgID and TeamID are nil (global scope).
 func defaultMCPParams(alias string) CreateMCPServerParams {
 	return CreateMCPServerParams{
 		Name:     "Test MCP " + alias,
@@ -26,6 +26,34 @@ func defaultMCPParams(alias string) CreateMCPServerParams {
 		URL:      "https://mcp.example.com/" + alias,
 		AuthType: "none",
 	}
+}
+
+// mustCreateOrgForMCP creates an org for use in MCP server scope tests.
+// It uses a unique slug derived from the provided suffix to avoid conflicts.
+func mustCreateOrgForMCP(t *testing.T, d *DB, suffix string) *Org {
+	t.Helper()
+	return mustCreateOrg(t, d, CreateOrgParams{Name: "MCP Org " + suffix, Slug: "mcp-org-" + suffix})
+}
+
+// mustCreateTeamForMCP creates a team in the given org for use in MCP server scope tests.
+func mustCreateTeamForMCP(t *testing.T, d *DB, orgID, suffix string) *Team {
+	t.Helper()
+	return mustCreateTeam(t, d, CreateTeamParams{OrgID: orgID, Name: "MCP Team " + suffix, Slug: "mcp-team-" + suffix})
+}
+
+// orgScopedMCPParams returns params for an org-scoped MCP server.
+func orgScopedMCPParams(alias, orgID string) CreateMCPServerParams {
+	p := defaultMCPParams(alias)
+	p.OrgID = &orgID
+	return p
+}
+
+// teamScopedMCPParams returns params for a team-scoped MCP server.
+func teamScopedMCPParams(alias, orgID, teamID string) CreateMCPServerParams {
+	p := defaultMCPParams(alias)
+	p.OrgID = &orgID
+	p.TeamID = &teamID
+	return p
 }
 
 // ---- CreateMCPServer --------------------------------------------------------
@@ -76,6 +104,13 @@ func TestCreateMCPServer(t *testing.T) {
 				// created_by is NULL because CreatedBy was empty.
 				if got.CreatedBy != nil {
 					t.Errorf("CreatedBy = %v, want nil", got.CreatedBy)
+				}
+				// OrgID and TeamID are nil for global servers.
+				if got.OrgID != nil {
+					t.Errorf("OrgID = %v, want nil for global server", got.OrgID)
+				}
+				if got.TeamID != nil {
+					t.Errorf("TeamID = %v, want nil for global server", got.TeamID)
 				}
 				if !got.IsActive {
 					t.Error("IsActive = false, want true for new server")
@@ -142,6 +177,60 @@ func TestCreateMCPServer(t *testing.T) {
 	}
 }
 
+func TestCreateMCPServer_OrgScoped(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+	org := mustCreateOrgForMCP(t, d, "orgscoped")
+
+	params := CreateMCPServerParams{
+		Name:     "Org MCP",
+		Alias:    "org-scoped",
+		URL:      "https://mcp.org.example.com",
+		AuthType: "none",
+		OrgID:    &org.ID,
+	}
+
+	got, err := d.CreateMCPServer(context.Background(), params)
+	if err != nil {
+		t.Fatalf("CreateMCPServer() error = %v", err)
+	}
+	if got.OrgID == nil || *got.OrgID != org.ID {
+		t.Errorf("OrgID = %v, want %q", got.OrgID, org.ID)
+	}
+	if got.TeamID != nil {
+		t.Errorf("TeamID = %v, want nil for org-scoped server", got.TeamID)
+	}
+}
+
+func TestCreateMCPServer_TeamScoped(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+	org := mustCreateOrgForMCP(t, d, "teamscoped")
+	team := mustCreateTeamForMCP(t, d, org.ID, "ts")
+
+	params := CreateMCPServerParams{
+		Name:     "Team MCP",
+		Alias:    "team-scoped",
+		URL:      "https://mcp.team.example.com",
+		AuthType: "none",
+		OrgID:    &org.ID,
+		TeamID:   &team.ID,
+	}
+
+	got, err := d.CreateMCPServer(context.Background(), params)
+	if err != nil {
+		t.Fatalf("CreateMCPServer() error = %v", err)
+	}
+	if got.OrgID == nil || *got.OrgID != org.ID {
+		t.Errorf("OrgID = %v, want %q", got.OrgID, org.ID)
+	}
+	if got.TeamID == nil || *got.TeamID != team.ID {
+		t.Errorf("TeamID = %v, want %q", got.TeamID, team.ID)
+	}
+}
+
 func TestCreateMCPServer_DuplicateAlias(t *testing.T) {
 	t.Parallel()
 
@@ -151,6 +240,37 @@ func TestCreateMCPServer_DuplicateAlias(t *testing.T) {
 	_, err := d.CreateMCPServer(context.Background(), defaultMCPParams("dup-alias"))
 	if !errors.Is(err, ErrConflict) {
 		t.Errorf("CreateMCPServer() error = %v, want ErrConflict", err)
+	}
+}
+
+// Same alias is allowed across different scopes because the unique index is on
+// (ifnull(org_id,”), ifnull(team_id,”), alias) covering non-deleted rows.
+func TestCreateMCPServer_SameAliasAcrossScopes(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+	org := mustCreateOrgForMCP(t, d, "crossscope")
+	team := mustCreateTeamForMCP(t, d, org.ID, "cs")
+
+	// Global server with alias "shared".
+	mustCreateMCPServer(t, d, defaultMCPParams("shared"))
+
+	// Org-scoped server with the same alias — should succeed.
+	_, err := d.CreateMCPServer(context.Background(), orgScopedMCPParams("shared", org.ID))
+	if err != nil {
+		t.Errorf("CreateMCPServer() org-scoped with same alias error = %v, want nil", err)
+	}
+
+	// Team-scoped server with the same alias — should succeed.
+	_, err = d.CreateMCPServer(context.Background(), teamScopedMCPParams("shared", org.ID, team.ID))
+	if err != nil {
+		t.Errorf("CreateMCPServer() team-scoped with same alias error = %v, want nil", err)
+	}
+
+	// Duplicate org-scoped server for same org — should fail.
+	_, err = d.CreateMCPServer(context.Background(), orgScopedMCPParams("shared", org.ID))
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("CreateMCPServer() duplicate org-scoped error = %v, want ErrConflict", err)
 	}
 }
 
@@ -216,7 +336,7 @@ func TestGetMCPServerByAlias(t *testing.T) {
 		wantErr error
 	}{
 		{
-			name: "existing alias returns server",
+			name: "existing global alias returns server",
 			setup: func(t *testing.T, d *DB) string {
 				t.Helper()
 				mustCreateMCPServer(t, d, defaultMCPParams("by-alias-ok"))
@@ -240,6 +360,16 @@ func TestGetMCPServerByAlias(t *testing.T) {
 					t.Fatalf("DeleteMCPServer: %v", err)
 				}
 				return "by-alias-deleted"
+			},
+			wantErr: ErrNotFound,
+		},
+		{
+			name: "org-scoped server not returned by global lookup",
+			setup: func(t *testing.T, d *DB) string {
+				t.Helper()
+				org := mustCreateOrgForMCP(t, d, "byalias-orgonly")
+				mustCreateMCPServer(t, d, orgScopedMCPParams("org-only", org.ID))
+				return "org-only"
 			},
 			wantErr: ErrNotFound,
 		},
@@ -268,6 +398,94 @@ func TestGetMCPServerByAlias(t *testing.T) {
 	}
 }
 
+// ---- GetMCPServerByAliasScoped ----------------------------------------------
+
+func TestGetMCPServerByAliasScoped(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns team-scoped server when team matches", func(t *testing.T) {
+		t.Parallel()
+		d := openMigratedDB(t)
+		org := mustCreateOrgForMCP(t, d, "scoped-team-wins")
+		team := mustCreateTeamForMCP(t, d, org.ID, "tw")
+
+		mustCreateMCPServer(t, d, defaultMCPParams("tool"))
+		mustCreateMCPServer(t, d, orgScopedMCPParams("tool", org.ID))
+		mustCreateMCPServer(t, d, teamScopedMCPParams("tool", org.ID, team.ID))
+
+		got, err := d.GetMCPServerByAliasScoped(context.Background(), "tool", org.ID, team.ID)
+		if err != nil {
+			t.Fatalf("GetMCPServerByAliasScoped() error = %v", err)
+		}
+		if got.TeamID == nil || *got.TeamID != team.ID {
+			t.Errorf("TeamID = %v, want %q (team-scoped wins)", got.TeamID, team.ID)
+		}
+	})
+
+	t.Run("falls back to org-scoped when no team match", func(t *testing.T) {
+		t.Parallel()
+		d := openMigratedDB(t)
+		org := mustCreateOrgForMCP(t, d, "scoped-org-wins")
+
+		mustCreateMCPServer(t, d, defaultMCPParams("tool2"))
+		mustCreateMCPServer(t, d, orgScopedMCPParams("tool2", org.ID))
+
+		got, err := d.GetMCPServerByAliasScoped(context.Background(), "tool2", org.ID, "nonexistent-team")
+		if err != nil {
+			t.Fatalf("GetMCPServerByAliasScoped() error = %v", err)
+		}
+		if got.OrgID == nil || *got.OrgID != org.ID {
+			t.Errorf("OrgID = %v, want %q (org-scoped wins over global)", got.OrgID, org.ID)
+		}
+		if got.TeamID != nil {
+			t.Errorf("TeamID = %v, want nil", got.TeamID)
+		}
+	})
+
+	t.Run("falls back to global when no org or team match", func(t *testing.T) {
+		t.Parallel()
+		d := openMigratedDB(t)
+
+		mustCreateMCPServer(t, d, defaultMCPParams("tool3"))
+
+		got, err := d.GetMCPServerByAliasScoped(context.Background(), "tool3", "org-c", "team-c")
+		if err != nil {
+			t.Fatalf("GetMCPServerByAliasScoped() error = %v", err)
+		}
+		if got.OrgID != nil {
+			t.Errorf("OrgID = %v, want nil (global server)", got.OrgID)
+		}
+		if got.TeamID != nil {
+			t.Errorf("TeamID = %v, want nil (global server)", got.TeamID)
+		}
+	})
+
+	t.Run("returns ErrNotFound when no matching server exists", func(t *testing.T) {
+		t.Parallel()
+		d := openMigratedDB(t)
+
+		_, err := d.GetMCPServerByAliasScoped(context.Background(), "unknown", "org-z", "team-z")
+		if !errors.Is(err, ErrNotFound) {
+			t.Errorf("GetMCPServerByAliasScoped() error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("empty orgID and teamID still returns global server", func(t *testing.T) {
+		t.Parallel()
+		d := openMigratedDB(t)
+
+		mustCreateMCPServer(t, d, defaultMCPParams("global-only"))
+
+		got, err := d.GetMCPServerByAliasScoped(context.Background(), "global-only", "", "")
+		if err != nil {
+			t.Fatalf("GetMCPServerByAliasScoped() error = %v", err)
+		}
+		if got.OrgID != nil || got.TeamID != nil {
+			t.Errorf("expected global server, got OrgID=%v TeamID=%v", got.OrgID, got.TeamID)
+		}
+	})
+}
+
 // ---- ListMCPServers ---------------------------------------------------------
 
 func TestListMCPServers_OrderedByAlias(t *testing.T) {
@@ -292,6 +510,29 @@ func TestListMCPServers_OrderedByAlias(t *testing.T) {
 	for i, s := range servers {
 		if s.Alias != want[i] {
 			t.Errorf("servers[%d].Alias = %q, want %q", i, s.Alias, want[i])
+		}
+	}
+}
+
+func TestListMCPServers_GlobalOnly(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+	org := mustCreateOrgForMCP(t, d, "listglobal")
+
+	// Insert one global and one org-scoped server.
+	mustCreateMCPServer(t, d, defaultMCPParams("global-vis"))
+	mustCreateMCPServer(t, d, orgScopedMCPParams("org-vis", org.ID))
+
+	servers, err := d.ListMCPServers(context.Background())
+	if err != nil {
+		t.Fatalf("ListMCPServers() error = %v", err)
+	}
+
+	for _, s := range servers {
+		if s.OrgID != nil || s.TeamID != nil {
+			t.Errorf("ListMCPServers() returned non-global server %q (org=%v, team=%v)",
+				s.Alias, s.OrgID, s.TeamID)
 		}
 	}
 }
@@ -358,6 +599,99 @@ func TestListMCPServers_ExcludesSoftDeleted(t *testing.T) {
 		}
 	}
 	_ = active
+}
+
+// ---- ListMCPServersByOrg ----------------------------------------------------
+
+func TestListMCPServersByOrg(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+	org1 := mustCreateOrgForMCP(t, d, "listorg1")
+	org2 := mustCreateOrgForMCP(t, d, "listorg2")
+	team1 := mustCreateTeamForMCP(t, d, org1.ID, "lo1")
+
+	// Global servers visible to everyone.
+	mustCreateMCPServer(t, d, defaultMCPParams("global-a"))
+	mustCreateMCPServer(t, d, defaultMCPParams("global-b"))
+
+	// Org-scoped for org1.
+	mustCreateMCPServer(t, d, orgScopedMCPParams("org1-server", org1.ID))
+
+	// Org-scoped for org2 — must not appear in org1 results.
+	mustCreateMCPServer(t, d, orgScopedMCPParams("org2-server", org2.ID))
+
+	// Team-scoped for org1 — must not appear (ListMCPServersByOrg excludes team-scoped).
+	mustCreateMCPServer(t, d, teamScopedMCPParams("team-server", org1.ID, team1.ID))
+
+	servers, err := d.ListMCPServersByOrg(context.Background(), org1.ID)
+	if err != nil {
+		t.Fatalf("ListMCPServersByOrg() error = %v", err)
+	}
+
+	aliases := make(map[string]bool, len(servers))
+	for _, s := range servers {
+		aliases[s.Alias] = true
+	}
+
+	for _, want := range []string{"global-a", "global-b", "org1-server"} {
+		if !aliases[want] {
+			t.Errorf("ListMCPServersByOrg() missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{"org2-server", "team-server"} {
+		if aliases[unwanted] {
+			t.Errorf("ListMCPServersByOrg() unexpectedly contains %q", unwanted)
+		}
+	}
+}
+
+// ---- ListMCPServersByTeam ---------------------------------------------------
+
+func TestListMCPServersByTeam(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+	org1 := mustCreateOrgForMCP(t, d, "listteam1")
+	org2 := mustCreateOrgForMCP(t, d, "listteam2")
+	teamA := mustCreateTeamForMCP(t, d, org1.ID, "lt-a")
+	teamB := mustCreateTeamForMCP(t, d, org1.ID, "lt-b")
+
+	// Global servers.
+	mustCreateMCPServer(t, d, defaultMCPParams("global-t"))
+
+	// Org-scoped for org1.
+	mustCreateMCPServer(t, d, orgScopedMCPParams("org1-t", org1.ID))
+
+	// Org-scoped for org2 — must not appear.
+	mustCreateMCPServer(t, d, orgScopedMCPParams("org2-t", org2.ID))
+
+	// Team-scoped for (org1, teamA).
+	mustCreateMCPServer(t, d, teamScopedMCPParams("team-a-server", org1.ID, teamA.ID))
+
+	// Team-scoped for (org1, teamB) — must not appear.
+	mustCreateMCPServer(t, d, teamScopedMCPParams("team-b-server", org1.ID, teamB.ID))
+
+	servers, err := d.ListMCPServersByTeam(context.Background(), teamA.ID, org1.ID)
+	if err != nil {
+		t.Fatalf("ListMCPServersByTeam() error = %v", err)
+	}
+
+	aliases := make(map[string]bool, len(servers))
+	for _, s := range servers {
+		aliases[s.Alias] = true
+	}
+
+	for _, want := range []string{"global-t", "org1-t", "team-a-server"} {
+		if !aliases[want] {
+			t.Errorf("ListMCPServersByTeam() missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{"org2-t", "team-b-server"} {
+		if aliases[unwanted] {
+			t.Errorf("ListMCPServersByTeam() unexpectedly contains %q", unwanted)
+		}
+	}
 }
 
 // ---- UpdateMCPServer --------------------------------------------------------
