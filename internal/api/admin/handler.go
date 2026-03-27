@@ -16,6 +16,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/health"
 	"github.com/voidmind-io/voidllm/internal/license"
+	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 	"github.com/voidmind-io/voidllm/internal/sso"
@@ -49,6 +50,9 @@ type Handler struct {
 	// HealthChecker provides upstream model health status. Nil when health
 	// monitoring is not enabled.
 	HealthChecker ModelHealthProvider
+	// MCPServer is the MCP JSON-RPC server for AI assistant tool access. Nil
+	// when MCP is not configured — the route is only registered when non-nil.
+	MCPServer *mcp.Server
 }
 
 // swaggerErrorResponse is the standard API error envelope used in OpenAPI docs.

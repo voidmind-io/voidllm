@@ -119,6 +119,12 @@ func Middleware(logger *Logger) fiber.Handler {
 func parseRoute(c fiber.Ctx) (action, resourceType, resourceID string) {
 	routePath := c.Route().Path
 
+	// MCP endpoints carry opaque JSON-RPC payloads that do not map to the
+	// admin resource/action taxonomy. Skip them entirely.
+	if strings.HasPrefix(routePath, "/api/v1/mcp/") {
+		return "", "", ""
+	}
+
 	// Strip the /api/v1 prefix.
 	trimmed := strings.TrimPrefix(routePath, "/api/v1")
 	if trimmed == routePath {

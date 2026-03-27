@@ -156,4 +156,10 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 
 	// License — any authenticated user may inspect the current license.
 	api.Get("/license", auth.RequireRole(auth.RoleMember), handler.GetLicense)
+
+	// MCP server — any authenticated caller may send MCP requests; individual
+	// tools enforce their own RBAC checks via the injected KeyIdentity.
+	if handler.MCPServer != nil {
+		api.Post("/mcp/voidllm", handler.HandleMCP)
+	}
 }
