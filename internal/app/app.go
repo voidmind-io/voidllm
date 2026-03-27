@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/voidmind-io/voidllm/internal/api/admin"
+	apihealth "github.com/voidmind-io/voidllm/internal/api/health"
 	"github.com/voidmind-io/voidllm/internal/audit"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/cache"
@@ -34,6 +35,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/docs"
 	"github.com/voidmind-io/voidllm/internal/health"
 	"github.com/voidmind-io/voidllm/internal/license"
+	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	voidotel "github.com/voidmind-io/voidllm/internal/otel"
 	"github.com/voidmind-io/voidllm/internal/proxy"
@@ -44,6 +46,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/sso"
 	"github.com/voidmind-io/voidllm/internal/usage"
 	"github.com/voidmind-io/voidllm/pkg/crypto"
+	"github.com/voidmind-io/voidllm/pkg/keygen"
 )
 
 // Application is the top-level VoidLLM server lifecycle coordinator. It owns
@@ -551,6 +554,190 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	if healthChecker != nil {
 		adminHandler.HealthChecker = healthChecker
 	}
+
+	// Wire MCP server with VoidLLM management tools. The MCP server is
+	// always created; the route is only registered when MCPServer is non-nil
+	// (which it always is after this block). Tools that need DB access or
+	// RBAC enforcement perform those checks inside the handler function.
+	mcpServer := mcp.NewServer("voidllm", apihealth.Version)
+	mcp.RegisterVoidLLMTools(mcpServer, mcp.VoidLLMDeps{
+		ListModels: func(ctx context.Context) ([]map[string]any, error) {
+			infos := registry.ListInfo()
+			result := make([]map[string]any, len(infos))
+			for i, info := range infos {
+				result[i] = map[string]any{
+					"name":               info.Name,
+					"provider":           info.Provider,
+					"type":               info.Type,
+					"aliases":            info.Aliases,
+					"max_context_tokens": info.MaxContextTokens,
+					"strategy":           info.Strategy,
+					"deployment_count":   info.DeploymentCount,
+				}
+			}
+			return result, nil
+		},
+		ListAvailableModels: func(ctx context.Context) ([]map[string]any, error) {
+			// Return only name + type for models accessible to the caller.
+			// Uses the same access-cache logic as the /me/available-models endpoint
+			// but scoped via the KeyIdentity carried in the MCP context.
+			id := mcp.KeyIdentityFromCtx(ctx)
+			infos := registry.ListInfo()
+			result := make([]map[string]any, 0, len(infos))
+			for _, info := range infos {
+				if accessCache == nil || accessCache.Check(id.OrgID, "", id.KeyID, info.Name) {
+					modelType := info.Type
+					if modelType == "" {
+						modelType = "chat"
+					}
+					result = append(result, map[string]any{
+						"name": info.Name,
+						"type": modelType,
+					})
+				}
+			}
+			return result, nil
+		},
+		GetAllHealth: func() []map[string]any {
+			if healthChecker == nil {
+				return nil
+			}
+			healths := healthChecker.GetAllHealth()
+			result := make([]map[string]any, len(healths))
+			for i, h := range healths {
+				result[i] = map[string]any{
+					"name":       h.ModelName,
+					"status":     h.Status,
+					"latency_ms": h.LatencyMs,
+					"last_error": h.LastError,
+				}
+			}
+			return result
+		},
+		GetHealth: func(key string) (map[string]any, bool) {
+			if healthChecker == nil {
+				return nil, false
+			}
+			h, ok := healthChecker.GetHealth(key)
+			if !ok {
+				return nil, false
+			}
+			return map[string]any{
+				"name":          h.ModelName,
+				"status":        h.Status,
+				"latency_ms":    h.LatencyMs,
+				"last_error":    h.LastError,
+				"health_ok":     h.HealthOK,
+				"models_ok":     h.ModelsOK,
+				"functional_ok": h.FunctionalOK,
+			}, true
+		},
+		GetUsage: func(ctx context.Context, from, to, groupBy, orgID, keyID string) (any, error) {
+			return map[string]any{
+				"message": "use the VoidLLM web UI or GET /api/v1/usage for detailed analytics",
+			}, nil
+		},
+		ListKeys: func(ctx context.Context, orgID, role string) ([]map[string]any, error) {
+			// Org admins and system admins see all non-session keys in the org.
+			// Members see only their own keys via the userID filter.
+			var userID string
+			if role != auth.RoleOrgAdmin && role != auth.RoleSystemAdmin {
+				id := mcp.KeyIdentityFromCtx(ctx)
+				userID = id.UserID
+			}
+			keys, err := database.ListAPIKeys(ctx, orgID, userID, "", "", 200, false)
+			if err != nil {
+				return nil, fmt.Errorf("list api keys: %w", err)
+			}
+			result := make([]map[string]any, len(keys))
+			for i, k := range keys {
+				result[i] = map[string]any{
+					"id":         k.ID,
+					"key_hint":   k.KeyHint,
+					"key_type":   k.KeyType,
+					"name":       k.Name,
+					"created_at": k.CreatedAt,
+				}
+			}
+			return result, nil
+		},
+		CreateKey: func(ctx context.Context, orgID, userID, name string, expiresIn time.Duration) (map[string]any, error) {
+			plaintextKey, err := keygen.Generate(keygen.KeyTypeUser)
+			if err != nil {
+				return nil, fmt.Errorf("generate key: %w", err)
+			}
+			keyHash := keygen.Hash(plaintextKey, hmacSecret)
+			keyHint := keygen.Hint(plaintextKey)
+
+			var expiresAt *string
+			if expiresIn > 0 {
+				t := time.Now().UTC().Add(expiresIn).Format(time.RFC3339)
+				expiresAt = &t
+			}
+
+			apiKey, err := database.CreateAPIKey(ctx, db.CreateAPIKeyParams{
+				KeyHash:   keyHash,
+				KeyHint:   keyHint,
+				KeyType:   keygen.KeyTypeUser,
+				Name:      name,
+				OrgID:     orgID,
+				UserID:    &userID,
+				ExpiresAt: expiresAt,
+				CreatedBy: userID,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("create api key: %w", err)
+			}
+
+			// Resolve the user's role so the key cache entry is accurate.
+			resolvedRole, roleErr := database.GetUserOrgRole(ctx, userID, orgID)
+			if roleErr == nil && resolvedRole != "" {
+				var expTime *time.Time
+				if apiKey.ExpiresAt != nil {
+					if t, parseErr := time.Parse(time.RFC3339, *apiKey.ExpiresAt); parseErr == nil {
+						expTime = &t
+					}
+				}
+				keyCache.Set(apiKey.KeyHash, auth.KeyInfo{
+					ID:        apiKey.ID,
+					KeyType:   apiKey.KeyType,
+					Role:      resolvedRole,
+					OrgID:     apiKey.OrgID,
+					UserID:    userID,
+					Name:      apiKey.Name,
+					ExpiresAt: expTime,
+				})
+			}
+
+			return map[string]any{
+				"id":         apiKey.ID,
+				"key":        plaintextKey,
+				"key_hint":   apiKey.KeyHint,
+				"name":       apiKey.Name,
+				"expires_at": apiKey.ExpiresAt,
+			}, nil
+		},
+		ListDeployments: func(ctx context.Context, modelID string) ([]map[string]any, error) {
+			deps, err := database.ListDeployments(ctx, modelID)
+			if err != nil {
+				return nil, fmt.Errorf("list deployments: %w", err)
+			}
+			result := make([]map[string]any, len(deps))
+			for i, d := range deps {
+				result[i] = map[string]any{
+					"id":        d.ID,
+					"name":      d.Name,
+					"provider":  d.Provider,
+					"base_url":  d.BaseURL,
+					"weight":    d.Weight,
+					"priority":  d.Priority,
+					"is_active": d.IsActive,
+				}
+			}
+			return result, nil
+		},
+	})
+	adminHandler.MCPServer = mcpServer
 
 	success = true
 	return &Application{

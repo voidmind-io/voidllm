@@ -156,4 +156,13 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 
 	// License — any authenticated user may inspect the current license.
 	api.Get("/license", auth.RequireRole(auth.RoleMember), handler.GetLicense)
+
+	// MCP server — any authenticated caller may send MCP requests; individual
+	// tools enforce their own RBAC checks via the injected KeyIdentity.
+	// GET opens a persistent SSE stream (legacy SSE transport); POST handles
+	// JSON-RPC requests and responds with JSON or SSE based on the Accept header.
+	if handler.MCPServer != nil {
+		api.Post("/mcp/voidllm", handler.HandleMCP)
+		api.Get("/mcp/voidllm", handler.HandleMCPSSE)
+	}
 }
