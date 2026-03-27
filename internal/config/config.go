@@ -284,6 +284,18 @@ func (s SSOConfig) LogValue() slog.Value {
 	)
 }
 
+// MCPConfig holds configuration for the MCP Gateway subsystem.
+type MCPConfig struct {
+	// CallTimeout is the maximum duration for a single proxied MCP tool call.
+	// Defaults to 30 seconds.
+	CallTimeout time.Duration `yaml:"call_timeout"`
+	// AllowPrivateURLs disables SSRF protection for MCP server URLs, permitting
+	// localhost, private IPs, and link-local addresses. Enable this for internal
+	// deployments where MCP servers run on the same network. Default: false.
+	// This setting is only configurable via YAML/ENV — not via Admin API/UI.
+	AllowPrivateURLs bool `yaml:"allow_private_urls"`
+}
+
 // HealthCheckConfig holds configuration for the upstream model health monitoring subsystem.
 type HealthCheckConfig struct {
 	// Health configures the lightweight GET / reachability probe.
@@ -321,6 +333,7 @@ type SettingsConfig struct {
 	TokenCounting  TokenCountingConfig  `yaml:"token_counting"`
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
 	HealthCheck    HealthCheckConfig    `yaml:"health_check"`
+	MCP            MCPConfig            `yaml:"mcp"`
 	// SoftLimitThreshold uses *float64 so that an explicit 0.0 can be
 	// distinguished from the zero value after unmarshalling. Use
 	// GetSoftLimitThreshold to read the value.
@@ -606,6 +619,11 @@ func (c *Config) setDefaults() {
 	}
 	if c.Settings.HealthCheck.Functional.Enabled && c.Settings.HealthCheck.Functional.Interval < 60*time.Second {
 		c.Settings.HealthCheck.Functional.Interval = 60 * time.Second
+	}
+
+	// MCP Gateway
+	if c.Settings.MCP.CallTimeout == 0 {
+		c.Settings.MCP.CallTimeout = 30 * time.Second
 	}
 
 	// Logging
