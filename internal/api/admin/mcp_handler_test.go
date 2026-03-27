@@ -878,6 +878,301 @@ func TestMCPHandler_Methods(t *testing.T) {
 	}
 }
 
+// ---- SSE POST tests ---------------------------------------------------------
+
+// mcpPostSSE sends a POST to /api/v1/mcp/voidllm with Accept: text/event-stream
+// and returns the response.
+func mcpPostSSE(t *testing.T, app *fiber.App, key, body string) *http.Response {
+	t.Helper()
+	req := httptest.NewRequest("POST", mcpURL, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test (SSE): %v", err)
+	}
+	return resp
+}
+
+// extractSSEData reads the response body and returns the value of the first
+// "data: " line in the SSE stream. It also validates that the stream starts
+// with "event: message\n".
+func extractSSEData(t *testing.T, body io.ReadCloser) string {
+	t.Helper()
+	defer body.Close()
+	raw, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("read SSE body: %v", err)
+	}
+	text := string(raw)
+	if !strings.HasPrefix(text, "event: message\n") {
+		t.Errorf("SSE body does not start with 'event: message\\n'; got: %q", text)
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "data: ") {
+			return strings.TrimPrefix(line, "data: ")
+		}
+	}
+	t.Fatalf("no 'data: ' line found in SSE body: %q", text)
+	return ""
+}
+
+// TestMCPHandler_SSE_PostWithAcceptSSE verifies that a POST carrying
+// Accept: text/event-stream wraps the JSON-RPC response in SSE format.
+func TestMCPHandler_SSE_PostWithAcceptSSE(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_SSE_PostWithAcceptSSE?mode=memory&cache=private")
+
+	resp := mcpPostSSE(t, app, key, mcpRequest(1, "initialize", nil))
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream prefix", ct)
+	}
+
+	dataLine := extractSSEData(t, resp.Body)
+
+	var mcpResp mcp.Response
+	if err := json.Unmarshal([]byte(dataLine), &mcpResp); err != nil {
+		t.Fatalf("data line is not valid JSON: %v; raw: %q", err, dataLine)
+	}
+	if mcpResp.Error != nil {
+		t.Fatalf("unexpected MCP error: %+v", mcpResp.Error)
+	}
+
+	b, _ := json.Marshal(mcpResp.Result)
+	var result map[string]any
+	if err := json.Unmarshal(b, &result); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	pv, _ := result["protocolVersion"].(string)
+	if pv == "" {
+		t.Errorf("protocolVersion missing or empty in SSE data payload")
+	}
+}
+
+// TestMCPHandler_SSE_PostWithAcceptJSON verifies that a POST carrying an
+// explicit Accept: application/json header returns a raw JSON body without SSE
+// wrapping, preserving existing non-SSE behaviour.
+func TestMCPHandler_SSE_PostWithAcceptJSON(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_SSE_PostWithAcceptJSON?mode=memory&cache=private")
+
+	req := httptest.NewRequest("POST", mcpURL, strings.NewReader(mcpRequest(1, "initialize", nil)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+key)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json prefix", ct)
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	text := string(raw)
+	if strings.Contains(text, "event: message") {
+		t.Errorf("response must not contain SSE framing; got: %q", text)
+	}
+	if strings.HasPrefix(text, "data: ") {
+		t.Errorf("response must not start with SSE data line; got: %q", text)
+	}
+
+	// Body should be valid JSON-RPC.
+	var mcpResp mcp.Response
+	if err := json.Unmarshal(raw, &mcpResp); err != nil {
+		t.Fatalf("body is not valid JSON-RPC: %v; raw: %q", err, text)
+	}
+	if mcpResp.Error != nil {
+		t.Fatalf("unexpected MCP error: %+v", mcpResp.Error)
+	}
+}
+
+// TestMCPHandler_SSE_PostToolsCallSSE verifies that a tools/call request with
+// Accept: text/event-stream returns the tool result wrapped in SSE format.
+func TestMCPHandler_SSE_PostToolsCallSSE(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_SSE_PostToolsCallSSE?mode=memory&cache=private")
+
+	params := map[string]any{
+		"name":      "list_models",
+		"arguments": map[string]any{},
+	}
+	resp := mcpPostSSE(t, app, key, mcpRequest(2, "tools/call", params))
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream prefix", ct)
+	}
+
+	dataLine := extractSSEData(t, resp.Body)
+
+	var mcpResp mcp.Response
+	if err := json.Unmarshal([]byte(dataLine), &mcpResp); err != nil {
+		t.Fatalf("data line is not valid JSON: %v; raw: %q", err, dataLine)
+	}
+	if mcpResp.Error != nil {
+		t.Fatalf("unexpected protocol error: %+v", mcpResp.Error)
+	}
+
+	b, _ := json.Marshal(mcpResp.Result)
+	var tr mcp.ToolResult
+	if err := json.Unmarshal(b, &tr); err != nil {
+		t.Fatalf("decode ToolResult: %v", err)
+	}
+	if tr.IsError {
+		t.Fatalf("tool returned error: %s", tr.Content[0].Text)
+	}
+	if len(tr.Content) == 0 {
+		t.Fatal("empty content in tool result")
+	}
+	if !strings.Contains(tr.Content[0].Text, "gpt-4o") {
+		t.Errorf("expected gpt-4o in SSE tool result; got: %s", tr.Content[0].Text)
+	}
+}
+
+// TestMCPHandler_SSE_NotificationStill202 verifies that a JSON-RPC
+// notification (no id) with Accept: text/event-stream still returns 202
+// Accepted. Notifications produce no response body so SSE wrapping does not
+// apply.
+func TestMCPHandler_SSE_NotificationStill202(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_SSE_NotificationStill202?mode=memory&cache=private")
+
+	resp := mcpPostSSE(t, app, key, mcpNotification("notifications/initialized"))
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusAccepted {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want 202; body: %s", resp.StatusCode, raw)
+	}
+}
+
+// ---- SSE GET tests ----------------------------------------------------------
+
+// TestMCPHandler_SSE_GetOpensStream verifies that GET /api/v1/mcp/voidllm
+// returns a text/event-stream response containing the initial endpoint event.
+func TestMCPHandler_SSE_GetOpensStream(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_SSE_GetOpensStream?mode=memory&cache=private")
+
+	req := httptest.NewRequest("GET", mcpURL, nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test (GET): %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream prefix", ct)
+	}
+
+	// io.ReadAll on a streaming response may return io.ErrUnexpectedEOF when
+	// the test framework closes the connection after the initial event is
+	// written. Treat partial data with that error as a successful read.
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil && !strings.Contains(err.Error(), "unexpected EOF") {
+		t.Fatalf("read SSE body: %v", err)
+	}
+	text := string(raw)
+	const wantPrefix = "event: endpoint\ndata: /api/v1/mcp/voidllm"
+	if !strings.HasPrefix(text, wantPrefix) {
+		t.Errorf("SSE body does not start with %q; got: %q", wantPrefix, text)
+	}
+}
+
+// TestMCPHandler_SSE_GetRequiresAuth verifies that GET /api/v1/mcp/voidllm
+// without an Authorization header returns 401.
+func TestMCPHandler_SSE_GetRequiresAuth(t *testing.T) {
+	t.Parallel()
+
+	app, _, _ := setupTestAppWithMCP(t, "file:TestMCPHandler_SSE_GetRequiresAuth?mode=memory&cache=private")
+
+	req := httptest.NewRequest("GET", mcpURL, nil)
+	// Deliberately no Authorization header.
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test (GET no auth): %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusUnauthorized {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want 401; body: %s", resp.StatusCode, raw)
+	}
+}
+
+// TestMCPHandler_SSE_GetHeaders verifies that GET /api/v1/mcp/voidllm sets the
+// required SSE proxy headers: Cache-Control: no-cache and X-Accel-Buffering: no.
+func TestMCPHandler_SSE_GetHeaders(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_SSE_GetHeaders?mode=memory&cache=private")
+
+	req := httptest.NewRequest("GET", mcpURL, nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test (GET headers): %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("Cache-Control = %q, want %q", cc, "no-cache")
+	}
+	if xab := resp.Header.Get("X-Accel-Buffering"); xab != "no" {
+		t.Errorf("X-Accel-Buffering = %q, want %q", xab, "no")
+	}
+}
+
 // ---- Helpers ----------------------------------------------------------------
 
 // noopLogger returns a slog.Logger that discards all output.

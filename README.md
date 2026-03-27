@@ -90,6 +90,7 @@ Any OpenAI-compatible SDK works out of the box — just change the base URL to y
 - **Streaming (SSE)** — transparent proxy pass-through with per-chunk usage extraction
 - **SQLite or PostgreSQL** — zero-dep default or production-grade
 - **Helm chart** — production-ready Kubernetes deployment
+- **MCP server** — Model Context Protocol endpoint for IDE integration (Claude Code, Cursor, Windsurf)
 - **Graceful shutdown** — phased drain, in-flight request tracking, K8s-ready
 
 ### Pro ($299/mo)
@@ -111,6 +112,41 @@ Any OpenAI-compatible SDK works out of the box — just change the base URL to y
 - Dedicated Slack support
 
 Flat pricing — no per-user fees, no per-request charges. Self-hosted on your infrastructure.
+
+---
+
+## MCP Integration
+
+VoidLLM exposes a [Model Context Protocol](https://modelcontextprotocol.io) server for IDE integration. Manage your LLM proxy directly from Claude Code, Cursor, or Windsurf.
+
+### Setup
+
+Add to your `.mcp.json` (project root or `~/.claude/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "voidllm": {
+      "type": "http",
+      "url": "http://localhost:8080/api/v1/mcp/voidllm",
+      "headers": {
+        "Authorization": "Bearer vl_uk_your_key_here"
+      }
+    }
+  }
+}
+```
+
+### Available Tools
+
+| Tool | Description |
+|---|---|
+| `list_models` | List models with health status (RBAC-scoped) |
+| `get_model_health` | Health status for a specific model or deployment |
+| `get_usage` | Usage stats for your key/team/org |
+| `list_keys` | API keys visible to you |
+| `create_key` | Create a temporary API key |
+| `list_deployments` | Deployment details (system_admin only) |
 
 ---
 

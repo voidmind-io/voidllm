@@ -131,6 +131,49 @@ models:
 
 **Circuit breakers:** Each deployment has its own circuit breaker. After repeated failures a deployment is temporarily removed from rotation and automatically recovers.
 
+## MCP Server
+
+VoidLLM exposes a [Model Context Protocol](https://modelcontextprotocol.io) endpoint at `/api/v1/mcp/voidllm` for IDE integration. No additional configuration needed — the MCP server starts automatically when VoidLLM runs.
+
+**Endpoints:**
+- `POST /api/v1/mcp/voidllm` — JSON-RPC 2.0 requests (JSON or SSE response based on `Accept` header)
+- `GET /api/v1/mcp/voidllm` — SSE stream for legacy MCP clients (sends endpoint event + keep-alive pings)
+
+**Protocol:** JSON-RPC 2.0 over Streamable HTTP (MCP spec version `2025-03-26`). Supports both `application/json` and `text/event-stream` response formats.
+
+**Authentication:** Standard VoidLLM Bearer token — same API key used for the proxy.
+
+**Tools:**
+
+| Tool | Description | Min Role |
+|---|---|---|
+| `list_models` | Models with health. Admin sees strategy/deployments, member sees name/type only | member |
+| `get_model_health` | Per-model or per-deployment health status | member |
+| `get_usage` | Usage stats scoped to caller's key/org | member |
+| `list_keys` | API keys. Member sees own, admin sees all | member |
+| `create_key` | Create API key with optional expiry | member |
+| `list_deployments` | Deployment details for a model | system_admin |
+
+**IDE Setup (Claude Code / Cursor):**
+
+Add to `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "voidllm": {
+      "type": "http",
+      "url": "https://your-voidllm-instance:8080/api/v1/mcp/voidllm",
+      "headers": {
+        "Authorization": "Bearer vl_uk_your_key"
+      }
+    }
+  }
+}
+```
+
+**Privacy:** MCP tool call arguments and results are not logged or stored. Consistent with VoidLLM's zero-knowledge proxy architecture.
+
 ## Settings
 
 ```yaml
