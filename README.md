@@ -1,7 +1,7 @@
 # VoidLLM
 
 [![CI](https://github.com/voidmind-io/voidllm/actions/workflows/ci.yml/badge.svg)](https://github.com/voidmind-io/voidllm/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/voidmind-io/voidllm/graph/badge.svg)](https://codecov.io/gh/voidmind-io/voidllm)
+[![codecov](https://codecov.io/gh/voidmind-io/voidllm/graph/badge.svg?token=1OCK31RDMG)](https://codecov.io/gh/voidmind-io/voidllm)
 [![Go Report Card](https://goreportcard.com/badge/github.com/voidmind-io/voidllm)](https://goreportcard.com/report/github.com/voidmind-io/voidllm)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/voidmind-io/voidllm/badge)](https://securityscorecards.dev/viewer/?uri=github.com/voidmind-io/voidllm)
 [![Release](https://img.shields.io/github/v/release/voidmind-io/voidllm)](https://github.com/voidmind-io/voidllm/releases/latest)
