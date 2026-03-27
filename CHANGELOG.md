@@ -2,83 +2,117 @@
 
 All notable changes to VoidLLM are documented in this file.
 
-## [0.3.0] — 2026-03-21
+## [0.0.5] — 2026-03-26
 
-### v0.3 "Production Ready"
+### Multi-Deployment Load Balancing
 
-Large teams and enterprises can safely run VoidLLM in production.
-First enterprise features ship.
+- **Load balancing** — multi-deployment models with round-robin, least-latency, weighted, and priority routing strategies
+- **Automatic failover** — retry on 5xx/timeout/connection error, per-deployment circuit breakers
+- **Health-aware routing** — unhealthy deployments skipped, all-unhealthy fallback
+- **Deployment CRUD** — Admin API + UI for managing deployments per model
+- **Create Model dialog** — mode switch (Single Endpoint / Load Balanced)
+- **Expandable deployment rows** — Models page shows per-deployment health, provider, base URL
+- **Table component** — generic `renderExpandedRow` support
+- **ARM64 Docker images** — multi-arch builds (linux/amd64 + linux/arm64)
+- **Cross-compile Dockerfile** — builds in ~2.5 min instead of ~20 min
+- **Flexible encryption key** — accepts base64 or any string >= 16 characters (SHA-256 derived)
+- **Default config fallback** — start with just `VOIDLLM_ENCRYPTION_KEY` env var, no config file needed
+- **Bootstrap log ordering** — credentials shown after server start, cleared from memory after print
+- **Codecov integration** — coverage reporting in CI with badge
+- **Admin API tests** — models, invites, model aliases, model access (3700+ lines)
+- **Router tests** — 23 tests, 98.9% coverage
+- **Deployment tests** — 11 DB + 14 API tests with IDOR checks
 
-#### Reliability
-- **Graceful shutdown** — phased drain with configurable timeout, force-cancel, second-signal hard exit
-- **Configurable timeouts per model** — `timeout` field on model config (YAML + API)
-- **Circuit breaker** — per-model, Closed/Open/HalfOpen states, configurable threshold + timeout
+---
+
+## [0.0.4] — 2026-03-24
+
+### Model Types & Health Monitoring
+
+- **Model types** — `model_type` field across full stack (chat, embedding, reranking, completion, image, audio, tts)
+- **Playground tabs** — type-based tabs (Chat / Embedding / Completion), shown dynamically
+- **Embedding interface** — text → vector display + cosine similarity comparison
+- **Type badge** — color-coded type indicator on Models page
+- **Type selector** — in Create and Edit Model dialogs
+- **Health checker** — type-aware functional probe (skips non-chat types)
+- **Upstream health monitoring** — 3-level probes (health, models, functional) with configurable intervals
+- **Dashboard health section** — healthy/degraded/unhealthy model counts
+- **Model performance table** — latency + throughput per model
+- **Recharts integration** — AreaChart, DonutChart, HorizontalBar, MiniTable
+- **Glassmorphism dialogs** — backdrop-blur, semi-transparent, purple border-top
+- **Segmented pill tabs** — replaced underline tab styling
+- **README badges** — Go Report Card, Release version, Go version
+
+---
+
+## [0.0.3] — 2026-03-23
+
+### UI Redesign
+
+- **Complete UI redesign** — premium dark theme across all pages
+- **Dashboard** — stat cards with icons, usage charts, model performance, budget warnings
+- **Playground** — split panel layout, advanced parameters, code blocks
+- **Keys page** — stat cards, icon actions, key counts
+- **GitHub Actions** — CI (Go + UI), Release (Docker to GHCR), CodeQL, OpenSSF Scorecard
+
+---
+
+## [0.0.2] — 2026-03-23
+
+### Distributed Rate Limiting
+
+- **Redis rate limiting** — Lua scripting for distributed rate limit enforcement
+- **Checker interface** — pluggable rate limit backends (in-memory + Redis)
+
+---
+
+## [0.0.1] — 2026-03-23
+
+### Initial Release
+
+First tagged release. Includes all features developed during the pre-release phase:
+
+#### Proxy
+- OpenAI-compatible passthrough proxy (`/v1/*`)
+- Streaming / SSE support with per-chunk usage extraction
+- Provider adapters: Anthropic (full translation), Azure (URL mapping), vLLM, OpenAI, Ollama, custom
+- Header sanitization, hop-by-hop stripping
+
+#### Access Control
+- Bearer token auth with HMAC-SHA256 hashing (O(1) lookup)
+- Key types: user (`vl_uk_`), team (`vl_tk_`), service account (`vl_sa_`)
+- RBAC: system_admin > org_admin > team_admin > member
+- Org → Team → User → Key hierarchy
+- Model access control (explicit-allow, most-restrictive-wins)
+- Model aliases (org/team scoped)
+
+#### Usage & Limits
+- Async usage logging (buffered channel → batch DB write)
+- Token counting from upstream responses (streaming included)
+- Rate limits (requests per minute/day) at org, team, key level
+- Token budgets (daily/monthly) with real-time enforcement
+- Cost estimation per request (configurable per-model pricing)
+- TTFT + TPS metrics per request
+
+#### Web UI
+- Dashboard, Playground, Keys, Teams, Users, Service Accounts, Models, Usage, Settings, License pages
+- Login + session auth, invite token system, role-aware sidebar
+- Cost reports, usage export (CSV/JSON)
 
 #### Enterprise
-- **Audit logs** — async middleware captures all admin API mutations, filterable API + UI, config-gated
-- **SSO / OIDC** — generic OpenID Connect, works with Google/Azure AD/Okta/Keycloak/any OIDC provider, auto-provisioning, group sync
-- **License verification** — Ed25519-signed JWT, offline-verifiable, feature-based gating
-- **OpenTelemetry tracing** — OTLP/gRPC export, proxy spans, slog trace correlation
+- Audit logs — async middleware, filterable API + UI
+- SSO / OIDC — Google, Azure AD, Okta, Keycloak, auto-provisioning, group sync
+- License verification — Ed25519 JWT, offline-verifiable, feature gating
+- OpenTelemetry tracing — OTLP/gRPC export
 
-#### Observability
-- **14 Prometheus metrics** — proxy requests, duration, TTFT, tokens, active streams, upstream errors, rate limit rejections, circuit breaker rejections, cache sizes, DB pool, usage buffer depth
-- **Request ID** — UUIDv7 per request, in error responses, logs, usage events, audit events, X-Request-Id header
-
-#### Key Management
-- **Key rotation** — `POST /orgs/:id/keys/:id/rotate` with 24h grace period
-
-#### Architecture (internal)
-- **`apierror` package** — unified error responses across auth, admin, proxy
-- **Handle() decomposition** — 370 → 70 lines, 8 private helper methods
-- **Application struct** — main.go 780 → 70 lines, clean lifecycle management
-- **N+1 fix** — ServiceAccounts use LEFT JOIN with counts
-- **Single-parse body** — reduced JSON parse/serialize from 4x to 1x
-- **HTTP/2 transport** — ForceAttemptHTTP2 for upstream connections
-- **Cursor pagination** — audit logs switched from OFFSET/LIMIT to cursor-based
-- **Static analysis clean** — staticcheck, golangci-lint, gosec all pass
-
----
-
-## [0.2.0] — 2026-03-20
-
-### v0.2 "Usable by Teams"
-
-Team leads can manage their deployment without touching curl.
-UI foundation, model management via API, PostgreSQL, Helm chart.
-
-#### UI
-- Dashboard, Keys, Teams, Users, Service Accounts, Models, Usage, Settings, License pages
-- Login + session auth, invite token system, role-aware sidebar
-
-#### Model Management
-- Model CRUD via Admin API, activate/deactivate, aliases, access control
-- Ollama provider support, Test Connection endpoint
-
-#### Storage & Deployment
-- PostgreSQL support (pgx/v5), bidirectional migration tool
-- Redis support (pub/sub invalidation, rate limiting, token budgets)
-- Helm chart with PG/Redis subcharts, security hardened
-- OpenAPI spec (60+ annotated handlers, Swagger UI)
-- 3-stage Dockerfile (Node→Go→Alpine)
-
----
-
-## [0.1.0] — 2026-03-15
-
-### v0.1 "It Works"
-
-Working proxy with auth, org structure, usage tracking. No UI.
-
-#### Core
-- OpenAI-compatible passthrough proxy (/v1/*)
-- Streaming / SSE support
-- Provider adapters: Anthropic, Azure, vLLM, OpenAI, Ollama
-- Auth: Bearer token, HMAC-SHA256 hashing, key types (user, team, SA)
-- RBAC: system_admin > org_admin > team_admin > member
-- Organizations, Teams, Users, Service Accounts CRUD
-- API keys CRUD with create-once plaintext
-- Token limits (daily/monthly) + rate limits (rpm/rpd)
-- Async usage logging with token counting
-- Health endpoints, Prometheus runtime metrics
-- Structured JSON logging (slog)
-- Docker + docker-compose
+#### Infrastructure
+- Graceful shutdown with phased drain
+- Per-model timeouts and circuit breakers
+- 14 Prometheus metrics
+- Request ID correlation (UUIDv7)
+- SQLite (default) + PostgreSQL support
+- Redis (optional) for distributed rate limiting
+- Bidirectional database migration tool
+- Helm chart with PG/Redis subcharts
+- 3-stage Dockerfile (Node → Go → Alpine)
+- Key rotation with 24h grace period
