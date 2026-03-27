@@ -1,0 +1,22 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 2%
+    patch:
+      default:
+        target: 70%
+
+flags:
+  backend:
+    paths:
+      - "internal/"
+      - "cmd/"
+      - "pkg/"
+    carryforward: true
+
+ignore:
+  - "ui/"
+  - "docs/"
+  - "scripts/"
