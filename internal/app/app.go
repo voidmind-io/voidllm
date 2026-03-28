@@ -5,7 +5,6 @@ package app
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,7 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
 	"golang.org/x/crypto/hkdf"
 
 	"github.com/gofiber/fiber/v3"
@@ -613,10 +611,20 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// is always created; the route is only registered when MCPServer is non-nil
 	// (which it always is after this block). Tools that need DB access or RBAC
 	// enforcement perform those checks inside the handler function.
-	//
-	// voidllmDeps is captured as a named variable so that the Code Mode server
-	// below can reuse the ExecuteCode, ListAccessibleMCPServers, and
-	// SearchMCPTools closures without duplicating them.
+
+	// Create Code Mode service — wires the three Code Mode VoidLLMDeps functions
+	// and the OnToolsListHook as methods on a single struct so they share state
+	// without ad-hoc closure captures.
+	cmService := &codeModeService{
+		executor:     adminHandler.CodeExecutor,
+		toolCache:    adminHandler.ToolCache,
+		callMCPTool:  adminHandler.CallMCPTool,
+		db:           database,
+		log:          log,
+		maxToolCalls: cfg.Settings.MCP.CodeMode.MaxToolCalls,
+		codePool:     adminHandler.CodePool,
+	}
+
 	mcpServer := mcp.NewServer("voidllm", apihealth.Version)
 	voidllmDeps := mcp.VoidLLMDeps{
 		ListModels: func(ctx context.Context) ([]map[string]any, error) {
@@ -794,307 +802,9 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			}
 			return result, nil
 		},
-		ExecuteCode: func(ctx context.Context, code string, serverAliases []string) (*mcp.ExecuteResult, error) {
-			if adminHandler.CodeExecutor == nil {
-				return nil, nil
-			}
-			ki := mcp.KeyIdentityFromCtx(ctx)
-
-			// List MCP servers accessible to this caller with code_mode_enabled.
-			var servers []db.MCPServer
-			var listErr error
-			if ki.TeamID != "" {
-				servers, listErr = database.ListMCPServersByTeam(ctx, ki.TeamID, ki.OrgID)
-			} else if ki.OrgID != "" {
-				servers, listErr = database.ListMCPServersByOrg(ctx, ki.OrgID)
-			} else {
-				servers, listErr = database.ListMCPServers(ctx)
-			}
-			if listErr != nil {
-				return nil, fmt.Errorf("execute code: list servers: %w", listErr)
-			}
-
-			// Filter global servers (OrgID == nil && TeamID == nil) to only those
-			// explicitly allowed via org/team/key access tables. Org- and team-scoped
-			// servers are implicitly accessible to members of that org/team.
-			var accessible []db.MCPServer
-			for _, s := range servers {
-				if s.OrgID != nil || s.TeamID != nil {
-					accessible = append(accessible, s)
-					continue
-				}
-				allowed, accessErr := database.CheckMCPAccess(ctx, ki.OrgID, ki.TeamID, ki.KeyID, s.ID)
-				if accessErr != nil {
-					continue
-				}
-				if allowed {
-					accessible = append(accessible, s)
-				}
-			}
-			servers = accessible
-
-			// Build a set of requested aliases for fast lookup (nil = all).
-			wantSet := make(map[string]bool, len(serverAliases))
-			for _, a := range serverAliases {
-				wantSet[a] = true
-			}
-
-			// Build a blocklist map (alias → set of blocked tool names) once so
-			// it can be used both for filtering the tool list and as a second
-			// defense inside the ToolCaller closure.
-			blockedByServer := make(map[string]map[string]bool)
-			for _, s := range servers {
-				if !s.CodeModeEnabled {
-					continue
-				}
-				if len(wantSet) > 0 && !wantSet[s.Alias] {
-					continue
-				}
-				blocked, blockErr := database.ListBlockedToolNames(ctx, s.ID)
-				if blockErr != nil {
-					log.LogAttrs(ctx, slog.LevelWarn, "code mode: list blocked tools",
-						slog.String("server", s.Alias),
-						slog.String("error", blockErr.Error()),
-					)
-					// Continue with an empty blocklist for this server rather than
-					// aborting; the ToolCache fetch below will still run.
-				}
-				if len(blocked) > 0 {
-					set := make(map[string]bool, len(blocked))
-					for _, name := range blocked {
-						set[name] = true
-					}
-					blockedByServer[s.Alias] = set
-				}
-			}
-
-			serverTools := make(map[string][]mcp.Tool)
-			for _, s := range servers {
-				if !s.CodeModeEnabled {
-					continue
-				}
-				if len(wantSet) > 0 && !wantSet[s.Alias] {
-					continue
-				}
-				tools, toolErr := adminHandler.ToolCache.GetTools(ctx, s.Alias)
-				if toolErr != nil {
-					// A single server failure does not abort the whole execution.
-					log.LogAttrs(ctx, slog.LevelWarn, "code mode: get tools",
-						slog.String("server", s.Alias),
-						slog.String("error", toolErr.Error()),
-					)
-					continue
-				}
-				if bs := blockedByServer[s.Alias]; len(bs) > 0 {
-					filtered := make([]mcp.Tool, 0, len(tools))
-					for _, t := range tools {
-						if !bs[t.Name] {
-							filtered = append(filtered, t)
-						}
-					}
-					serverTools[s.Alias] = filtered
-				} else {
-					serverTools[s.Alias] = tools
-				}
-			}
-
-			// Build auth.KeyInfo from mcp.KeyIdentity so CallMCPTool can enforce access.
-			kiAuth := &auth.KeyInfo{
-				ID:     ki.KeyID,
-				OrgID:  ki.OrgID,
-				TeamID: ki.TeamID,
-				UserID: ki.UserID,
-				Role:   ki.Role,
-			}
-
-			executionUUID, uuidErr := uuid.NewV7()
-			if uuidErr != nil {
-				return nil, fmt.Errorf("execute code: generate execution id: %w", uuidErr)
-			}
-			executionID := executionUUID.String()
-
-			callTool := mcp.ToolCaller(func(callCtx context.Context, serverAlias, toolName string, args json.RawMessage) (json.RawMessage, error) {
-				if bs, ok := blockedByServer[serverAlias]; ok && bs[toolName] {
-					return nil, fmt.Errorf("tool %q is blocked on server %q", toolName, serverAlias)
-				}
-				return adminHandler.CallMCPTool(callCtx, kiAuth, serverAlias, toolName, args, true, executionID)
-			})
-
-			start := time.Now()
-			result, execErr := adminHandler.CodeExecutor.Execute(ctx, mcp.ExecuteParams{
-				Code:         code,
-				ServerTools:  serverTools,
-				CallTool:     callTool,
-				MaxToolCalls: cfg.Settings.MCP.CodeMode.MaxToolCalls,
-				ExecutionID:  executionID,
-			})
-			duration := time.Since(start)
-
-			if execErr != nil {
-				metrics.CodeModeExecutionsTotal.WithLabelValues("error").Inc()
-				return nil, fmt.Errorf("execute code: %w", execErr)
-			}
-
-			execStatus := "success"
-			if result.Error != "" {
-				execStatus = "error"
-				if isCodeModeTimeout(result.Error) {
-					execStatus = "timeout"
-				} else if isCodeModeOOM(result.Error) {
-					execStatus = "oom"
-				}
-			}
-			metrics.CodeModeExecutionsTotal.WithLabelValues(execStatus).Inc()
-			metrics.CodeModeExecutionDurationSeconds.Observe(duration.Seconds())
-			metrics.CodeModeToolCallsPerExecution.Observe(float64(len(result.ToolCalls)))
-			if adminHandler.CodePool != nil {
-				metrics.CodeModePoolAvailable.Set(float64(adminHandler.CodePool.Available()))
-			}
-
-			return result, nil
-		},
-		ListAccessibleMCPServers: func(ctx context.Context, codeModeOnly bool) ([]map[string]any, error) {
-			if adminHandler.ToolCache == nil {
-				return nil, nil
-			}
-			ki := mcp.KeyIdentityFromCtx(ctx)
-
-			var servers []db.MCPServer
-			var listErr error
-			if ki.TeamID != "" {
-				servers, listErr = database.ListMCPServersByTeam(ctx, ki.TeamID, ki.OrgID)
-			} else if ki.OrgID != "" {
-				servers, listErr = database.ListMCPServersByOrg(ctx, ki.OrgID)
-			} else {
-				servers, listErr = database.ListMCPServers(ctx)
-			}
-			if listErr != nil {
-				return nil, fmt.Errorf("list accessible mcp servers: %w", listErr)
-			}
-
-			// Filter global servers (OrgID == nil && TeamID == nil) to only those
-			// explicitly allowed via org/team/key access tables. Org- and team-scoped
-			// servers are implicitly accessible to members of that org/team.
-			var accessible []db.MCPServer
-			for _, s := range servers {
-				if s.OrgID != nil || s.TeamID != nil {
-					accessible = append(accessible, s)
-					continue
-				}
-				allowed, accessErr := database.CheckMCPAccess(ctx, ki.OrgID, ki.TeamID, ki.KeyID, s.ID)
-				if accessErr != nil {
-					continue
-				}
-				if allowed {
-					accessible = append(accessible, s)
-				}
-			}
-			servers = accessible
-
-			result := make([]map[string]any, 0, len(servers))
-			for _, s := range servers {
-				if codeModeOnly && !s.CodeModeEnabled {
-					continue
-				}
-				toolCount := adminHandler.ToolCache.ToolCount(s.Alias)
-				blocked, _ := database.ListBlockedToolNames(ctx, s.ID)
-				toolCount -= len(blocked)
-				if toolCount < 0 {
-					toolCount = 0
-				}
-				entry := map[string]any{
-					"alias":             s.Alias,
-					"name":              s.Name,
-					"code_mode_enabled": s.CodeModeEnabled,
-					"tool_count":        toolCount,
-				}
-				result = append(result, entry)
-			}
-			return result, nil
-		},
-		SearchMCPTools: func(ctx context.Context, query string, serverAliases []string) ([]map[string]any, error) {
-			if adminHandler.ToolCache == nil {
-				return nil, nil
-			}
-			ki := mcp.KeyIdentityFromCtx(ctx)
-
-			var servers []db.MCPServer
-			var listErr error
-			if ki.TeamID != "" {
-				servers, listErr = database.ListMCPServersByTeam(ctx, ki.TeamID, ki.OrgID)
-			} else if ki.OrgID != "" {
-				servers, listErr = database.ListMCPServersByOrg(ctx, ki.OrgID)
-			} else {
-				servers, listErr = database.ListMCPServers(ctx)
-			}
-			if listErr != nil {
-				return nil, fmt.Errorf("search mcp tools: list servers: %w", listErr)
-			}
-
-			// Filter global servers (OrgID == nil && TeamID == nil) to only those
-			// explicitly allowed via org/team/key access tables. Org- and team-scoped
-			// servers are implicitly accessible to members of that org/team.
-			var accessible []db.MCPServer
-			for _, s := range servers {
-				if s.OrgID != nil || s.TeamID != nil {
-					accessible = append(accessible, s)
-					continue
-				}
-				allowed, accessErr := database.CheckMCPAccess(ctx, ki.OrgID, ki.TeamID, ki.KeyID, s.ID)
-				if accessErr != nil {
-					continue
-				}
-				if allowed {
-					accessible = append(accessible, s)
-				}
-			}
-			servers = accessible
-
-			wantSet := make(map[string]bool, len(serverAliases))
-			for _, a := range serverAliases {
-				wantSet[a] = true
-			}
-
-			queryLower := strings.ToLower(query)
-			var matches []map[string]any
-			for _, s := range servers {
-				if !s.CodeModeEnabled {
-					continue
-				}
-				if len(wantSet) > 0 && !wantSet[s.Alias] {
-					continue
-				}
-				tools, toolErr := adminHandler.ToolCache.GetTools(ctx, s.Alias)
-				if toolErr != nil {
-					log.LogAttrs(ctx, slog.LevelWarn, "search mcp tools: get tools",
-						slog.String("server", s.Alias),
-						slog.String("error", toolErr.Error()),
-					)
-					continue
-				}
-				blocked, _ := database.ListBlockedToolNames(ctx, s.ID)
-				blockedSet := make(map[string]bool, len(blocked))
-				for _, name := range blocked {
-					blockedSet[name] = true
-				}
-				for _, t := range tools {
-					if blockedSet[t.Name] {
-						continue
-					}
-					if strings.Contains(strings.ToLower(t.Name), queryLower) ||
-						strings.Contains(strings.ToLower(t.Description), queryLower) {
-						matches = append(matches, map[string]any{
-							"server":       s.Alias,
-							"server_name":  s.Name,
-							"name":         t.Name,
-							"description":  t.Description,
-							"input_schema": t.InputSchema,
-						})
-					}
-				}
-			}
-			return matches, nil
-		},
+		ExecuteCode:              cmService.ExecuteCode,
+		ListAccessibleMCPServers: cmService.ListAccessibleMCPServers,
+		SearchMCPTools:           cmService.SearchMCPTools,
 	}
 	mcp.RegisterVoidLLMTools(mcpServer, voidllmDeps)
 	adminHandler.MCPServer = mcpServer
@@ -1114,27 +824,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		// description so LLMs can generate correct tool calls without calling
 		// search_tools first. The hook runs on every tools/list request so the
 		// declarations stay current as the ToolCache is populated lazily.
-		toolCache := adminHandler.ToolCache
-		codeModeServer.SetOnToolsList(func(tools []mcp.Tool) []mcp.Tool {
-			allCached := toolCache.GetAllTools()
-			if len(allCached) == 0 {
-				return tools
-			}
-			types := mcp.GenerateToolTypeDefs(allCached)
-			if types == "" {
-				return tools
-			}
-			desc := "Execute JavaScript code in a sandboxed WASM runtime.\n\n" +
-				"## Available Tools\n\n" + types + "\n\n" +
-				"Call tools via `await tools.serverAlias.toolName(args)`. Return a value as the result."
-			for i := range tools {
-				if tools[i].Name == "execute_code" {
-					tools[i].Description = desc
-					break
-				}
-			}
-			return tools
-		})
+		codeModeServer.SetOnToolsList(cmService.toolsListHook())
 
 		adminHandler.CodeModeServer = codeModeServer
 	}
