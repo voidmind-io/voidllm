@@ -5,6 +5,7 @@ package app
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -559,6 +560,29 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		adminHandler.HealthChecker = healthChecker
 	}
 
+	// Code Mode: create the runtime pool, executor, and tool cache when enabled.
+	// These are assigned to the handler before RegisterVoidLLMTools is called so
+	// that the deps closures below can close over the handler and its fields.
+	if cfg.Settings.MCP.CodeMode.IsEnabled() {
+		codePool, poolErr := mcp.NewRuntimePool(
+			cfg.Settings.MCP.CodeMode.PoolSize,
+			cfg.Settings.MCP.CodeMode.MemoryLimitMB,
+			cfg.Settings.MCP.CodeMode.Timeout,
+		)
+		if poolErr != nil {
+			redisCancel()
+			return nil, fmt.Errorf("create code mode pool: %w", poolErr)
+		}
+		adminHandler.CodePool = codePool
+		adminHandler.CodeExecutor = mcp.NewExecutor(codePool)
+		adminHandler.ToolCache = mcp.NewToolCache(adminHandler.MakeToolFetcher(), 10*time.Minute)
+		log.LogAttrs(ctx, slog.LevelInfo, "code mode enabled",
+			slog.Int("pool_size", cfg.Settings.MCP.CodeMode.PoolSize),
+			slog.Int("memory_limit_mb", cfg.Settings.MCP.CodeMode.MemoryLimitMB),
+			slog.Duration("timeout", cfg.Settings.MCP.CodeMode.Timeout),
+		)
+	}
+
 	// Wire MCP server with VoidLLM management tools. The MCP server is
 	// always created; the route is only registered when MCPServer is non-nil
 	// (which it always is after this block). Tools that need DB access or
@@ -740,6 +764,188 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			}
 			return result, nil
 		},
+		ExecuteCode: func(ctx context.Context, code string, serverAliases []string) (*mcp.ExecuteResult, error) {
+			if adminHandler.CodeExecutor == nil {
+				return nil, nil
+			}
+			ki := mcp.KeyIdentityFromCtx(ctx)
+
+			// List MCP servers accessible to this caller with code_mode_enabled.
+			var servers []db.MCPServer
+			var listErr error
+			if ki.TeamID != "" {
+				servers, listErr = database.ListMCPServersByTeam(ctx, ki.TeamID, ki.OrgID)
+			} else if ki.OrgID != "" {
+				servers, listErr = database.ListMCPServersByOrg(ctx, ki.OrgID)
+			} else {
+				servers, listErr = database.ListMCPServers(ctx)
+			}
+			if listErr != nil {
+				return nil, fmt.Errorf("execute code: list servers: %w", listErr)
+			}
+
+			// Build a set of requested aliases for fast lookup (nil = all).
+			wantSet := make(map[string]bool, len(serverAliases))
+			for _, a := range serverAliases {
+				wantSet[a] = true
+			}
+
+			serverTools := make(map[string][]mcp.Tool)
+			for _, s := range servers {
+				if !s.CodeModeEnabled {
+					continue
+				}
+				if len(wantSet) > 0 && !wantSet[s.Alias] {
+					continue
+				}
+				tools, toolErr := adminHandler.ToolCache.GetTools(ctx, s.Alias)
+				if toolErr != nil {
+					// A single server failure does not abort the whole execution.
+					log.LogAttrs(ctx, slog.LevelWarn, "code mode: get tools",
+						slog.String("server", s.Alias),
+						slog.String("error", toolErr.Error()),
+					)
+					continue
+				}
+				serverTools[s.Alias] = tools
+			}
+
+			// Build auth.KeyInfo from mcp.KeyIdentity so CallMCPTool can enforce access.
+			kiAuth := &auth.KeyInfo{
+				ID:     ki.KeyID,
+				OrgID:  ki.OrgID,
+				TeamID: ki.TeamID,
+				UserID: ki.UserID,
+				Role:   ki.Role,
+			}
+
+			callTool := mcp.ToolCaller(func(callCtx context.Context, serverAlias, toolName string, args json.RawMessage) (json.RawMessage, error) {
+				return adminHandler.CallMCPTool(callCtx, kiAuth, serverAlias, toolName, args, true)
+			})
+
+			start := time.Now()
+			result, execErr := adminHandler.CodeExecutor.Execute(ctx, mcp.ExecuteParams{
+				Code:         code,
+				ServerTools:  serverTools,
+				CallTool:     callTool,
+				MaxToolCalls: cfg.Settings.MCP.CodeMode.MaxToolCalls,
+			})
+			duration := time.Since(start)
+
+			if execErr != nil {
+				metrics.CodeModeExecutionsTotal.WithLabelValues("error").Inc()
+				return nil, fmt.Errorf("execute code: %w", execErr)
+			}
+
+			execStatus := "success"
+			if result.Error != "" {
+				execStatus = "error"
+				if isCodeModeTimeout(result.Error) {
+					execStatus = "timeout"
+				} else if isCodeModeOOM(result.Error) {
+					execStatus = "oom"
+				}
+			}
+			metrics.CodeModeExecutionsTotal.WithLabelValues(execStatus).Inc()
+			metrics.CodeModeExecutionDurationSeconds.Observe(duration.Seconds())
+			metrics.CodeModeToolCallsPerExecution.Observe(float64(len(result.ToolCalls)))
+			if adminHandler.CodePool != nil {
+				metrics.CodeModePoolAvailable.Set(float64(adminHandler.CodePool.Available()))
+			}
+
+			return result, nil
+		},
+		ListAccessibleMCPServers: func(ctx context.Context, codeModeOnly bool) ([]map[string]any, error) {
+			if adminHandler.ToolCache == nil {
+				return nil, nil
+			}
+			ki := mcp.KeyIdentityFromCtx(ctx)
+
+			var servers []db.MCPServer
+			var listErr error
+			if ki.TeamID != "" {
+				servers, listErr = database.ListMCPServersByTeam(ctx, ki.TeamID, ki.OrgID)
+			} else if ki.OrgID != "" {
+				servers, listErr = database.ListMCPServersByOrg(ctx, ki.OrgID)
+			} else {
+				servers, listErr = database.ListMCPServers(ctx)
+			}
+			if listErr != nil {
+				return nil, fmt.Errorf("list accessible mcp servers: %w", listErr)
+			}
+
+			result := make([]map[string]any, 0, len(servers))
+			for _, s := range servers {
+				if codeModeOnly && !s.CodeModeEnabled {
+					continue
+				}
+				toolCount := adminHandler.ToolCache.ToolCount(s.Alias)
+				entry := map[string]any{
+					"alias":             s.Alias,
+					"name":              s.Name,
+					"code_mode_enabled": s.CodeModeEnabled,
+					"tool_count":        toolCount,
+				}
+				result = append(result, entry)
+			}
+			return result, nil
+		},
+		SearchMCPTools: func(ctx context.Context, query string, serverAliases []string) ([]map[string]any, error) {
+			if adminHandler.ToolCache == nil {
+				return nil, nil
+			}
+			ki := mcp.KeyIdentityFromCtx(ctx)
+
+			var servers []db.MCPServer
+			var listErr error
+			if ki.TeamID != "" {
+				servers, listErr = database.ListMCPServersByTeam(ctx, ki.TeamID, ki.OrgID)
+			} else if ki.OrgID != "" {
+				servers, listErr = database.ListMCPServersByOrg(ctx, ki.OrgID)
+			} else {
+				servers, listErr = database.ListMCPServers(ctx)
+			}
+			if listErr != nil {
+				return nil, fmt.Errorf("search mcp tools: list servers: %w", listErr)
+			}
+
+			wantSet := make(map[string]bool, len(serverAliases))
+			for _, a := range serverAliases {
+				wantSet[a] = true
+			}
+
+			queryLower := strings.ToLower(query)
+			var matches []map[string]any
+			for _, s := range servers {
+				if !s.CodeModeEnabled {
+					continue
+				}
+				if len(wantSet) > 0 && !wantSet[s.Alias] {
+					continue
+				}
+				tools, toolErr := adminHandler.ToolCache.GetTools(ctx, s.Alias)
+				if toolErr != nil {
+					log.LogAttrs(ctx, slog.LevelWarn, "search mcp tools: get tools",
+						slog.String("server", s.Alias),
+						slog.String("error", toolErr.Error()),
+					)
+					continue
+				}
+				for _, t := range tools {
+					if strings.Contains(strings.ToLower(t.Name), queryLower) ||
+						strings.Contains(strings.ToLower(t.Description), queryLower) {
+						matches = append(matches, map[string]any{
+							"server":       s.Alias,
+							"server_name":  s.Name,
+							"name":         t.Name,
+							"description":  t.Description,
+							"input_schema": t.InputSchema,
+						})
+					}
+				}
+			}
+			return matches, nil
+		},
 	})
 	adminHandler.MCPServer = mcpServer
 	adminHandler.MCPCallTimeout = cfg.Settings.MCP.CallTimeout
@@ -833,6 +1039,15 @@ func (a *Application) Start() error {
 	// Start upstream model health monitoring when at least one probe is enabled.
 	if a.healthChecker != nil {
 		a.stopFuncs = append(a.stopFuncs, a.healthChecker.Start())
+	}
+
+	// Register Code Mode pool cleanup. Close must be called after all in-flight
+	// executions complete; the LIFO stop order ensures this runs before the
+	// admin server is stopped.
+	if a.adminHandler.CodePool != nil {
+		a.stopFuncs = append(a.stopFuncs, func() {
+			a.adminHandler.CodePool.Close()
+		})
 	}
 
 	// Start heartbeat if a license key was configured, even if it has expired.
@@ -1010,6 +1225,20 @@ func (a *Application) PrintBootstrapCredentials() {
 // against a different row.
 func deploymentAAD(id string) []byte {
 	return []byte("deployment:" + id)
+}
+
+// isCodeModeTimeout reports whether a Code Mode execution error message
+// indicates the script exceeded its wall-clock time limit.
+func isCodeModeTimeout(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "interrupted") || strings.Contains(lower, "timeout")
+}
+
+// isCodeModeOOM reports whether a Code Mode execution error message indicates
+// the script exceeded its memory limit inside the WASM sandbox.
+func isCodeModeOOM(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "out of memory") || strings.Contains(lower, "stack overflow")
 }
 
 // cleanup tears down resources in reverse startup order: Redis pub/sub,

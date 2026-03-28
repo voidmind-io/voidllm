@@ -813,6 +813,35 @@ func TestVoidLLM_ListDeployments_MissingModelID(t *testing.T) {
 
 // ---- KeyIdentity context round-trip -----------------------------------------
 
+// TestKeyIdentityFromCtx_Exported verifies the exported KeyIdentityFromCtx
+// wrapper returns the same value as WithKeyIdentity stored.
+func TestKeyIdentityFromCtx_Exported(t *testing.T) {
+	t.Parallel()
+
+	want := mcp.KeyIdentity{
+		OrgID:  "org-exported",
+		TeamID: "team-e",
+		KeyID:  "key-e",
+		UserID: "user-e",
+		Role:   "org_admin",
+	}
+	ctx := mcp.WithKeyIdentity(context.Background(), want)
+	got := mcp.KeyIdentityFromCtx(ctx)
+
+	if got != want {
+		t.Errorf("KeyIdentityFromCtx() = %+v, want %+v", got, want)
+	}
+}
+
+func TestKeyIdentityFromCtx_Empty(t *testing.T) {
+	t.Parallel()
+
+	got := mcp.KeyIdentityFromCtx(context.Background())
+	if got != (mcp.KeyIdentity{}) {
+		t.Errorf("KeyIdentityFromCtx(empty ctx) = %+v, want zero value", got)
+	}
+}
+
 func TestKeyIdentity_ContextRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -927,5 +956,454 @@ func TestRegisterVoidLLMTools_AllToolsListed(t *testing.T) {
 
 	if len(tools) != len(wantTools) {
 		t.Errorf("tools/list length = %d, want %d", len(tools), len(wantTools))
+	}
+}
+
+// ---- Code Mode tools not registered when ExecuteCode is nil -----------------
+
+func TestRegisterVoidLLMTools_CodeModeAbsent_WhenExecuteCodeNil(t *testing.T) {
+	t.Parallel()
+
+	// Build deps with all Code Mode fields nil.
+	deps := defaultDeps()
+	deps.ExecuteCode = nil
+	deps.ListAccessibleMCPServers = nil
+	deps.SearchMCPTools = nil
+
+	s := buildVoidLLMServer(deps)
+
+	resp := callRaw(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	assertNoError(t, resp)
+
+	m := resultMap(t, resp)
+	tools, _ := m["tools"].([]any)
+
+	names := make(map[string]bool, len(tools))
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		name, _ := tool["name"].(string)
+		names[name] = true
+	}
+
+	codeModeTools := []string{"list_servers", "search_tools", "execute_code"}
+	for _, cm := range codeModeTools {
+		if names[cm] {
+			t.Errorf("tool %q should not be registered when ExecuteCode is nil", cm)
+		}
+	}
+}
+
+// ---- list_servers -----------------------------------------------------------
+
+func TestVoidLLM_ListServers_Success(t *testing.T) {
+	t.Parallel()
+
+	servers := []map[string]any{
+		{"alias": "weather", "name": "Weather MCP", "tool_count": float64(5)},
+		{"alias": "calendar", "name": "Calendar MCP", "tool_count": float64(3)},
+	}
+
+	var capturedCodeModeOnly bool
+	deps := defaultDeps()
+	deps.ListAccessibleMCPServers = func(_ context.Context, codeModeOnly bool) ([]map[string]any, error) {
+		capturedCodeModeOnly = codeModeOnly
+		return servers, nil
+	}
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
+	}
+
+	s := buildVoidLLMServer(deps)
+	tr := callTool(t, s, context.Background(), "list_servers", nil)
+
+	if tr.IsError {
+		t.Fatalf("unexpected error: %s", tr.Content[0].Text)
+	}
+	if !capturedCodeModeOnly {
+		t.Errorf("ListAccessibleMCPServers called with codeModeOnly=false, want true")
+	}
+	text := tr.Content[0].Text
+	for _, srv := range []string{"weather", "calendar"} {
+		if !strings.Contains(text, srv) {
+			t.Errorf("output missing server %q\ngot: %s", srv, text)
+		}
+	}
+}
+
+func TestVoidLLM_ListServers_Empty(t *testing.T) {
+	t.Parallel()
+
+	deps := defaultDeps()
+	deps.ListAccessibleMCPServers = func(_ context.Context, _ bool) ([]map[string]any, error) {
+		return []map[string]any{}, nil
+	}
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
+	}
+
+	s := buildVoidLLMServer(deps)
+	tr := callTool(t, s, context.Background(), "list_servers", nil)
+
+	if tr.IsError {
+		t.Fatalf("unexpected error: %s", tr.Content[0].Text)
+	}
+	if strings.TrimSpace(tr.Content[0].Text) != "[]" {
+		t.Errorf("expected [], got: %s", tr.Content[0].Text)
+	}
+}
+
+func TestVoidLLM_ListServers_DepError(t *testing.T) {
+	t.Parallel()
+
+	deps := defaultDeps()
+	deps.ListAccessibleMCPServers = func(_ context.Context, _ bool) ([]map[string]any, error) {
+		return nil, errors.New("db error")
+	}
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
+	}
+
+	s := buildVoidLLMServer(deps)
+
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "list_servers",
+			"arguments": map[string]any{},
+		},
+	}
+	reqBytes, _ := json.Marshal(req)
+	raw := s.Handle(context.Background(), reqBytes)
+
+	var resp mcp.Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected protocol error: %+v", resp.Error)
+	}
+
+	b, _ := json.Marshal(resp.Result)
+	var tr mcp.ToolResult
+	if err := json.Unmarshal(b, &tr); err != nil {
+		t.Fatalf("decode ToolResult: %v", err)
+	}
+	if !tr.IsError {
+		t.Errorf("IsError = false, want true for dep error")
+	}
+}
+
+// ---- search_tools -----------------------------------------------------------
+
+func TestVoidLLM_SearchTools_Success(t *testing.T) {
+	t.Parallel()
+
+	var capturedQuery string
+	var capturedAliases []string
+
+	tools := []map[string]any{
+		{"name": "get_weather", "description": "Get current weather", "server": "weather"},
+	}
+
+	deps := defaultDeps()
+	deps.SearchMCPTools = func(_ context.Context, query string, serverAliases []string) ([]map[string]any, error) {
+		capturedQuery = query
+		capturedAliases = serverAliases
+		return tools, nil
+	}
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
+	}
+
+	s := buildVoidLLMServer(deps)
+	tr := callTool(t, s, context.Background(), "search_tools", map[string]any{
+		"query": "weather",
+	})
+
+	if tr.IsError {
+		t.Fatalf("unexpected error: %s", tr.Content[0].Text)
+	}
+	if capturedQuery != "weather" {
+		t.Errorf("query = %q, want %q", capturedQuery, "weather")
+	}
+	if len(capturedAliases) != 0 {
+		t.Errorf("serverAliases = %v, want nil (no server filter)", capturedAliases)
+	}
+	if !strings.Contains(tr.Content[0].Text, "get_weather") {
+		t.Errorf("output missing 'get_weather'\ngot: %s", tr.Content[0].Text)
+	}
+}
+
+func TestVoidLLM_SearchTools_WithServerFilter(t *testing.T) {
+	t.Parallel()
+
+	var capturedAliases []string
+
+	deps := defaultDeps()
+	deps.SearchMCPTools = func(_ context.Context, _ string, serverAliases []string) ([]map[string]any, error) {
+		capturedAliases = serverAliases
+		return []map[string]any{}, nil
+	}
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
+	}
+
+	s := buildVoidLLMServer(deps)
+	callTool(t, s, context.Background(), "search_tools", map[string]any{
+		"query":  "calendar",
+		"server": "cal-server",
+	})
+
+	if len(capturedAliases) != 1 || capturedAliases[0] != "cal-server" {
+		t.Errorf("serverAliases = %v, want [\"cal-server\"]", capturedAliases)
+	}
+}
+
+func TestVoidLLM_SearchTools_MissingQuery(t *testing.T) {
+	t.Parallel()
+
+	deps := defaultDeps()
+	deps.SearchMCPTools = func(_ context.Context, _ string, _ []string) ([]map[string]any, error) {
+		return nil, nil
+	}
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
+	}
+
+	s := buildVoidLLMServer(deps)
+	tr := callTool(t, s, context.Background(), "search_tools", map[string]any{})
+
+	if !tr.IsError {
+		t.Errorf("expected IsError=true when query is missing")
+	}
+	if !strings.Contains(tr.Content[0].Text, "query parameter is required") {
+		t.Errorf("expected 'query parameter is required', got: %s", tr.Content[0].Text)
+	}
+}
+
+func TestVoidLLM_SearchTools_DepError(t *testing.T) {
+	t.Parallel()
+
+	deps := defaultDeps()
+	deps.SearchMCPTools = func(_ context.Context, _ string, _ []string) ([]map[string]any, error) {
+		return nil, errors.New("search index unavailable")
+	}
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
+	}
+
+	s := buildVoidLLMServer(deps)
+
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "search_tools",
+			"arguments": map[string]any{"query": "anything"},
+		},
+	}
+	reqBytes, _ := json.Marshal(req)
+	raw := s.Handle(context.Background(), reqBytes)
+
+	var resp mcp.Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	b, _ := json.Marshal(resp.Result)
+	var tr mcp.ToolResult
+	if err := json.Unmarshal(b, &tr); err != nil {
+		t.Fatalf("decode ToolResult: %v", err)
+	}
+	if !tr.IsError {
+		t.Errorf("IsError = false, want true for dep error")
+	}
+	if strings.Contains(tr.Content[0].Text, "search index") {
+		t.Errorf("raw dep error must not be leaked: %q", tr.Content[0].Text)
+	}
+}
+
+// ---- execute_code -----------------------------------------------------------
+
+func TestVoidLLM_ExecuteCode_Success(t *testing.T) {
+	t.Parallel()
+
+	var capturedCode string
+	var capturedServers []string
+
+	deps := defaultDeps()
+	deps.ExecuteCode = func(_ context.Context, code string, serverAliases []string) (*mcp.ExecuteResult, error) {
+		capturedCode = code
+		capturedServers = serverAliases
+		return &mcp.ExecuteResult{
+			Result:     json.RawMessage(`{"answer":42}`),
+			ToolCalls:  []mcp.ToolCallLog{},
+			DurationMS: 7,
+		}, nil
+	}
+
+	s := buildVoidLLMServer(deps)
+	tr := callTool(t, s, context.Background(), "execute_code", map[string]any{
+		"code":    "const x = 42; JSON.stringify({answer: x})",
+		"servers": []string{"weather", "calendar"},
+	})
+
+	if tr.IsError {
+		t.Fatalf("unexpected error: %s", tr.Content[0].Text)
+	}
+	if capturedCode != "const x = 42; JSON.stringify({answer: x})" {
+		t.Errorf("code = %q, want the JS source", capturedCode)
+	}
+	if len(capturedServers) != 2 {
+		t.Errorf("serverAliases = %v, want [weather calendar]", capturedServers)
+	}
+	if !strings.Contains(tr.Content[0].Text, "42") {
+		t.Errorf("output missing result value\ngot: %s", tr.Content[0].Text)
+	}
+}
+
+func TestVoidLLM_ExecuteCode_NoServers(t *testing.T) {
+	t.Parallel()
+
+	var capturedServers []string
+
+	deps := defaultDeps()
+	deps.ExecuteCode = func(_ context.Context, _ string, serverAliases []string) (*mcp.ExecuteResult, error) {
+		capturedServers = serverAliases
+		return &mcp.ExecuteResult{
+			Result:    json.RawMessage(`"done"`),
+			ToolCalls: []mcp.ToolCallLog{},
+		}, nil
+	}
+
+	s := buildVoidLLMServer(deps)
+	callTool(t, s, context.Background(), "execute_code", map[string]any{
+		"code": "1 + 1",
+	})
+
+	if capturedServers != nil {
+		t.Errorf("serverAliases = %v, want nil when servers field absent", capturedServers)
+	}
+}
+
+func TestVoidLLM_ExecuteCode_MissingCode(t *testing.T) {
+	t.Parallel()
+
+	deps := defaultDeps()
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return &mcp.ExecuteResult{}, nil
+	}
+
+	s := buildVoidLLMServer(deps)
+	tr := callTool(t, s, context.Background(), "execute_code", map[string]any{})
+
+	if !tr.IsError {
+		t.Errorf("expected IsError=true when code is missing")
+	}
+	if !strings.Contains(tr.Content[0].Text, "code parameter is required") {
+		t.Errorf("expected 'code parameter is required', got: %s", tr.Content[0].Text)
+	}
+}
+
+func TestVoidLLM_ExecuteCode_ScriptError(t *testing.T) {
+	t.Parallel()
+
+	deps := defaultDeps()
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return &mcp.ExecuteResult{
+			Error:     "SyntaxError: unexpected token",
+			ToolCalls: []mcp.ToolCallLog{},
+		}, nil
+	}
+
+	s := buildVoidLLMServer(deps)
+	tr := callTool(t, s, context.Background(), "execute_code", map[string]any{
+		"code": "invalid @@ syntax",
+	})
+
+	if !tr.IsError {
+		t.Errorf("expected IsError=true when script returns an error")
+	}
+	if !strings.Contains(tr.Content[0].Text, "SyntaxError") {
+		t.Errorf("expected script error message, got: %s", tr.Content[0].Text)
+	}
+}
+
+func TestVoidLLM_ExecuteCode_DepError(t *testing.T) {
+	t.Parallel()
+
+	deps := defaultDeps()
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return nil, errors.New("sandbox crashed")
+	}
+
+	s := buildVoidLLMServer(deps)
+
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "execute_code",
+			"arguments": map[string]any{"code": "1+1"},
+		},
+	}
+	reqBytes, _ := json.Marshal(req)
+	raw := s.Handle(context.Background(), reqBytes)
+
+	var resp mcp.Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	b, _ := json.Marshal(resp.Result)
+	var tr mcp.ToolResult
+	if err := json.Unmarshal(b, &tr); err != nil {
+		t.Fatalf("decode ToolResult: %v", err)
+	}
+	if !tr.IsError {
+		t.Errorf("IsError = false, want true for dep error")
+	}
+	if strings.Contains(tr.Content[0].Text, "sandbox crashed") {
+		t.Errorf("raw dep error must not be leaked: %q", tr.Content[0].Text)
+	}
+}
+
+// ---- Code Mode tools appear in tools/list when registered -------------------
+
+func TestRegisterVoidLLMTools_CodeModeToolsListed(t *testing.T) {
+	t.Parallel()
+
+	deps := defaultDeps()
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
+	}
+	deps.ListAccessibleMCPServers = func(_ context.Context, _ bool) ([]map[string]any, error) {
+		return nil, nil
+	}
+	deps.SearchMCPTools = func(_ context.Context, _ string, _ []string) ([]map[string]any, error) {
+		return nil, nil
+	}
+
+	s := buildVoidLLMServer(deps)
+
+	resp := callRaw(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	assertNoError(t, resp)
+
+	m := resultMap(t, resp)
+	tools, _ := m["tools"].([]any)
+
+	names := make(map[string]bool, len(tools))
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		name, _ := tool["name"].(string)
+		names[name] = true
+	}
+
+	for _, want := range []string{"list_servers", "search_tools", "execute_code"} {
+		if !names[want] {
+			t.Errorf("Code Mode tool %q not found in tools/list", want)
+		}
 	}
 }

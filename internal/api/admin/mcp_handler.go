@@ -33,6 +33,7 @@ func (h *Handler) HandleMCP(c fiber.Ctx) error {
 	if ki != nil {
 		ctx = mcp.WithKeyIdentity(ctx, mcp.KeyIdentity{
 			OrgID:  ki.OrgID,
+			TeamID: ki.TeamID,
 			KeyID:  ki.ID,
 			UserID: ki.UserID,
 			Role:   ki.Role,

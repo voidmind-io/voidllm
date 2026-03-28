@@ -27,11 +27,13 @@ CREATE TABLE mcp_servers (
     team_id         TEXT REFERENCES teams(id),          -- NULL for global/org-scoped servers
     is_active       INTEGER NOT NULL DEFAULT 1,
     created_by      TEXT,                               -- NULL for system/yaml-sourced entries
-    source          TEXT NOT NULL DEFAULT 'api',        -- 'api' | 'yaml'
+    source              TEXT NOT NULL DEFAULT 'api',        -- 'api' | 'yaml'
+    code_mode_enabled   INTEGER NOT NULL DEFAULT 1,
     created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at      TEXT,
-    CHECK (is_active IN (0, 1))
+    CHECK (is_active IN (0, 1)),
+    CHECK (code_mode_enabled IN (0, 1))
 );
 
 -- Scope-aware alias uniqueness: (org_id, team_id, alias) must be unique within
@@ -110,6 +112,7 @@ CREATE TABLE mcp_tool_calls (
     tool_name           TEXT NOT NULL,
     duration_ms         INTEGER,
     status              TEXT NOT NULL DEFAULT 'success',
+    code_mode           INTEGER NOT NULL DEFAULT 0,
     created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

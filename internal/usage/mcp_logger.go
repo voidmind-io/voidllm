@@ -34,6 +34,8 @@ type MCPToolCallEvent struct {
 	Status string
 	// RequestID is the per-gateway-request trace identifier.
 	RequestID string
+	// CodeMode indicates the call originated from a Code Mode sandboxed execution.
+	CodeMode bool
 }
 
 // MCPToolCallLogger logs MCP tool call events asynchronously.
@@ -127,6 +129,7 @@ func (l *MCPLogger) run() {
 				DurationMS:       &durationMS,
 				Status:           event.Status,
 				RequestID:        event.RequestID,
+				CodeMode:         event.CodeMode,
 			})
 			if len(batch) >= 100 {
 				flush()

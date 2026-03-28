@@ -63,6 +63,16 @@ type Handler struct {
 	// MCPAllowPrivateURLs disables SSRF protection for MCP server URLs.
 	// Set via YAML config only — not exposed in Admin API.
 	MCPAllowPrivateURLs bool
+	// ToolCache holds cached tool schemas from upstream MCP servers for use by
+	// Code Mode. Nil when Code Mode is disabled.
+	ToolCache *mcp.ToolCache
+	// CodeExecutor runs Code Mode JavaScript in sandboxed QJS runtimes.
+	// Nil when Code Mode is disabled.
+	CodeExecutor *mcp.Executor
+	// CodePool is the QJS runtime pool backing CodeExecutor. Held here so that
+	// app.cleanup can drain and close the pool on graceful shutdown.
+	// Nil when Code Mode is disabled.
+	CodePool *mcp.RuntimePool
 }
 
 // swaggerErrorResponse is the standard API error envelope used in OpenAPI docs.

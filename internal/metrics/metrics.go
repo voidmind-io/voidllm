@@ -174,6 +174,49 @@ var MCPTransportErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help:      "Total MCP transport errors when proxying to external servers.",
 }, []string{"server", "error_type"})
 
+// Code Mode metrics
+
+// CodeModeExecutionsTotal counts Code Mode script executions by outcome.
+var CodeModeExecutionsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "voidllm",
+		Name:      "code_mode_executions_total",
+		Help:      "Total Code Mode script executions by status.",
+	},
+	[]string{"status"}, // "success", "error", "timeout", "oom"
+)
+
+// CodeModeExecutionDurationSeconds observes the total wall-clock duration of
+// Code Mode executions, including time spent on tool calls.
+var CodeModeExecutionDurationSeconds = promauto.NewHistogram(
+	prometheus.HistogramOpts{
+		Namespace: "voidllm",
+		Name:      "code_mode_execution_duration_seconds",
+		Help:      "Code Mode total execution time including tool calls.",
+		Buckets:   []float64{0.1, 0.5, 1, 2, 5, 10, 30},
+	},
+)
+
+// CodeModeToolCallsPerExecution observes the number of MCP tool calls made
+// within a single Code Mode execution.
+var CodeModeToolCallsPerExecution = promauto.NewHistogram(
+	prometheus.HistogramOpts{
+		Namespace: "voidllm",
+		Name:      "code_mode_tool_calls_per_execution",
+		Help:      "Number of MCP tool calls per Code Mode execution.",
+		Buckets:   []float64{1, 2, 3, 5, 10, 20, 50},
+	},
+)
+
+// CodeModePoolAvailable tracks the number of idle QJS runtimes in the pool.
+var CodeModePoolAvailable = promauto.NewGauge(
+	prometheus.GaugeOpts{
+		Namespace: "voidllm",
+		Name:      "code_mode_pool_available",
+		Help:      "Number of available QJS runtimes in the Code Mode pool.",
+	},
+)
+
 // RegisterUsageCollector registers the usage buffer depth metric against the
 // default Prometheus registry. The gauge is implemented as a GaugeFunc that
 // reads the current channel length on each scrape.

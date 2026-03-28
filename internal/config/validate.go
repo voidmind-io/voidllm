@@ -242,6 +242,22 @@ func (c *Config) validate() error {
 		}
 	}
 
+	// --- settings.mcp.code_mode ---
+	if c.Settings.MCP.CodeMode.IsEnabled() {
+		if c.Settings.MCP.CodeMode.MemoryLimitMB < 1 || c.Settings.MCP.CodeMode.MemoryLimitMB > 128 {
+			errs = append(errs, fmt.Errorf("settings.mcp.code_mode.memory_limit_mb: must be between 1 and 128, got %d", c.Settings.MCP.CodeMode.MemoryLimitMB))
+		}
+		if c.Settings.MCP.CodeMode.Timeout < time.Second || c.Settings.MCP.CodeMode.Timeout > 120*time.Second {
+			errs = append(errs, fmt.Errorf("settings.mcp.code_mode.timeout: must be between 1s and 120s, got %s", c.Settings.MCP.CodeMode.Timeout))
+		}
+		if c.Settings.MCP.CodeMode.PoolSize < 1 || c.Settings.MCP.CodeMode.PoolSize > 32 {
+			errs = append(errs, fmt.Errorf("settings.mcp.code_mode.pool_size: must be between 1 and 32, got %d", c.Settings.MCP.CodeMode.PoolSize))
+		}
+		if c.Settings.MCP.CodeMode.MaxToolCalls < 1 || c.Settings.MCP.CodeMode.MaxToolCalls > 1000 {
+			errs = append(errs, fmt.Errorf("settings.mcp.code_mode.max_tool_calls: must be between 1 and 1000, got %d", c.Settings.MCP.CodeMode.MaxToolCalls))
+		}
+	}
+
 	// --- settings.bootstrap.admin_email ---
 	if c.Settings.Bootstrap.AdminEmail != "" && !strings.Contains(c.Settings.Bootstrap.AdminEmail, "@") {
 		errs = append(errs, fmt.Errorf("settings.bootstrap.admin_email: invalid email format"))

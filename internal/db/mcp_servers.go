@@ -15,7 +15,7 @@ import (
 // mcpServerSelectColumns is the ordered column list used in all mcp_servers SELECT queries.
 // It must match the scan order in scanMCPServer exactly.
 const mcpServerSelectColumns = "id, name, alias, url, auth_type, auth_header, " +
-	"auth_token_enc, org_id, team_id, is_active, created_by, source, created_at, updated_at, deleted_at"
+	"auth_token_enc, org_id, team_id, is_active, created_by, source, code_mode_enabled, created_at, updated_at, deleted_at"
 
 // MCPServer represents an external MCP server record in the database.
 type MCPServer struct {
@@ -32,10 +32,13 @@ type MCPServer struct {
 	CreatedBy    *string
 	// Source indicates how this server was registered: "api" for Admin API-created
 	// servers, "yaml" for config-file-sourced servers. Defaults to "api".
-	Source    string
-	CreatedAt string
-	UpdatedAt string
-	DeletedAt *string
+	Source string
+	// CodeModeEnabled controls whether this server's tools are available in
+	// Code Mode sandboxed execution. Default true.
+	CodeModeEnabled bool
+	CreatedAt       string
+	UpdatedAt       string
+	DeletedAt       *string
 }
 
 // CreateMCPServerParams holds the input for creating an MCP server record.
@@ -52,6 +55,9 @@ type CreateMCPServerParams struct {
 	// Source is "yaml" for config-file-sourced servers or "api" for Admin
 	// API-created servers. Defaults to "api" when empty.
 	Source string
+	// CodeModeEnabled controls whether this server's tools are available in
+	// Code Mode sandboxed execution. Defaults to true when nil.
+	CodeModeEnabled *bool
 }
 
 // UpdateMCPServerParams holds optional fields for updating an MCP server.
@@ -66,6 +72,8 @@ type UpdateMCPServerParams struct {
 	// IsActive, when non-nil, sets the is_active flag. Use the dedicated
 	// ActivateMCPServer / DeactivateMCPServer helpers where possible.
 	IsActive *bool
+	// CodeModeEnabled, when non-nil, sets the code_mode_enabled flag.
+	CodeModeEnabled *bool
 }
 
 // CreateMCPServer inserts a new MCP server record and returns the persisted row.
@@ -81,15 +89,20 @@ func (d *DB) CreateMCPServer(ctx context.Context, params CreateMCPServerParams) 
 		source = "api"
 	}
 
+	codeModeEnabled := 1
+	if params.CodeModeEnabled != nil && !*params.CodeModeEnabled {
+		codeModeEnabled = 0
+	}
+
 	p := d.dialect.Placeholder
 	insertQuery := "INSERT INTO mcp_servers " +
 		"(id, name, alias, url, auth_type, auth_header, auth_token_enc, " +
-		"org_id, team_id, is_active, created_by, source, created_at, updated_at) " +
+		"org_id, team_id, is_active, created_by, source, code_mode_enabled, created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " +
 		p(6) + ", " + p(7) + ", " +
 		p(8) + ", " + p(9) + ", " +
-		"1, " + p(10) + ", " + p(11) + ", " +
+		"1, " + p(10) + ", " + p(11) + ", " + p(12) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + mcpServerSelectColumns +
@@ -114,6 +127,7 @@ func (d *DB) CreateMCPServer(ctx context.Context, params CreateMCPServerParams) 
 			params.TeamID,
 			createdBy,
 			source,
+			codeModeEnabled,
 		)
 		if execErr != nil {
 			return translateError(execErr)
@@ -353,6 +367,15 @@ func (d *DB) UpdateMCPServer(ctx context.Context, id string, params UpdateMCPSer
 		args = append(args, val)
 		argN++
 	}
+	if params.CodeModeEnabled != nil {
+		val := 0
+		if *params.CodeModeEnabled {
+			val = 1
+		}
+		setClauses = append(setClauses, "code_mode_enabled = "+p(argN))
+		args = append(args, val)
+		argN++
+	}
 
 	if len(setClauses) == 0 {
 		return d.GetMCPServer(ctx, id)
@@ -421,15 +444,17 @@ func (d *DB) DeleteMCPServer(ctx context.Context, id string) error {
 func scanMCPServer(scanner interface{ Scan(...any) error }) (*MCPServer, error) {
 	var s MCPServer
 	var isActiveInt int
+	var codeModeEnabledInt int
 	err := scanner.Scan(
 		&s.ID, &s.Name, &s.Alias, &s.URL, &s.AuthType, &s.AuthHeader,
 		&s.AuthTokenEnc, &s.OrgID, &s.TeamID, &isActiveInt, &s.CreatedBy,
-		&s.Source, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt,
+		&s.Source, &codeModeEnabledInt, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 	s.IsActive = isActiveInt == 1
+	s.CodeModeEnabled = codeModeEnabledInt == 1
 	return &s, nil
 }
 
