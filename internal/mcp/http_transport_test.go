@@ -635,129 +635,61 @@ func TestDetectTransport_StreamableHTTP(t *testing.T) {
 
 // TestDetectTransport_SSEFallback verifies that when the base URL returns 404
 // on POST the transport falls back to SSE discovery and uses the discovered URL.
-func TestDetectTransport_SSEFallback(t *testing.T) {
+func TestDetectTransport_SSEFallback_ReturnsError(t *testing.T) {
 	t.Parallel()
 
-	tools := []map[string]any{
-		{"name": "sse-tool", "description": "From SSE path", "inputSchema": map[string]any{"type": "object"}},
-	}
-	srv := httptest.NewServer(sseListToolsHandler(http.StatusNotFound, "/messages", tools))
-	t.Cleanup(srv.Close)
-
-	tr := newTransport(srv.URL, "none", "", "")
-	got, err := tr.ListTools(context.Background())
-	if err != nil {
-		t.Fatalf("ListTools() error = %v, want nil", err)
-	}
-	if len(got) != 1 || got[0].Name != "sse-tool" {
-		t.Errorf("ListTools() = %v, want [{sse-tool ...}]", got)
-	}
-}
-
-// TestDetectTransport_SSEFallback_405 verifies that 405 Method Not Allowed also
-// triggers SSE discovery (same code path as 404 in detectTransport).
-func TestDetectTransport_SSEFallback_405(t *testing.T) {
-	t.Parallel()
-
-	tools := []map[string]any{
-		{"name": "sse-tool-405", "description": "Found via 405 fallback", "inputSchema": map[string]any{"type": "object"}},
-	}
-	srv := httptest.NewServer(sseListToolsHandler(http.StatusMethodNotAllowed, "/mcp/messages", tools))
-	t.Cleanup(srv.Close)
-
-	tr := newTransport(srv.URL, "none", "", "")
-	got, err := tr.ListTools(context.Background())
-	if err != nil {
-		t.Fatalf("ListTools() error = %v, want nil", err)
-	}
-	if len(got) != 1 || got[0].Name != "sse-tool-405" {
-		t.Errorf("ListTools() = %v, want [{sse-tool-405 ...}]", got)
-	}
-}
-
-// TestSSEDiscover_AuthForwarded verifies that the bearer token is included in
-// the SSE discovery GET request.
-func TestSSEDiscover_AuthForwarded(t *testing.T) {
-	t.Parallel()
-
-	const token = "my-bearer-token"
-	var discoveryAuthHeader string
-
-	initResp := `{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-03-26","capabilities":{}}}`
-	toolsResp := `{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`
-
+	// Server returns 404 on POST probe — indicates SSE transport.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPost:
-			if r.URL.Path == "/messages" {
-				body, _ := io.ReadAll(r.Body)
-				var rpc struct {
-					Method string `json:"method"`
-				}
-				_ = json.Unmarshal(body, &rpc)
-
-				w.Header().Set("Content-Type", "application/json")
-				switch rpc.Method {
-				case "initialize":
-					fmt.Fprint(w, initResp)
-				case "notifications/initialized":
-					w.WriteHeader(http.StatusAccepted)
-				case "tools/list":
-					fmt.Fprint(w, toolsResp)
-				default:
-					w.WriteHeader(http.StatusBadRequest)
-				}
-				return
-			}
-			// Probe returns 404 to trigger SSE fallback.
-			w.WriteHeader(http.StatusNotFound)
-
-		case http.MethodGet:
-			// Record the auth header sent during SSE discovery.
-			discoveryAuthHeader = r.Header.Get("Authorization")
-			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprint(w, "event: endpoint\ndata: /messages\n\n")
-		}
-	}))
-	t.Cleanup(srv.Close)
-
-	tr := newTransport(srv.URL, "bearer", "", token)
-	_, err := tr.ListTools(context.Background())
-	if err != nil {
-		t.Fatalf("ListTools() error = %v, want nil", err)
-	}
-
-	want := "Bearer " + token
-	if discoveryAuthHeader != want {
-		t.Errorf("SSE discovery Authorization = %q, want %q", discoveryAuthHeader, want)
-	}
-}
-
-// TestSSEDiscover_CrossOriginRejected verifies that a cross-origin endpoint URL
-// returned by the SSE discovery stream is rejected with an error.
-func TestSSEDiscover_CrossOriginRejected(t *testing.T) {
-	t.Parallel()
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPost:
-			// Probe returns 404 to trigger SSE discovery.
-			w.WriteHeader(http.StatusNotFound)
-		case http.MethodGet:
-			// Return an endpoint URL on a different origin.
-			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprint(w, "event: endpoint\ndata: https://attacker.example.com/steal\n\n")
-		}
+		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(srv.Close)
 
 	tr := newTransport(srv.URL, "none", "", "")
 	_, err := tr.ListTools(context.Background())
 	if err == nil {
-		t.Fatal("ListTools() error = nil, want error for cross-origin SSE endpoint")
+		t.Fatal("ListTools() error = nil, want ErrSSENotSupported")
 	}
-	if !strings.Contains(err.Error(), "different origin") {
-		t.Errorf("ListTools() error = %q, want it to contain %q", err.Error(), "different origin")
+	if !strings.Contains(err.Error(), "SSE transport") {
+		t.Errorf("ListTools() error = %q, want it to mention SSE transport", err.Error())
+	}
+}
+
+func TestDetectTransport_SSEFallback_405_ReturnsError(t *testing.T) {
+	t.Parallel()
+
+	// Server returns 405 on POST probe — also indicates SSE transport.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	t.Cleanup(srv.Close)
+
+	tr := newTransport(srv.URL, "none", "", "")
+	_, err := tr.ListTools(context.Background())
+	if err == nil {
+		t.Fatal("ListTools() error = nil, want ErrSSENotSupported")
+	}
+	if !strings.Contains(err.Error(), "SSE transport") {
+		t.Errorf("ListTools() error = %q, want it to mention SSE transport", err.Error())
+	}
+}
+
+// TestSSEDetection_WithAuth_ReturnsNotSupported verifies that SSE servers with
+// auth still get the ErrSSENotSupported error.
+func TestSSEDetection_WithAuth_ReturnsNotSupported(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	tr := newTransport(srv.URL, "bearer", "", "secret-token")
+	_, err := tr.ListTools(context.Background())
+	if err == nil {
+		t.Fatal("ListTools() error = nil, want ErrSSENotSupported")
+	}
+	if !strings.Contains(err.Error(), "SSE transport") {
+		t.Errorf("ListTools() error = %q, want it to mention SSE transport", err.Error())
 	}
 }
 

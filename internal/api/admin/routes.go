@@ -209,4 +209,7 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 
 	// MCP server tool cache refresh — scope permissions enforced in handler.
 	api.Post("/mcp-servers/:server_id/refresh-tools", auth.RequireRole(auth.RoleMember), handler.HandleRefreshMCPServerTools)
+
+	// MCP server cached tools — returns cached schemas with blocked status.
+	api.Get("/mcp-servers/:server_id/tools", auth.RequireRole(auth.RoleMember), handler.HandleListMCPServerTools)
 }

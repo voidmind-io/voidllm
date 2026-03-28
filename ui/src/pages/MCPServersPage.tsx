@@ -16,10 +16,10 @@ import {
   useDeleteMCPServer,
   useToggleMCPServer,
   useTestMCPServer,
-  useMCPServerBlocklist,
   useAddBlocklistEntry,
   useRemoveBlocklistEntry,
   useRefreshMCPServerTools,
+  useMCPServerTools,
 } from '../hooks/useMCPServers'
 import type { MCPServerResponse, CreateMCPServerParams, UpdateMCPServerParams } from '../hooks/useMCPServers'
 import { useMe } from '../hooks/useMe'
@@ -96,9 +96,10 @@ function IconPlug() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M12 22v-5" />
-      <path d="M9 8V2" />
-      <path d="M15 8V2" />
-      <path d="M18 8H6a2 2 0 0 0-2 2v3a6 6 0 0 0 12 0v-3a2 2 0 0 0-2-2z" />
+      <path d="M9 7V2" />
+      <path d="M15 7V2" />
+      <path d="M6 7h12" />
+      <path d="M6 7v4a6 6 0 0 0 12 0V7" />
     </svg>
   )
 }
@@ -109,15 +110,6 @@ function IconRefresh() {
       <polyline points="23 4 23 10 17 10" />
       <polyline points="1 20 1 14 7 14" />
       <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
-    </svg>
-  )
-}
-
-function IconXSmall() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <line x1="18" y1="6" x2="6" y2="18" />
-      <line x1="6" y1="6" x2="18" y2="18" />
     </svg>
   )
 }
@@ -558,52 +550,54 @@ interface ServerExpandedRowProps {
   canModify: boolean
 }
 
-function ServerExpandedRow({ server, canModify }: ServerExpandedRowProps) {
-  const [blockToolName, setBlockToolName] = useState('')
-  const [blockReason, setBlockReason] = useState('')
+function truncateText(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text
+  return text.slice(0, maxLength) + '…'
+}
 
-  const { data: blocklist, isLoading: blocklistLoading } = useMCPServerBlocklist(server.id)
+function cn(...classes: (string | false | undefined | null)[]): string {
+  return classes.filter(Boolean).join(' ')
+}
+
+function ServerExpandedRow({ server, canModify }: ServerExpandedRowProps) {
+  const { data: tools, isLoading: toolsLoading } = useMCPServerTools(server.id)
   const addEntry = useAddBlocklistEntry()
   const removeEntry = useRemoveBlocklistEntry()
   const refreshTools = useRefreshMCPServerTools()
   const { toast } = useToast()
 
-  function handleBlock() {
-    const name = blockToolName.trim()
-    if (!name) return
-    addEntry.mutate(
-      { serverId: server.id, toolName: name, reason: blockReason.trim() || undefined },
-      {
-        onSuccess: () => {
-          toast({ variant: 'success', message: `Tool "${name}" blocked` })
-          setBlockToolName('')
-          setBlockReason('')
+  function handleToggleTool(toolName: string, currentlyBlocked: boolean) {
+    if (currentlyBlocked) {
+      removeEntry.mutate(
+        { serverId: server.id, toolName },
+        {
+          onSuccess: () => {
+            toast({ variant: 'success', message: `Tool "${toolName}" unblocked` })
+          },
+          onError: (err) => {
+            toast({
+              variant: 'error',
+              message: err instanceof Error ? err.message : 'Failed to unblock tool',
+            })
+          },
         },
-        onError: (err) => {
-          toast({
-            variant: 'error',
-            message: err instanceof Error ? err.message : 'Failed to block tool',
-          })
+      )
+    } else {
+      addEntry.mutate(
+        { serverId: server.id, toolName },
+        {
+          onSuccess: () => {
+            toast({ variant: 'success', message: `Tool "${toolName}" blocked` })
+          },
+          onError: (err) => {
+            toast({
+              variant: 'error',
+              message: err instanceof Error ? err.message : 'Failed to block tool',
+            })
+          },
         },
-      },
-    )
-  }
-
-  function handleUnblock(toolName: string) {
-    removeEntry.mutate(
-      { serverId: server.id, toolName },
-      {
-        onSuccess: () => {
-          toast({ variant: 'success', message: `Tool "${toolName}" unblocked` })
-        },
-        onError: (err) => {
-          toast({
-            variant: 'error',
-            message: err instanceof Error ? err.message : 'Failed to unblock tool',
-          })
-        },
-      },
-    )
+      )
+    }
   }
 
   function handleRefresh() {
@@ -620,14 +614,20 @@ function ServerExpandedRow({ server, canModify }: ServerExpandedRowProps) {
     })
   }
 
-  const entries = blocklist ?? []
+  const toolList = tools ?? []
+
+  function isToolPending(toolName: string): boolean {
+    const addPending = addEntry.isPending && addEntry.variables?.toolName === toolName
+    const removePending = removeEntry.isPending && removeEntry.variables?.toolName === toolName
+    return addPending || removePending
+  }
 
   return (
-    <div className="px-6 py-4 space-y-4">
+    <div className="px-6 py-4 space-y-3">
       {/* Header row */}
       <div className="flex items-center justify-between">
         <span className="text-xs font-medium uppercase tracking-wider text-text-tertiary">
-          Tool Blocklist
+          Tools
         </span>
         <button
           type="button"
@@ -640,76 +640,54 @@ function ServerExpandedRow({ server, canModify }: ServerExpandedRowProps) {
         </button>
       </div>
 
-      {/* Blocked tools list */}
-      {blocklistLoading ? (
+      {/* Tools list */}
+      {toolsLoading ? (
         <div className="space-y-1.5">
-          {[1, 2].map((i) => (
-            <div key={i} className="h-7 bg-bg-tertiary rounded animate-pulse" />
+          {[1, 2, 3].map((i) => (
+            <div key={i} className="h-10 bg-bg-tertiary rounded animate-pulse" />
           ))}
         </div>
-      ) : entries.length === 0 ? (
-        <p className="text-xs text-text-tertiary">No tools are currently blocked.</p>
+      ) : toolList.length === 0 ? (
+        <p className="text-xs text-text-tertiary py-1">
+          No tools cached. Click Refresh to fetch.
+        </p>
       ) : (
-        <ul className="space-y-1.5">
-          {entries.map((entry) => (
-            <li
-              key={entry.id}
-              className="flex items-center justify-between gap-3 px-3 py-2 rounded-md bg-bg-tertiary/50 border border-border"
-            >
-              <div className="flex items-center gap-2 min-w-0">
-                <span className="font-mono text-xs text-text-primary truncate">{entry.tool_name}</span>
-                {entry.reason && (
-                  <span className="text-xs text-text-tertiary truncate">{entry.reason}</span>
+        <ul className="space-y-0.5">
+          {toolList.map((tool) => (
+            <li key={tool.name}>
+              <div className="flex items-center justify-between py-2 px-3 rounded-md hover:bg-bg-tertiary transition-colors">
+                <div className="flex-1 min-w-0">
+                  <span className="font-mono text-sm text-text-primary">{tool.name}</span>
+                  {tool.description && (
+                    <p className="text-xs text-text-tertiary truncate mt-0.5">
+                      {truncateText(tool.description, 80)}
+                    </p>
+                  )}
+                </div>
+                {canModify && (
+                  <button
+                    type="button"
+                    onClick={() => handleToggleTool(tool.name, tool.blocked)}
+                    disabled={isToolPending(tool.name)}
+                    className={cn(
+                      'ml-3 px-2 py-1 text-xs rounded-md font-medium shrink-0 transition-colors disabled:opacity-40',
+                      tool.blocked
+                        ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20'
+                        : 'text-text-tertiary hover:text-text-secondary hover:bg-bg-tertiary',
+                    )}
+                  >
+                    {tool.blocked ? 'Blocked' : 'Block'}
+                  </button>
+                )}
+                {!canModify && tool.blocked && (
+                  <span className="ml-3 px-2 py-1 text-xs rounded-md font-medium shrink-0 bg-red-500/10 text-red-400">
+                    Blocked
+                  </span>
                 )}
               </div>
-              {canModify && (
-                <button
-                  type="button"
-                  onClick={() => handleUnblock(entry.tool_name)}
-                  disabled={removeEntry.isPending && removeEntry.variables?.toolName === entry.tool_name}
-                  title="Unblock tool"
-                  className="flex-shrink-0 p-1 rounded text-text-tertiary hover:text-error hover:bg-error/10 transition-colors disabled:opacity-40"
-                >
-                  <IconXSmall />
-                </button>
-              )}
             </li>
           ))}
         </ul>
-      )}
-
-      {/* Add to blocklist */}
-      {canModify && (
-        <div className="flex items-end gap-2 pt-1">
-          <div className="flex-1 min-w-0">
-            <Input
-              label="Tool name"
-              value={blockToolName}
-              onChange={(e) => setBlockToolName(e.target.value)}
-              placeholder="e.g. read_file"
-              disabled={addEntry.isPending}
-            />
-          </div>
-          <div className="flex-1 min-w-0">
-            <Input
-              label="Reason (optional)"
-              value={blockReason}
-              onChange={(e) => setBlockReason(e.target.value)}
-              placeholder="e.g. security policy"
-              disabled={addEntry.isPending}
-            />
-          </div>
-          <div className="pb-0.5">
-            <Button
-              size="sm"
-              onClick={handleBlock}
-              disabled={!blockToolName.trim()}
-              loading={addEntry.isPending}
-            >
-              Block
-            </Button>
-          </div>
-        </div>
       )}
     </div>
   )
@@ -1021,12 +999,14 @@ export default function MCPServersPage() {
         expandedKeys={expandedKeys}
         onToggleExpand={handleToggleExpand}
         renderExpandedRow={(row) => {
-          const canModify =
-            row.source !== 'yaml' &&
-            ((row.scope === 'global' && isSystemAdmin) ||
+          // Blocklist management is allowed regardless of source (YAML or API)
+          // — only the RBAC role matters. Server config editing (name, URL, etc.)
+          // is still restricted for YAML-sourced servers.
+          const canBlockTools =
+            (row.scope === 'global' && isSystemAdmin) ||
             (row.scope === 'org' && isOrgAdmin) ||
-            (row.scope === 'team' && isTeamAdmin))
-          return <ServerExpandedRow server={row} canModify={canModify} />
+            (row.scope === 'team' && isTeamAdmin)
+          return <ServerExpandedRow server={row} canModify={canBlockTools} />
         }}
       />
 

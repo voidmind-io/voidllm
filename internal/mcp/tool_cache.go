@@ -7,6 +7,19 @@ import (
 	"time"
 )
 
+// ToolStore persists and retrieves tool schemas from a backing store (typically
+// a database). When non-nil, the ToolCache writes through on every fetch and
+// loads from the store at startup for zero-HTTP-call warm starts.
+type ToolStore interface {
+	// LoadAll returns all cached tool schemas grouped by server alias.
+	LoadAll(ctx context.Context) (map[string][]Tool, error)
+	// Save persists the tool schemas for a server alias, replacing any previous entry.
+	Save(ctx context.Context, alias string, tools []Tool) error
+	// Delete removes all cached tool schemas for a server. serverID is the
+	// database ID, used because alias-based lookups fail after soft-delete.
+	Delete(ctx context.Context, serverID string) error
+}
+
 // ToolFetcher retrieves the list of tools from an MCP server identified by
 // alias. Implementations typically create an HTTPTransport, send initialize
 // + tools/list, and return the parsed tool array.
@@ -26,6 +39,7 @@ type ToolCache struct {
 	entries map[string]*cacheEntry // keyed by server alias
 	fetcher ToolFetcher
 	maxAge  time.Duration
+	store   ToolStore // optional, nil for pure in-memory
 }
 
 // NewToolCache creates a ToolCache that uses fetcher to retrieve tool schemas
@@ -37,6 +51,44 @@ func NewToolCache(fetcher ToolFetcher, maxAge time.Duration) *ToolCache {
 		fetcher: fetcher,
 		maxAge:  maxAge,
 	}
+}
+
+// NewPersistentToolCache creates a ToolCache backed by a persistent store.
+// Tools are written through to the store on every fetch and can be loaded
+// from the store at startup via LoadFromStore.
+func NewPersistentToolCache(fetcher ToolFetcher, maxAge time.Duration, store ToolStore) *ToolCache {
+	return &ToolCache{
+		entries: make(map[string]*cacheEntry),
+		fetcher: fetcher,
+		maxAge:  maxAge,
+		store:   store,
+	}
+}
+
+// LoadFromStore populates the in-memory cache from the backing store.
+// Call once at startup before serving requests. Returns nil if the store
+// is nil or empty.
+func (tc *ToolCache) LoadFromStore(ctx context.Context) error {
+	if tc.store == nil {
+		return nil
+	}
+	all, err := tc.store.LoadAll(ctx)
+	if err != nil {
+		return err
+	}
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	for alias, tools := range all {
+		// Set fetchedAt to zero so entries loaded from the DB are considered
+		// stale on first access. This ensures tools are refreshed from upstream
+		// within maxAge of startup, while still providing immediate availability
+		// for TypeScript type generation and list_servers tool counts.
+		tc.entries[alias] = &cacheEntry{
+			tools:     tools,
+			fetchedAt: time.Time{},
+		}
+	}
+	return nil
 }
 
 // isFresh reports whether e is still within maxAge. When maxAge is zero,
@@ -91,6 +143,9 @@ func (tc *ToolCache) GetTools(ctx context.Context, alias string) ([]Tool, error)
 		tools:     tools,
 		fetchedAt: time.Now(),
 	}
+	if tc.store != nil {
+		_ = tc.store.Save(ctx, alias, tools) //nolint:errcheck
+	}
 	return copyTools(tools), nil
 }
 
@@ -123,6 +178,10 @@ func (tc *ToolCache) RefreshServer(ctx context.Context, alias string) error {
 		fetchedAt: time.Now(),
 	}
 	tc.mu.Unlock()
+
+	if tc.store != nil {
+		_ = tc.store.Save(ctx, alias, tools) //nolint:errcheck
+	}
 	return nil
 }
 
@@ -152,6 +211,18 @@ func (tc *ToolCache) Invalidate(alias string) {
 	tc.mu.Lock()
 	delete(tc.entries, alias)
 	tc.mu.Unlock()
+}
+
+// InvalidateWithStore removes a server from the cache and deletes its
+// persisted tools from the backing store. serverID is the database ID,
+// needed because alias-based lookups fail after soft-delete.
+func (tc *ToolCache) InvalidateWithStore(ctx context.Context, alias, serverID string) {
+	tc.mu.Lock()
+	delete(tc.entries, alias)
+	tc.mu.Unlock()
+	if tc.store != nil {
+		_ = tc.store.Delete(ctx, serverID) //nolint:errcheck
+	}
 }
 
 // FreshFor returns how long the cache entry for alias has been fresh, measured

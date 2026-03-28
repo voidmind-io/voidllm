@@ -213,6 +213,27 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		return nil, fmt.Errorf("sync YAML MCP servers: %w", err)
 	}
 
+	// Probe all active MCP servers to detect deprecated SSE transport.
+	// Servers that only support SSE are auto-deactivated with a warning.
+	if allServers, listErr := database.ListMCPServers(ctx); listErr == nil {
+		for _, s := range allServers {
+			var token string
+			if s.AuthTokenEnc != nil && *s.AuthTokenEnc != "" {
+				token, _ = crypto.DecryptString(*s.AuthTokenEnc, encKey, []byte("mcp_server:"+s.ID))
+			}
+			transport := mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, token, 10*time.Second, cfg.Settings.MCP.AllowPrivateURLs)
+			_, probeErr := transport.ListTools(ctx)
+			transport.Close()
+			if errors.Is(probeErr, mcp.ErrSSENotSupported) {
+				isActive := false
+				database.UpdateMCPServer(ctx, s.ID, db.UpdateMCPServerParams{IsActive: &isActive}) //nolint:errcheck
+				log.WarnContext(ctx, "MCP server uses deprecated SSE transport, deactivated",
+					slog.String("alias", s.Alias),
+					slog.String("url", s.URL))
+			}
+		}
+	}
+
 	// Step 4a: build the in-memory registry from the YAML config.
 	registry, err := proxy.NewRegistry(cfg.Models)
 	if err != nil {
@@ -576,7 +597,11 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		}
 		adminHandler.CodePool = codePool
 		adminHandler.CodeExecutor = mcp.NewExecutor(codePool)
-		adminHandler.ToolCache = mcp.NewToolCache(adminHandler.MakeToolFetcher(), 10*time.Minute)
+		toolStore := &dbToolStore{db: database}
+		adminHandler.ToolCache = mcp.NewPersistentToolCache(adminHandler.MakeToolFetcher(), time.Hour, toolStore)
+		if loadErr := adminHandler.ToolCache.LoadFromStore(ctx); loadErr != nil {
+			log.WarnContext(ctx, "failed to load cached tools from DB", slog.String("error", loadErr.Error()))
+		}
 		log.LogAttrs(ctx, slog.LevelInfo, "code mode enabled",
 			slog.Int("pool_size", cfg.Settings.MCP.CodeMode.PoolSize),
 			slog.Int("memory_limit_mb", cfg.Settings.MCP.CodeMode.MemoryLimitMB),
@@ -1214,6 +1239,17 @@ func (a *Application) Start() error {
 		a.stopFuncs = append(a.stopFuncs, func() {
 			a.adminHandler.CodePool.Close()
 		})
+	}
+
+	// 24h background refresh of tool schemas from upstream MCP servers.
+	if a.adminHandler.ToolCache != nil {
+		a.stopFuncs = append(a.stopFuncs, startTicker(24*time.Hour, func() {
+			refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			if err := a.adminHandler.ToolCache.RefreshAll(refreshCtx); err != nil {
+				a.log.WarnContext(refreshCtx, "periodic tool cache refresh", slog.String("error", err.Error()))
+			}
+		}))
 	}
 
 	// Start heartbeat if a license key was configured, even if it has expired.

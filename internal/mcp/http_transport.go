@@ -21,6 +21,11 @@ import (
 // with HTTP 404, indicating the session ID is no longer valid.
 var ErrSessionExpired = errors.New("MCP session expired")
 
+// ErrSSENotSupported is returned by detectTransport when the upstream MCP
+// server uses the deprecated SSE transport (pre 2025-03-26 spec). SSE requires
+// a persistent bidirectional connection that VoidLLM does not yet support.
+var ErrSSENotSupported = errors.New("server uses deprecated SSE transport (not supported, use Streamable HTTP)")
+
 // cloudMetadataIP is the well-known link-local address used by cloud provider
 // instance metadata services (AWS, GCP, Azure, DigitalOcean, etc.).
 var cloudMetadataIP = net.ParseIP("169.254.169.254")
@@ -301,14 +306,10 @@ func (t *HTTPTransport) detectTransport(ctx context.Context) error {
 		t.postURL = t.endpoint
 		return nil
 	case http.StatusNotFound, http.StatusMethodNotAllowed:
-		// Older SSE transport — discover the POST URL via GET.
-		postURL, err := t.sseDiscover(ctx)
-		if err != nil {
-			return fmt.Errorf("sse discover: %w", err)
-		}
-		t.postURL = postURL
-		t.sseMode = true
-		return nil
+		// The upstream uses the deprecated SSE transport (pre 2025-03-26).
+		// SSE requires a persistent bidirectional connection (GET stream for
+		// responses, POST for requests) which VoidLLM does not yet support.
+		return ErrSSENotSupported
 	default:
 		return fmt.Errorf("unexpected probe status %d", resp.StatusCode)
 	}

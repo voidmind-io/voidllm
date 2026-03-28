@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -401,6 +402,15 @@ func (h *Handler) CreateMCPServer(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to create MCP server")
 	}
 
+	if h.ToolCache != nil {
+		alias := s.Alias
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			h.ToolCache.RefreshServer(ctx, alias) //nolint:errcheck
+		}()
+	}
+
 	return c.Status(fiber.StatusCreated).JSON(mcpServerToResponse(s))
 }
 
@@ -459,6 +469,15 @@ func (h *Handler) CreateOrgMCPServer(c fiber.Ctx) error {
 			return apierror.Conflict(c, "an MCP server with this alias already exists")
 		}
 		return apierror.InternalError(c, "failed to create MCP server")
+	}
+
+	if h.ToolCache != nil {
+		alias := s.Alias
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			h.ToolCache.RefreshServer(ctx, alias) //nolint:errcheck
+		}()
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(mcpServerToResponse(s))
@@ -522,6 +541,15 @@ func (h *Handler) CreateTeamMCPServer(c fiber.Ctx) error {
 			return apierror.Conflict(c, "an MCP server with this alias already exists")
 		}
 		return apierror.InternalError(c, "failed to create MCP server")
+	}
+
+	if h.ToolCache != nil {
+		alias := s.Alias
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			h.ToolCache.RefreshServer(ctx, alias) //nolint:errcheck
+		}()
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(mcpServerToResponse(s))
@@ -806,6 +834,10 @@ func (h *Handler) DeleteMCPServer(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to delete MCP server")
 	}
 
+	if h.ToolCache != nil {
+		h.ToolCache.InvalidateWithStore(ctx, existing.Alias, existing.ID)
+	}
+
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -877,6 +909,19 @@ func (h *Handler) setMCPServerActive(c fiber.Ctx, active bool) error {
 		h.Log.ErrorContext(ctx, "set mcp server active: update",
 			slog.String("id", serverID), slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to update MCP server")
+	}
+
+	if h.ToolCache != nil {
+		if active {
+			alias := updated.Alias
+			go func() {
+				rCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				h.ToolCache.RefreshServer(rCtx, alias) //nolint:errcheck
+			}()
+		} else {
+			h.ToolCache.InvalidateWithStore(ctx, updated.Alias, updated.ID)
+		}
 	}
 
 	return c.JSON(mcpServerToResponse(updated))
@@ -1125,6 +1170,93 @@ func (h *Handler) HandleRefreshMCPServerTools(c fiber.Ctx) error {
 	})
 }
 
+// mcpToolResponse is the JSON representation of a single cached MCP tool
+// returned by HandleListMCPServerTools. Blocked indicates that the tool is
+// present on the server's blocklist and will not be executed by Code Mode.
+type mcpToolResponse struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Blocked     bool   `json:"blocked"`
+}
+
+// HandleListMCPServerTools handles GET /api/v1/mcp-servers/:server_id/tools.
+// It returns the cached tool schemas for the server, annotated with each
+// tool's blocked status. If the cache is empty for this server a fetch is
+// triggered first. Requires Code Mode to be enabled (h.ToolCache non-nil).
+// Read permission is scope-checked.
+//
+// @Summary      List cached tools for an MCP server
+// @Description  Returns cached tool schemas with blocked status. Triggers an upstream fetch if the cache is empty. Access is scope-checked against the caller's role.
+// @Tags         mcp-servers
+// @Produce      json
+// @Param        server_id  path      string  true  "MCP server ID"
+// @Success      200        {array}   mcpToolResponse
+// @Failure      401        {object}  swaggerErrorResponse
+// @Failure      403        {object}  swaggerErrorResponse
+// @Failure      404        {object}  swaggerErrorResponse
+// @Failure      502        {object}  swaggerErrorResponse
+// @Failure      503        {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /mcp-servers/{server_id}/tools [get]
+func (h *Handler) HandleListMCPServerTools(c fiber.Ctx) error {
+	ctx := c.Context()
+	serverID := c.Params("server_id")
+
+	server, err := h.DB.GetMCPServer(ctx, serverID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return apierror.NotFound(c, "MCP server not found")
+		}
+		h.Log.ErrorContext(ctx, "list mcp server tools: get server",
+			slog.String("id", serverID), slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to get MCP server")
+	}
+
+	ki := auth.KeyInfoFromCtx(c)
+	if permErr := checkMCPServerReadPermission(c, server, ki); permErr != nil {
+		return permErr
+	}
+
+	if h.ToolCache == nil {
+		return apierror.Send(c, fiber.StatusServiceUnavailable, "code_mode_disabled",
+			"Code Mode is not enabled on this instance")
+	}
+
+	tools, err := h.ToolCache.GetTools(ctx, server.Alias)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "list mcp server tools: get tools",
+			slog.String("server_id", serverID),
+			slog.String("alias", server.Alias),
+			slog.String("error", err.Error()))
+		return apierror.Send(c, fiber.StatusBadGateway, "upstream_error",
+			"failed to retrieve tools from upstream MCP server")
+	}
+
+	blockedNames, err := h.DB.ListBlockedToolNames(ctx, server.ID)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "list mcp server tools: list blocklist",
+			slog.String("server_id", serverID), slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to retrieve tool blocklist")
+	}
+
+	blockedSet := make(map[string]struct{}, len(blockedNames))
+	for _, name := range blockedNames {
+		blockedSet[name] = struct{}{}
+	}
+
+	resp := make([]mcpToolResponse, len(tools))
+	for i, t := range tools {
+		_, blocked := blockedSet[t.Name]
+		resp[i] = mcpToolResponse{
+			Name:        t.Name,
+			Description: t.Description,
+			Blocked:     blocked,
+		}
+	}
+
+	return c.JSON(resp)
+}
+
 // TestMCPServerConnection handles POST /api/v1/mcp-servers/:server_id/test.
 // It sends a tools/list JSON-RPC request to the MCP server and reports the
 // number of available tools on success, or an error message on failure.
@@ -1175,6 +1307,11 @@ func (h *Handler) TestMCPServerConnection(c fiber.Ctx) error {
 
 	tools, probeErr := transport.ListTools(ctx)
 	if probeErr != nil {
+		// If the server uses deprecated SSE transport, auto-deactivate it.
+		if errors.Is(probeErr, mcp.ErrSSENotSupported) {
+			isActive := false
+			h.DB.UpdateMCPServer(ctx, s.ID, db.UpdateMCPServerParams{IsActive: &isActive}) //nolint:errcheck
+		}
 		return c.JSON(testMCPServerResponse{
 			Success: false,
 			Error:   probeErr.Error(),
