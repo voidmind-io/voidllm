@@ -550,7 +550,7 @@ export default function MCPServersPage() {
   const deleteServer = useDeleteMCPServer()
   const toggleServer = useToggleMCPServer()
   const testServer = useTestMCPServer()
-  const { toast } = useToast()
+  const { toast, update } = useToast()
 
   const allServers = servers ?? []
   const activeCount = allServers.filter((s) => s.is_active).length
@@ -649,20 +649,21 @@ export default function MCPServersPage() {
             <button
               type="button"
               onClick={() => {
+                const tid = toast({ variant: 'info', message: `Testing connection to ${row.name}...`, duration: 60000 })
                 testServer.mutate(row.id, {
                   onSuccess: (result) => {
                     if (result.success) {
                       const toolCount = result.tools != null ? ` (${result.tools} tools)` : ''
-                      toast({ variant: 'success', message: `Connection successful${toolCount}` })
+                      update(tid, { variant: 'success', message: `Connection successful${toolCount}` })
                     } else {
-                      toast({
+                      update(tid, {
                         variant: 'error',
                         message: result.error ?? 'Connection test failed',
                       })
                     }
                   },
                   onError: (err) => {
-                    toast({
+                    update(tid, {
                       variant: 'error',
                       message: err instanceof Error ? err.message : 'Connection test failed',
                     })

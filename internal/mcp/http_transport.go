@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,10 @@ import (
 	"syscall"
 	"time"
 )
+
+// ErrSessionExpired is returned by Call when the upstream MCP server responds
+// with HTTP 404, indicating the session ID is no longer valid.
+var ErrSessionExpired = errors.New("MCP session expired")
 
 // cloudMetadataIP is the well-known link-local address used by cloud provider
 // instance metadata services (AWS, GCP, Azure, DigitalOcean, etc.).
@@ -91,16 +96,27 @@ func NewHTTPTransport(endpoint, authType, authHeader, authToken string, timeout 
 }
 
 // Call sends raw JSON-RPC bytes to the remote MCP server and returns the
-// response body bytes.
-// Returns nil, nil for HTTP 202 Accepted (notification with no response body).
-// Returns an error for any non-200/non-202 status code or transport failure.
-func (t *HTTPTransport) Call(ctx context.Context, raw []byte) ([]byte, error) {
+// response body bytes along with any session ID returned by the server.
+//
+// If sessionID is non-empty it is forwarded to the upstream server via the
+// Mcp-Session-Id request header. The server may return a new or updated
+// session ID in the same response header, which is returned as newSessionID.
+//
+// Returns nil body and empty session for HTTP 202 Accepted (notification with
+// no response body). Returns ErrSessionExpired when the upstream responds with
+// HTTP 404. Returns an error for any other non-200/non-202 status or transport
+// failure.
+func (t *HTTPTransport) Call(ctx context.Context, raw []byte, sessionID string) ([]byte, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(raw))
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, "", fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+
+	if sessionID != "" {
+		req.Header.Set("Mcp-Session-Id", sessionID)
+	}
 
 	switch t.authType {
 	case "bearer":
@@ -113,33 +129,39 @@ func (t *HTTPTransport) Call(ctx context.Context, raw []byte) ([]byte, error) {
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("transport: %w", err)
+		return nil, "", fmt.Errorf("transport: %w", err)
 	}
 	defer resp.Body.Close()
+
+	newSessionID := resp.Header.Get("Mcp-Session-Id")
 
 	// Limit body reads to 10 MiB to prevent OOM on misbehaving upstream servers.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		return nil, "", fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, "", ErrSessionExpired
 	}
 
 	if resp.StatusCode == http.StatusAccepted {
 		// Notification acknowledged — no response body expected per the MCP spec.
-		return nil, nil
+		return nil, newSessionID, nil
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
+		return nil, "", fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
 	}
 
 	// If the upstream responded with SSE, extract the JSON payload from the
 	// first "data:" line. This handles MCP servers that prefer text/event-stream.
 	ct := resp.Header.Get("Content-Type")
 	if strings.HasPrefix(ct, "text/event-stream") {
-		return extractSSEData(body), nil
+		return extractSSEData(body), newSessionID, nil
 	}
 
-	return body, nil
+	return body, newSessionID, nil
 }
 
 // extractSSEData pulls the first "data:" line from an SSE response body.
@@ -155,9 +177,33 @@ func extractSSEData(body []byte) []byte {
 	return body // fallback: return as-is
 }
 
-// ListTools sends a tools/list JSON-RPC request and parses the returned tool
-// definitions. Returns nil, nil if the server responds with 202 Accepted.
+// ListTools sends initialize + tools/list to the remote server and parses
+// the returned tool definitions. It handles session management automatically.
 func (t *HTTPTransport) ListTools(ctx context.Context) ([]Tool, error) {
+	// Initialize first to establish session
+	initReq, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      0,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-03-26",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "voidllm", "version": "1.0"},
+		},
+	})
+	_, sessionID, initErr := t.Call(ctx, initReq, "")
+	if initErr != nil {
+		return nil, fmt.Errorf("initialize: %w", initErr)
+	}
+
+	// Send notifications/initialized
+	notifyReq, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/initialized",
+	})
+	t.Call(ctx, notifyReq, sessionID) //nolint:errcheck — fire-and-forget
+
+	// Now send tools/list
 	req := Request{
 		JSONRPC: "2.0",
 		ID:      json.RawMessage(`1`),
@@ -168,7 +214,7 @@ func (t *HTTPTransport) ListTools(ctx context.Context) ([]Tool, error) {
 		return nil, fmt.Errorf("marshal tools/list: %w", err)
 	}
 
-	resp, err := t.Call(ctx, raw)
+	resp, _, err := t.Call(ctx, raw, sessionID)
 	if err != nil {
 		return nil, err
 	}

@@ -35,7 +35,7 @@ func TestHTTPTransport_Call_Success(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tr := newTransport(srv.URL, "none", "", "")
-	got, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	got, _, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), "")
 	if err != nil {
 		t.Fatalf("Call() error = %v, want nil", err)
 	}
@@ -58,7 +58,7 @@ func TestHTTPTransport_Call_BearerAuth(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tr := newTransport(srv.URL, "bearer", "", token)
-	_, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	_, _, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), "")
 	if err != nil {
 		t.Fatalf("Call() error = %v, want nil", err)
 	}
@@ -84,7 +84,7 @@ func TestHTTPTransport_Call_HeaderAuth(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tr := newTransport(srv.URL, "header", headerName, token)
-	_, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	_, _, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), "")
 	if err != nil {
 		t.Fatalf("Call() error = %v, want nil", err)
 	}
@@ -108,7 +108,7 @@ func TestHTTPTransport_Call_NoAuth(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tr := newTransport(srv.URL, "none", "", "")
-	_, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	_, _, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), "")
 	if err != nil {
 		t.Fatalf("Call() error = %v, want nil", err)
 	}
@@ -143,7 +143,7 @@ func TestHTTPTransport_Call_Timeout(t *testing.T) {
 	})
 
 	tr := mcp.NewHTTPTransport(srv.URL, "none", "", "", 50*time.Millisecond, true)
-	_, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	_, _, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), "")
 	if err == nil {
 		t.Fatal("Call() error = nil, want timeout error")
 	}
@@ -161,7 +161,7 @@ func TestHTTPTransport_Call_HTTPError(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tr := newTransport(srv.URL, "none", "", "")
-	_, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	_, _, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), "")
 	if err == nil {
 		t.Fatal("Call() error = nil, want error for HTTP 500")
 	}
@@ -179,7 +179,7 @@ func TestHTTPTransport_Call_Notification_202(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tr := newTransport(srv.URL, "none", "", "")
-	resp, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","method":"notifications/ping"}`))
+	resp, _, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","method":"notifications/ping"}`), "")
 	if err != nil {
 		t.Fatalf("Call() error = %v, want nil for 202", err)
 	}
@@ -204,7 +204,7 @@ func TestHTTPTransport_Call_BodyLimit(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tr := newTransport(srv.URL, "none", "", "")
-	got, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	got, _, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), "")
 	// Must not error — body is merely truncated.
 	if err != nil {
 		t.Fatalf("Call() error = %v, want nil (body should be truncated not error)", err)

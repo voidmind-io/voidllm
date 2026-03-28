@@ -134,7 +134,7 @@ func validateMCPServerURL(rawURL string, allowPrivate bool) error {
 }
 
 // mcpTestTimeout is the per-request deadline used by TestMCPServerConnection.
-const mcpTestTimeout = 10 * time.Second
+const mcpTestTimeout = 30 * time.Second
 
 // mcpServerToResponse converts a db.MCPServer to its API wire representation.
 // The scope field is derived from the OrgID and TeamID fields: a server with

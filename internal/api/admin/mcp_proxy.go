@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -15,6 +16,11 @@ import (
 	"github.com/voidmind-io/voidllm/internal/usage"
 	"github.com/voidmind-io/voidllm/pkg/crypto"
 )
+
+// mcpSessions stores the most-recently-seen Mcp-Session-Id for each MCP server
+// alias. Keys are server alias strings; values are session ID strings.
+// Concurrent access is safe; no explicit locking is required.
+var mcpSessions sync.Map // map[string]string — server alias → Mcp-Session-Id
 
 // MCPToolCallLogger logs MCP tool call events asynchronously.
 // Implementations must be safe for concurrent use. Log must never block.
@@ -102,8 +108,45 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 
 	toolName := extractToolName(body)
 
+	// Load any existing session for this server alias.
+	var sessionID string
+	if sid, ok := mcpSessions.Load(alias); ok {
+		sessionID = sid.(string)
+	}
+
+	isInit := isInitializeRequest(body)
+
 	start := time.Now()
-	result, callErr := transport.Call(c.Context(), body)
+	result, newSID, callErr := transport.Call(c.Context(), body, sessionID)
+
+	// If the upstream reports session expired, delete the stale session and
+	// re-initialize once before retrying the original request.
+	if errors.Is(callErr, mcp.ErrSessionExpired) && !isInit {
+		mcpSessions.Delete(alias)
+
+		initBody := buildInitializeRequest()
+		_, initSID, initErr := transport.Call(c.Context(), initBody, "")
+		if initErr != nil {
+			h.Log.ErrorContext(c.Context(), "mcp proxy: re-initialize after session expiry",
+				slog.String("server", alias),
+				slog.String("error", initErr.Error()))
+			return c.Status(fiber.StatusBadGateway).JSON(
+				mcp.NewErrorResponse(nil, mcp.CodeInternalError, "upstream MCP server unavailable"))
+		}
+		if initSID != "" {
+			mcpSessions.Store(alias, initSID)
+			notifyBody := buildInitializedNotification()
+			// Fire-and-forget: ignore errors — the notification is advisory.
+			transport.Call(c.Context(), notifyBody, initSID) //nolint:errcheck
+		}
+		// Retry the original request with the freshly established session.
+		result, newSID, callErr = transport.Call(c.Context(), body, initSID)
+	}
+
+	if newSID != "" {
+		mcpSessions.Store(alias, newSID)
+	}
+
 	duration := time.Since(start)
 
 	status := "success"
@@ -211,6 +254,47 @@ func extractToolName(body []byte) string {
 		return req.Method
 	}
 	return "unknown"
+}
+
+// isInitializeRequest reports whether body is an MCP initialize JSON-RPC call.
+func isInitializeRequest(body []byte) bool {
+	var req struct {
+		Method string `json:"method"`
+	}
+	json.Unmarshal(body, &req) //nolint:errcheck — best-effort parse
+	return req.Method == "initialize"
+}
+
+// buildInitializeRequest returns a minimal MCP initialize JSON-RPC request
+// that VoidLLM sends on behalf of the downstream client when re-establishing
+// an expired session.
+func buildInitializeRequest() []byte {
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      0,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-03-26",
+			"capabilities":    map[string]any{},
+			"clientInfo": map[string]any{
+				"name":    "voidllm",
+				"version": "1.0",
+			},
+		},
+	}
+	b, _ := json.Marshal(req)
+	return b
+}
+
+// buildInitializedNotification returns the notifications/initialized JSON-RPC
+// notification that must be sent after a successful initialize handshake.
+func buildInitializedNotification() []byte {
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/initialized",
+	}
+	b, _ := json.Marshal(req)
+	return b
 }
 
 // mcpServerAAD returns the additional authenticated data used when
