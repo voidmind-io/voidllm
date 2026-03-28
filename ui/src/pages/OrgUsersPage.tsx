@@ -6,6 +6,7 @@ import { Badge } from '../components/ui/Badge'
 import { Button } from '../components/ui/Button'
 import { Input } from '../components/ui/Input'
 import { Select } from '../components/ui/Select'
+import TabSwitcher from '../components/ui/TabSwitcher'
 import { StatCard } from '../components/ui/StatCard'
 import { CopyButton } from '../components/ui/CopyButton'
 import { TimeAgo } from '../components/ui/TimeAgo'
@@ -25,8 +26,8 @@ import { useToast } from '../hooks/useToast'
 // ---------------------------------------------------------------------------
 
 const ROLE_OPTIONS = [
-  { value: 'member', label: 'Member' },
   { value: 'org_admin', label: 'Org Admin' },
+  { value: 'member', label: 'Member' },
 ]
 
 function roleVariant(role: string): 'default' | 'muted' {
@@ -212,15 +213,16 @@ function InviteUserDialog({ open, onClose, orgId }: InviteUserDialogProps) {
           />
         </div>
         <div>
-          <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-1.5">
+          <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-2">
             Role
           </p>
-          <Select
-            options={ROLE_OPTIONS}
-            value={role}
-            onChange={setRole}
-            disabled={createInvite.isPending}
-          />
+          <div className="-mb-4">
+            <TabSwitcher
+              tabs={ROLE_OPTIONS.map(o => ({ key: o.value, label: o.label }))}
+              activeKey={role}
+              onChange={setRole}
+            />
+          </div>
         </div>
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="secondary" onClick={handleClose} disabled={createInvite.isPending}>

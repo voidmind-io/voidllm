@@ -245,19 +245,6 @@ function CreateServiceAccountDialog({ open, onClose, orgId }: CreateServiceAccou
       <form onSubmit={handleSubmit} className="space-y-5" noValidate>
         <div className="space-y-1.5">
           <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
-            Name
-          </p>
-          <Input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. ci-deploy-bot"
-            error={nameError}
-            disabled={createServiceAccount.isPending}
-          />
-        </div>
-
-        <div className="space-y-1.5">
-          <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
             Team
           </p>
           <Select
@@ -269,6 +256,19 @@ function CreateServiceAccountDialog({ open, onClose, orgId }: CreateServiceAccou
             }}
             placeholder={isOrgAdmin ? 'Org-scoped (no team)' : 'Select a team...'}
             error={teamError}
+            disabled={createServiceAccount.isPending}
+          />
+        </div>
+
+        <div className="space-y-1.5">
+          <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
+            Name
+          </p>
+          <Input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. ci-deploy-bot"
+            error={nameError}
             disabled={createServiceAccount.isPending}
           />
         </div>
