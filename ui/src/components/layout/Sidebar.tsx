@@ -175,6 +175,17 @@ function IconPersonPlus() {
   )
 }
 
+function IconPlug() {
+  return (
+    <svg {...iconProps}>
+      <path d="M12 22v-5" />
+      <path d="M9 8V2" />
+      <path d="M15 8V2" />
+      <path d="M18 8H6a2 2 0 0 0-2 2v3a6 6 0 0 0 12 0v-3a2 2 0 0 0-2-2z" />
+    </svg>
+  )
+}
+
 function buildNavigation(hasFeature: (f: string) => boolean): NavGroup[] {
   return [
     {
@@ -190,6 +201,7 @@ function buildNavigation(hasFeature: (f: string) => boolean): NavGroup[] {
         { label: 'Keys', path: '/keys', icon: <IconKey /> },
         { label: 'Teams', path: '/teams', icon: <IconUsers />, minRole: 'team_admin', end: false },
         { label: 'Service Accounts', path: '/service-accounts', icon: <IconBot /> },
+        { label: 'MCP Servers', path: '/mcp-servers', icon: <IconPlug /> },
       ],
     },
     {

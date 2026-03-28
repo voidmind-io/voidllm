@@ -131,19 +131,13 @@ models:
 
 **Circuit breakers:** Each deployment has its own circuit breaker. After repeated failures a deployment is temporarily removed from rotation and automatically recovers.
 
-## MCP Server
+## MCP
 
-VoidLLM exposes a [Model Context Protocol](https://modelcontextprotocol.io) endpoint at `/api/v1/mcp/voidllm` for IDE integration. No additional configuration needed — the MCP server starts automatically when VoidLLM runs.
+VoidLLM is an MCP Gateway — it exposes built-in management tools and proxies requests to external MCP servers with access control, usage tracking, and session management.
 
-**Endpoints:**
-- `POST /api/v1/mcp/voidllm` — JSON-RPC 2.0 requests (JSON or SSE response based on `Accept` header)
-- `GET /api/v1/mcp/voidllm` — SSE stream for legacy MCP clients (sends endpoint event + keep-alive pings)
+### Built-in VoidLLM Tools
 
-**Protocol:** JSON-RPC 2.0 over Streamable HTTP (MCP spec version `2025-03-26`). Supports both `application/json` and `text/event-stream` response formats.
-
-**Authentication:** Standard VoidLLM Bearer token — same API key used for the proxy.
-
-**Tools:**
+The built-in MCP server at `/api/v1/mcp/voidllm` provides management tools for IDE integration.
 
 | Tool | Description | Min Role |
 |---|---|---|
@@ -154,16 +148,49 @@ VoidLLM exposes a [Model Context Protocol](https://modelcontextprotocol.io) endp
 | `create_key` | Create API key with optional expiry | member |
 | `list_deployments` | Deployment details for a model | system_admin |
 
-**IDE Setup (Claude Code / Cursor):**
+### External MCP Servers
 
-Add to `.mcp.json`:
+Register external MCP servers (GitHub, Zapier, custom tools) and proxy requests through VoidLLM. Access any registered server via `/api/v1/mcp/:alias`.
 
+**Scoping:** MCP servers can be registered at three levels:
+
+| Scope | Created by | Visible to |
+|---|---|---|
+| Global | system_admin | All orgs (via access control) |
+| Organization | org_admin | Members of that org |
+| Team | team_admin | Members of that team |
+
+**Session management:** VoidLLM automatically handles MCP sessions with upstream servers. On the first request, VoidLLM sends `initialize` to the upstream, stores the `Mcp-Session-Id`, and includes it on all subsequent requests. Expired sessions (404) trigger automatic re-initialization with a single retry. Sessions are per VoidLLM instance, in-memory only.
+
+**Alias shadowing:** A team-scoped server with alias "github" takes priority over an org-scoped or global server with the same alias. Resolution order: team → org → global.
+
+### Endpoints
+
+```
+POST /api/v1/mcp/:alias                — Proxy JSON-RPC to any registered MCP server
+GET  /api/v1/mcp/:alias                — SSE stream (built-in voidllm server only)
+
+POST /api/v1/mcp-servers               — Register global server (system_admin)
+GET  /api/v1/mcp-servers               — List global servers (system_admin)
+POST /api/v1/orgs/:id/mcp-servers      — Register org-scoped server (org_admin)
+GET  /api/v1/orgs/:id/mcp-servers      — List org + global servers (member)
+POST /api/v1/orgs/:id/teams/:id/mcp-servers  — Register team-scoped server (team_admin)
+GET  /api/v1/orgs/:id/teams/:id/mcp-servers  — List team + org + global servers (member)
+```
+
+### Protocol
+
+JSON-RPC 2.0 over Streamable HTTP (MCP spec version `2025-03-26`). Supports both `application/json` and `text/event-stream` response formats. Authentication via standard VoidLLM Bearer token.
+
+### IDE Setup (Claude Code / Cursor)
+
+Built-in VoidLLM tools:
 ```json
 {
   "mcpServers": {
     "voidllm": {
       "type": "http",
-      "url": "https://your-voidllm-instance:8080/api/v1/mcp/voidllm",
+      "url": "https://your-voidllm-instance/api/v1/mcp/voidllm",
       "headers": {
         "Authorization": "Bearer vl_uk_your_key"
       }
@@ -172,7 +199,50 @@ Add to `.mcp.json`:
 }
 ```
 
-**Privacy:** MCP tool call arguments and results are not logged or stored. Consistent with VoidLLM's zero-knowledge proxy architecture.
+External server via VoidLLM proxy:
+```json
+{
+  "mcpServers": {
+    "github": {
+      "type": "http",
+      "url": "https://your-voidllm-instance/api/v1/mcp/github",
+      "headers": {
+        "Authorization": "Bearer vl_uk_your_key"
+      }
+    }
+  }
+}
+```
+
+### Configuration
+
+```yaml
+settings:
+  mcp:
+    call_timeout: 30s            # Max duration per proxied tool call (default: 30s)
+    allow_private_urls: false     # Allow localhost/private IPs for MCP server URLs
+
+mcp_servers:
+  - name: GitHub
+    alias: github
+    url: https://mcp.github.com/sse
+    auth_type: bearer
+    auth_token: ${GITHUB_TOKEN}
+```
+
+MCP servers declared here are synced to the database at startup with `source: yaml`. Servers created via the Admin API (`source: api`) are never overwritten by YAML entries.
+
+### Privacy
+
+MCP tool call arguments and results are not logged or stored. Only metadata is tracked: who called which tool on which server, duration, and status. Consistent with VoidLLM's zero-knowledge architecture.
+
+### Metrics
+
+```
+voidllm_mcp_tool_calls_total{server, tool, status}
+voidllm_mcp_tool_call_duration_seconds{server, tool}
+voidllm_mcp_transport_errors_total{server, error_type}
+```
 
 ## Settings
 

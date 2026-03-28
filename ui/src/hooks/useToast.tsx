@@ -10,7 +10,8 @@ export interface ToastMessage {
 }
 
 export interface ToastContextValue {
-  toast: (opts: Omit<ToastMessage, 'id' | 'duration'> & { duration?: number }) => void
+  toast: (opts: Omit<ToastMessage, 'id' | 'duration'> & { duration?: number }) => string
+  update: (id: string, opts: Omit<ToastMessage, 'id' | 'duration'> & { duration?: number }) => void
   dismiss: (id: string) => void
 }
 
@@ -184,19 +185,28 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   }, [])
 
   const toast = useCallback(
-    (opts: Omit<ToastMessage, 'id' | 'duration'> & { duration?: number }) => {
+    (opts: Omit<ToastMessage, 'id' | 'duration'> & { duration?: number }): string => {
       const id = crypto.randomUUID()
       const duration = opts.duration ?? DEFAULT_DURATION[opts.variant]
       setToasts((prev) => {
         const next = [...prev, { ...opts, id, duration }]
         return next.length > 5 ? next.slice(next.length - 5) : next
       })
+      return id
+    },
+    [],
+  )
+
+  const update = useCallback(
+    (id: string, opts: Omit<ToastMessage, 'id' | 'duration'> & { duration?: number }) => {
+      const duration = opts.duration ?? DEFAULT_DURATION[opts.variant]
+      setToasts((prev) => prev.map((t) => (t.id === id ? { ...opts, id, duration } : t)))
     },
     [],
   )
 
   return (
-    <ToastContext.Provider value={{ toast, dismiss }}>
+    <ToastContext.Provider value={{ toast, update, dismiss }}>
       {children}
       <ToastContainer toasts={toasts} onDismiss={dismiss} />
     </ToastContext.Provider>

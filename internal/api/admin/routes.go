@@ -157,12 +157,39 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 	// License — any authenticated user may inspect the current license.
 	api.Get("/license", auth.RequireRole(auth.RoleMember), handler.GetLicense)
 
-	// MCP server — any authenticated caller may send MCP requests; individual
-	// tools enforce their own RBAC checks via the injected KeyIdentity.
-	// GET opens a persistent SSE stream (legacy SSE transport); POST handles
-	// JSON-RPC requests and responds with JSON or SSE based on the Accept header.
+	// MCP gateway — any authenticated caller may send MCP requests.
+	// The :alias parameter routes to the built-in "voidllm" server or any
+	// registered external MCP server. Individual tools enforce their own RBAC
+	// checks via the injected KeyIdentity.
+	// GET opens a persistent SSE stream (legacy SSE transport for "voidllm");
+	// POST handles JSON-RPC and responds with JSON or SSE per the Accept header.
 	if handler.MCPServer != nil {
-		api.Post("/mcp/voidllm", handler.HandleMCP)
-		api.Get("/mcp/voidllm", handler.HandleMCPSSE)
+		api.Post("/mcp/:alias", handler.HandleMCPProxy)
+		api.Get("/mcp/:alias", handler.HandleMCPProxySSE)
 	}
+
+	// MCP Servers — global resources (system_admin only for write; handler checks
+	// scope permissions for shared read/mutate routes).
+	// Static sub-paths (:server_id/test) are registered before /:server_id
+	// so Fiber does not treat "test" as a server_id parameter value.
+	api.Post("/mcp-servers", auth.RequireRole(auth.RoleSystemAdmin), handler.CreateMCPServer)
+	api.Get("/mcp-servers", auth.RequireRole(auth.RoleSystemAdmin), handler.ListMCPServers)
+
+	// Org-scoped MCP Servers.
+	api.Post("/orgs/:org_id/mcp-servers", auth.RequireRole(auth.RoleOrgAdmin), handler.CreateOrgMCPServer)
+	api.Get("/orgs/:org_id/mcp-servers", auth.RequireRole(auth.RoleMember), handler.ListOrgMCPServers)
+
+	// Team-scoped MCP Servers.
+	api.Post("/orgs/:org_id/teams/:team_id/mcp-servers", auth.RequireRole(auth.RoleTeamAdmin), handler.CreateTeamMCPServer)
+	api.Get("/orgs/:org_id/teams/:team_id/mcp-servers", auth.RequireRole(auth.RoleMember), handler.ListTeamMCPServers)
+
+	// Shared MCP server operations — handler enforces scope-based ownership.
+	// Static sub-paths (activate, deactivate, test) are registered before
+	// /:server_id so Fiber does not treat them as server_id parameter values.
+	api.Get("/mcp-servers/:server_id", auth.RequireRole(auth.RoleMember), handler.GetMCPServer)
+	api.Patch("/mcp-servers/:server_id", auth.RequireRole(auth.RoleMember), handler.UpdateMCPServer)
+	api.Delete("/mcp-servers/:server_id", auth.RequireRole(auth.RoleMember), handler.DeleteMCPServer)
+	api.Patch("/mcp-servers/:server_id/activate", auth.RequireRole(auth.RoleMember), handler.ActivateMCPServer)
+	api.Patch("/mcp-servers/:server_id/deactivate", auth.RequireRole(auth.RoleMember), handler.DeactivateMCPServer)
+	api.Post("/mcp-servers/:server_id/test", auth.RequireRole(auth.RoleMember), handler.TestMCPServerConnection)
 }

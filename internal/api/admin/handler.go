@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
@@ -53,6 +54,15 @@ type Handler struct {
 	// MCPServer is the MCP JSON-RPC server for AI assistant tool access. Nil
 	// when MCP is not configured — the route is only registered when non-nil.
 	MCPServer *mcp.Server
+	// MCPCallTimeout is the maximum duration for a single proxied MCP tool call
+	// to an external server. Zero falls back to a 30-second default.
+	MCPCallTimeout time.Duration
+	// MCPLogger receives asynchronous usage events for proxied MCP tool calls.
+	// Nil disables usage logging for MCP proxy calls.
+	MCPLogger MCPToolCallLogger
+	// MCPAllowPrivateURLs disables SSRF protection for MCP server URLs.
+	// Set via YAML config only — not exposed in Admin API.
+	MCPAllowPrivateURLs bool
 }
 
 // swaggerErrorResponse is the standard API error envelope used in OpenAPI docs.

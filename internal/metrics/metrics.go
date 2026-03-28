@@ -148,6 +148,32 @@ func RegisterDBCollectors(sqlDB *sql.DB) {
 	))
 }
 
+// MCPToolCallsTotal counts MCP tool calls proxied to external servers, partitioned
+// by server alias, tool name, and call status ("success", "error", or "timeout").
+var MCPToolCallsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "voidllm",
+	Name:      "mcp_tool_calls_total",
+	Help:      "Total MCP tool calls proxied to external servers.",
+}, []string{"server", "tool", "status"})
+
+// MCPToolCallDurationSeconds observes the round-trip duration of each proxied
+// MCP tool call in seconds, labelled by server alias and tool name.
+var MCPToolCallDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Namespace: "voidllm",
+	Name:      "mcp_tool_call_duration_seconds",
+	Help:      "Duration of proxied MCP tool calls.",
+	Buckets:   []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10},
+}, []string{"server", "tool"})
+
+// MCPTransportErrorsTotal counts transport-level failures when contacting
+// external MCP servers (i.e. the HTTP client returned a non-nil error),
+// partitioned by server alias and error type.
+var MCPTransportErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "voidllm",
+	Name:      "mcp_transport_errors_total",
+	Help:      "Total MCP transport errors when proxying to external servers.",
+}, []string{"server", "error_type"})
+
 // RegisterUsageCollector registers the usage buffer depth metric against the
 // default Prometheus registry. The gauge is implemented as a GaugeFunc that
 // reads the current channel length on each scrape.

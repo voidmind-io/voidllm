@@ -8,6 +8,7 @@ import { Badge } from '../components/ui/Badge'
 import { Button } from '../components/ui/Button'
 import { Input } from '../components/ui/Input'
 import { Select } from '../components/ui/Select'
+import TabSwitcher from '../components/ui/TabSwitcher'
 import { Toggle } from '../components/ui/Toggle'
 import { KeyHint } from '../components/ui/KeyHint'
 import { TimeAgo } from '../components/ui/TimeAgo'
@@ -402,13 +403,15 @@ function CreateKeyDialog({ open, onClose, onCreated, orgId }: CreateKeyDialogPro
           error={nameError}
           disabled={createKey.isPending}
         />
-        <Select
-          label="Key Type"
-          options={KEY_TYPE_OPTIONS}
-          value={keyType}
-          onChange={handleKeyTypeChange}
-          disabled={createKey.isPending}
-        />
+        <div>
+          <label className="block text-xs font-medium tracking-wider uppercase text-text-tertiary mb-2">Key Type</label>
+          <TabSwitcher
+            tabs={KEY_TYPE_OPTIONS.map(o => ({ key: o.value, label: o.label }))}
+            activeKey={keyType}
+            onChange={handleKeyTypeChange}
+            className="mb-0"
+          />
+        </div>
         {showTeamPicker && (
           <Select
             label="Team"

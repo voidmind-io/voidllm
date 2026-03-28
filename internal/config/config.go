@@ -14,13 +14,14 @@ import (
 
 // Config is the top-level configuration structure for VoidLLM.
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	Database DatabaseConfig `yaml:"database"`
-	Cache    CacheConfig    `yaml:"cache"`
-	Redis    RedisConfig    `yaml:"redis"`
-	Models   []ModelConfig  `yaml:"models"`
-	Settings SettingsConfig `yaml:"settings"`
-	Logging  LoggingConfig  `yaml:"logging"`
+	Server     ServerConfig      `yaml:"server"`
+	Database   DatabaseConfig    `yaml:"database"`
+	Cache      CacheConfig       `yaml:"cache"`
+	Redis      RedisConfig       `yaml:"redis"`
+	Models     []ModelConfig     `yaml:"models"`
+	MCPServers []MCPServerConfig `yaml:"mcp_servers"`
+	Settings   SettingsConfig    `yaml:"settings"`
+	Logging    LoggingConfig     `yaml:"logging"`
 }
 
 // ServerConfig holds configuration for both the proxy and admin HTTP servers.
@@ -284,6 +285,52 @@ func (s SSOConfig) LogValue() slog.Value {
 	)
 }
 
+// MCPServerConfig defines a single MCP server entry in the static registry.
+// Servers declared here are upserted into the database at startup with
+// source="yaml". API-created servers (source="api") are never overwritten by
+// YAML entries.
+type MCPServerConfig struct {
+	// Name is the human-readable display name of the MCP server (required).
+	Name string `yaml:"name"`
+	// Alias is the stable short identifier used in URLs and tool call logs (required).
+	// Must be lowercase alphanumeric and hyphens, e.g. "github".
+	Alias string `yaml:"alias"`
+	// URL is the base endpoint of the MCP server (required). Must start with
+	// http:// or https://.
+	URL string `yaml:"url"`
+	// AuthType controls how VoidLLM authenticates to the upstream server.
+	// Valid values: "none", "bearer", "header". Defaults to "none" when empty.
+	AuthType string `yaml:"auth_type"`
+	// AuthHeader is the HTTP header name used when AuthType is "header".
+	AuthHeader string `yaml:"auth_header"`
+	// AuthToken is the plaintext credential. It is encrypted with AES-256-GCM
+	// before being written to the database and is redacted from all logs.
+	AuthToken string `yaml:"auth_token" json:"-"`
+}
+
+// LogValue implements slog.LogValuer to prevent the auth token from appearing
+// in log output.
+func (c MCPServerConfig) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("name", c.Name),
+		slog.String("alias", c.Alias),
+		slog.String("url", c.URL),
+		slog.String("auth_token", "[REDACTED]"),
+	)
+}
+
+// MCPConfig holds configuration for the MCP Gateway subsystem.
+type MCPConfig struct {
+	// CallTimeout is the maximum duration for a single proxied MCP tool call.
+	// Defaults to 30 seconds.
+	CallTimeout time.Duration `yaml:"call_timeout"`
+	// AllowPrivateURLs disables SSRF protection for MCP server URLs, permitting
+	// localhost, private IPs, and link-local addresses. Enable this for internal
+	// deployments where MCP servers run on the same network. Default: false.
+	// This setting is only configurable via YAML/ENV — not via Admin API/UI.
+	AllowPrivateURLs bool `yaml:"allow_private_urls"`
+}
+
 // HealthCheckConfig holds configuration for the upstream model health monitoring subsystem.
 type HealthCheckConfig struct {
 	// Health configures the lightweight GET / reachability probe.
@@ -321,6 +368,7 @@ type SettingsConfig struct {
 	TokenCounting  TokenCountingConfig  `yaml:"token_counting"`
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
 	HealthCheck    HealthCheckConfig    `yaml:"health_check"`
+	MCP            MCPConfig            `yaml:"mcp"`
 	// SoftLimitThreshold uses *float64 so that an explicit 0.0 can be
 	// distinguished from the zero value after unmarshalling. Use
 	// GetSoftLimitThreshold to read the value.
@@ -606,6 +654,11 @@ func (c *Config) setDefaults() {
 	}
 	if c.Settings.HealthCheck.Functional.Enabled && c.Settings.HealthCheck.Functional.Interval < 60*time.Second {
 		c.Settings.HealthCheck.Functional.Interval = 60 * time.Second
+	}
+
+	// MCP Gateway
+	if c.Settings.MCP.CallTimeout == 0 {
+		c.Settings.MCP.CallTimeout = 30 * time.Second
 	}
 
 	// Logging

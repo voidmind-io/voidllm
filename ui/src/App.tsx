@@ -30,6 +30,7 @@ import ProfilePage from './pages/ProfilePage'
 import AuditLogPage from './pages/AuditLogPage'
 import PlaygroundPage from './pages/PlaygroundPage'
 import SystemUsersPage from './pages/SystemUsersPage'
+import MCPServersPage from './pages/MCPServersPage'
 import { ToastProvider } from './hooks/useToast'
 import { Shell } from './components/layout/Shell'
 import { PageHeader } from './components/ui/PageHeader'
@@ -104,6 +105,7 @@ export default function App() {
                 <Route path="sso" element={<OrgDetailSSOTab />} />
               </Route>
               <Route path="users" element={<SystemUsersPage />} />
+              <Route path="mcp-servers" element={<MCPServersPage />} />
               <Route
                 path="*"
                 element={

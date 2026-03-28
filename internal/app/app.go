@@ -73,6 +73,7 @@ type Application struct {
 	rateLimiter   ratelimit.Checker
 	tokenCounter  *ratelimit.TokenCounter
 	usageLogger   *usage.Logger
+	mcpLogger     *usage.MCPLogger
 	auditLogger   *audit.Logger
 	healthChecker *health.Checker
 
@@ -205,6 +206,9 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// and can be discovered by the Admin API.
 	if err := database.SyncYAMLModels(ctx, cfg.Models, encKey); err != nil {
 		return nil, fmt.Errorf("sync YAML models: %w", err)
+	}
+	if err := database.SyncYAMLMCPServers(ctx, cfg.MCPServers, encKey); err != nil {
+		return nil, fmt.Errorf("sync YAML MCP servers: %w", err)
 	}
 
 	// Step 4a: build the in-memory registry from the YAML config.
@@ -738,6 +742,11 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		},
 	})
 	adminHandler.MCPServer = mcpServer
+	adminHandler.MCPCallTimeout = cfg.Settings.MCP.CallTimeout
+	adminHandler.MCPAllowPrivateURLs = cfg.Settings.MCP.AllowPrivateURLs
+
+	mcpLogger := usage.NewMCPLogger(database, 1000, log)
+	adminHandler.MCPLogger = mcpLogger
 
 	success = true
 	return &Application{
@@ -757,6 +766,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		rateLimiter:     rateLimiter,
 		tokenCounter:    tokenCounter,
 		usageLogger:     usageLogger,
+		mcpLogger:       mcpLogger,
 		auditLogger:     auditLogger,
 		healthChecker:   healthChecker,
 		shutdownState:   shutdownState,
@@ -1023,8 +1033,11 @@ func (a *Application) cleanup(ctx context.Context) {
 		a.stopFuncs[i]()
 	}
 
-	// Flush buffered usage and audit events.
+	// Flush buffered usage, MCP, and audit events.
 	a.usageLogger.Stop()
+	if a.mcpLogger != nil {
+		a.mcpLogger.Stop()
+	}
 	if a.auditLogger != nil {
 		a.auditLogger.Stop()
 	}
