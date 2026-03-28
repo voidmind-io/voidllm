@@ -216,13 +216,12 @@ function InviteUserDialog({ open, onClose, orgId }: InviteUserDialogProps) {
           <p className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary mb-2">
             Role
           </p>
-          <div className="-mb-4">
-            <TabSwitcher
-              tabs={ROLE_OPTIONS.map(o => ({ key: o.value, label: o.label }))}
-              activeKey={role}
-              onChange={setRole}
-            />
-          </div>
+          <TabSwitcher
+            tabs={ROLE_OPTIONS.map(o => ({ key: o.value, label: o.label }))}
+            activeKey={role}
+            onChange={setRole}
+            className="mb-0"
+          />
         </div>
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="secondary" onClick={handleClose} disabled={createInvite.isPending}>

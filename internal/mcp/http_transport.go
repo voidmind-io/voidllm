@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -99,7 +100,7 @@ func (t *HTTPTransport) Call(ctx context.Context, raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
 
 	switch t.authType {
 	case "bearer":
@@ -131,7 +132,27 @@ func (t *HTTPTransport) Call(ctx context.Context, raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
 	}
 
+	// If the upstream responded with SSE, extract the JSON payload from the
+	// first "data:" line. This handles MCP servers that prefer text/event-stream.
+	ct := resp.Header.Get("Content-Type")
+	if strings.HasPrefix(ct, "text/event-stream") {
+		return extractSSEData(body), nil
+	}
+
 	return body, nil
+}
+
+// extractSSEData pulls the first "data:" line from an SSE response body.
+func extractSSEData(body []byte) []byte {
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		if bytes.HasPrefix(line, []byte("data: ")) {
+			return bytes.TrimPrefix(line, []byte("data: "))
+		}
+		if bytes.HasPrefix(line, []byte("data:")) {
+			return bytes.TrimPrefix(line, []byte("data:"))
+		}
+	}
+	return body // fallback: return as-is
 }
 
 // ListTools sends a tools/list JSON-RPC request and parses the returned tool

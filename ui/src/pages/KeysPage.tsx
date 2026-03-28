@@ -405,13 +405,12 @@ function CreateKeyDialog({ open, onClose, onCreated, orgId }: CreateKeyDialogPro
         />
         <div>
           <label className="block text-xs font-medium tracking-wider uppercase text-text-tertiary mb-2">Key Type</label>
-          <div className="-mb-4">
-            <TabSwitcher
-              tabs={KEY_TYPE_OPTIONS.map(o => ({ key: o.value, label: o.label }))}
-              activeKey={keyType}
-              onChange={handleKeyTypeChange}
-            />
-          </div>
+          <TabSwitcher
+            tabs={KEY_TYPE_OPTIONS.map(o => ({ key: o.value, label: o.label }))}
+            activeKey={keyType}
+            onChange={handleKeyTypeChange}
+            className="mb-0"
+          />
         </div>
         {showTeamPicker && (
           <Select

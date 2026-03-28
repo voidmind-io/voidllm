@@ -9,11 +9,12 @@ export interface TabSwitcherProps {
   tabs: Tab[]
   activeKey: string
   onChange: (key: string) => void
+  className?: string
 }
 
-export default function TabSwitcher({ tabs, activeKey, onChange }: TabSwitcherProps) {
+export default function TabSwitcher({ tabs, activeKey, onChange, className }: TabSwitcherProps) {
   return (
-    <div role="tablist" className="inline-flex gap-1 rounded-lg bg-bg-tertiary p-1 mb-6">
+    <div role="tablist" className={cn('inline-flex gap-1 rounded-lg bg-bg-tertiary p-1', className ?? 'mb-6')}>
       {tabs.map((tab) => (
         <button
           key={tab.key}

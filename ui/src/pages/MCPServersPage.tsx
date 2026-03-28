@@ -235,9 +235,16 @@ function CreateMCPServerDialog({
       params.auth_header = authHeader.trim()
     }
 
-    let endpoint = '/mcp-servers'
-    if (scope === 'org' && orgId) endpoint = `/orgs/${orgId}/mcp-servers`
-    if (scope === 'team' && orgId && teamId) endpoint = `/orgs/${orgId}/teams/${teamId}/mcp-servers`
+    let endpoint: string
+    if (scope === 'global') {
+      endpoint = '/mcp-servers'
+    } else if (scope === 'org') {
+      if (!orgId) { toast({ variant: 'error', message: 'Organization context required' }); return }
+      endpoint = `/orgs/${orgId}/mcp-servers`
+    } else {
+      if (!orgId || !teamId) { toast({ variant: 'error', message: 'Organization and team required' }); return }
+      endpoint = `/orgs/${orgId}/teams/${teamId}/mcp-servers`
+    }
 
     setIsPending(true)
     apiClient<MCPServerResponse>(endpoint, {
@@ -322,13 +329,12 @@ function CreateMCPServerDialog({
         />
         <div>
           <label className="block text-xs font-medium tracking-wider uppercase text-text-tertiary mb-2">Auth Type</label>
-          <div className="-mb-4">
-            <TabSwitcher
-              tabs={AUTH_TYPE_OPTIONS.map(o => ({ key: o.value, label: o.label }))}
-              activeKey={authType}
-              onChange={setAuthType}
-            />
-          </div>
+          <TabSwitcher
+            tabs={AUTH_TYPE_OPTIONS.map(o => ({ key: o.value, label: o.label }))}
+            activeKey={authType}
+            onChange={setAuthType}
+            className="mb-0"
+          />
         </div>
         {authType !== 'none' && (
           <Input
@@ -471,13 +477,12 @@ function EditMCPServerDialog({ server, onClose }: EditMCPServerDialogProps) {
         />
         <div>
           <label className="block text-xs font-medium tracking-wider uppercase text-text-tertiary mb-2">Auth Type</label>
-          <div className="-mb-4">
-            <TabSwitcher
-              tabs={AUTH_TYPE_OPTIONS.map(o => ({ key: o.value, label: o.label }))}
-              activeKey={authType}
-              onChange={setAuthType}
-            />
-          </div>
+          <TabSwitcher
+            tabs={AUTH_TYPE_OPTIONS.map(o => ({ key: o.value, label: o.label }))}
+            activeKey={authType}
+            onChange={setAuthType}
+            className="mb-0"
+          />
         </div>
         {authType !== 'none' && (
           <Input

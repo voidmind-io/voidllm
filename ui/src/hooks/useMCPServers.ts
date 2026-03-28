@@ -55,20 +55,6 @@ export function useOrgMCPServers(orgId: string) {
   })
 }
 
-export function useCreateMCPServer() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (params: CreateMCPServerParams) =>
-      apiClient<MCPServerResponse>('/mcp-servers', {
-        method: 'POST',
-        body: JSON.stringify(params),
-      }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['mcp-servers'] })
-    },
-  })
-}
-
 export function useUpdateMCPServer() {
   const queryClient = useQueryClient()
   return useMutation({
