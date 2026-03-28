@@ -117,9 +117,9 @@ type VoidLLMDeps struct {
 	SearchMCPTools func(ctx context.Context, query string, serverAliases []string) ([]map[string]any, error)
 }
 
-// RegisterVoidLLMTools registers all built-in VoidLLM management tools on the
-// given MCP server. The tools cover model listing, health inspection, usage
-// statistics, key management, and deployment inspection.
+// RegisterVoidLLMTools registers the VoidLLM management tools on the given MCP
+// server. The tools cover model listing, health inspection, usage statistics,
+// key management, and deployment inspection.
 //
 // Dependencies are injected via deps so the mcp package remains decoupled from
 // VoidLLM internals. All function fields in deps must be non-nil.
@@ -214,56 +214,63 @@ func RegisterVoidLLMTools(s *Server, deps VoidLLMDeps) {
 			Required: []string{"model_id"},
 		},
 	}, makeListDeployments(deps))
+}
 
-	if deps.ExecuteCode != nil {
-		s.RegisterTool(Tool{
-			Name:        "list_servers",
-			Description: "List MCP servers available for Code Mode execution. Shows server names, aliases, and tool counts.",
-			InputSchema: InputSchema{
-				Type: "object",
-			},
-		}, makeListServers(deps))
-
-		s.RegisterTool(Tool{
-			Name:        "search_tools",
-			Description: "Search for MCP tools across accessible servers by keyword. Returns matching tool names, descriptions, and input schemas for writing Code Mode scripts.",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"query": {
-						Type:        "string",
-						Description: "Search keyword to match against tool names and descriptions.",
-					},
-					"server": {
-						Type:        "string",
-						Description: "Optional server alias to restrict search scope.",
-					},
-				},
-				Required: []string{"query"},
-			},
-		}, makeSearchTools(deps))
-
-		s.RegisterTool(Tool{
-			Name: "execute_code",
-			Description: "Execute JavaScript code in a sandboxed WASM runtime with MCP tools available as async functions. " +
-				"Tools are accessible via tools.serverAlias.toolName(args). Use await for tool calls. " +
-				"Return a value to send it back as the result.",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"code": {
-						Type:        "string",
-						Description: "JavaScript code to execute. MCP tools are available as async functions under tools.serverAlias.toolName(args).",
-					},
-					"servers": {
-						Type:        "array",
-						Description: "Optional list of server aliases to include. Omit for all accessible servers.",
-					},
-				},
-				Required: []string{"code"},
-			},
-		}, makeExecuteCode(deps))
+// RegisterCodeModeTools registers the Code Mode tools (list_servers,
+// search_tools, execute_code) on the given MCP server. These tools are
+// only registered when deps.ExecuteCode is non-nil (Code Mode enabled).
+func RegisterCodeModeTools(s *Server, deps VoidLLMDeps) {
+	if deps.ExecuteCode == nil {
+		return
 	}
+
+	s.RegisterTool(Tool{
+		Name:        "list_servers",
+		Description: "List MCP servers available for Code Mode execution. Shows server names, aliases, and tool counts.",
+		InputSchema: InputSchema{
+			Type: "object",
+		},
+	}, makeListServers(deps))
+
+	s.RegisterTool(Tool{
+		Name:        "search_tools",
+		Description: "Search for MCP tools across accessible servers by keyword. Returns matching tool names, descriptions, and input schemas for writing Code Mode scripts.",
+		InputSchema: InputSchema{
+			Type: "object",
+			Properties: map[string]Property{
+				"query": {
+					Type:        "string",
+					Description: "Search keyword to match against tool names and descriptions.",
+				},
+				"server": {
+					Type:        "string",
+					Description: "Optional server alias to restrict search scope.",
+				},
+			},
+			Required: []string{"query"},
+		},
+	}, makeSearchTools(deps))
+
+	s.RegisterTool(Tool{
+		Name: "execute_code",
+		Description: "Execute JavaScript code in a sandboxed WASM runtime with MCP tools available as async functions. " +
+			"Tools are accessible via tools.serverAlias.toolName(args). Use await for tool calls. " +
+			"Return a value to send it back as the result.",
+		InputSchema: InputSchema{
+			Type: "object",
+			Properties: map[string]Property{
+				"code": {
+					Type:        "string",
+					Description: "JavaScript code to execute. MCP tools are available as async functions under tools.serverAlias.toolName(args).",
+				},
+				"servers": {
+					Type:        "array",
+					Description: "Optional list of server aliases to include. Omit for all accessible servers.",
+				},
+			},
+			Required: []string{"code"},
+		},
+	}, makeExecuteCode(deps))
 }
 
 // makeListModels returns the handler for the list_models tool. Callers with

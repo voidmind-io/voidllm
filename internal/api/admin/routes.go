@@ -157,10 +157,19 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 	// License — any authenticated user may inspect the current license.
 	api.Get("/license", auth.RequireRole(auth.RoleMember), handler.GetLicense)
 
+	// Code Mode MCP server — aggregated code execution tools (list_servers,
+	// search_tools, execute_code). These routes MUST be registered before the
+	// /mcp/:alias routes so that Fiber does not treat the bare /mcp path as
+	// alias="" on the parameterised route.
+	if handler.CodeModeServer != nil {
+		api.Post("/mcp", handler.HandleCodeModeMCP)
+		api.Get("/mcp", handler.HandleCodeModeMCPSSE)
+	}
+
 	// MCP gateway — any authenticated caller may send MCP requests.
-	// The :alias parameter routes to the built-in "voidllm" server or any
-	// registered external MCP server. Individual tools enforce their own RBAC
-	// checks via the injected KeyIdentity.
+	// The :alias parameter routes to the built-in "voidllm" management server
+	// or any registered external MCP server. Individual tools enforce their own
+	// RBAC checks via the injected KeyIdentity.
 	// GET opens a persistent SSE stream (legacy SSE transport for "voidllm");
 	// POST handles JSON-RPC and responds with JSON or SSE per the Accept header.
 	if handler.MCPServer != nil {
@@ -192,4 +201,12 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 	api.Patch("/mcp-servers/:server_id/activate", auth.RequireRole(auth.RoleMember), handler.ActivateMCPServer)
 	api.Patch("/mcp-servers/:server_id/deactivate", auth.RequireRole(auth.RoleMember), handler.DeactivateMCPServer)
 	api.Post("/mcp-servers/:server_id/test", auth.RequireRole(auth.RoleMember), handler.TestMCPServerConnection)
+
+	// MCP server tool blocklist — scope permissions enforced in handlers.
+	api.Get("/mcp-servers/:server_id/blocklist", auth.RequireRole(auth.RoleMember), handler.ListMCPServerBlocklist)
+	api.Post("/mcp-servers/:server_id/blocklist", auth.RequireRole(auth.RoleMember), handler.AddMCPServerBlocklist)
+	api.Delete("/mcp-servers/:server_id/blocklist", auth.RequireRole(auth.RoleMember), handler.RemoveMCPServerBlocklist)
+
+	// MCP server tool cache refresh — scope permissions enforced in handler.
+	api.Post("/mcp-servers/:server_id/refresh-tools", auth.RequireRole(auth.RoleMember), handler.HandleRefreshMCPServerTools)
 }

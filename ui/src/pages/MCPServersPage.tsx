@@ -16,6 +16,10 @@ import {
   useDeleteMCPServer,
   useToggleMCPServer,
   useTestMCPServer,
+  useMCPServerBlocklist,
+  useAddBlocklistEntry,
+  useRemoveBlocklistEntry,
+  useRefreshMCPServerTools,
 } from '../hooks/useMCPServers'
 import type { MCPServerResponse, CreateMCPServerParams, UpdateMCPServerParams } from '../hooks/useMCPServers'
 import { useMe } from '../hooks/useMe'
@@ -95,6 +99,25 @@ function IconPlug() {
       <path d="M9 8V2" />
       <path d="M15 8V2" />
       <path d="M18 8H6a2 2 0 0 0-2 2v3a6 6 0 0 0 12 0v-3a2 2 0 0 0-2-2z" />
+    </svg>
+  )
+}
+
+function IconRefresh() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="23 4 23 10 17 10" />
+      <polyline points="1 20 1 14 7 14" />
+      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+    </svg>
+  )
+}
+
+function IconXSmall() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
     </svg>
   )
 }
@@ -527,6 +550,172 @@ function EditMCPServerDialog({ server, onClose }: EditMCPServerDialogProps) {
 }
 
 // ---------------------------------------------------------------------------
+// ServerExpandedRow
+// ---------------------------------------------------------------------------
+
+interface ServerExpandedRowProps {
+  server: MCPServerResponse
+  canModify: boolean
+}
+
+function ServerExpandedRow({ server, canModify }: ServerExpandedRowProps) {
+  const [blockToolName, setBlockToolName] = useState('')
+  const [blockReason, setBlockReason] = useState('')
+
+  const { data: blocklist, isLoading: blocklistLoading } = useMCPServerBlocklist(server.id)
+  const addEntry = useAddBlocklistEntry()
+  const removeEntry = useRemoveBlocklistEntry()
+  const refreshTools = useRefreshMCPServerTools()
+  const { toast } = useToast()
+
+  function handleBlock() {
+    const name = blockToolName.trim()
+    if (!name) return
+    addEntry.mutate(
+      { serverId: server.id, toolName: name, reason: blockReason.trim() || undefined },
+      {
+        onSuccess: () => {
+          toast({ variant: 'success', message: `Tool "${name}" blocked` })
+          setBlockToolName('')
+          setBlockReason('')
+        },
+        onError: (err) => {
+          toast({
+            variant: 'error',
+            message: err instanceof Error ? err.message : 'Failed to block tool',
+          })
+        },
+      },
+    )
+  }
+
+  function handleUnblock(toolName: string) {
+    removeEntry.mutate(
+      { serverId: server.id, toolName },
+      {
+        onSuccess: () => {
+          toast({ variant: 'success', message: `Tool "${toolName}" unblocked` })
+        },
+        onError: (err) => {
+          toast({
+            variant: 'error',
+            message: err instanceof Error ? err.message : 'Failed to unblock tool',
+          })
+        },
+      },
+    )
+  }
+
+  function handleRefresh() {
+    refreshTools.mutate(server.id, {
+      onSuccess: (result) => {
+        toast({ variant: 'success', message: `Tools refreshed — ${result.tool_count} tool${result.tool_count === 1 ? '' : 's'} found` })
+      },
+      onError: (err) => {
+        toast({
+          variant: 'error',
+          message: err instanceof Error ? err.message : 'Failed to refresh tools',
+        })
+      },
+    })
+  }
+
+  const entries = blocklist ?? []
+
+  return (
+    <div className="px-6 py-4 space-y-4">
+      {/* Header row */}
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium uppercase tracking-wider text-text-tertiary">
+          Tool Blocklist
+        </span>
+        <button
+          type="button"
+          onClick={handleRefresh}
+          disabled={refreshTools.isPending}
+          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs text-text-secondary hover:text-text-primary hover:bg-bg-tertiary transition-colors disabled:opacity-40"
+        >
+          <IconRefresh />
+          {refreshTools.isPending ? 'Refreshing…' : 'Refresh Tools'}
+        </button>
+      </div>
+
+      {/* Blocked tools list */}
+      {blocklistLoading ? (
+        <div className="space-y-1.5">
+          {[1, 2].map((i) => (
+            <div key={i} className="h-7 bg-bg-tertiary rounded animate-pulse" />
+          ))}
+        </div>
+      ) : entries.length === 0 ? (
+        <p className="text-xs text-text-tertiary">No tools are currently blocked.</p>
+      ) : (
+        <ul className="space-y-1.5">
+          {entries.map((entry) => (
+            <li
+              key={entry.id}
+              className="flex items-center justify-between gap-3 px-3 py-2 rounded-md bg-bg-tertiary/50 border border-border"
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="font-mono text-xs text-text-primary truncate">{entry.tool_name}</span>
+                {entry.reason && (
+                  <span className="text-xs text-text-tertiary truncate">{entry.reason}</span>
+                )}
+              </div>
+              {canModify && (
+                <button
+                  type="button"
+                  onClick={() => handleUnblock(entry.tool_name)}
+                  disabled={removeEntry.isPending && removeEntry.variables?.toolName === entry.tool_name}
+                  title="Unblock tool"
+                  className="flex-shrink-0 p-1 rounded text-text-tertiary hover:text-error hover:bg-error/10 transition-colors disabled:opacity-40"
+                >
+                  <IconXSmall />
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {/* Add to blocklist */}
+      {canModify && (
+        <div className="flex items-end gap-2 pt-1">
+          <div className="flex-1 min-w-0">
+            <Input
+              label="Tool name"
+              value={blockToolName}
+              onChange={(e) => setBlockToolName(e.target.value)}
+              placeholder="e.g. read_file"
+              disabled={addEntry.isPending}
+            />
+          </div>
+          <div className="flex-1 min-w-0">
+            <Input
+              label="Reason (optional)"
+              value={blockReason}
+              onChange={(e) => setBlockReason(e.target.value)}
+              placeholder="e.g. security policy"
+              disabled={addEntry.isPending}
+            />
+          </div>
+          <div className="pb-0.5">
+            <Button
+              size="sm"
+              onClick={handleBlock}
+              disabled={!blockToolName.trim()}
+              loading={addEntry.isPending}
+            >
+              Block
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // MCPServersPage
 // ---------------------------------------------------------------------------
 
@@ -534,6 +723,7 @@ export default function MCPServersPage() {
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [editServer, setEditServer] = useState<MCPServerResponse | null>(null)
   const [deleteServerId, setDeleteServerId] = useState<string | null>(null)
+  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set())
 
   const { data: me } = useMe()
   const orgId = me?.org_id ?? ''
@@ -557,8 +747,21 @@ export default function MCPServersPage() {
 
   const deleteServer = useDeleteMCPServer()
   const toggleServer = useToggleMCPServer()
+  const updateServer = useUpdateMCPServer()
   const testServer = useTestMCPServer()
   const { toast, update } = useToast()
+
+  function handleToggleExpand(key: string) {
+    setExpandedKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) {
+        next.delete(key)
+      } else {
+        next.add(key)
+      }
+      return next
+    })
+  }
 
   const allServers = servers ?? []
   const activeCount = allServers.filter((s) => s.is_active).length
@@ -648,6 +851,40 @@ export default function MCPServersPage() {
             disabled={
               !canToggle ||
               (toggleServer.isPending && toggleServer.variables?.serverId === row.id)
+            }
+            size="sm"
+          />
+        )
+      },
+    },
+    {
+      key: 'code_mode_enabled',
+      header: 'Code Mode',
+      render: (row) => {
+        const canToggle =
+          row.source !== 'yaml' &&
+          ((row.scope === 'global' && isSystemAdmin) ||
+          (row.scope === 'org' && isOrgAdmin) ||
+          (row.scope === 'team' && isTeamAdmin))
+        return (
+          <Toggle
+            checked={row.code_mode_enabled}
+            onChange={(enabled) =>
+              updateServer.mutate(
+                { serverId: row.id, params: { code_mode_enabled: enabled } },
+                {
+                  onError: (err) => {
+                    toast({
+                      variant: 'error',
+                      message: err instanceof Error ? err.message : 'Failed to update code mode',
+                    })
+                  },
+                },
+              )
+            }
+            disabled={
+              !canToggle ||
+              (updateServer.isPending && updateServer.variables?.serverId === row.id)
             }
             size="sm"
           />
@@ -781,6 +1018,16 @@ export default function MCPServersPage() {
         keyExtractor={(row) => row.id}
         loading={isLoading}
         emptyMessage="No MCP servers configured"
+        expandedKeys={expandedKeys}
+        onToggleExpand={handleToggleExpand}
+        renderExpandedRow={(row) => {
+          const canModify =
+            row.source !== 'yaml' &&
+            ((row.scope === 'global' && isSystemAdmin) ||
+            (row.scope === 'org' && isOrgAdmin) ||
+            (row.scope === 'team' && isTeamAdmin))
+          return <ServerExpandedRow server={row} canModify={canModify} />
+        }}
       />
 
       {showCreateDialog && (

@@ -583,12 +583,16 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		)
 	}
 
-	// Wire MCP server with VoidLLM management tools. The MCP server is
-	// always created; the route is only registered when MCPServer is non-nil
-	// (which it always is after this block). Tools that need DB access or
-	// RBAC enforcement perform those checks inside the handler function.
+	// Wire the management MCP server with VoidLLM management tools. The server
+	// is always created; the route is only registered when MCPServer is non-nil
+	// (which it always is after this block). Tools that need DB access or RBAC
+	// enforcement perform those checks inside the handler function.
+	//
+	// voidllmDeps is captured as a named variable so that the Code Mode server
+	// below can reuse the ExecuteCode, ListAccessibleMCPServers, and
+	// SearchMCPTools closures without duplicating them.
 	mcpServer := mcp.NewServer("voidllm", apihealth.Version)
-	mcp.RegisterVoidLLMTools(mcpServer, mcp.VoidLLMDeps{
+	voidllmDeps := mcp.VoidLLMDeps{
 		ListModels: func(ctx context.Context) ([]map[string]any, error) {
 			infos := registry.ListInfo()
 			result := make([]map[string]any, len(infos))
@@ -790,6 +794,35 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 				wantSet[a] = true
 			}
 
+			// Build a blocklist map (alias → set of blocked tool names) once so
+			// it can be used both for filtering the tool list and as a second
+			// defense inside the ToolCaller closure.
+			blockedByServer := make(map[string]map[string]bool)
+			for _, s := range servers {
+				if !s.CodeModeEnabled {
+					continue
+				}
+				if len(wantSet) > 0 && !wantSet[s.Alias] {
+					continue
+				}
+				blocked, blockErr := database.ListBlockedToolNames(ctx, s.ID)
+				if blockErr != nil {
+					log.LogAttrs(ctx, slog.LevelWarn, "code mode: list blocked tools",
+						slog.String("server", s.Alias),
+						slog.String("error", blockErr.Error()),
+					)
+					// Continue with an empty blocklist for this server rather than
+					// aborting; the ToolCache fetch below will still run.
+				}
+				if len(blocked) > 0 {
+					set := make(map[string]bool, len(blocked))
+					for _, name := range blocked {
+						set[name] = true
+					}
+					blockedByServer[s.Alias] = set
+				}
+			}
+
 			serverTools := make(map[string][]mcp.Tool)
 			for _, s := range servers {
 				if !s.CodeModeEnabled {
@@ -807,7 +840,17 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 					)
 					continue
 				}
-				serverTools[s.Alias] = tools
+				if bs := blockedByServer[s.Alias]; len(bs) > 0 {
+					filtered := make([]mcp.Tool, 0, len(tools))
+					for _, t := range tools {
+						if !bs[t.Name] {
+							filtered = append(filtered, t)
+						}
+					}
+					serverTools[s.Alias] = filtered
+				} else {
+					serverTools[s.Alias] = tools
+				}
 			}
 
 			// Build auth.KeyInfo from mcp.KeyIdentity so CallMCPTool can enforce access.
@@ -820,6 +863,9 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			}
 
 			callTool := mcp.ToolCaller(func(callCtx context.Context, serverAlias, toolName string, args json.RawMessage) (json.RawMessage, error) {
+				if bs, ok := blockedByServer[serverAlias]; ok && bs[toolName] {
+					return nil, fmt.Errorf("tool %q is blocked on server %q", toolName, serverAlias)
+				}
 				return adminHandler.CallMCPTool(callCtx, kiAuth, serverAlias, toolName, args, true)
 			})
 
@@ -880,6 +926,11 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 					continue
 				}
 				toolCount := adminHandler.ToolCache.ToolCount(s.Alias)
+				blocked, _ := database.ListBlockedToolNames(ctx, s.ID)
+				toolCount -= len(blocked)
+				if toolCount < 0 {
+					toolCount = 0
+				}
 				entry := map[string]any{
 					"alias":             s.Alias,
 					"name":              s.Name,
@@ -931,7 +982,15 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 					)
 					continue
 				}
+				blocked, _ := database.ListBlockedToolNames(ctx, s.ID)
+				blockedSet := make(map[string]bool, len(blocked))
+				for _, name := range blocked {
+					blockedSet[name] = true
+				}
 				for _, t := range tools {
+					if blockedSet[t.Name] {
+						continue
+					}
 					if strings.Contains(strings.ToLower(t.Name), queryLower) ||
 						strings.Contains(strings.ToLower(t.Description), queryLower) {
 						matches = append(matches, map[string]any{
@@ -946,8 +1005,23 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			}
 			return matches, nil
 		},
-	})
+	}
+	mcp.RegisterVoidLLMTools(mcpServer, voidllmDeps)
 	adminHandler.MCPServer = mcpServer
+
+	// Wire the Code Mode MCP server when Code Mode is enabled. It exposes only
+	// the list_servers, search_tools, and execute_code tools and is served at
+	// /api/v1/mcp (distinct from the management server at /api/v1/mcp/voidllm).
+	if cfg.Settings.MCP.CodeMode.IsEnabled() {
+		codeModeServer := mcp.NewServer("voidllm-code-mode", apihealth.Version)
+		mcp.RegisterCodeModeTools(codeModeServer, mcp.VoidLLMDeps{
+			ExecuteCode:              voidllmDeps.ExecuteCode,
+			ListAccessibleMCPServers: voidllmDeps.ListAccessibleMCPServers,
+			SearchMCPTools:           voidllmDeps.SearchMCPTools,
+		})
+		adminHandler.CodeModeServer = codeModeServer
+	}
+
 	adminHandler.MCPCallTimeout = cfg.Settings.MCP.CallTimeout
 	adminHandler.MCPAllowPrivateURLs = cfg.Settings.MCP.AllowPrivateURLs
 

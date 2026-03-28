@@ -154,6 +154,20 @@ func (tc *ToolCache) Invalidate(alias string) {
 	tc.mu.Unlock()
 }
 
+// FreshFor returns how long the cache entry for alias has been fresh, measured
+// from the time the entry was last fetched. It returns -1 if the alias is not
+// present in the cache. The caller can use this to enforce a cooldown between
+// forced refreshes.
+func (tc *ToolCache) FreshFor(alias string) time.Duration {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	entry, ok := tc.entries[alias]
+	if !ok {
+		return -1
+	}
+	return time.Since(entry.fetchedAt)
+}
+
 // ToolCount returns the number of tools cached for alias. It returns 0 if the
 // alias is not present in the cache; no upstream fetch is performed.
 func (tc *ToolCache) ToolCount(alias string) int {

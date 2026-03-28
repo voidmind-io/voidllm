@@ -11,11 +11,19 @@ import (
 	"github.com/voidmind-io/voidllm/internal/mcp"
 )
 
-// buildVoidLLMServer returns a Server with all VoidLLM tools registered using
-// the provided deps.
+// buildVoidLLMServer returns a Server with all VoidLLM management tools
+// registered using the provided deps.
 func buildVoidLLMServer(deps mcp.VoidLLMDeps) *mcp.Server {
 	s := mcp.NewServer("voidllm-test", "0.1.0")
 	mcp.RegisterVoidLLMTools(s, deps)
+	return s
+}
+
+// buildCodeModeServer returns a Server with Code Mode tools registered
+// using the provided deps.
+func buildCodeModeServer(deps mcp.VoidLLMDeps) *mcp.Server {
+	s := mcp.NewServer("code-mode-test", "0.1.0")
+	mcp.RegisterCodeModeTools(s, deps)
 	return s
 }
 
@@ -1013,7 +1021,7 @@ func TestVoidLLM_ListServers_Success(t *testing.T) {
 		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 	tr := callTool(t, s, context.Background(), "list_servers", nil)
 
 	if tr.IsError {
@@ -1041,7 +1049,7 @@ func TestVoidLLM_ListServers_Empty(t *testing.T) {
 		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 	tr := callTool(t, s, context.Background(), "list_servers", nil)
 
 	if tr.IsError {
@@ -1063,7 +1071,7 @@ func TestVoidLLM_ListServers_DepError(t *testing.T) {
 		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 
 	req := map[string]any{
 		"jsonrpc": "2.0",
@@ -1117,7 +1125,7 @@ func TestVoidLLM_SearchTools_Success(t *testing.T) {
 		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 	tr := callTool(t, s, context.Background(), "search_tools", map[string]any{
 		"query": "weather",
 	})
@@ -1150,7 +1158,7 @@ func TestVoidLLM_SearchTools_WithServerFilter(t *testing.T) {
 		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 	callTool(t, s, context.Background(), "search_tools", map[string]any{
 		"query":  "calendar",
 		"server": "cal-server",
@@ -1172,7 +1180,7 @@ func TestVoidLLM_SearchTools_MissingQuery(t *testing.T) {
 		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 	tr := callTool(t, s, context.Background(), "search_tools", map[string]any{})
 
 	if !tr.IsError {
@@ -1194,7 +1202,7 @@ func TestVoidLLM_SearchTools_DepError(t *testing.T) {
 		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 
 	req := map[string]any{
 		"jsonrpc": "2.0",
@@ -1244,7 +1252,7 @@ func TestVoidLLM_ExecuteCode_Success(t *testing.T) {
 		}, nil
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 	tr := callTool(t, s, context.Background(), "execute_code", map[string]any{
 		"code":    "const x = 42; JSON.stringify({answer: x})",
 		"servers": []string{"weather", "calendar"},
@@ -1278,7 +1286,7 @@ func TestVoidLLM_ExecuteCode_NoServers(t *testing.T) {
 		}, nil
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 	callTool(t, s, context.Background(), "execute_code", map[string]any{
 		"code": "1 + 1",
 	})
@@ -1296,7 +1304,7 @@ func TestVoidLLM_ExecuteCode_MissingCode(t *testing.T) {
 		return &mcp.ExecuteResult{}, nil
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 	tr := callTool(t, s, context.Background(), "execute_code", map[string]any{})
 
 	if !tr.IsError {
@@ -1318,7 +1326,7 @@ func TestVoidLLM_ExecuteCode_ScriptError(t *testing.T) {
 		}, nil
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 	tr := callTool(t, s, context.Background(), "execute_code", map[string]any{
 		"code": "invalid @@ syntax",
 	})
@@ -1339,7 +1347,7 @@ func TestVoidLLM_ExecuteCode_DepError(t *testing.T) {
 		return nil, errors.New("sandbox crashed")
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 
 	req := map[string]any{
 		"jsonrpc": "2.0",
@@ -1386,7 +1394,7 @@ func TestRegisterVoidLLMTools_CodeModeToolsListed(t *testing.T) {
 		return nil, nil
 	}
 
-	s := buildVoidLLMServer(deps)
+	s := buildCodeModeServer(deps)
 
 	resp := callRaw(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 	assertNoError(t, resp)

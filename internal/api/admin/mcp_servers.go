@@ -31,12 +31,13 @@ type createMCPServerRequest struct {
 // updateMCPServerRequest is the JSON body accepted by UpdateMCPServer.
 // All fields are optional; a nil pointer means the field is left unchanged.
 type updateMCPServerRequest struct {
-	Name       *string `json:"name"`
-	Alias      *string `json:"alias"`
-	URL        *string `json:"url"`
-	AuthType   *string `json:"auth_type"`
-	AuthHeader *string `json:"auth_header"`
-	AuthToken  *string `json:"auth_token"` // plaintext; encrypted before storage, never returned
+	Name            *string `json:"name"`
+	Alias           *string `json:"alias"`
+	URL             *string `json:"url"`
+	AuthType        *string `json:"auth_type"`
+	AuthHeader      *string `json:"auth_header"`
+	AuthToken       *string `json:"auth_token"` // plaintext; encrypted before storage, never returned
+	CodeModeEnabled *bool   `json:"code_mode_enabled"`
 }
 
 // mcpServerResponse is the JSON representation of an MCP server returned by the API.
@@ -51,12 +52,13 @@ type mcpServerResponse struct {
 	IsActive   bool   `json:"is_active"`
 	// Source indicates how this server was registered: "api" for Admin
 	// API-created servers, "yaml" for config-file-sourced servers.
-	Source    string  `json:"source"`
-	Scope     string  `json:"scope"` // "global", "org", or "team"
-	OrgID     *string `json:"org_id,omitempty"`
-	TeamID    *string `json:"team_id,omitempty"`
-	CreatedAt string  `json:"created_at"`
-	UpdatedAt string  `json:"updated_at"`
+	Source          string  `json:"source"`
+	Scope           string  `json:"scope"` // "global", "org", or "team"
+	OrgID           *string `json:"org_id,omitempty"`
+	TeamID          *string `json:"team_id,omitempty"`
+	CodeModeEnabled bool    `json:"code_mode_enabled"`
+	CreatedAt       string  `json:"created_at"`
+	UpdatedAt       string  `json:"updated_at"`
 }
 
 // testMCPServerResponse is the JSON response from TestMCPServerConnection.
@@ -151,19 +153,20 @@ func mcpServerToResponse(s *db.MCPServer) mcpServerResponse {
 		scope = "org"
 	}
 	return mcpServerResponse{
-		ID:         s.ID,
-		Name:       s.Name,
-		Alias:      s.Alias,
-		URL:        s.URL,
-		AuthType:   s.AuthType,
-		AuthHeader: s.AuthHeader,
-		IsActive:   s.IsActive,
-		Source:     s.Source,
-		Scope:      scope,
-		OrgID:      s.OrgID,
-		TeamID:     s.TeamID,
-		CreatedAt:  s.CreatedAt,
-		UpdatedAt:  s.UpdatedAt,
+		ID:              s.ID,
+		Name:            s.Name,
+		Alias:           s.Alias,
+		URL:             s.URL,
+		AuthType:        s.AuthType,
+		AuthHeader:      s.AuthHeader,
+		IsActive:        s.IsActive,
+		Source:          s.Source,
+		Scope:           scope,
+		OrgID:           s.OrgID,
+		TeamID:          s.TeamID,
+		CodeModeEnabled: s.CodeModeEnabled,
+		CreatedAt:       s.CreatedAt,
+		UpdatedAt:       s.UpdatedAt,
 	}
 }
 
@@ -729,11 +732,12 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 	}
 
 	params := db.UpdateMCPServerParams{
-		Name:       req.Name,
-		Alias:      req.Alias,
-		URL:        req.URL,
-		AuthType:   req.AuthType,
-		AuthHeader: req.AuthHeader,
+		Name:            req.Name,
+		Alias:           req.Alias,
+		URL:             req.URL,
+		AuthType:        req.AuthType,
+		AuthHeader:      req.AuthHeader,
+		CodeModeEnabled: req.CodeModeEnabled,
 	}
 
 	// Encrypt the auth token using the immutable server ID as AAD.
@@ -876,6 +880,249 @@ func (h *Handler) setMCPServerActive(c fiber.Ctx, active bool) error {
 	}
 
 	return c.JSON(mcpServerToResponse(updated))
+}
+
+// addMCPBlocklistRequest is the JSON body accepted by AddMCPServerBlocklist.
+type addMCPBlocklistRequest struct {
+	ToolName string `json:"tool_name"`
+	Reason   string `json:"reason"`
+}
+
+// mcpRefreshToolsResponse is the JSON body returned by HandleRefreshMCPServerTools.
+type mcpRefreshToolsResponse struct {
+	ToolCount int `json:"tool_count"`
+}
+
+// ListMCPServerBlocklist handles GET /api/v1/mcp-servers/:server_id/blocklist.
+// It returns all blocklist entries for the given MCP server.
+// Read permission is checked against the caller's scope.
+//
+// @Summary      List tool blocklist for an MCP server
+// @Description  Returns all tool blocklist entries for the given MCP server. Access is scope-checked against the caller's role.
+// @Tags         mcp-servers
+// @Produce      json
+// @Param        server_id  path      string  true  "MCP server ID"
+// @Success      200        {array}   db.ToolBlocklistEntry
+// @Failure      401        {object}  swaggerErrorResponse
+// @Failure      403        {object}  swaggerErrorResponse
+// @Failure      404        {object}  swaggerErrorResponse
+// @Failure      500        {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /mcp-servers/{server_id}/blocklist [get]
+func (h *Handler) ListMCPServerBlocklist(c fiber.Ctx) error {
+	ctx := c.Context()
+	serverID := c.Params("server_id")
+
+	server, err := h.DB.GetMCPServer(ctx, serverID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return apierror.NotFound(c, "MCP server not found")
+		}
+		h.Log.ErrorContext(ctx, "list mcp blocklist: get server",
+			slog.String("id", serverID), slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to get MCP server")
+	}
+
+	ki := auth.KeyInfoFromCtx(c)
+	if permErr := checkMCPServerReadPermission(c, server, ki); permErr != nil {
+		return permErr
+	}
+
+	entries, err := h.DB.ListToolBlocklist(ctx, serverID)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "list mcp blocklist",
+			slog.String("server_id", serverID), slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to list tool blocklist")
+	}
+
+	return c.JSON(entries)
+}
+
+// AddMCPServerBlocklist handles POST /api/v1/mcp-servers/:server_id/blocklist.
+// It adds a tool to the blocklist for the given MCP server.
+// Write permission is scope-checked.
+//
+// @Summary      Add a tool to the MCP server blocklist
+// @Description  Adds a tool to the blocklist for the given MCP server. Access is scope-checked against the caller's role.
+// @Tags         mcp-servers
+// @Accept       json
+// @Produce      json
+// @Param        server_id  path      string                  true  "MCP server ID"
+// @Param        body       body      addMCPBlocklistRequest  true  "Tool to block"
+// @Success      201        {object}  db.ToolBlocklistEntry
+// @Failure      400        {object}  swaggerErrorResponse
+// @Failure      401        {object}  swaggerErrorResponse
+// @Failure      403        {object}  swaggerErrorResponse
+// @Failure      404        {object}  swaggerErrorResponse
+// @Failure      409        {object}  swaggerErrorResponse
+// @Failure      500        {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /mcp-servers/{server_id}/blocklist [post]
+func (h *Handler) AddMCPServerBlocklist(c fiber.Ctx) error {
+	ctx := c.Context()
+	serverID := c.Params("server_id")
+
+	server, err := h.DB.GetMCPServer(ctx, serverID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return apierror.NotFound(c, "MCP server not found")
+		}
+		h.Log.ErrorContext(ctx, "add mcp blocklist: get server",
+			slog.String("id", serverID), slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to get MCP server")
+	}
+
+	ki := auth.KeyInfoFromCtx(c)
+	if permErr := checkMCPServerScopePermission(c, server, ki); permErr != nil {
+		return permErr
+	}
+
+	var req addMCPBlocklistRequest
+	if err := c.Bind().JSON(&req); err != nil {
+		return apierror.BadRequest(c, "invalid request body")
+	}
+	if req.ToolName == "" {
+		return apierror.BadRequest(c, "tool_name is required")
+	}
+	if len(req.ToolName) > 256 {
+		return apierror.BadRequest(c, "tool_name must be 256 characters or fewer")
+	}
+
+	createdBy := ""
+	if ki != nil {
+		createdBy = ki.UserID
+	}
+
+	entry, err := h.DB.CreateToolBlocklistEntry(ctx, serverID, req.ToolName, req.Reason, createdBy)
+	if err != nil {
+		if errors.Is(err, db.ErrConflict) {
+			return apierror.Conflict(c, "tool is already on the blocklist for this server")
+		}
+		h.Log.ErrorContext(ctx, "add mcp blocklist",
+			slog.String("server_id", serverID),
+			slog.String("tool_name", req.ToolName),
+			slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to add tool to blocklist")
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(entry)
+}
+
+// RemoveMCPServerBlocklist handles DELETE /api/v1/mcp-servers/:server_id/blocklist.
+// The tool name is passed as the ?tool_name query parameter to avoid path-routing
+// issues with tool names that contain slashes or other special characters.
+// Write permission is scope-checked.
+//
+// @Summary      Remove a tool from the MCP server blocklist
+// @Description  Removes a tool from the blocklist for the given MCP server. Access is scope-checked against the caller's role.
+// @Tags         mcp-servers
+// @Param        server_id  path   string  true  "MCP server ID"
+// @Param        tool_name  query  string  true  "Tool name to remove from blocklist"
+// @Success      204
+// @Failure      400  {object}  swaggerErrorResponse
+// @Failure      401  {object}  swaggerErrorResponse
+// @Failure      403  {object}  swaggerErrorResponse
+// @Failure      404  {object}  swaggerErrorResponse
+// @Failure      500  {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /mcp-servers/{server_id}/blocklist [delete]
+func (h *Handler) RemoveMCPServerBlocklist(c fiber.Ctx) error {
+	ctx := c.Context()
+	serverID := c.Params("server_id")
+	toolName := c.Query("tool_name")
+	if toolName == "" {
+		return apierror.BadRequest(c, "tool_name query parameter is required")
+	}
+
+	server, err := h.DB.GetMCPServer(ctx, serverID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return apierror.NotFound(c, "MCP server not found")
+		}
+		h.Log.ErrorContext(ctx, "remove mcp blocklist: get server",
+			slog.String("id", serverID), slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to get MCP server")
+	}
+
+	ki := auth.KeyInfoFromCtx(c)
+	if permErr := checkMCPServerScopePermission(c, server, ki); permErr != nil {
+		return permErr
+	}
+
+	if err := h.DB.DeleteToolBlocklistEntry(ctx, serverID, toolName); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return apierror.NotFound(c, "blocklist entry not found")
+		}
+		h.Log.ErrorContext(ctx, "remove mcp blocklist",
+			slog.String("server_id", serverID),
+			slog.String("tool_name", toolName),
+			slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to remove tool from blocklist")
+	}
+
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// HandleRefreshMCPServerTools handles POST /api/v1/mcp-servers/:server_id/refresh-tools.
+// It forces a re-fetch of the tool list for the server from the upstream MCP
+// endpoint and returns the number of tools now cached. Requires Code Mode to be
+// enabled (h.ToolCache non-nil). Read permission is scope-checked.
+//
+// @Summary      Refresh cached tools for an MCP server
+// @Description  Forces a re-fetch of the tool list from the upstream MCP server and returns the updated tool count. Requires Code Mode to be enabled.
+// @Tags         mcp-servers
+// @Produce      json
+// @Param        server_id  path      string  true  "MCP server ID"
+// @Success      200        {object}  mcpRefreshToolsResponse
+// @Failure      401        {object}  swaggerErrorResponse
+// @Failure      403        {object}  swaggerErrorResponse
+// @Failure      404        {object}  swaggerErrorResponse
+// @Failure      500        {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /mcp-servers/{server_id}/refresh-tools [post]
+func (h *Handler) HandleRefreshMCPServerTools(c fiber.Ctx) error {
+	ctx := c.Context()
+	serverID := c.Params("server_id")
+
+	server, err := h.DB.GetMCPServer(ctx, serverID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return apierror.NotFound(c, "MCP server not found")
+		}
+		h.Log.ErrorContext(ctx, "refresh mcp server tools: get server",
+			slog.String("id", serverID), slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to get MCP server")
+	}
+
+	ki := auth.KeyInfoFromCtx(c)
+	if permErr := checkMCPServerReadPermission(c, server, ki); permErr != nil {
+		return permErr
+	}
+
+	if h.ToolCache == nil {
+		return apierror.Send(c, fiber.StatusServiceUnavailable, "code_mode_disabled",
+			"Code Mode is not enabled on this instance")
+	}
+
+	const refreshCooldown = 60 * time.Second
+	if age := h.ToolCache.FreshFor(server.Alias); age >= 0 && age < refreshCooldown {
+		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+			"error":               "tool cache was refreshed recently, try again later",
+			"retry_after_seconds": int((refreshCooldown - age).Seconds()),
+		})
+	}
+
+	if err := h.ToolCache.RefreshServer(ctx, server.Alias); err != nil {
+		h.Log.ErrorContext(ctx, "refresh mcp server tools",
+			slog.String("server_id", serverID),
+			slog.String("alias", server.Alias),
+			slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to refresh tools from upstream MCP server")
+	}
+
+	return c.JSON(mcpRefreshToolsResponse{
+		ToolCount: h.ToolCache.ToolCount(server.Alias),
+	})
 }
 
 // TestMCPServerConnection handles POST /api/v1/mcp-servers/:server_id/test.
