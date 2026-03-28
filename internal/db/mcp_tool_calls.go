@@ -38,6 +38,9 @@ type MCPToolCall struct {
 	// CodeMode indicates whether this tool call was made inside a Code Mode
 	// sandboxed execution session.
 	CodeMode bool
+	// CodeModeExecutionID groups all tool calls that belong to a single
+	// execute_code invocation. Nil for non-Code-Mode calls.
+	CodeModeExecutionID *string
 	// CreatedAt is the UTC timestamp of the event stored as a string.
 	CreatedAt string
 }
@@ -54,11 +57,11 @@ func (d *DB) InsertMCPToolCalls(ctx context.Context, calls []MCPToolCall) error 
 	p := d.dialect.Placeholder
 	query := "INSERT INTO mcp_tool_calls " +
 		"(id, request_id, key_id, key_type, org_id, team_id, user_id, service_account_id, " +
-		"server_alias, tool_name, duration_ms, status, code_mode) " +
+		"server_alias, tool_name, duration_ms, status, code_mode, code_mode_execution_id) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " +
 		p(6) + ", " + p(7) + ", " + p(8) + ", " +
-		p(9) + ", " + p(10) + ", " + p(11) + ", " + p(12) + ", " + p(13) + ")"
+		p(9) + ", " + p(10) + ", " + p(11) + ", " + p(12) + ", " + p(13) + ", " + p(14) + ")"
 
 	if err := d.WithTx(ctx, func(q Querier) error {
 		for _, call := range calls {
@@ -87,6 +90,11 @@ func (d *DB) InsertMCPToolCalls(ctx context.Context, calls []MCPToolCall) error 
 				codeMode = 1
 			}
 
+			var executionID any
+			if call.CodeModeExecutionID != nil {
+				executionID = *call.CodeModeExecutionID
+			}
+
 			_, err := q.ExecContext(ctx, query,
 				id,
 				call.RequestID,
@@ -101,6 +109,7 @@ func (d *DB) InsertMCPToolCalls(ctx context.Context, calls []MCPToolCall) error 
 				call.DurationMS,
 				call.Status,
 				codeMode,
+				executionID,
 			)
 			if err != nil {
 				return fmt.Errorf("insert mcp tool calls: exec: %w", err)

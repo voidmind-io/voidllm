@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,7 +10,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -66,6 +69,10 @@ type HTTPTransport struct {
 	authHeader string // header name used when authType is "header"
 	authToken  string // decrypted token value
 	client     *http.Client
+	postURL    string    // resolved POST endpoint after transport detection
+	sseMode    bool      // true when the upstream uses SSE transport (not Streamable HTTP)
+	detectOnce sync.Once // ensures detectTransport runs exactly once
+	detectErr  error     // cached error from detectTransport
 }
 
 // NewHTTPTransport creates a transport for the given endpoint with the
@@ -107,7 +114,11 @@ func NewHTTPTransport(endpoint, authType, authHeader, authToken string, timeout 
 // HTTP 404. Returns an error for any other non-200/non-202 status or transport
 // failure.
 func (t *HTTPTransport) Call(ctx context.Context, raw []byte, sessionID string) ([]byte, string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(raw))
+	target := t.endpoint
+	if t.postURL != "" {
+		target = t.postURL
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(raw))
 	if err != nil {
 		return nil, "", fmt.Errorf("build request: %w", err)
 	}
@@ -180,6 +191,13 @@ func extractSSEData(body []byte) []byte {
 // ListTools sends initialize + tools/list to the remote server and parses
 // the returned tool definitions. It handles session management automatically.
 func (t *HTTPTransport) ListTools(ctx context.Context) ([]Tool, error) {
+	t.detectOnce.Do(func() {
+		t.detectErr = t.detectTransport(ctx)
+	})
+	if t.detectErr != nil {
+		return nil, fmt.Errorf("detect transport: %w", t.detectErr)
+	}
+
 	// Initialize first to establish session
 	initReq, _ := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
@@ -236,6 +254,174 @@ func (t *HTTPTransport) ListTools(ctx context.Context) ([]Tool, error) {
 	}
 
 	return rpcResp.Result.Tools, nil
+}
+
+// detectTransport probes the upstream endpoint to determine whether it speaks
+// Streamable HTTP (MCP 2025-03-26) or the older SSE transport. On success it
+// sets t.postURL and t.sseMode. Called via sync.Once from ListTools.
+func (t *HTTPTransport) detectTransport(ctx context.Context) error {
+	probe, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      0,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-03-26",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "voidllm", "version": "1.0"},
+		},
+	})
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(probe))
+	if err != nil {
+		return fmt.Errorf("build probe request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+
+	switch t.authType {
+	case "bearer":
+		req.Header.Set("Authorization", "Bearer "+t.authToken)
+	case "header":
+		if t.authHeader != "" {
+			req.Header.Set(t.authHeader, t.authToken)
+		}
+	}
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("probe: %w", err)
+	}
+	defer resp.Body.Close()
+	// Drain body (size-limited) to allow connection reuse.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 10<<20))
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusAccepted:
+		// Streamable HTTP — use the base endpoint directly.
+		t.postURL = t.endpoint
+		return nil
+	case http.StatusNotFound, http.StatusMethodNotAllowed:
+		// Older SSE transport — discover the POST URL via GET.
+		postURL, err := t.sseDiscover(ctx)
+		if err != nil {
+			return fmt.Errorf("sse discover: %w", err)
+		}
+		t.postURL = postURL
+		t.sseMode = true
+		return nil
+	default:
+		return fmt.Errorf("unexpected probe status %d", resp.StatusCode)
+	}
+}
+
+// sseDiscover performs a GET to the base endpoint with Accept: text/event-stream
+// and parses the SSE endpoint URL from the response body.
+func (t *HTTPTransport) sseDiscover(ctx context.Context) (string, error) {
+	discoverCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(discoverCtx, http.MethodGet, t.endpoint, nil)
+	if err != nil {
+		return "", fmt.Errorf("build discover request: %w", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+
+	switch t.authType {
+	case "bearer":
+		req.Header.Set("Authorization", "Bearer "+t.authToken)
+	case "header":
+		if t.authHeader != "" {
+			req.Header.Set(t.authHeader, t.authToken)
+		}
+	}
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("discover get: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read the SSE stream line-by-line instead of buffering the entire
+	// response. SSE connections stay open indefinitely, so io.ReadAll
+	// would block until the context timeout fires.
+	scanner := bufio.NewScanner(resp.Body)
+	var eventType string
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
+		if line == "" {
+			eventType = "" // end of event block
+			continue
+		}
+		if strings.HasPrefix(line, "event: ") {
+			eventType = strings.TrimPrefix(line, "event: ")
+			continue
+		}
+		if eventType == "endpoint" {
+			var raw string
+			if strings.HasPrefix(line, "data: ") {
+				raw = strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+			} else if strings.HasPrefix(line, "data:") {
+				raw = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			}
+			if raw != "" {
+				return resolveSSEEndpoint(raw, t.endpoint)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read discover stream: %w", err)
+	}
+	return "", fmt.Errorf("no endpoint event found in SSE discovery response")
+}
+
+// parseSSEEndpoint scans an SSE stream body for an "endpoint" event and
+// returns the URL carried in the subsequent data line. Relative URLs are
+// resolved against baseURL.
+func parseSSEEndpoint(body []byte, baseURL string) (string, error) {
+	lines := bytes.Split(body, []byte("\n"))
+	for i, line := range lines {
+		line = bytes.TrimRight(line, "\r")
+		if string(line) == "event: endpoint" {
+			// Find the next non-empty line for the data field.
+			for j := i + 1; j < len(lines); j++ {
+				dataLine := bytes.TrimRight(lines[j], "\r")
+				if len(dataLine) == 0 {
+					continue
+				}
+				var raw string
+				if bytes.HasPrefix(dataLine, []byte("data: ")) {
+					raw = string(bytes.TrimPrefix(dataLine, []byte("data: ")))
+				} else if bytes.HasPrefix(dataLine, []byte("data:")) {
+					raw = string(bytes.TrimPrefix(dataLine, []byte("data:")))
+				} else {
+					break
+				}
+				raw = strings.TrimSpace(raw)
+				if raw == "" {
+					break
+				}
+				return resolveSSEEndpoint(raw, baseURL)
+			}
+		}
+	}
+	return "", fmt.Errorf("no endpoint event found in SSE discovery response")
+}
+
+// resolveSSEEndpoint parses a raw URL from an SSE endpoint event and resolves
+// it relative to baseURL. Absolute URLs with a different origin are rejected.
+func resolveSSEEndpoint(raw, baseURL string) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("parse endpoint URL %q: %w", raw, err)
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("parse base URL %q: %w", baseURL, err)
+	}
+	if parsed.IsAbs() && (parsed.Scheme != base.Scheme || parsed.Host != base.Host) {
+		return "", fmt.Errorf("SSE endpoint %q has different origin than base %q", raw, baseURL)
+	}
+	return base.ResolveReference(parsed).String(), nil
 }
 
 // Close releases idle connections held by the underlying HTTP client.

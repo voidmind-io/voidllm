@@ -758,23 +758,29 @@ func TestNeedsQuoting(t *testing.T) {
 	}
 }
 
-// ---- Tool name collisions ----------------------------------------------------
+// ---- Similar tool names are independently callable --------------------------
 
-func TestExecute_ToolNameCollisions(t *testing.T) {
+func TestExecute_SimilarToolNamesDistinct(t *testing.T) {
 	t.Parallel()
 
 	exec := newTestExecutor(t)
 
-	// "tool-a" and "tool.a" both sanitize to "tool_a", producing the same
-	// flat function name. The executor must detect this collision and return
-	// an error rather than silently overwriting one tool with the other.
+	// With the Proxy pattern, "tool-a" and "tool.a" are distinct keys in the
+	// dispatch map. Both must be independently callable.
 	caller := mockToolCaller(map[string]json.RawMessage{
 		"srv/tool-a": json.RawMessage(`{"source":"hyphen"}`),
 		"srv/tool.a": json.RawMessage(`{"source":"dot"}`),
 	})
 
 	res, err := exec.Execute(context.Background(), mcp.ExecuteParams{
-		Code: `return "should not run";`,
+		Code: `
+			async function main() {
+				const a = await tools.srv["tool-a"]({});
+				const b = await tools.srv["tool.a"]({});
+				return JSON.stringify({a: a.source, b: b.source});
+			}
+			await main();
+		`,
 		ServerTools: map[string][]mcp.Tool{
 			"srv": {
 				{Name: "tool-a"},
@@ -786,11 +792,15 @@ func TestExecute_ToolNameCollisions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if res.Error == "" {
-		t.Fatal("expected collision error in result.Error, got empty")
+	if res.Error != "" {
+		t.Fatalf("unexpected error: %s", res.Error)
 	}
-	if !strings.Contains(res.Error, "tool function name collision") {
-		t.Errorf("result.Error = %q, want it to mention collision", res.Error)
+	if len(res.ToolCalls) != 2 {
+		t.Errorf("ToolCalls = %d, want 2", len(res.ToolCalls))
+	}
+	// Verify both tools returned their distinct results
+	if !strings.Contains(string(res.Result), "hyphen") || !strings.Contains(string(res.Result), "dot") {
+		t.Errorf("result = %s, want both hyphen and dot sources", res.Result)
 	}
 }
 

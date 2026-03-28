@@ -370,8 +370,10 @@ func buildToolCallRequest(toolName string, args json.RawMessage) []byte {
 // behalf of the given caller identity. It performs the same server lookup,
 // access control, credential decryption, session management, metrics recording,
 // and usage logging as HandleMCPProxy. codeMode should be true when the call
-// originates from a Code Mode execution.
-func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias, toolName string, args json.RawMessage, codeMode bool) (json.RawMessage, error) {
+// originates from a Code Mode execution. executionID is the UUIDv7 that groups
+// all tool calls from a single execute_code invocation; pass an empty string
+// for non-Code-Mode calls.
+func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias, toolName string, args json.RawMessage, codeMode bool, executionID string) (json.RawMessage, error) {
 	server, err := h.DB.GetMCPServerByAliasScoped(ctx, serverAlias, ki.OrgID, ki.TeamID)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
@@ -464,17 +466,18 @@ func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias
 
 	if h.MCPLogger != nil {
 		h.MCPLogger.Log(usage.MCPToolCallEvent{
-			KeyID:            ki.ID,
-			KeyType:          ki.KeyType,
-			OrgID:            ki.OrgID,
-			TeamID:           ki.TeamID,
-			UserID:           ki.UserID,
-			ServiceAccountID: ki.ServiceAccountID,
-			ServerAlias:      serverAlias,
-			ToolName:         toolName,
-			DurationMS:       int(duration.Milliseconds()),
-			Status:           status,
-			CodeMode:         codeMode,
+			KeyID:               ki.ID,
+			KeyType:             ki.KeyType,
+			OrgID:               ki.OrgID,
+			TeamID:              ki.TeamID,
+			UserID:              ki.UserID,
+			ServiceAccountID:    ki.ServiceAccountID,
+			ServerAlias:         serverAlias,
+			ToolName:            toolName,
+			DurationMS:          int(duration.Milliseconds()),
+			Status:              status,
+			CodeMode:            codeMode,
+			CodeModeExecutionID: executionID,
 		})
 	}
 
@@ -487,12 +490,13 @@ func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias
 
 // MakeToolFetcher returns a ToolFetcher that retrieves tool schemas from the
 // upstream MCP server identified by alias. It creates a fresh HTTPTransport,
-// sends initialize + tools/list, and parses the response. Only global servers
-// (org_id IS NULL, team_id IS NULL) are looked up because the ToolCache is
-// global and not scoped to any particular caller.
+// sends initialize + tools/list, and parses the response. The lookup uses
+// GetMCPServerByAliasAny so that org-scoped and team-scoped servers are
+// resolved in addition to global servers. Access control is enforced
+// separately at the call layer; the fetcher only reads URL and auth config.
 func (h *Handler) MakeToolFetcher() mcp.ToolFetcher {
 	return func(ctx context.Context, alias string) ([]mcp.Tool, error) {
-		server, err := h.DB.GetMCPServerByAlias(ctx, alias)
+		server, err := h.DB.GetMCPServerByAliasAny(ctx, alias)
 		if err != nil {
 			return nil, fmt.Errorf("tool fetcher %s: lookup: %w", alias, err)
 		}

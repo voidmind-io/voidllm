@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/crypto/hkdf"
 
 	"github.com/gofiber/fiber/v3"
@@ -788,6 +789,25 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 				return nil, fmt.Errorf("execute code: list servers: %w", listErr)
 			}
 
+			// Filter global servers (OrgID == nil && TeamID == nil) to only those
+			// explicitly allowed via org/team/key access tables. Org- and team-scoped
+			// servers are implicitly accessible to members of that org/team.
+			var accessible []db.MCPServer
+			for _, s := range servers {
+				if s.OrgID != nil || s.TeamID != nil {
+					accessible = append(accessible, s)
+					continue
+				}
+				allowed, accessErr := database.CheckMCPAccess(ctx, ki.OrgID, ki.TeamID, ki.KeyID, s.ID)
+				if accessErr != nil {
+					continue
+				}
+				if allowed {
+					accessible = append(accessible, s)
+				}
+			}
+			servers = accessible
+
 			// Build a set of requested aliases for fast lookup (nil = all).
 			wantSet := make(map[string]bool, len(serverAliases))
 			for _, a := range serverAliases {
@@ -862,11 +882,17 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 				Role:   ki.Role,
 			}
 
+			executionUUID, uuidErr := uuid.NewV7()
+			if uuidErr != nil {
+				return nil, fmt.Errorf("execute code: generate execution id: %w", uuidErr)
+			}
+			executionID := executionUUID.String()
+
 			callTool := mcp.ToolCaller(func(callCtx context.Context, serverAlias, toolName string, args json.RawMessage) (json.RawMessage, error) {
 				if bs, ok := blockedByServer[serverAlias]; ok && bs[toolName] {
 					return nil, fmt.Errorf("tool %q is blocked on server %q", toolName, serverAlias)
 				}
-				return adminHandler.CallMCPTool(callCtx, kiAuth, serverAlias, toolName, args, true)
+				return adminHandler.CallMCPTool(callCtx, kiAuth, serverAlias, toolName, args, true, executionID)
 			})
 
 			start := time.Now()
@@ -875,6 +901,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 				ServerTools:  serverTools,
 				CallTool:     callTool,
 				MaxToolCalls: cfg.Settings.MCP.CodeMode.MaxToolCalls,
+				ExecutionID:  executionID,
 			})
 			duration := time.Since(start)
 
@@ -920,6 +947,25 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 				return nil, fmt.Errorf("list accessible mcp servers: %w", listErr)
 			}
 
+			// Filter global servers (OrgID == nil && TeamID == nil) to only those
+			// explicitly allowed via org/team/key access tables. Org- and team-scoped
+			// servers are implicitly accessible to members of that org/team.
+			var accessible []db.MCPServer
+			for _, s := range servers {
+				if s.OrgID != nil || s.TeamID != nil {
+					accessible = append(accessible, s)
+					continue
+				}
+				allowed, accessErr := database.CheckMCPAccess(ctx, ki.OrgID, ki.TeamID, ki.KeyID, s.ID)
+				if accessErr != nil {
+					continue
+				}
+				if allowed {
+					accessible = append(accessible, s)
+				}
+			}
+			servers = accessible
+
 			result := make([]map[string]any, 0, len(servers))
 			for _, s := range servers {
 				if codeModeOnly && !s.CodeModeEnabled {
@@ -959,6 +1005,25 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			if listErr != nil {
 				return nil, fmt.Errorf("search mcp tools: list servers: %w", listErr)
 			}
+
+			// Filter global servers (OrgID == nil && TeamID == nil) to only those
+			// explicitly allowed via org/team/key access tables. Org- and team-scoped
+			// servers are implicitly accessible to members of that org/team.
+			var accessible []db.MCPServer
+			for _, s := range servers {
+				if s.OrgID != nil || s.TeamID != nil {
+					accessible = append(accessible, s)
+					continue
+				}
+				allowed, accessErr := database.CheckMCPAccess(ctx, ki.OrgID, ki.TeamID, ki.KeyID, s.ID)
+				if accessErr != nil {
+					continue
+				}
+				if allowed {
+					accessible = append(accessible, s)
+				}
+			}
+			servers = accessible
 
 			wantSet := make(map[string]bool, len(serverAliases))
 			for _, a := range serverAliases {
@@ -1019,6 +1084,33 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			ListAccessibleMCPServers: voidllmDeps.ListAccessibleMCPServers,
 			SearchMCPTools:           voidllmDeps.SearchMCPTools,
 		})
+
+		// Inject TypeScript type declarations into the execute_code tool
+		// description so LLMs can generate correct tool calls without calling
+		// search_tools first. The hook runs on every tools/list request so the
+		// declarations stay current as the ToolCache is populated lazily.
+		toolCache := adminHandler.ToolCache
+		codeModeServer.SetOnToolsList(func(tools []mcp.Tool) []mcp.Tool {
+			allCached := toolCache.GetAllTools()
+			if len(allCached) == 0 {
+				return tools
+			}
+			types := mcp.GenerateToolTypeDefs(allCached)
+			if types == "" {
+				return tools
+			}
+			desc := "Execute JavaScript code in a sandboxed WASM runtime.\n\n" +
+				"## Available Tools\n\n" + types + "\n\n" +
+				"Call tools via `await tools.serverAlias.toolName(args)`. Return a value as the result."
+			for i := range tools {
+				if tools[i].Name == "execute_code" {
+					tools[i].Description = desc
+					break
+				}
+			}
+			return tools
+		})
+
 		adminHandler.CodeModeServer = codeModeServer
 	}
 

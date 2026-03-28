@@ -143,7 +143,7 @@ export function useRemoveBlocklistEntry() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({ serverId, toolName }: { serverId: string; toolName: string }) =>
-      apiClient<void>(`/mcp-servers/${serverId}/blocklist/${encodeURIComponent(toolName)}`, {
+      apiClient<void>(`/mcp-servers/${serverId}/blocklist?tool_name=${encodeURIComponent(toolName)}`, {
         method: 'DELETE',
       }),
     onSuccess: (_, vars) => {

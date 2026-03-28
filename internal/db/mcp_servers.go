@@ -217,6 +217,33 @@ func (d *DB) GetMCPServerByAliasScoped(ctx context.Context, alias, orgID, teamID
 	return server, nil
 }
 
+// GetMCPServerByAliasAny retrieves the first active MCP server matching alias
+// regardless of scope (global, org-scoped, or team-scoped). When multiple
+// servers share the same alias across scopes, the narrowest scope wins:
+// team-scoped is preferred over org-scoped, which is preferred over global.
+//
+// This is intended for the ToolCache fetcher, which resolves a server solely
+// to obtain its URL and auth credentials for fetching tool schemas. Access
+// control is enforced at a higher layer before any tool is invoked.
+// It returns ErrNotFound if no matching active server exists.
+func (d *DB) GetMCPServerByAliasAny(ctx context.Context, alias string) (*MCPServer, error) {
+	p := d.dialect.Placeholder
+	query := "SELECT " + mcpServerSelectColumns +
+		" FROM mcp_servers WHERE alias = " + p(1) +
+		" AND is_active = 1 AND deleted_at IS NULL" +
+		" ORDER BY CASE WHEN team_id IS NOT NULL THEN 1" +
+		"               WHEN org_id IS NOT NULL THEN 2" +
+		"               ELSE 3 END" +
+		" LIMIT 1"
+
+	row := d.sql.QueryRowContext(ctx, query, alias)
+	server, err := scanMCPServer(row)
+	if err != nil {
+		return nil, fmt.Errorf("get mcp server by alias any %q: %w", alias, translateError(err))
+	}
+	return server, nil
+}
+
 // ListMCPServers returns all active, non-deleted global MCP servers
 // (org_id IS NULL, team_id IS NULL) ordered by alias ascending.
 // Intended for system_admin use only.

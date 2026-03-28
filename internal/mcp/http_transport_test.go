@@ -446,6 +446,321 @@ func TestListTools_AutoInitialize(t *testing.T) {
 	}
 }
 
+// ---- parseSSEEndpoint -------------------------------------------------------
+
+func TestParseSSEEndpoint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		body    string
+		baseURL string
+		want    string
+		wantErr string // non-empty means we expect an error containing this substring
+	}{
+		{
+			name:    "RelativeURL",
+			body:    "event: endpoint\ndata: /messages?sid=123\n\n",
+			baseURL: "https://example.com/sse",
+			want:    "https://example.com/messages?sid=123",
+		},
+		{
+			name:    "AbsoluteURLSameOrigin",
+			body:    "event: endpoint\ndata: https://example.com/msg\n\n",
+			baseURL: "https://example.com/sse",
+			want:    "https://example.com/msg",
+		},
+		{
+			name:    "AbsoluteURLCrossOrigin",
+			body:    "event: endpoint\ndata: https://evil.com/steal\n\n",
+			baseURL: "https://example.com/sse",
+			wantErr: "different origin",
+		},
+		{
+			name:    "NoEndpointEvent",
+			body:    "event: message\ndata: hello\n\n",
+			baseURL: "https://example.com/sse",
+			wantErr: "no endpoint event",
+		},
+		{
+			name:    "EmptyBody",
+			body:    "",
+			baseURL: "https://example.com/sse",
+			wantErr: "no endpoint event",
+		},
+		{
+			name:    "MultipleEvents",
+			body:    "event: message\ndata: ignore\n\nevent: endpoint\ndata: /real\n\n",
+			baseURL: "https://example.com/sse",
+			want:    "https://example.com/real",
+		},
+		{
+			name:    "WindowsLineEndings",
+			body:    "event: endpoint\r\ndata: /msg\r\n\r\n",
+			baseURL: "https://example.com/sse",
+			want:    "https://example.com/msg",
+		},
+		{
+			name:    "DataNoSpace",
+			body:    "event: endpoint\ndata:/messages\n\n",
+			baseURL: "https://example.com/sse",
+			want:    "https://example.com/messages",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := mcp.ParseSSEEndpoint([]byte(tc.body), tc.baseURL)
+
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("ParseSSEEndpoint() error = nil, want error containing %q", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("ParseSSEEndpoint() error = %q, want it to contain %q", err.Error(), tc.wantErr)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("ParseSSEEndpoint() error = %v, want nil", err)
+			}
+			if got != tc.want {
+				t.Errorf("ParseSSEEndpoint() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// ---- detectTransport + ListTools integration --------------------------------
+
+// sseListToolsHandler is a reusable httptest handler that responds correctly to
+// the full SSE-transport protocol flow:
+//   - POST to base URL → the status given by probeStatus
+//   - GET to base URL  → SSE endpoint event pointing to postPath
+//   - POST to postPath → initialize response, then tools/list response
+func sseListToolsHandler(probeStatus int, postPath string, tools []map[string]any) http.Handler {
+	initResp := `{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-03-26","capabilities":{}}}`
+	toolsJSON, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"result":  map[string]any{"tools": tools},
+	})
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			if r.URL.Path == postPath {
+				// Read the incoming method so we can dispatch.
+				body, _ := io.ReadAll(r.Body)
+				var rpc struct {
+					Method string `json:"method"`
+				}
+				_ = json.Unmarshal(body, &rpc)
+
+				w.Header().Set("Content-Type", "application/json")
+				switch rpc.Method {
+				case "initialize":
+					fmt.Fprint(w, initResp)
+				case "notifications/initialized":
+					w.WriteHeader(http.StatusAccepted)
+				case "tools/list":
+					w.Write(toolsJSON) //nolint:errcheck
+				default:
+					w.WriteHeader(http.StatusBadRequest)
+				}
+				return
+			}
+			// POST to base URL — return probe status (404 or 405 triggers SSE fallback).
+			w.WriteHeader(probeStatus)
+
+		case http.MethodGet:
+			// SSE discovery response.
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, "event: endpoint\ndata: %s\n\n", postPath)
+		}
+	})
+}
+
+// TestDetectTransport_StreamableHTTP verifies that when POST to the base URL
+// returns 200 the transport uses Streamable HTTP without an SSE discovery step.
+func TestDetectTransport_StreamableHTTP(t *testing.T) {
+	t.Parallel()
+
+	initResp := `{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-03-26","capabilities":{}}}`
+	toolsResp := `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"ping","description":"Ping tool","inputSchema":{"type":"object"}}]}}`
+
+	var getCount int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			getCount++
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		var rpc struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(body, &rpc)
+
+		w.Header().Set("Content-Type", "application/json")
+		switch rpc.Method {
+		case "initialize":
+			fmt.Fprint(w, initResp)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			fmt.Fprint(w, toolsResp)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	tr := newTransport(srv.URL, "none", "", "")
+	tools, err := tr.ListTools(context.Background())
+	if err != nil {
+		t.Fatalf("ListTools() error = %v, want nil", err)
+	}
+	if len(tools) != 1 || tools[0].Name != "ping" {
+		t.Errorf("ListTools() = %v, want [{ping ...}]", tools)
+	}
+	// No GET request should have been made — Streamable HTTP uses POST only.
+	if getCount != 0 {
+		t.Errorf("GET request count = %d, want 0 (Streamable HTTP should not do SSE discovery)", getCount)
+	}
+}
+
+// TestDetectTransport_SSEFallback verifies that when the base URL returns 404
+// on POST the transport falls back to SSE discovery and uses the discovered URL.
+func TestDetectTransport_SSEFallback(t *testing.T) {
+	t.Parallel()
+
+	tools := []map[string]any{
+		{"name": "sse-tool", "description": "From SSE path", "inputSchema": map[string]any{"type": "object"}},
+	}
+	srv := httptest.NewServer(sseListToolsHandler(http.StatusNotFound, "/messages", tools))
+	t.Cleanup(srv.Close)
+
+	tr := newTransport(srv.URL, "none", "", "")
+	got, err := tr.ListTools(context.Background())
+	if err != nil {
+		t.Fatalf("ListTools() error = %v, want nil", err)
+	}
+	if len(got) != 1 || got[0].Name != "sse-tool" {
+		t.Errorf("ListTools() = %v, want [{sse-tool ...}]", got)
+	}
+}
+
+// TestDetectTransport_SSEFallback_405 verifies that 405 Method Not Allowed also
+// triggers SSE discovery (same code path as 404 in detectTransport).
+func TestDetectTransport_SSEFallback_405(t *testing.T) {
+	t.Parallel()
+
+	tools := []map[string]any{
+		{"name": "sse-tool-405", "description": "Found via 405 fallback", "inputSchema": map[string]any{"type": "object"}},
+	}
+	srv := httptest.NewServer(sseListToolsHandler(http.StatusMethodNotAllowed, "/mcp/messages", tools))
+	t.Cleanup(srv.Close)
+
+	tr := newTransport(srv.URL, "none", "", "")
+	got, err := tr.ListTools(context.Background())
+	if err != nil {
+		t.Fatalf("ListTools() error = %v, want nil", err)
+	}
+	if len(got) != 1 || got[0].Name != "sse-tool-405" {
+		t.Errorf("ListTools() = %v, want [{sse-tool-405 ...}]", got)
+	}
+}
+
+// TestSSEDiscover_AuthForwarded verifies that the bearer token is included in
+// the SSE discovery GET request.
+func TestSSEDiscover_AuthForwarded(t *testing.T) {
+	t.Parallel()
+
+	const token = "my-bearer-token"
+	var discoveryAuthHeader string
+
+	initResp := `{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-03-26","capabilities":{}}}`
+	toolsResp := `{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			if r.URL.Path == "/messages" {
+				body, _ := io.ReadAll(r.Body)
+				var rpc struct {
+					Method string `json:"method"`
+				}
+				_ = json.Unmarshal(body, &rpc)
+
+				w.Header().Set("Content-Type", "application/json")
+				switch rpc.Method {
+				case "initialize":
+					fmt.Fprint(w, initResp)
+				case "notifications/initialized":
+					w.WriteHeader(http.StatusAccepted)
+				case "tools/list":
+					fmt.Fprint(w, toolsResp)
+				default:
+					w.WriteHeader(http.StatusBadRequest)
+				}
+				return
+			}
+			// Probe returns 404 to trigger SSE fallback.
+			w.WriteHeader(http.StatusNotFound)
+
+		case http.MethodGet:
+			// Record the auth header sent during SSE discovery.
+			discoveryAuthHeader = r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "event: endpoint\ndata: /messages\n\n")
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	tr := newTransport(srv.URL, "bearer", "", token)
+	_, err := tr.ListTools(context.Background())
+	if err != nil {
+		t.Fatalf("ListTools() error = %v, want nil", err)
+	}
+
+	want := "Bearer " + token
+	if discoveryAuthHeader != want {
+		t.Errorf("SSE discovery Authorization = %q, want %q", discoveryAuthHeader, want)
+	}
+}
+
+// TestSSEDiscover_CrossOriginRejected verifies that a cross-origin endpoint URL
+// returned by the SSE discovery stream is rejected with an error.
+func TestSSEDiscover_CrossOriginRejected(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			// Probe returns 404 to trigger SSE discovery.
+			w.WriteHeader(http.StatusNotFound)
+		case http.MethodGet:
+			// Return an endpoint URL on a different origin.
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "event: endpoint\ndata: https://attacker.example.com/steal\n\n")
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	tr := newTransport(srv.URL, "none", "", "")
+	_, err := tr.ListTools(context.Background())
+	if err == nil {
+		t.Fatal("ListTools() error = nil, want error for cross-origin SSE endpoint")
+	}
+	if !strings.Contains(err.Error(), "different origin") {
+		t.Errorf("ListTools() error = %q, want it to contain %q", err.Error(), "different origin")
+	}
+}
+
 // TestListTools_InitializeReturnsSession verifies that the session ID obtained
 // from the initialize response is forwarded to the tools/list request.
 func TestListTools_InitializeReturnsSession(t *testing.T) {
