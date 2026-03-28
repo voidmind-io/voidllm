@@ -17,10 +17,15 @@ import (
 	"github.com/voidmind-io/voidllm/pkg/crypto"
 )
 
-// mcpSessions stores the most-recently-seen Mcp-Session-Id for each MCP server
-// alias. Keys are server alias strings; values are session ID strings.
-// Concurrent access is safe; no explicit locking is required.
-var mcpSessions sync.Map // map[string]string — server alias → Mcp-Session-Id
+// mcpSessions stores the most-recently-seen Mcp-Session-Id per (orgID, alias)
+// pair. Keys are "alias:orgID" strings; values are session ID strings.
+// Concurrent access is safe via sync.Map.
+var mcpSessions sync.Map // map[string]string — "alias:orgID" → Mcp-Session-Id
+
+// mcpReInitMu serialises session re-initialisation. Re-init only happens on
+// ErrSessionExpired which is rare; a global mutex avoids a per-key lock map
+// while still preventing concurrent duplicate re-inits for the same server.
+var mcpReInitMu sync.Mutex
 
 // MCPToolCallLogger logs MCP tool call events asynchronously.
 // Implementations must be safe for concurrent use. Log must never block.
@@ -106,11 +111,16 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 		return c.JSON(mcp.NewErrorResponse(nil, mcp.CodeParseError, "empty request body"))
 	}
 
-	toolName := extractToolName(body)
+	toolName := extractToolNameForLog(body)
+	method := extractMethodForMetrics(body)
 
-	// Load any existing session for this server alias.
+	// Session key is scoped per (alias, orgID) to prevent cross-org session
+	// confusion when the same alias is registered under different organisations.
+	sessionKey := alias + ":" + ki.OrgID
+
+	// Load any existing session for this server alias + org.
 	var sessionID string
-	if sid, ok := mcpSessions.Load(alias); ok {
+	if sid, ok := mcpSessions.Load(sessionKey); ok {
 		sessionID = sid.(string)
 	}
 
@@ -121,30 +131,41 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 
 	// If the upstream reports session expired, delete the stale session and
 	// re-initialize once before retrying the original request.
+	// mcpReInitMu prevents concurrent goroutines from racing to re-initialize
+	// the same (or any) session simultaneously; re-init is rare so a global
+	// lock is sufficient.
 	if errors.Is(callErr, mcp.ErrSessionExpired) && !isInit {
-		mcpSessions.Delete(alias)
-
-		initBody := buildInitializeRequest()
-		_, initSID, initErr := transport.Call(c.Context(), initBody, "")
-		if initErr != nil {
-			h.Log.ErrorContext(c.Context(), "mcp proxy: re-initialize after session expiry",
-				slog.String("server", alias),
-				slog.String("error", initErr.Error()))
-			return c.Status(fiber.StatusBadGateway).JSON(
-				mcp.NewErrorResponse(nil, mcp.CodeInternalError, "upstream MCP server unavailable"))
+		mcpReInitMu.Lock()
+		// Double-check: another goroutine may have already re-initialized.
+		if sid, ok := mcpSessions.Load(sessionKey); ok {
+			mcpReInitMu.Unlock()
+			result, newSID, callErr = transport.Call(c.Context(), body, sid.(string))
+		} else {
+			mcpSessions.Delete(sessionKey)
+			initBody := buildInitializeRequest()
+			_, initSID, initErr := transport.Call(c.Context(), initBody, "")
+			if initErr != nil {
+				mcpReInitMu.Unlock()
+				h.Log.ErrorContext(c.Context(), "mcp proxy: re-initialize after session expiry",
+					slog.String("server", alias),
+					slog.String("error", initErr.Error()))
+				return c.Status(fiber.StatusBadGateway).JSON(
+					mcp.NewErrorResponse(nil, mcp.CodeInternalError, "upstream MCP server unavailable"))
+			}
+			if initSID != "" {
+				mcpSessions.Store(sessionKey, initSID)
+				notifyBody := buildInitializedNotification()
+				// Fire-and-forget: ignore errors — the notification is advisory.
+				transport.Call(c.Context(), notifyBody, initSID) //nolint:errcheck
+			}
+			mcpReInitMu.Unlock()
+			// Retry the original request with the freshly established session.
+			result, newSID, callErr = transport.Call(c.Context(), body, initSID)
 		}
-		if initSID != "" {
-			mcpSessions.Store(alias, initSID)
-			notifyBody := buildInitializedNotification()
-			// Fire-and-forget: ignore errors — the notification is advisory.
-			transport.Call(c.Context(), notifyBody, initSID) //nolint:errcheck
-		}
-		// Retry the original request with the freshly established session.
-		result, newSID, callErr = transport.Call(c.Context(), body, initSID)
 	}
 
 	if newSID != "" {
-		mcpSessions.Store(alias, newSID)
+		mcpSessions.Store(sessionKey, newSID)
 	}
 
 	duration := time.Since(start)
@@ -154,9 +175,9 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 		status = "transport_error"
 		metrics.MCPTransportErrorsTotal.WithLabelValues(alias, "call").Inc()
 	}
-	metrics.MCPToolCallsTotal.WithLabelValues(alias, toolName, status).Inc()
-	if toolName != "" {
-		metrics.MCPToolCallDurationSeconds.WithLabelValues(alias, toolName).Observe(duration.Seconds())
+	metrics.MCPToolCallsTotal.WithLabelValues(alias, method, status).Inc()
+	if method != "" {
+		metrics.MCPToolCallDurationSeconds.WithLabelValues(alias, method).Observe(duration.Seconds())
 	}
 
 	if h.MCPLogger != nil {
@@ -229,11 +250,13 @@ var validMCPMethods = map[string]bool{
 	"prompts/get":               true,
 }
 
-// extractToolName parses the MCP tool name from a JSON-RPC tools/call request
-// body. For tools/call, it returns the tool name (truncated to 64 bytes to
-// prevent label bloat). For other known MCP methods it returns the method name.
-// Unknown methods and unparseable bodies return "unknown".
-func extractToolName(body []byte) string {
+// extractToolNameForLog parses the MCP tool name from a JSON-RPC request body
+// for use in the async usage logger (DB). For tools/call it returns the tool
+// name (truncated to 64 bytes). For other known MCP methods it returns the
+// method name. Unknown methods and unparseable bodies return "unknown".
+// This function may return user-controlled tool names and must NOT be used as
+// a Prometheus label value.
+func extractToolNameForLog(body []byte) string {
 	var req struct {
 		Method string `json:"method"`
 		Params struct {
@@ -249,6 +272,25 @@ func extractToolName(body []byte) string {
 			name = name[:64]
 		}
 		return name
+	}
+	if validMCPMethods[req.Method] {
+		return req.Method
+	}
+	return "unknown"
+}
+
+// extractMethodForMetrics returns a Prometheus-safe label value from an MCP
+// JSON-RPC request body. Only values from the bounded validMCPMethods set are
+// returned as-is. For tools/call the literal string "tools/call" is returned
+// regardless of the tool name, preventing cardinality explosion from arbitrary
+// user-controlled tool names in Prometheus metrics. Unparseable bodies and
+// unknown methods return "unknown".
+func extractMethodForMetrics(body []byte) string {
+	var req struct {
+		Method string `json:"method"`
+	}
+	if json.Unmarshal(body, &req) != nil {
+		return "unknown"
 	}
 	if validMCPMethods[req.Method] {
 		return req.Method

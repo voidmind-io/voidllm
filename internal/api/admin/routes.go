@@ -184,8 +184,12 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 	api.Get("/orgs/:org_id/teams/:team_id/mcp-servers", auth.RequireRole(auth.RoleMember), handler.ListTeamMCPServers)
 
 	// Shared MCP server operations — handler enforces scope-based ownership.
+	// Static sub-paths (activate, deactivate, test) are registered before
+	// /:server_id so Fiber does not treat them as server_id parameter values.
 	api.Get("/mcp-servers/:server_id", auth.RequireRole(auth.RoleMember), handler.GetMCPServer)
 	api.Patch("/mcp-servers/:server_id", auth.RequireRole(auth.RoleMember), handler.UpdateMCPServer)
 	api.Delete("/mcp-servers/:server_id", auth.RequireRole(auth.RoleMember), handler.DeleteMCPServer)
+	api.Patch("/mcp-servers/:server_id/activate", auth.RequireRole(auth.RoleMember), handler.ActivateMCPServer)
+	api.Patch("/mcp-servers/:server_id/deactivate", auth.RequireRole(auth.RoleMember), handler.DeactivateMCPServer)
 	api.Post("/mcp-servers/:server_id/test", auth.RequireRole(auth.RoleMember), handler.TestMCPServerConnection)
 }

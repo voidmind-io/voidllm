@@ -8,6 +8,8 @@ export interface MCPServerResponse {
   url: string
   auth_type: string
   auth_header?: string
+  /** source is "api" for Admin API-created servers and "yaml" for config-file-sourced servers. */
+  source: string
   scope: string
   org_id?: string
   team_id?: string

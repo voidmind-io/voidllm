@@ -90,7 +90,8 @@ Any OpenAI-compatible SDK works out of the box — just change the base URL to y
 - **Streaming (SSE)** — transparent proxy pass-through with per-chunk usage extraction
 - **SQLite or PostgreSQL** — zero-dep default or production-grade
 - **Helm chart** — production-ready Kubernetes deployment
-- **MCP server** — Model Context Protocol endpoint for IDE integration (Claude Code, Cursor, Windsurf)
+- **MCP gateway** — proxy and manage external MCP servers with access control, session management, and usage tracking
+- **MCP tools** — built-in management tools for IDE integration (Claude Code, Cursor, Windsurf)
 - **Graceful shutdown** — phased drain, in-flight request tracking, K8s-ready
 
 ### Pro ($299/mo)
@@ -115,29 +116,11 @@ Flat pricing — no per-user fees, no per-request charges. Self-hosted on your i
 
 ---
 
-## MCP Integration
+## MCP Gateway
 
-VoidLLM exposes a [Model Context Protocol](https://modelcontextprotocol.io) server for IDE integration. Manage your LLM proxy directly from Claude Code, Cursor, or Windsurf.
+VoidLLM is an [MCP](https://modelcontextprotocol.io) gateway — it exposes built-in management tools and proxies requests to external MCP servers with access control, usage tracking, and automatic session management.
 
-### Setup
-
-Add to your `.mcp.json` (project root or `~/.claude/mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "voidllm": {
-      "type": "http",
-      "url": "http://localhost:8080/api/v1/mcp/voidllm",
-      "headers": {
-        "Authorization": "Bearer vl_uk_your_key_here"
-      }
-    }
-  }
-}
-```
-
-### Available Tools
+### Built-in Tools
 
 | Tool | Description |
 |---|---|
@@ -147,6 +130,33 @@ Add to your `.mcp.json` (project root or `~/.claude/mcp.json`):
 | `list_keys` | API keys visible to you |
 | `create_key` | Create a temporary API key |
 | `list_deployments` | Deployment details (system_admin only) |
+
+### External MCP Servers
+
+Register external MCP servers via the Admin UI or API. VoidLLM proxies tool calls through `/api/v1/mcp/:alias` with:
+- **Scoped access control** — global, org, or team level
+- **Session management** — automatic initialize + session ID forwarding
+- **Usage tracking** — who called which tool, when, how long
+- **Prometheus metrics** — tool call counts, duration, errors
+
+### IDE Setup
+
+```json
+{
+  "mcpServers": {
+    "voidllm": {
+      "type": "http",
+      "url": "http://localhost:8080/api/v1/mcp/voidllm",
+      "headers": { "Authorization": "Bearer vl_uk_your_key" }
+    },
+    "github": {
+      "type": "http",
+      "url": "http://localhost:8080/api/v1/mcp/github",
+      "headers": { "Authorization": "Bearer vl_uk_your_key" }
+    }
+  }
+}
+```
 
 ---
 

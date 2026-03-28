@@ -27,6 +27,7 @@ CREATE TABLE mcp_servers (
     team_id         TEXT REFERENCES teams(id),          -- NULL for global/org-scoped servers
     is_active       INTEGER NOT NULL DEFAULT 1,
     created_by      TEXT,                               -- NULL for system/yaml-sourced entries
+    source          TEXT NOT NULL DEFAULT 'api',        -- 'api' | 'yaml'
     created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at      TEXT,

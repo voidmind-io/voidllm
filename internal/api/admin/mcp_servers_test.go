@@ -881,3 +881,50 @@ func TestMCPServers_RBAC_SharedRoutes_NotFound(t *testing.T) {
 		}
 	}
 }
+
+// ---- Source field -----------------------------------------------------------
+
+func TestCreateMCPServer_SourceIsAPI(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestCreateMCPServer_SourceIsAPI?mode=memory&cache=private"
+	app, _, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-source-api")
+
+	body := map[string]any{
+		"name":      "Source Test Server",
+		"alias":     "source-test",
+		"url":       "https://source-test.example.com",
+		"auth_type": "none",
+	}
+
+	got := createMCPServerViaAPI(t, app, key, body)
+
+	if got["source"] != "api" {
+		t.Errorf("source = %v, want %q (API-created servers must have source=api)", got["source"], "api")
+	}
+}
+
+func TestCreateMCPServer_CannotSetSourceYAML(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestCreateMCPServer_CannotSetSourceYAML?mode=memory&cache=private"
+	app, _, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-source-yaml")
+
+	// Include source="yaml" in the request body — the handler must ignore it.
+	body := map[string]any{
+		"name":      "YAML Override Test",
+		"alias":     "yaml-override",
+		"url":       "https://yaml-override.example.com",
+		"auth_type": "none",
+		"source":    "yaml",
+	}
+
+	got := createMCPServerViaAPI(t, app, key, body)
+
+	// Regardless of what the caller sent, source must always be "api".
+	if got["source"] != "api" {
+		t.Errorf("source = %v, want %q (client cannot set source=yaml via API)", got["source"], "api")
+	}
+}

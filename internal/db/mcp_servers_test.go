@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/voidmind-io/voidllm/internal/config"
+	"github.com/voidmind-io/voidllm/pkg/crypto"
 )
 
 // mustCreateMCPServer creates an MCP server and fails the test on error.
@@ -872,5 +875,190 @@ func TestDeleteMCPServer(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ---- SyncYAMLMCPServers -----------------------------------------------------
+
+// testSyncEncKey is a 32-byte AES-256 key used in SyncYAMLMCPServers tests.
+var testSyncEncKey = []byte("12345678901234567890123456789012")
+
+// mustParseCryptoKey parses a raw key string via crypto.ParseKey, failing on error.
+func mustParseCryptoKey(t *testing.T, raw string) []byte {
+	t.Helper()
+	key, err := crypto.ParseKey(raw)
+	if err != nil {
+		t.Fatalf("crypto.ParseKey(%q): %v", raw, err)
+	}
+	return key
+}
+
+func TestSyncYAMLMCPServers_CreatesNew(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	servers := []config.MCPServerConfig{
+		{Name: "GitHub MCP", Alias: "github", URL: "https://mcp.github.com", AuthType: "none"},
+	}
+
+	if err := d.SyncYAMLMCPServers(context.Background(), servers, testSyncEncKey); err != nil {
+		t.Fatalf("SyncYAMLMCPServers() error = %v, want nil", err)
+	}
+
+	got, err := d.GetMCPServerByAlias(context.Background(), "github")
+	if err != nil {
+		t.Fatalf("GetMCPServerByAlias() error = %v", err)
+	}
+	if got.Source != "yaml" {
+		t.Errorf("Source = %q, want %q", got.Source, "yaml")
+	}
+	if got.Name != "GitHub MCP" {
+		t.Errorf("Name = %q, want %q", got.Name, "GitHub MCP")
+	}
+	if got.URL != "https://mcp.github.com" {
+		t.Errorf("URL = %q, want %q", got.URL, "https://mcp.github.com")
+	}
+}
+
+func TestSyncYAMLMCPServers_UpdatesExisting(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	// First sync — creates the record.
+	initial := []config.MCPServerConfig{
+		{Name: "Tool A", Alias: "tool-a", URL: "https://old.example.com", AuthType: "none"},
+	}
+	if err := d.SyncYAMLMCPServers(context.Background(), initial, testSyncEncKey); err != nil {
+		t.Fatalf("first SyncYAMLMCPServers() error = %v", err)
+	}
+
+	// Second sync — same alias, different URL and name.
+	updated := []config.MCPServerConfig{
+		{Name: "Tool A v2", Alias: "tool-a", URL: "https://new.example.com", AuthType: "none"},
+	}
+	if err := d.SyncYAMLMCPServers(context.Background(), updated, testSyncEncKey); err != nil {
+		t.Fatalf("second SyncYAMLMCPServers() error = %v", err)
+	}
+
+	got, err := d.GetMCPServerByAlias(context.Background(), "tool-a")
+	if err != nil {
+		t.Fatalf("GetMCPServerByAlias() error = %v", err)
+	}
+	if got.URL != "https://new.example.com" {
+		t.Errorf("URL = %q, want %q", got.URL, "https://new.example.com")
+	}
+	if got.Name != "Tool A v2" {
+		t.Errorf("Name = %q, want %q", got.Name, "Tool A v2")
+	}
+}
+
+func TestSyncYAMLMCPServers_SkipsAPICreated(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	// Create a server directly via the DB with source="api".
+	mustCreateMCPServer(t, d, CreateMCPServerParams{
+		Name:     "API Server",
+		Alias:    "api-server",
+		URL:      "https://api-created.example.com",
+		AuthType: "none",
+		Source:   "api",
+	})
+
+	// Attempt to overwrite it via YAML sync.
+	servers := []config.MCPServerConfig{
+		{Name: "YAML Override Attempt", Alias: "api-server", URL: "https://yaml-override.example.com", AuthType: "none"},
+	}
+	if err := d.SyncYAMLMCPServers(context.Background(), servers, testSyncEncKey); err != nil {
+		t.Fatalf("SyncYAMLMCPServers() error = %v", err)
+	}
+
+	// Verify the API-created record was NOT overwritten.
+	got, err := d.GetMCPServerByAlias(context.Background(), "api-server")
+	if err != nil {
+		t.Fatalf("GetMCPServerByAlias() error = %v", err)
+	}
+	if got.URL != "https://api-created.example.com" {
+		t.Errorf("URL = %q, want original %q (API-created must not be overwritten)", got.URL, "https://api-created.example.com")
+	}
+	if got.Source != "api" {
+		t.Errorf("Source = %q, want %q", got.Source, "api")
+	}
+}
+
+func TestSyncYAMLMCPServers_EncryptsToken(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	// Use a 32-byte key parsed by the real crypto package. The literal below is
+	// exactly 32 ASCII characters so ParseKey will SHA-256 derive it.
+	key := mustParseCryptoKey(t, "test-enc-key-exactly-32-bytes!!!")
+
+	servers := []config.MCPServerConfig{
+		{Name: "Secure MCP", Alias: "secure-mcp", URL: "https://secure.example.com", AuthType: "bearer", AuthToken: "super-secret"},
+	}
+	if err := d.SyncYAMLMCPServers(context.Background(), servers, key); err != nil {
+		t.Fatalf("SyncYAMLMCPServers() error = %v", err)
+	}
+
+	got, err := d.GetMCPServerByAlias(context.Background(), "secure-mcp")
+	if err != nil {
+		t.Fatalf("GetMCPServerByAlias() error = %v", err)
+	}
+	if got.AuthTokenEnc == nil {
+		t.Fatal("AuthTokenEnc = nil, want non-nil (token must be encrypted)")
+	}
+	// The encrypted value must differ from the plaintext.
+	if *got.AuthTokenEnc == "super-secret" {
+		t.Error("AuthTokenEnc stores the plaintext, want the ciphertext")
+	}
+}
+
+func TestSyncYAMLMCPServers_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	servers := []config.MCPServerConfig{
+		{Name: "Stable MCP", Alias: "stable", URL: "https://stable.example.com", AuthType: "none"},
+	}
+
+	// Sync twice with identical config.
+	for i := range 2 {
+		if err := d.SyncYAMLMCPServers(context.Background(), servers, testSyncEncKey); err != nil {
+			t.Fatalf("SyncYAMLMCPServers() call %d error = %v", i+1, err)
+		}
+	}
+
+	// Only one record must exist.
+	all, err := d.ListMCPServers(context.Background())
+	if err != nil {
+		t.Fatalf("ListMCPServers() error = %v", err)
+	}
+	count := 0
+	for _, s := range all {
+		if s.Alias == "stable" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("found %d servers with alias %q after two syncs, want 1", count, "stable")
+	}
+}
+
+func TestSyncYAMLMCPServers_Empty(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	if err := d.SyncYAMLMCPServers(context.Background(), nil, testSyncEncKey); err != nil {
+		t.Errorf("SyncYAMLMCPServers(nil) error = %v, want nil", err)
+	}
+	if err := d.SyncYAMLMCPServers(context.Background(), []config.MCPServerConfig{}, testSyncEncKey); err != nil {
+		t.Errorf("SyncYAMLMCPServers([]) error = %v, want nil", err)
 	}
 }

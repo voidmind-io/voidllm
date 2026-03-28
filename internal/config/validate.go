@@ -3,11 +3,23 @@ package config
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/voidmind-io/voidllm/internal/provider"
 )
+
+// mcpAliasRe matches a valid MCP server alias: lowercase alphanumeric
+// characters and hyphens, starting with an alphanumeric character.
+var mcpAliasRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
+// validMCPAuthTypes is the set of accepted MCP server auth type values.
+var validMCPAuthTypes = map[string]bool{
+	"none":   true,
+	"bearer": true,
+	"header": true,
+}
 
 // validModelTypes is the set of accepted model type values in the YAML config.
 // An empty string is also valid and resolves to "chat" at sync time.
@@ -188,6 +200,45 @@ func (c *Config) validate() error {
 			} else {
 				seenAliases[alias] = m.Name
 			}
+		}
+	}
+
+	// --- mcp_servers ---
+	seenMCPAliases := make(map[string]bool)
+	for i, s := range c.MCPServers {
+		prefix := fmt.Sprintf("mcp_servers[%d]", i)
+
+		if s.Name == "" {
+			errs = append(errs, fmt.Errorf("%s.name: must not be empty", prefix))
+		}
+
+		if s.Alias == "" {
+			errs = append(errs, fmt.Errorf("%s.alias: must not be empty", prefix))
+		} else if s.Alias == "voidllm" {
+			errs = append(errs, fmt.Errorf(`%s.alias: "voidllm" is reserved`, prefix))
+		} else if !mcpAliasRe.MatchString(s.Alias) {
+			errs = append(errs, fmt.Errorf("%s.alias: must contain only lowercase alphanumeric characters and hyphens, and must start with an alphanumeric character", prefix))
+		} else if seenMCPAliases[s.Alias] {
+			errs = append(errs, fmt.Errorf("%s.alias: duplicate alias %q", prefix, s.Alias))
+		} else {
+			seenMCPAliases[s.Alias] = true
+		}
+
+		if s.URL == "" {
+			errs = append(errs, fmt.Errorf("%s.url: must not be empty", prefix))
+		} else if !strings.HasPrefix(s.URL, "http://") && !strings.HasPrefix(s.URL, "https://") {
+			errs = append(errs, fmt.Errorf("%s.url: must start with http:// or https://", prefix))
+		}
+
+		authType := s.AuthType
+		if authType == "" {
+			authType = "none"
+		}
+		if !validMCPAuthTypes[authType] {
+			errs = append(errs, fmt.Errorf(`%s.auth_type: must be one of "none", "bearer", "header"; got %q`, prefix, s.AuthType))
+		}
+		if authType == "header" && s.AuthHeader == "" {
+			errs = append(errs, fmt.Errorf(`%s.auth_header: must not be empty when auth_type is "header"`, prefix))
 		}
 	}
 

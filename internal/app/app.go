@@ -207,6 +207,9 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	if err := database.SyncYAMLModels(ctx, cfg.Models, encKey); err != nil {
 		return nil, fmt.Errorf("sync YAML models: %w", err)
 	}
+	if err := database.SyncYAMLMCPServers(ctx, cfg.MCPServers, encKey); err != nil {
+		return nil, fmt.Errorf("sync YAML MCP servers: %w", err)
+	}
 
 	// Step 4a: build the in-memory registry from the YAML config.
 	registry, err := proxy.NewRegistry(cfg.Models)

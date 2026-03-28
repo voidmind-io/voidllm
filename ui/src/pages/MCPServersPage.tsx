@@ -129,6 +129,14 @@ function scopeLabel(scope: string): string {
   return scope
 }
 
+function sourceBadgeVariant(source: string): 'muted' | 'warning' {
+  return source === 'yaml' ? 'warning' : 'muted'
+}
+
+function sourceLabel(source: string): string {
+  return source === 'yaml' ? 'YAML' : 'API'
+}
+
 // ---------------------------------------------------------------------------
 // CreateMCPServerDialog
 // ---------------------------------------------------------------------------
@@ -602,14 +610,25 @@ export default function MCPServersPage() {
       ),
     },
     {
+      key: 'source',
+      header: 'Source',
+      render: (row) => (
+        <Badge variant={sourceBadgeVariant(row.source)}>
+          {sourceLabel(row.source)}
+        </Badge>
+      ),
+    },
+    {
       key: 'is_active',
       header: 'Status',
       render: (row) => {
-        // Only allow toggling if the user has permission for that server's scope
+        // Only allow toggling if the user has permission for that server's scope.
+        // yaml-sourced servers cannot be toggled through the Admin API.
         const canToggle =
-          (row.scope === 'global' && isSystemAdmin) ||
+          row.source !== 'yaml' &&
+          ((row.scope === 'global' && isSystemAdmin) ||
           (row.scope === 'org' && isOrgAdmin) ||
-          (row.scope === 'team' && isTeamAdmin)
+          (row.scope === 'team' && isTeamAdmin))
         return (
           <Toggle
             checked={row.is_active}
@@ -640,10 +659,13 @@ export default function MCPServersPage() {
       header: '',
       align: 'right',
       render: (row) => {
+        // yaml-sourced servers are managed via config file and cannot be
+        // edited or deleted through the Admin API.
         const canModify =
-          (row.scope === 'global' && isSystemAdmin) ||
+          row.source !== 'yaml' &&
+          ((row.scope === 'global' && isSystemAdmin) ||
           (row.scope === 'org' && isOrgAdmin) ||
-          (row.scope === 'team' && isTeamAdmin)
+          (row.scope === 'team' && isTeamAdmin))
         return (
           <div className="flex items-center justify-end gap-1">
             <button

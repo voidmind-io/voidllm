@@ -731,6 +731,194 @@ models:
 	}
 }
 
+// ---- validate — mcp_servers -------------------------------------------------
+
+// minimalValidYAMLWithMCPServers returns a valid config YAML with the provided
+// mcp_servers block appended. This avoids repeating all required fields in every
+// MCP server test case.
+func minimalValidYAMLWithMCPServers(mcpBlock string) string {
+	return `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+mcp_servers:
+` + mcpBlock
+}
+
+func TestValidate_MCPServer(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		yaml        string
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name: "valid MCP server config passes",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "GitHub MCP"
+    alias: "github"
+    url: "https://mcp.github.com"
+    auth_type: "none"
+`),
+			wantErr: false,
+		},
+		{
+			name: "missing name returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: ""
+    alias: "github"
+    url: "https://mcp.github.com"
+    auth_type: "none"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].name",
+		},
+		{
+			name: "missing alias returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "GitHub MCP"
+    alias: ""
+    url: "https://mcp.github.com"
+    auth_type: "none"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].alias",
+		},
+		{
+			name: "alias with uppercase characters returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "GitHub MCP"
+    alias: "GitHub"
+    url: "https://mcp.github.com"
+    auth_type: "none"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].alias",
+		},
+		{
+			name: "alias with spaces returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "GitHub MCP"
+    alias: "has spaces"
+    url: "https://mcp.github.com"
+    auth_type: "none"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].alias",
+		},
+		{
+			name: "reserved alias voidllm returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "VoidLLM MCP"
+    alias: "voidllm"
+    url: "https://mcp.example.com"
+    auth_type: "none"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].alias",
+		},
+		{
+			name: "duplicate aliases return error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "Server One"
+    alias: "shared"
+    url: "https://one.example.com"
+    auth_type: "none"
+  - name: "Server Two"
+    alias: "shared"
+    url: "https://two.example.com"
+    auth_type: "none"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[1].alias",
+		},
+		{
+			name: "missing URL returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "GitHub MCP"
+    alias: "github"
+    url: ""
+    auth_type: "none"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].url",
+		},
+		{
+			name: "ftp URL scheme returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "FTP MCP"
+    alias: "ftpserver"
+    url: "ftp://mcp.example.com"
+    auth_type: "none"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].url",
+		},
+		{
+			name: "invalid auth_type oauth returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "OAuth MCP"
+    alias: "oauthserver"
+    url: "https://mcp.example.com"
+    auth_type: "oauth"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].auth_type",
+		},
+		{
+			name: "auth_type header without auth_header returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "Header MCP"
+    alias: "headerserver"
+    url: "https://mcp.example.com"
+    auth_type: "header"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].auth_header",
+		},
+		{
+			name: "empty auth_type defaults to none and passes validation",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "Default Auth MCP"
+    alias: "defaultauth"
+    url: "https://mcp.example.com"
+`),
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := writeTemp(t, "voidllm.yaml", tc.yaml)
+			_, _, err := config.Load(path)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("Load() expected error, got nil")
+				}
+				if tc.errContains != "" && !strings.Contains(err.Error(), tc.errContains) {
+					t.Errorf("error %q does not contain %q", err.Error(), tc.errContains)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Load() unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestValidate_AllErrorsCollected(t *testing.T) {
 	t.Parallel()
 

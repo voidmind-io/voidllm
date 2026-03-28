@@ -42,18 +42,21 @@ type updateMCPServerRequest struct {
 // mcpServerResponse is the JSON representation of an MCP server returned by the API.
 // The auth token is never included in the response — it is write-only.
 type mcpServerResponse struct {
-	ID         string  `json:"id"`
-	Name       string  `json:"name"`
-	Alias      string  `json:"alias"`
-	URL        string  `json:"url"`
-	AuthType   string  `json:"auth_type"`
-	AuthHeader string  `json:"auth_header,omitempty"`
-	IsActive   bool    `json:"is_active"`
-	Scope      string  `json:"scope"` // "global", "org", or "team"
-	OrgID      *string `json:"org_id,omitempty"`
-	TeamID     *string `json:"team_id,omitempty"`
-	CreatedAt  string  `json:"created_at"`
-	UpdatedAt  string  `json:"updated_at"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Alias      string `json:"alias"`
+	URL        string `json:"url"`
+	AuthType   string `json:"auth_type"`
+	AuthHeader string `json:"auth_header,omitempty"`
+	IsActive   bool   `json:"is_active"`
+	// Source indicates how this server was registered: "api" for Admin
+	// API-created servers, "yaml" for config-file-sourced servers.
+	Source    string  `json:"source"`
+	Scope     string  `json:"scope"` // "global", "org", or "team"
+	OrgID     *string `json:"org_id,omitempty"`
+	TeamID    *string `json:"team_id,omitempty"`
+	CreatedAt string  `json:"created_at"`
+	UpdatedAt string  `json:"updated_at"`
 }
 
 // testMCPServerResponse is the JSON response from TestMCPServerConnection.
@@ -155,6 +158,7 @@ func mcpServerToResponse(s *db.MCPServer) mcpServerResponse {
 		AuthType:   s.AuthType,
 		AuthHeader: s.AuthHeader,
 		IsActive:   s.IsActive,
+		Source:     s.Source,
 		Scope:      scope,
 		OrgID:      s.OrgID,
 		TeamID:     s.TeamID,
@@ -265,6 +269,34 @@ func (h *Handler) createMCPServerWithToken(c fiber.Ctx, params db.CreateMCPServe
 	return s, nil
 }
 
+// checkMCPServerReadPermission verifies that the caller may read a server.
+// The rules are intentionally less restrictive than the write permission check:
+//   - system_admin: always allowed.
+//   - org_admin / team_admin / member: allowed for org- or team-scoped servers
+//     where the caller's org matches the server's org.
+//   - Global servers (org_id IS NULL) are restricted to system_admin; direct ID
+//     enumeration of global servers by lower-privileged callers is not permitted.
+//
+// It writes the appropriate 401/403 response and returns an error when access
+// is denied.
+func checkMCPServerReadPermission(c fiber.Ctx, server *db.MCPServer, ki *auth.KeyInfo) error {
+	if ki == nil {
+		return apierror.Unauthorized(c, "authentication required")
+	}
+	if ki.Role == auth.RoleSystemAdmin {
+		return nil
+	}
+	// Global servers are readable by system_admin only.
+	if server.OrgID == nil {
+		return apierror.Forbidden(c, "system_admin role required to access global servers")
+	}
+	// Org- or team-scoped: caller must belong to the same org.
+	if *server.OrgID != ki.OrgID {
+		return apierror.Forbidden(c, "access denied")
+	}
+	return nil
+}
+
 // checkMCPServerScopePermission verifies that the caller has sufficient RBAC
 // privilege to mutate a server based on its scope. It writes the appropriate
 // 403 response and returns an error when access is denied.
@@ -357,6 +389,7 @@ func (h *Handler) CreateMCPServer(c fiber.Ctx) error {
 		OrgID:        nil,
 		TeamID:       nil,
 		CreatedBy:    createdBy,
+		Source:       "api",
 	}, req.AuthToken)
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
@@ -416,6 +449,7 @@ func (h *Handler) CreateOrgMCPServer(c fiber.Ctx) error {
 		OrgID:        &orgID,
 		TeamID:       nil,
 		CreatedBy:    createdBy,
+		Source:       "api",
 	}, req.AuthToken)
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
@@ -478,6 +512,7 @@ func (h *Handler) CreateTeamMCPServer(c fiber.Ctx) error {
 		OrgID:        &orgID,
 		TeamID:       &teamID,
 		CreatedBy:    keyInfo.UserID,
+		Source:       "api",
 	}, req.AuthToken)
 	if createErr != nil {
 		if errors.Is(createErr, db.ErrConflict) {
@@ -625,7 +660,7 @@ func (h *Handler) GetMCPServer(c fiber.Ctx) error {
 	}
 
 	ki := auth.KeyInfoFromCtx(c)
-	if permErr := checkMCPServerScopePermission(c, s, ki); permErr != nil {
+	if permErr := checkMCPServerReadPermission(c, s, ki); permErr != nil {
 		return permErr
 	}
 
@@ -768,6 +803,79 @@ func (h *Handler) DeleteMCPServer(c fiber.Ctx) error {
 	}
 
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// ActivateMCPServer handles PATCH /api/v1/mcp-servers/:server_id/activate.
+// It sets is_active = true on the server. Access is scope-checked.
+//
+// @Summary      Activate an MCP server
+// @Description  Marks the MCP server as active. Access is scope-checked against the caller's role.
+// @Tags         mcp-servers
+// @Produce      json
+// @Param        server_id  path      string  true  "MCP server ID"
+// @Success      200        {object}  mcpServerResponse
+// @Failure      401        {object}  swaggerErrorResponse
+// @Failure      403        {object}  swaggerErrorResponse
+// @Failure      404        {object}  swaggerErrorResponse
+// @Failure      500        {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /mcp-servers/{server_id}/activate [patch]
+func (h *Handler) ActivateMCPServer(c fiber.Ctx) error {
+	return h.setMCPServerActive(c, true)
+}
+
+// DeactivateMCPServer handles PATCH /api/v1/mcp-servers/:server_id/deactivate.
+// It sets is_active = false on the server. Access is scope-checked.
+//
+// @Summary      Deactivate an MCP server
+// @Description  Marks the MCP server as inactive. Access is scope-checked against the caller's role.
+// @Tags         mcp-servers
+// @Produce      json
+// @Param        server_id  path      string  true  "MCP server ID"
+// @Success      200        {object}  mcpServerResponse
+// @Failure      401        {object}  swaggerErrorResponse
+// @Failure      403        {object}  swaggerErrorResponse
+// @Failure      404        {object}  swaggerErrorResponse
+// @Failure      500        {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /mcp-servers/{server_id}/deactivate [patch]
+func (h *Handler) DeactivateMCPServer(c fiber.Ctx) error {
+	return h.setMCPServerActive(c, false)
+}
+
+// setMCPServerActive is the shared implementation for ActivateMCPServer and
+// DeactivateMCPServer. It fetches the server, checks scope permissions, and
+// writes the updated is_active value.
+func (h *Handler) setMCPServerActive(c fiber.Ctx, active bool) error {
+	ctx := c.Context()
+	serverID := c.Params("server_id")
+
+	server, err := h.DB.GetMCPServer(ctx, serverID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return apierror.NotFound(c, "MCP server not found")
+		}
+		h.Log.ErrorContext(ctx, "set mcp server active: get server",
+			slog.String("id", serverID), slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to get MCP server")
+	}
+
+	ki := auth.KeyInfoFromCtx(c)
+	if permErr := checkMCPServerScopePermission(c, server, ki); permErr != nil {
+		return permErr
+	}
+
+	updated, err := h.DB.UpdateMCPServer(ctx, serverID, db.UpdateMCPServerParams{IsActive: &active})
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return apierror.NotFound(c, "MCP server not found")
+		}
+		h.Log.ErrorContext(ctx, "set mcp server active: update",
+			slog.String("id", serverID), slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to update MCP server")
+	}
+
+	return c.JSON(mcpServerToResponse(updated))
 }
 
 // TestMCPServerConnection handles POST /api/v1/mcp-servers/:server_id/test.
