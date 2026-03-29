@@ -1,43 +1,62 @@
-# VoidLLM Proxy Overhead Benchmark
+# VoidLLM Benchmark
 
-## What it measures
+Measures proxy overhead for LLM and MCP paths using embedded mock servers and the [Vegeta](https://github.com/tsenart/vegeta) load testing library.
 
-End-to-end proxy overhead — the extra latency VoidLLM adds on top of a direct
-call to the upstream LLM or MCP server. Auth, routing, usage logging, and header
-rewriting are all exercised by the hot path. Streaming is not tested here.
+## Usage
 
-## How to run
-
-```
-./scripts/bench/run.sh [rps] [duration]
+```bash
+go run ./scripts/bench [scenario] [flags]
 ```
 
-Defaults: 500 req/s for 15 s. Ports are configurable via environment variables:
+## Scenarios
+
+| Scenario | RPS | Duration | What it measures |
+|---|---|---|---|
+| `quick` (default) | 500 | 15s | Sanity check — all paths |
+| `sustained` | 5000 | 5 min | Memory leaks, GC pressure, connection exhaustion |
+| `burst` | 200→10k→200 | 90s | Spike handling and recovery |
+| `large-payload` | 100 | 60s | 100KB request bodies — allocation overhead |
+| `mixed` | 500 total | 60s | 60% LLM + 30% MCP + 10% Code Mode (parallel) |
+| `endurance` | 500 | 30 min | Long-running stability, goroutine leaks |
+| `all` | varies | varies | Run all scenarios sequentially |
+
+## Flags
 
 ```
-MOCK_PORT=9999 MCP_MOCK_PORT=9998 PROXY_PORT=8081 ./scripts/bench/run.sh 200 30s
+--rps N          Override default RPS
+--duration D     Override duration (e.g. 30s, 5m)
+--json           JSON report output (pipe to file for CI)
 ```
 
-Prerequisites: `go` in PATH. `vegeta` is installed automatically via `go install`
-if not already present.
+## Examples
 
-## How to interpret results
+```bash
+# Quick sanity check
+go run ./scripts/bench quick
 
-The script runs four phases and prints a vegeta text report for each:
+# Sustained heavy load
+go run ./scripts/bench sustained --rps 2000 --duration 120s
 
-1. **Calibration** — direct to mock LLM (baseline, ~10 ms mock latency)
-2. **LLM Overhead** — through the VoidLLM proxy
-3. **MCP Calibration** — direct to mock MCP server
-4. **MCP Overhead** — through the VoidLLM MCP proxy
+# JSON output for CI
+go run ./scripts/bench quick --json > bench-results.json
 
-The final "Overhead (computed)" section subtracts calibration mean from proxy
-mean to isolate the cost of the proxy itself.
+# All scenarios
+go run ./scripts/bench all
+```
 
-## What "good" looks like
+## How it works
 
-- Mean overhead **< 2 ms** on a modern laptop at 500 req/s.
-- p99 overhead **< 5 ms**.
-- Success rate **100 %** for both LLM and MCP phases.
+1. Starts embedded mock servers (LLM + MCP) on random ports
+2. Builds and starts a VoidLLM proxy instance with in-memory SQLite
+3. Runs Vegeta load tests against direct (calibration) and proxied paths
+4. Reports overhead = proxied latency - direct latency
 
-Higher values indicate lock contention in the in-memory cache, GC pressure, or
-a slow SQL write in the async usage logger falling behind its channel buffer.
+## Interpreting results
+
+- **LLM Proxy overhead** target: <2ms (currently ~150-400µs)
+- **MCP Proxy overhead** target: <2ms (currently ~400-800µs)
+- **Success rate** should be 100% — any failures indicate a bug
+- **P99** matters more than mean for production readiness
+
+Higher values indicate lock contention, GC pressure, or the async usage logger
+falling behind its channel buffer.

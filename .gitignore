@@ -39,3 +39,4 @@ node_modules/
 
 # Binary (built by go build)
 /voidllm
+/bench
