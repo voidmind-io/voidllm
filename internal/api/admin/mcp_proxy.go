@@ -539,23 +539,23 @@ func (h *Handler) callBuiltinTool(ctx context.Context, ki *auth.KeyInfo, toolNam
 }
 
 // MakeToolFetcher returns a ToolFetcher that retrieves tool schemas from the
-// upstream MCP server identified by alias. It creates a fresh HTTPTransport,
+// upstream MCP server identified by serverID. It creates a fresh HTTPTransport,
 // sends initialize + tools/list, and parses the response. The lookup uses
-// GetMCPServerByAliasAny so that org-scoped and team-scoped servers are
-// resolved in addition to global servers. Access control is enforced
+// GetMCPServer (by database ID) so that org-scoped, team-scoped, and global
+// servers are all resolved without ambiguity. Access control is enforced
 // separately at the call layer; the fetcher only reads URL and auth config.
 func (h *Handler) MakeToolFetcher() mcp.ToolFetcher {
-	return func(ctx context.Context, alias string) ([]mcp.Tool, error) {
-		server, err := h.DB.GetMCPServerByAliasAny(ctx, alias)
+	return func(ctx context.Context, serverID string) ([]mcp.Tool, error) {
+		server, err := h.DB.GetMCPServer(ctx, serverID)
 		if err != nil {
-			return nil, fmt.Errorf("tool fetcher %s: lookup: %w", alias, err)
+			return nil, fmt.Errorf("tool fetcher %s: lookup: %w", serverID, err)
 		}
 
 		var authToken string
 		if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
 			decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
 			if decErr != nil {
-				return nil, fmt.Errorf("tool fetcher %s: decrypt auth token: %w", alias, decErr)
+				return nil, fmt.Errorf("tool fetcher %s: decrypt auth token: %w", serverID, decErr)
 			}
 			authToken = decrypted
 		}
@@ -569,7 +569,7 @@ func (h *Handler) MakeToolFetcher() mcp.ToolFetcher {
 
 		tools, err := transport.ListTools(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("tool fetcher %s: list tools: %w", alias, err)
+			return nil, fmt.Errorf("tool fetcher %s: list tools: %w", serverID, err)
 		}
 		return tools, nil
 	}

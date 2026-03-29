@@ -87,10 +87,10 @@ func TestDBToolStore_LoadAll(t *testing.T) {
 	serverA := mustCreateToolStoreServer(t, d, "ts-load-all-a")
 	serverB := mustCreateToolStoreServer(t, d, "ts-load-all-b")
 
-	if err := store.Save(context.Background(), serverA.Alias, sampleTools("read_file", "write_file")); err != nil {
+	if err := store.Save(context.Background(), serverA.ID, sampleTools("read_file", "write_file")); err != nil {
 		t.Fatalf("Save(serverA): %v", err)
 	}
-	if err := store.Save(context.Background(), serverB.Alias, sampleTools("exec_cmd")); err != nil {
+	if err := store.Save(context.Background(), serverB.ID, sampleTools("exec_cmd")); err != nil {
 		t.Fatalf("Save(serverB): %v", err)
 	}
 
@@ -99,20 +99,20 @@ func TestDBToolStore_LoadAll(t *testing.T) {
 		t.Fatalf("LoadAll() error = %v, want nil", err)
 	}
 
-	toolsA, ok := got[serverA.Alias]
+	toolsA, ok := got[serverA.ID]
 	if !ok {
-		t.Fatalf("LoadAll() missing key %q", serverA.Alias)
+		t.Fatalf("LoadAll() missing key for serverA ID %q", serverA.ID)
 	}
 	if len(toolsA) != 2 {
-		t.Errorf("LoadAll()[%q] len = %d, want 2", serverA.Alias, len(toolsA))
+		t.Errorf("LoadAll()[serverA.ID] len = %d, want 2", len(toolsA))
 	}
 
-	toolsB, ok := got[serverB.Alias]
+	toolsB, ok := got[serverB.ID]
 	if !ok {
-		t.Fatalf("LoadAll() missing key %q", serverB.Alias)
+		t.Fatalf("LoadAll() missing key for serverB ID %q", serverB.ID)
 	}
 	if len(toolsB) != 1 || toolsB[0].Name != "exec_cmd" {
-		t.Errorf("LoadAll()[%q] = %v, want [{exec_cmd}]", serverB.Alias, toolsB)
+		t.Errorf("LoadAll()[serverB.ID] = %v, want [{exec_cmd}]", toolsB)
 	}
 }
 
@@ -142,7 +142,7 @@ func TestDBToolStore_Save(t *testing.T) {
 	s := mustCreateToolStoreServer(t, d, "ts-save")
 
 	tools := sampleTools("tool_alpha", "tool_beta")
-	if err := store.Save(context.Background(), s.Alias, tools); err != nil {
+	if err := store.Save(context.Background(), s.ID, tools); err != nil {
 		t.Fatalf("Save() error = %v, want nil", err)
 	}
 
@@ -172,12 +172,12 @@ func TestDBToolStore_Save_Replace(t *testing.T) {
 
 	s := mustCreateToolStoreServer(t, d, "ts-save-replace")
 
-	if err := store.Save(context.Background(), s.Alias, sampleTools("old_tool_one", "old_tool_two")); err != nil {
+	if err := store.Save(context.Background(), s.ID, sampleTools("old_tool_one", "old_tool_two")); err != nil {
 		t.Fatalf("Save() first call error = %v", err)
 	}
 
 	// Second save with different tools — previous entries must be replaced.
-	if err := store.Save(context.Background(), s.Alias, sampleTools("new_tool")); err != nil {
+	if err := store.Save(context.Background(), s.ID, sampleTools("new_tool")); err != nil {
 		t.Fatalf("Save() second call error = %v", err)
 	}
 
@@ -193,15 +193,16 @@ func TestDBToolStore_Save_Replace(t *testing.T) {
 	}
 }
 
-func TestDBToolStore_Save_UnknownAlias(t *testing.T) {
+func TestDBToolStore_Save_UnknownServerID(t *testing.T) {
 	t.Parallel()
 
 	d := openToolStoreDB(t)
 	store := &dbToolStore{db: d}
 
-	err := store.Save(context.Background(), "no-such-alias", sampleTools("tool_x"))
+	// A non-existent server ID triggers a FK constraint failure in the DB.
+	err := store.Save(context.Background(), "00000000-0000-0000-0000-000000000000", sampleTools("tool_x"))
 	if err == nil {
-		t.Fatal("Save() with unknown alias error = nil, want error")
+		t.Fatal("Save() with unknown server ID error = nil, want error")
 	}
 }
 
@@ -215,7 +216,7 @@ func TestDBToolStore_Delete(t *testing.T) {
 
 	s := mustCreateToolStoreServer(t, d, "ts-delete")
 
-	if err := store.Save(context.Background(), s.Alias, sampleTools("tool_to_remove")); err != nil {
+	if err := store.Save(context.Background(), s.ID, sampleTools("tool_to_remove")); err != nil {
 		t.Fatalf("Save(): %v", err)
 	}
 
@@ -271,13 +272,13 @@ func TestDBToolStore_LoadAll_SkipsCorruptJSON(t *testing.T) {
 		t.Fatalf("LoadAll() error = %v, want nil", err)
 	}
 
-	tools, ok := got[s.Alias]
+	tools, ok := got[s.ID]
 	if !ok {
-		t.Fatalf("LoadAll() missing key %q", s.Alias)
+		t.Fatalf("LoadAll() missing key for server ID %q", s.ID)
 	}
 	// Only the valid tool must be present; the corrupt one must be silently skipped.
 	if len(tools) != 1 {
-		t.Fatalf("LoadAll()[%q] len = %d, want 1 (corrupt entry skipped)", s.Alias, len(tools))
+		t.Fatalf("LoadAll()[s.ID] len = %d, want 1 (corrupt entry skipped)", len(tools))
 	}
 	if tools[0].Name != "valid_tool" {
 		t.Errorf("tools[0].Name = %q, want %q", tools[0].Name, "valid_tool")
@@ -308,7 +309,7 @@ func TestDBToolStore_Save_SchemaPreserved(t *testing.T) {
 			},
 		},
 	}
-	if err := store.Save(context.Background(), s.Alias, tools); err != nil {
+	if err := store.Save(context.Background(), s.ID, tools); err != nil {
 		t.Fatalf("Save(): %v", err)
 	}
 
@@ -317,9 +318,9 @@ func TestDBToolStore_Save_SchemaPreserved(t *testing.T) {
 		t.Fatalf("LoadAll(): %v", err)
 	}
 
-	loaded, ok := got[s.Alias]
+	loaded, ok := got[s.ID]
 	if !ok || len(loaded) != 1 {
-		t.Fatalf("LoadAll()[%q] len = %d, want 1", s.Alias, len(got[s.Alias]))
+		t.Fatalf("LoadAll()[s.ID] len = %d, want 1", len(got[s.ID]))
 	}
 
 	tool := loaded[0]

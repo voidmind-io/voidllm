@@ -26,6 +26,12 @@ type codeModeDB interface {
 	ListBlockedToolNames(ctx context.Context, serverID string) ([]string, error)
 }
 
+// mcpServerByIDer is the subset of proxy.MCPServerCache used by codeModeService
+// to resolve a server database ID to its alias for TypeScript type generation.
+type mcpServerByIDer interface {
+	GetByID(serverID string) (*db.MCPServer, bool)
+}
+
 // codeModeService holds the dependencies for the three Code Mode VoidLLMDeps
 // closures (ExecuteCode, ListAccessibleMCPServers, SearchMCPTools) and the
 // OnToolsListHook. It is constructed once in app.go and its methods are wired
@@ -37,6 +43,8 @@ type codeModeService struct {
 	db           codeModeDB
 	log          *slog.Logger
 	maxToolCalls int
+	// serverCache resolves server IDs to aliases for TypeScript type generation.
+	serverCache mcpServerByIDer
 	// codePool is optional; when non-nil the pool's Available count is recorded
 	// in the CodeModePoolAvailable metric after each execution.
 	codePool interface{ Available() int }
@@ -148,7 +156,7 @@ func (s *codeModeService) ExecuteCode(ctx context.Context, code string, serverAl
 		if len(wantSet) > 0 && !wantSet[sv.Alias] {
 			continue
 		}
-		tools, toolErr := s.toolCache.GetTools(ctx, sv.Alias)
+		tools, toolErr := s.toolCache.GetTools(ctx, sv.ID)
 		if toolErr != nil {
 			// A single server failure does not abort the whole execution.
 			s.log.LogAttrs(ctx, slog.LevelWarn, "code mode: get tools",
@@ -242,7 +250,7 @@ func (s *codeModeService) ListAccessibleMCPServers(ctx context.Context, codeMode
 
 	result := make([]map[string]any, 0, len(servers))
 	for _, sv := range servers {
-		toolCount := s.toolCache.ToolCount(sv.Alias)
+		toolCount := s.toolCache.ToolCount(sv.ID)
 		blocked, blockErr := s.db.ListBlockedToolNames(ctx, sv.ID)
 		if blockErr != nil {
 			s.log.LogAttrs(ctx, slog.LevelWarn, "list servers: list blocked tools",
@@ -289,7 +297,7 @@ func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serv
 		if len(wantSet) > 0 && !wantSet[sv.Alias] {
 			continue
 		}
-		tools, toolErr := s.toolCache.GetTools(ctx, sv.Alias)
+		tools, toolErr := s.toolCache.GetTools(ctx, sv.ID)
 		if toolErr != nil {
 			s.log.LogAttrs(ctx, slog.LevelWarn, "search mcp tools: get tools",
 				slog.String("server", sv.Alias),
@@ -332,11 +340,29 @@ func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serv
 // populated lazily.
 func (s *codeModeService) toolsListHook() mcp.OnToolsListHook {
 	return func(tools []mcp.Tool) []mcp.Tool {
-		allCached := s.toolCache.GetAllTools()
+		allCached := s.toolCache.GetAllTools() // map[serverID][]Tool
 		if len(allCached) == 0 {
 			return tools
 		}
-		types := mcp.GenerateToolTypeDefs(allCached)
+
+		// Convert server ID keys to alias keys so GenerateToolTypeDefs produces
+		// TypeScript namespaces that match the JS `await tools.alias.toolName()`
+		// calling convention. Entries whose server ID cannot be resolved in the
+		// cache are skipped rather than blocking the entire hook.
+		byAlias := make(map[string][]mcp.Tool, len(allCached))
+		for serverID, serverToolList := range allCached {
+			if s.serverCache != nil {
+				if server, ok := s.serverCache.GetByID(serverID); ok {
+					byAlias[server.Alias] = serverToolList
+					continue
+				}
+			}
+			// Fallback: use serverID as key so tools are not silently dropped
+			// when the cache is unavailable (e.g. in unit tests).
+			byAlias[serverID] = serverToolList
+		}
+
+		types := mcp.GenerateToolTypeDefs(byAlias)
 		if types == "" {
 			return tools
 		}

@@ -222,9 +222,9 @@ func TestCallMCPTool_AccessDenied(t *testing.T) {
 	handler, database := newCallMCPToolHandler(t, dsn, nil)
 
 	// Global server (no org_id) — requires explicit org_mcp_access entry.
-	// CheckMCPAccess with an empty allowlist returns true (passes through).
-	// To get access DENIED we must set a non-empty org allowlist that excludes
-	// our target server ID (a different server ID in the list).
+	// CheckMCPAccess with an empty allowlist denies access (closed-by-default).
+	// Here we also verify the explicit-exclusion path: set the org allowlist to
+	// a different server ID so the target server is excluded.
 	s := createActiveMCPServer(t, database, "global-server", upstream.URL)
 
 	// Create a second dummy server whose ID we will use as the only allowed entry,

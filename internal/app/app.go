@@ -212,7 +212,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	if err := database.SyncYAMLMCPServers(ctx, cfg.MCPServers, encKey); err != nil {
 		return nil, fmt.Errorf("sync YAML MCP servers: %w", err)
 	}
-	if _, err := database.EnsureBuiltinMCPServer(ctx); err != nil {
+	builtinServer, err := database.EnsureBuiltinMCPServer(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("ensure builtin MCP server: %w", err)
 	}
 
@@ -628,11 +629,12 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		adminHandler.CodeExecutor = mcp.NewExecutor(codePool)
 		toolStore = &dbToolStore{db: database}
 		httpFetcher := adminHandler.MakeToolFetcher()
-		adminHandler.ToolCache = mcp.NewPersistentToolCache(func(fetchCtx context.Context, alias string) ([]mcp.Tool, error) {
-			if alias == "voidllm" && builtinMCPServer != nil {
+		builtinServerID := builtinServer.ID
+		adminHandler.ToolCache = mcp.NewPersistentToolCache(func(fetchCtx context.Context, serverID string) ([]mcp.Tool, error) {
+			if serverID == builtinServerID && builtinMCPServer != nil {
 				return builtinMCPServer.Tools(), nil
 			}
-			return httpFetcher(fetchCtx, alias)
+			return httpFetcher(fetchCtx, serverID)
 		}, time.Hour, toolStore)
 		if loadErr := adminHandler.ToolCache.LoadFromStore(ctx); loadErr != nil {
 			log.WarnContext(ctx, "failed to load cached tools from DB", slog.String("error", loadErr.Error()))
@@ -659,6 +661,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		db:           database,
 		log:          log,
 		maxToolCalls: cfg.Settings.MCP.CodeMode.MaxToolCalls,
+		serverCache:  mcpServerCache,
 		codePool:     adminHandler.CodePool,
 	}
 
@@ -851,9 +854,9 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	builtinMCPServer = mcpServer
 	if adminHandler.ToolCache != nil {
 		builtinTools := mcpServer.Tools()
-		adminHandler.ToolCache.SetTools("voidllm", builtinTools)
+		adminHandler.ToolCache.SetTools(builtinServer.ID, builtinTools)
 		if toolStore != nil {
-			toolStore.Save(ctx, "voidllm", builtinTools) //nolint:errcheck
+			toolStore.Save(ctx, builtinServer.ID, builtinTools) //nolint:errcheck
 		}
 	}
 

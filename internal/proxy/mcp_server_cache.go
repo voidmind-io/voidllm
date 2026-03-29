@@ -70,6 +70,21 @@ func (c *MCPServerCache) LoadAll(servers []db.MCPServer) {
 	c.mu.Unlock()
 }
 
+// GetByID looks up a cached server by its database ID. It iterates all entries
+// under a read lock. The cache is small (typically fewer than 20 entries) so
+// linear scan is acceptable. Returns the server and true if found.
+func (c *MCPServerCache) GetByID(serverID string) (*db.MCPServer, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, s := range c.servers {
+		if s.ID == serverID {
+			cpy := *s
+			return &cpy, true
+		}
+	}
+	return nil, false
+}
+
 // Len returns the number of server records currently held in the cache.
 // It acquires a read lock so it is safe to call concurrently with LoadAll and Get.
 func (c *MCPServerCache) Len() int {

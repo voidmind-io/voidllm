@@ -5,10 +5,13 @@ import "sync"
 // MCPAccessCache caches MCP server access control lists (org/team/key
 // allowlists). Mirrors the ModelAccessCache pattern.
 //
-// A nil map entry for a given ID means that scope is unconfigured, which is
-// semantically equivalent to "all servers allowed at this level". A non-nil
-// but empty map means the allowlist was explicitly set to empty (same result).
-// A non-nil, non-empty map means only the listed servers are allowed.
+// Access policy (most-restrictive-wins, org → team → key):
+//   - Org level is CLOSED-by-default: a missing or empty org entry denies access
+//     to global MCP servers. The org must explicitly list a server ID to grant access.
+//   - Team level is OPEN-by-default: a missing or empty team entry does not restrict
+//     access further (inherits from org). A non-empty team set acts as an additional
+//     restriction.
+//   - Key level is OPEN-by-default: same inheritance rule as the team level.
 type MCPAccessCache struct {
 	mu        sync.RWMutex
 	orgAllow  map[string]map[string]bool // orgID  → serverID → true
@@ -48,19 +51,24 @@ func (c *MCPAccessCache) Load(
 
 // Check reports whether serverID is accessible given the org, team, and key
 // identifiers. The most-restrictive-wins rule is applied: org → team → key.
-// A scope that has no entry (or an empty allowlist) is treated as unconfigured
-// and passes all servers through at that level. teamID may be empty for keys
-// that are not scoped to a team.
+//
+// The org level is CLOSED-by-default: if the org has no configured allowlist,
+// or serverID is not in it, access is denied. The team and key levels are
+// OPEN-by-default: they only restrict access when a non-empty allowlist is
+// present and serverID is absent from it.
+//
+// teamID may be empty for keys that are not scoped to a team.
 func (c *MCPAccessCache) Check(orgID, teamID, keyID, serverID string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if orgSet, ok := c.orgAllow[orgID]; ok && len(orgSet) > 0 {
-		if !orgSet[serverID] {
-			return false
-		}
+	// Org level: CLOSED-by-default — deny when unconfigured or not in the set.
+	orgSet, orgConfigured := c.orgAllow[orgID]
+	if !orgConfigured || len(orgSet) == 0 || !orgSet[serverID] {
+		return false
 	}
 
+	// Team level: OPEN-by-default — only restrict when explicitly configured.
 	if teamID != "" {
 		if teamSet, ok := c.teamAllow[teamID]; ok && len(teamSet) > 0 {
 			if !teamSet[serverID] {
@@ -69,6 +77,7 @@ func (c *MCPAccessCache) Check(orgID, teamID, keyID, serverID string) bool {
 		}
 	}
 
+	// Key level: OPEN-by-default — only restrict when explicitly configured.
 	if keySet, ok := c.keyAllow[keyID]; ok && len(keySet) > 0 {
 		if !keySet[serverID] {
 			return false

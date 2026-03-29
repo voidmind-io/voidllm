@@ -439,12 +439,12 @@ func TestListAccessibleMCPServers_ToolCount(t *testing.T) {
 		},
 	}
 
-	// Cache has 5 tools for "myserver".
+	// Cache has 5 tools for sv (keyed by server ID).
 	toolList := make([]mcp.Tool, 5)
 	for i := range toolList {
 		toolList[i] = mcp.Tool{Name: "tool_" + string(rune('a'+i))}
 	}
-	tc := newPreloadedCache(t, map[string][]mcp.Tool{"myserver": toolList})
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{sv.ID: toolList})
 
 	svc := &codeModeService{
 		db:        mock,
@@ -497,6 +497,82 @@ func TestListAccessibleMCPServers_Empty(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// accessibleServers: closed-by-default for global servers
+// ---------------------------------------------------------------------------
+
+// TestAccessibleServers_GlobalDeniedWithoutAccess verifies that a global server
+// is excluded from the result when the org has no MCP access entries
+// (closed-by-default policy). The mock returns false for CheckMCPAccess when
+// accessAllowed is nil — matching the behaviour of DB.CheckMCPAccess for an org
+// with an empty org_mcp_access table.
+func TestAccessibleServers_GlobalDeniedWithoutAccess(t *testing.T) {
+	t.Parallel()
+
+	globalSv := db.MCPServer{
+		ID:              "sv-global-denied",
+		Alias:           "global-denied",
+		Name:            "Global Denied",
+		Source:          "api",
+		CodeModeEnabled: true,
+	}
+
+	mock := &mockCodeModeDB{
+		servers: []db.MCPServer{globalSv},
+		// accessAllowed is nil — CheckMCPAccess returns false for all servers.
+	}
+	svc := &codeModeService{db: mock, log: newDiscardLogger()}
+
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-gd", Role: "member"})
+	got, err := svc.accessibleServers(ctx, false)
+	if err != nil {
+		t.Fatalf("accessibleServers() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d servers, want 0 (org has no MCP access entries)", len(got))
+	}
+}
+
+// TestAccessibleServers_GlobalAllowedWithAccess verifies that a global server
+// IS included when CheckMCPAccess returns true for the server ID — i.e., the
+// org has an org_mcp_access entry granting access to it.
+//
+// A system_admin identity (no OrgID/TeamID) is used because it triggers
+// ListMCPServers, which is the code path for global servers. The mock's
+// accessAllowed map stands in for the DB's org_mcp_access check.
+func TestAccessibleServers_GlobalAllowedWithAccess(t *testing.T) {
+	t.Parallel()
+
+	globalSv := db.MCPServer{
+		ID:              "sv-global-allowed",
+		Alias:           "global-allowed",
+		Name:            "Global Allowed",
+		Source:          "api",
+		CodeModeEnabled: true,
+	}
+
+	mock := &mockCodeModeDB{
+		servers: []db.MCPServer{globalSv},
+		accessAllowed: map[string]bool{
+			"sv-global-allowed": true,
+		},
+	}
+	svc := &codeModeService{db: mock, log: newDiscardLogger()}
+
+	// system_admin has no OrgID/TeamID — routes to ListMCPServers for global servers.
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-ga", Role: "system_admin"})
+	got, err := svc.accessibleServers(ctx, false)
+	if err != nil {
+		t.Fatalf("accessibleServers() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d servers, want 1", len(got))
+	}
+	if got[0].ID != "sv-global-allowed" {
+		t.Errorf("got server ID %q, want %q", got[0].ID, "sv-global-allowed")
+	}
+}
+
 func TestListAccessibleMCPServers_NilCache(t *testing.T) {
 	t.Parallel()
 
@@ -538,7 +614,7 @@ func TestSearchMCPTools_KeywordMatch(t *testing.T) {
 		{Name: "find_documents", Description: "Search the document store"},
 		{Name: "create_report", Description: "Generate a PDF report"},
 	}
-	tc := newPreloadedCache(t, map[string][]mcp.Tool{"search-srv": tools})
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{sv.ID: tools})
 	svc := &codeModeService{db: mock, toolCache: tc, log: newDiscardLogger()}
 
 	ctx := ctxWithIdentity(mcp.KeyIdentity{OrgID: orgID, KeyID: "key-s1", Role: "member"})
@@ -572,7 +648,7 @@ func TestSearchMCPTools_DescriptionMatch(t *testing.T) {
 		{Name: "alpha", Description: "Converts units of measurement"},
 		{Name: "beta", Description: "Sends email notifications"},
 	}
-	tc := newPreloadedCache(t, map[string][]mcp.Tool{"desc-srv": tools})
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{sv.ID: tools})
 	svc := &codeModeService{db: mock, toolCache: tc, log: newDiscardLogger()}
 
 	ctx := ctxWithIdentity(mcp.KeyIdentity{OrgID: orgID, KeyID: "key-d1", Role: "member"})
@@ -605,7 +681,7 @@ func TestSearchMCPTools_CaseInsensitive(t *testing.T) {
 	tools := []mcp.Tool{
 		{Name: "ReadFile", Description: "Reads a file from disk"},
 	}
-	tc := newPreloadedCache(t, map[string][]mcp.Tool{"ci-srv": tools})
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{sv.ID: tools})
 	svc := &codeModeService{db: mock, toolCache: tc, log: newDiscardLogger()}
 
 	ctx := ctxWithIdentity(mcp.KeyIdentity{OrgID: orgID, KeyID: "key-ci", Role: "member"})
@@ -655,7 +731,7 @@ func TestSearchMCPTools_FiltersBlocked(t *testing.T) {
 		{Name: "safe_tool", Description: "Completely safe"},
 		{Name: "danger_tool", Description: "Dangerous operation"},
 	}
-	tc := newPreloadedCache(t, map[string][]mcp.Tool{"blocked-srv": tools})
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{sv.ID: tools})
 	svc := &codeModeService{db: mock, toolCache: tc, log: newDiscardLogger()}
 
 	ctx := ctxWithIdentity(mcp.KeyIdentity{OrgID: orgID, KeyID: "key-b1", Role: "member"})
@@ -693,8 +769,8 @@ func TestSearchMCPTools_ServerFilter(t *testing.T) {
 		orgServers: map[string][]db.MCPServer{orgID: {sv1, sv2}},
 	}
 	tc := newPreloadedCache(t, map[string][]mcp.Tool{
-		"first":  {{Name: "lookup", Description: "Lookup records"}},
-		"second": {{Name: "lookup", Description: "Lookup records"}},
+		sv1.ID: {{Name: "lookup", Description: "Lookup records"}},
+		sv2.ID: {{Name: "lookup", Description: "Lookup records"}},
 	})
 	svc := &codeModeService{db: mock, toolCache: tc, log: newDiscardLogger()}
 
@@ -735,7 +811,7 @@ func TestExecuteCode_SimpleScript(t *testing.T) {
 		},
 	}
 	tc := newPreloadedCache(t, map[string][]mcp.Tool{
-		"exec-srv": {{Name: "noop", Description: "No-op tool"}},
+		"sv-exec": {{Name: "noop", Description: "No-op tool"}},
 	})
 	executor := newTestExecutor(t)
 
@@ -833,7 +909,7 @@ func TestExecuteCode_WithToolCall(t *testing.T) {
 			InputSchema: mcp.InputSchema{Type: "object"},
 		},
 	}
-	tc := newPreloadedCache(t, map[string][]mcp.Tool{"tc-srv": tools})
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{sv.ID: tools})
 	executor := newTestExecutor(t)
 
 	callCount := 0
@@ -901,7 +977,7 @@ func TestExecuteCode_BlockedToolRejected(t *testing.T) {
 		{Name: "safe_tool", Description: "Safe"},
 		{Name: "blocked_tool", Description: "Should be blocked"},
 	}
-	tc := newPreloadedCache(t, map[string][]mcp.Tool{"btc-srv": tools})
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{sv.ID: tools})
 	executor := newTestExecutor(t)
 
 	caller := func(_ context.Context, _ *auth.KeyInfo, _, toolName string, _ json.RawMessage, _ bool, _ string) (json.RawMessage, error) {
@@ -958,8 +1034,8 @@ func TestExecuteCode_ServerAliasFilter(t *testing.T) {
 		orgServers: map[string][]db.MCPServer{orgID: {sv1, sv2}},
 	}
 	tc := newPreloadedCache(t, map[string][]mcp.Tool{
-		"server-a": {{Name: "tool_a"}},
-		"server-b": {{Name: "tool_b"}},
+		sv1.ID: {{Name: "tool_a"}},
+		sv2.ID: {{Name: "tool_b"}},
 	})
 	executor := newTestExecutor(t)
 

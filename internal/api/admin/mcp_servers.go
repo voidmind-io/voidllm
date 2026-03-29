@@ -405,11 +405,11 @@ func (h *Handler) CreateMCPServer(c fiber.Ctx) error {
 	h.refreshMCPServerCache(c.Context())
 
 	if h.ToolCache != nil {
-		alias := s.Alias
+		serverID := s.ID
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			h.ToolCache.RefreshServer(ctx, alias) //nolint:errcheck
+			h.ToolCache.RefreshServer(ctx, serverID) //nolint:errcheck
 		}()
 	}
 
@@ -476,11 +476,11 @@ func (h *Handler) CreateOrgMCPServer(c fiber.Ctx) error {
 	h.refreshMCPServerCache(c.Context())
 
 	if h.ToolCache != nil {
-		alias := s.Alias
+		serverID := s.ID
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			h.ToolCache.RefreshServer(ctx, alias) //nolint:errcheck
+			h.ToolCache.RefreshServer(ctx, serverID) //nolint:errcheck
 		}()
 	}
 
@@ -550,11 +550,11 @@ func (h *Handler) CreateTeamMCPServer(c fiber.Ctx) error {
 	h.refreshMCPServerCache(c.Context())
 
 	if h.ToolCache != nil {
-		alias := s.Alias
+		serverID := s.ID
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			h.ToolCache.RefreshServer(ctx, alias) //nolint:errcheck
+			h.ToolCache.RefreshServer(ctx, serverID) //nolint:errcheck
 		}()
 	}
 
@@ -843,7 +843,7 @@ func (h *Handler) DeleteMCPServer(c fiber.Ctx) error {
 	}
 
 	if h.ToolCache != nil {
-		h.ToolCache.InvalidateWithStore(ctx, existing.Alias, existing.ID)
+		h.ToolCache.InvalidateWithStore(ctx, existing.ID)
 	}
 
 	h.refreshMCPServerCache(ctx)
@@ -923,14 +923,14 @@ func (h *Handler) setMCPServerActive(c fiber.Ctx, active bool) error {
 
 	if h.ToolCache != nil {
 		if active {
-			alias := updated.Alias
+			serverID := updated.ID
 			go func() {
 				rCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
-				h.ToolCache.RefreshServer(rCtx, alias) //nolint:errcheck
+				h.ToolCache.RefreshServer(rCtx, serverID) //nolint:errcheck
 			}()
 		} else {
-			h.ToolCache.InvalidateWithStore(ctx, updated.Alias, updated.ID)
+			h.ToolCache.InvalidateWithStore(ctx, updated.ID)
 		}
 	}
 
@@ -1162,14 +1162,14 @@ func (h *Handler) HandleRefreshMCPServerTools(c fiber.Ctx) error {
 	}
 
 	const refreshCooldown = 60 * time.Second
-	if age := h.ToolCache.FreshFor(server.Alias); age >= 0 && age < refreshCooldown {
+	if age := h.ToolCache.FreshFor(server.ID); age >= 0 && age < refreshCooldown {
 		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
 			"error":               "tool cache was refreshed recently, try again later",
 			"retry_after_seconds": int((refreshCooldown - age).Seconds()),
 		})
 	}
 
-	if err := h.ToolCache.RefreshServer(ctx, server.Alias); err != nil {
+	if err := h.ToolCache.RefreshServer(ctx, server.ID); err != nil {
 		h.Log.ErrorContext(ctx, "refresh mcp server tools",
 			slog.String("server_id", serverID),
 			slog.String("alias", server.Alias),
@@ -1178,7 +1178,7 @@ func (h *Handler) HandleRefreshMCPServerTools(c fiber.Ctx) error {
 	}
 
 	return c.JSON(mcpRefreshToolsResponse{
-		ToolCount: h.ToolCache.ToolCount(server.Alias),
+		ToolCount: h.ToolCache.ToolCount(server.ID),
 	})
 }
 
@@ -1234,7 +1234,7 @@ func (h *Handler) HandleListMCPServerTools(c fiber.Ctx) error {
 			"Code Mode is not enabled on this instance")
 	}
 
-	tools, err := h.ToolCache.GetTools(ctx, server.Alias)
+	tools, err := h.ToolCache.GetTools(ctx, server.ID)
 	if err != nil {
 		h.Log.ErrorContext(ctx, "list mcp server tools: get tools",
 			slog.String("server_id", serverID),

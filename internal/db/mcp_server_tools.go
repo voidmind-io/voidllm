@@ -88,15 +88,15 @@ func (d *DB) ListServerTools(ctx context.Context, serverID string) ([]MCPServerT
 	return tools, nil
 }
 
-// ListAllServerTools returns a map of server alias to tool list for every active,
+// ListAllServerTools returns a map of server ID to tool list for every active,
 // non-deleted MCP server that has cached tools. A single JOIN query loads all data.
-// The map is keyed by server alias (not server ID).
+// The map is keyed by server ID (mcp_servers.id).
 func (d *DB) ListAllServerTools(ctx context.Context) (map[string][]MCPServerTool, error) {
-	query := "SELECT t.id, t.server_id, t.name, t.description, t.input_schema, t.fetched_at, s.alias" +
+	query := "SELECT t.id, t.server_id, t.name, t.description, t.input_schema, t.fetched_at" +
 		" FROM mcp_server_tools t" +
 		" JOIN mcp_servers s ON s.id = t.server_id" +
 		" WHERE s.is_active = 1 AND s.deleted_at IS NULL" +
-		" ORDER BY s.alias ASC, t.name ASC"
+		" ORDER BY t.server_id ASC, t.name ASC"
 
 	rows, err := d.sql.QueryContext(ctx, query)
 	if err != nil {
@@ -106,15 +106,11 @@ func (d *DB) ListAllServerTools(ctx context.Context) (map[string][]MCPServerTool
 
 	result := make(map[string][]MCPServerTool)
 	for rows.Next() {
-		var t MCPServerTool
-		var alias string
-		if scanErr := rows.Scan(
-			&t.ID, &t.ServerID, &t.Name, &t.Description, &t.InputSchema, &t.FetchedAt,
-			&alias,
-		); scanErr != nil {
+		t, scanErr := scanMCPServerTool(rows)
+		if scanErr != nil {
 			return nil, fmt.Errorf("list all server tools scan: %w", scanErr)
 		}
-		result[alias] = append(result[alias], t)
+		result[t.ServerID] = append(result[t.ServerID], *t)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list all server tools rows: %w", err)
