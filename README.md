@@ -92,6 +92,7 @@ Any OpenAI-compatible SDK works out of the box — just change the base URL to y
 - **Helm chart** — production-ready Kubernetes deployment
 - **MCP gateway** — proxy and manage external MCP servers with access control, session management, and usage tracking
 - **MCP tools** — built-in management tools for IDE integration (Claude Code, Cursor, Windsurf)
+- **Code Mode** — LLMs write JavaScript to orchestrate multiple MCP tool calls in one WASM-sandboxed execution
 - **Graceful shutdown** — phased drain, in-flight request tracking, K8s-ready
 
 ### Pro ($299/mo)
@@ -139,6 +140,32 @@ Register external MCP servers via the Admin UI or API. VoidLLM proxies tool call
 - **Usage tracking** — who called which tool, when, how long
 - **Prometheus metrics** — tool call counts, duration, errors
 
+### Code Mode
+
+Code Mode lets LLMs write JavaScript that orchestrates multiple MCP tool calls in a single execution — instead of one tool call per LLM turn. The JS runs in a WASM-sandboxed QuickJS runtime with no filesystem, no network, and no host access. Reduces token usage by 30-80%.
+
+```yaml
+mcp:
+  code_mode:
+    enabled: true
+    pool_size: 8          # concurrent WASM runtimes
+    memory_limit_mb: 16   # per execution
+    timeout: 30s          # per execution
+    max_tool_calls: 50    # per execution
+```
+
+Code Mode exposes three tools on `/api/v1/mcp`:
+
+| Tool | Description |
+|---|---|
+| `list_servers` | Discover available MCP servers and tool counts |
+| `search_tools` | Find tools by keyword across all servers |
+| `execute_code` | Run JS with MCP tools as `await tools.alias.toolName(args)` |
+
+TypeScript type declarations are auto-generated from tool schemas and included in the `execute_code` description, so LLMs see available tools and argument types at `tools/list` time.
+
+Admins can block specific tools from Code Mode via the per-tool blocklist API and UI.
+
 ### IDE Setup
 
 ```json
@@ -146,17 +173,20 @@ Register external MCP servers via the Admin UI or API. VoidLLM proxies tool call
   "mcpServers": {
     "voidllm": {
       "type": "http",
-      "url": "http://localhost:8080/api/v1/mcp/voidllm",
-      "headers": { "Authorization": "Bearer vl_uk_your_key" }
-    },
-    "github": {
-      "type": "http",
-      "url": "http://localhost:8080/api/v1/mcp/github",
+      "url": "http://your-voidllm-instance:8080/api/v1/mcp",
       "headers": { "Authorization": "Bearer vl_uk_your_key" }
     }
   }
 }
 ```
+
+This connects your IDE (Claude Code, Cursor, Windsurf) to the Code Mode endpoint. Management tools (list_models, get_usage, etc.) are available at `/api/v1/mcp/voidllm`. External MCP servers at `/api/v1/mcp/:alias`.
+
+### Known Limitations
+
+- **SSE transport not supported** — MCP servers using the deprecated SSE protocol (pre 2025-03-26 spec) are auto-detected and deactivated. Use servers that support Streamable HTTP.
+- **No OAuth for upstream MCP servers** — servers requiring per-user OAuth (Jira, Slack, Google) are not yet supported. API key and header auth work.
+- **Single instance only** — Code Mode's WASM runtime pool is in-memory. Multi-pod deployments require Redis support (coming soon).
 
 ---
 
@@ -202,9 +232,18 @@ models:
         api_key: ${OPENAI_KEY}
         priority: 2
 
+mcp_servers:
+  - name: AWS Knowledge
+    alias: aws
+    url: https://knowledge-mcp.global.api.aws
+    auth_type: none
+
 settings:
   admin_key: ${VOIDLLM_ADMIN_KEY}
   encryption_key: ${VOIDLLM_ENCRYPTION_KEY}
+  mcp:
+    code_mode:
+      enabled: true
 ```
 
 Supported providers: `openai` · `anthropic` · `azure` · `vllm` · `ollama` · `custom`

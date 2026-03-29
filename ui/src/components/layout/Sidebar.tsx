@@ -179,9 +179,10 @@ function IconPlug() {
   return (
     <svg {...iconProps}>
       <path d="M12 22v-5" />
-      <path d="M9 8V2" />
-      <path d="M15 8V2" />
-      <path d="M18 8H6a2 2 0 0 0-2 2v3a6 6 0 0 0 12 0v-3a2 2 0 0 0-2-2z" />
+      <path d="M9 7V2" />
+      <path d="M15 7V2" />
+      <path d="M6 7h12" />
+      <path d="M6 7v4a6 6 0 0 0 12 0V7" />
     </svg>
   )
 }

@@ -211,6 +211,27 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		return nil, fmt.Errorf("sync YAML MCP servers: %w", err)
 	}
 
+	// Probe all active MCP servers to detect deprecated SSE transport.
+	// Servers that only support SSE are auto-deactivated with a warning.
+	if allServers, listErr := database.ListMCPServers(ctx); listErr == nil {
+		for _, s := range allServers {
+			var token string
+			if s.AuthTokenEnc != nil && *s.AuthTokenEnc != "" {
+				token, _ = crypto.DecryptString(*s.AuthTokenEnc, encKey, []byte("mcp_server:"+s.ID))
+			}
+			transport := mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, token, 10*time.Second, cfg.Settings.MCP.AllowPrivateURLs)
+			_, probeErr := transport.ListTools(ctx)
+			transport.Close()
+			if errors.Is(probeErr, mcp.ErrSSENotSupported) {
+				isActive := false
+				database.UpdateMCPServer(ctx, s.ID, db.UpdateMCPServerParams{IsActive: &isActive}) //nolint:errcheck
+				log.WarnContext(ctx, "MCP server uses deprecated SSE transport, deactivated",
+					slog.String("alias", s.Alias),
+					slog.String("url", s.URL))
+			}
+		}
+	}
+
 	// Step 4a: build the in-memory registry from the YAML config.
 	registry, err := proxy.NewRegistry(cfg.Models)
 	if err != nil {
@@ -559,12 +580,53 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		adminHandler.HealthChecker = healthChecker
 	}
 
-	// Wire MCP server with VoidLLM management tools. The MCP server is
-	// always created; the route is only registered when MCPServer is non-nil
-	// (which it always is after this block). Tools that need DB access or
-	// RBAC enforcement perform those checks inside the handler function.
+	// Code Mode: create the runtime pool, executor, and tool cache when enabled.
+	// These are assigned to the handler before RegisterVoidLLMTools is called so
+	// that the deps closures below can close over the handler and its fields.
+	if cfg.Settings.MCP.CodeMode.IsEnabled() {
+		codePool, poolErr := mcp.NewRuntimePool(
+			cfg.Settings.MCP.CodeMode.PoolSize,
+			cfg.Settings.MCP.CodeMode.MemoryLimitMB,
+			cfg.Settings.MCP.CodeMode.Timeout,
+		)
+		if poolErr != nil {
+			redisCancel()
+			return nil, fmt.Errorf("create code mode pool: %w", poolErr)
+		}
+		adminHandler.CodePool = codePool
+		adminHandler.CodeExecutor = mcp.NewExecutor(codePool)
+		toolStore := &dbToolStore{db: database}
+		adminHandler.ToolCache = mcp.NewPersistentToolCache(adminHandler.MakeToolFetcher(), time.Hour, toolStore)
+		if loadErr := adminHandler.ToolCache.LoadFromStore(ctx); loadErr != nil {
+			log.WarnContext(ctx, "failed to load cached tools from DB", slog.String("error", loadErr.Error()))
+		}
+		log.LogAttrs(ctx, slog.LevelInfo, "code mode enabled",
+			slog.Int("pool_size", cfg.Settings.MCP.CodeMode.PoolSize),
+			slog.Int("memory_limit_mb", cfg.Settings.MCP.CodeMode.MemoryLimitMB),
+			slog.Duration("timeout", cfg.Settings.MCP.CodeMode.Timeout),
+		)
+	}
+
+	// Wire the management MCP server with VoidLLM management tools. The server
+	// is always created; the route is only registered when MCPServer is non-nil
+	// (which it always is after this block). Tools that need DB access or RBAC
+	// enforcement perform those checks inside the handler function.
+
+	// Create Code Mode service — wires the three Code Mode VoidLLMDeps functions
+	// and the OnToolsListHook as methods on a single struct so they share state
+	// without ad-hoc closure captures.
+	cmService := &codeModeService{
+		executor:     adminHandler.CodeExecutor,
+		toolCache:    adminHandler.ToolCache,
+		callMCPTool:  adminHandler.CallMCPTool,
+		db:           database,
+		log:          log,
+		maxToolCalls: cfg.Settings.MCP.CodeMode.MaxToolCalls,
+		codePool:     adminHandler.CodePool,
+	}
+
 	mcpServer := mcp.NewServer("voidllm", apihealth.Version)
-	mcp.RegisterVoidLLMTools(mcpServer, mcp.VoidLLMDeps{
+	voidllmDeps := mcp.VoidLLMDeps{
 		ListModels: func(ctx context.Context) ([]map[string]any, error) {
 			infos := registry.ListInfo()
 			result := make([]map[string]any, len(infos))
@@ -740,8 +802,33 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			}
 			return result, nil
 		},
-	})
+		ExecuteCode:              cmService.ExecuteCode,
+		ListAccessibleMCPServers: cmService.ListAccessibleMCPServers,
+		SearchMCPTools:           cmService.SearchMCPTools,
+	}
+	mcp.RegisterVoidLLMTools(mcpServer, voidllmDeps)
 	adminHandler.MCPServer = mcpServer
+
+	// Wire the Code Mode MCP server when Code Mode is enabled. It exposes only
+	// the list_servers, search_tools, and execute_code tools and is served at
+	// /api/v1/mcp (distinct from the management server at /api/v1/mcp/voidllm).
+	if cfg.Settings.MCP.CodeMode.IsEnabled() {
+		codeModeServer := mcp.NewServer("voidllm-code-mode", apihealth.Version)
+		mcp.RegisterCodeModeTools(codeModeServer, mcp.VoidLLMDeps{
+			ExecuteCode:              voidllmDeps.ExecuteCode,
+			ListAccessibleMCPServers: voidllmDeps.ListAccessibleMCPServers,
+			SearchMCPTools:           voidllmDeps.SearchMCPTools,
+		})
+
+		// Inject TypeScript type declarations into the execute_code tool
+		// description so LLMs can generate correct tool calls without calling
+		// search_tools first. The hook runs on every tools/list request so the
+		// declarations stay current as the ToolCache is populated lazily.
+		codeModeServer.SetOnToolsList(cmService.toolsListHook())
+
+		adminHandler.CodeModeServer = codeModeServer
+	}
+
 	adminHandler.MCPCallTimeout = cfg.Settings.MCP.CallTimeout
 	adminHandler.MCPAllowPrivateURLs = cfg.Settings.MCP.AllowPrivateURLs
 
@@ -833,6 +920,26 @@ func (a *Application) Start() error {
 	// Start upstream model health monitoring when at least one probe is enabled.
 	if a.healthChecker != nil {
 		a.stopFuncs = append(a.stopFuncs, a.healthChecker.Start())
+	}
+
+	// Register Code Mode pool cleanup. Close must be called after all in-flight
+	// executions complete; the LIFO stop order ensures this runs before the
+	// admin server is stopped.
+	if a.adminHandler.CodePool != nil {
+		a.stopFuncs = append(a.stopFuncs, func() {
+			a.adminHandler.CodePool.Close()
+		})
+	}
+
+	// 24h background refresh of tool schemas from upstream MCP servers.
+	if a.adminHandler.ToolCache != nil {
+		a.stopFuncs = append(a.stopFuncs, startTicker(24*time.Hour, func() {
+			refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			if err := a.adminHandler.ToolCache.RefreshAll(refreshCtx); err != nil {
+				a.log.WarnContext(refreshCtx, "periodic tool cache refresh", slog.String("error", err.Error()))
+			}
+		}))
 	}
 
 	// Start heartbeat if a license key was configured, even if it has expired.
@@ -1010,6 +1117,20 @@ func (a *Application) PrintBootstrapCredentials() {
 // against a different row.
 func deploymentAAD(id string) []byte {
 	return []byte("deployment:" + id)
+}
+
+// isCodeModeTimeout reports whether a Code Mode execution error message
+// indicates the script exceeded its wall-clock time limit.
+func isCodeModeTimeout(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "interrupted") || strings.Contains(lower, "timeout")
+}
+
+// isCodeModeOOM reports whether a Code Mode execution error message indicates
+// the script exceeded its memory limit inside the WASM sandbox.
+func isCodeModeOOM(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "out of memory") || strings.Contains(lower, "stack overflow")
 }
 
 // cleanup tears down resources in reverse startup order: Redis pub/sub,

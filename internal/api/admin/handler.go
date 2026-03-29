@@ -51,9 +51,13 @@ type Handler struct {
 	// HealthChecker provides upstream model health status. Nil when health
 	// monitoring is not enabled.
 	HealthChecker ModelHealthProvider
-	// MCPServer is the MCP JSON-RPC server for AI assistant tool access. Nil
-	// when MCP is not configured — the route is only registered when non-nil.
+	// MCPServer is the management MCP server (list_models, get_usage, etc.).
+	// Nil when MCP is not configured — the route is only registered when non-nil.
 	MCPServer *mcp.Server
+	// CodeModeServer is the Code Mode MCP server (list_servers, search_tools,
+	// execute_code). Nil when Code Mode is disabled — the /api/v1/mcp route is
+	// only registered when non-nil.
+	CodeModeServer *mcp.Server
 	// MCPCallTimeout is the maximum duration for a single proxied MCP tool call
 	// to an external server. Zero falls back to a 30-second default.
 	MCPCallTimeout time.Duration
@@ -63,6 +67,16 @@ type Handler struct {
 	// MCPAllowPrivateURLs disables SSRF protection for MCP server URLs.
 	// Set via YAML config only — not exposed in Admin API.
 	MCPAllowPrivateURLs bool
+	// ToolCache holds cached tool schemas from upstream MCP servers for use by
+	// Code Mode. Nil when Code Mode is disabled.
+	ToolCache *mcp.ToolCache
+	// CodeExecutor runs Code Mode JavaScript in sandboxed QJS runtimes.
+	// Nil when Code Mode is disabled.
+	CodeExecutor *mcp.Executor
+	// CodePool is the QJS runtime pool backing CodeExecutor. Held here so that
+	// app.cleanup can drain and close the pool on graceful shutdown.
+	// Nil when Code Mode is disabled.
+	CodePool *mcp.RuntimePool
 }
 
 // swaggerErrorResponse is the standard API error envelope used in OpenAPI docs.

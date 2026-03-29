@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -136,8 +137,10 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	// lock is sufficient.
 	if errors.Is(callErr, mcp.ErrSessionExpired) && !isInit {
 		mcpReInitMu.Lock()
-		// Double-check: another goroutine may have already re-initialized.
-		if sid, ok := mcpSessions.Load(sessionKey); ok {
+		// Double-check: if another goroutine already refreshed the session,
+		// the stored session will differ from the stale one we used — retry
+		// with the new one. If it is still the same stale session, re-init.
+		if sid, ok := mcpSessions.Load(sessionKey); ok && sid.(string) != sessionID {
 			mcpReInitMu.Unlock()
 			result, newSID, callErr = transport.Call(c.Context(), body, sid.(string))
 		} else {
@@ -344,4 +347,180 @@ func buildInitializedNotification() []byte {
 // server ID prevents a ciphertext from one server being replayed for another.
 func mcpServerAAD(serverID string) []byte {
 	return []byte("mcp_server:" + serverID)
+}
+
+// buildToolCallRequest serialises a JSON-RPC tools/call request body for the
+// given tool name and argument object. The error path of json.Marshal is
+// unreachable for the static structure used here; the result is always valid.
+func buildToolCallRequest(toolName string, args json.RawMessage) []byte {
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      toolName,
+			"arguments": args,
+		},
+	}
+	b, _ := json.Marshal(req)
+	return b
+}
+
+// CallMCPTool executes a single MCP tool call against an upstream server on
+// behalf of the given caller identity. It performs the same server lookup,
+// access control, credential decryption, session management, metrics recording,
+// and usage logging as HandleMCPProxy. codeMode should be true when the call
+// originates from a Code Mode execution. executionID is the UUIDv7 that groups
+// all tool calls from a single execute_code invocation; pass an empty string
+// for non-Code-Mode calls.
+func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias, toolName string, args json.RawMessage, codeMode bool, executionID string) (json.RawMessage, error) {
+	server, err := h.DB.GetMCPServerByAliasScoped(ctx, serverAlias, ki.OrgID, ki.TeamID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return nil, fmt.Errorf("CallMCPTool %s: unknown MCP server", serverAlias)
+		}
+		return nil, fmt.Errorf("CallMCPTool %s: lookup: %w", serverAlias, err)
+	}
+
+	if !server.IsActive {
+		return nil, fmt.Errorf("CallMCPTool %s: server is disabled", serverAlias)
+	}
+
+	// Global servers require explicit access control via the access tables.
+	if server.OrgID == nil && server.TeamID == nil {
+		allowed, accessErr := h.DB.CheckMCPAccess(ctx, ki.OrgID, ki.TeamID, ki.ID, server.ID)
+		if accessErr != nil {
+			return nil, fmt.Errorf("CallMCPTool %s: check access: %w", serverAlias, accessErr)
+		}
+		if !allowed {
+			return nil, fmt.Errorf("CallMCPTool %s: access denied", serverAlias)
+		}
+	}
+
+	var authToken string
+	if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
+		decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
+		if decErr != nil {
+			return nil, fmt.Errorf("CallMCPTool %s: decrypt auth token: %w", serverAlias, decErr)
+		}
+		authToken = decrypted
+	}
+
+	timeout := h.MCPCallTimeout
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+	transport := mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
+	defer transport.Close() //nolint:errcheck
+
+	body := buildToolCallRequest(toolName, args)
+
+	sessionKey := serverAlias + ":" + ki.OrgID
+	var sessionID string
+	if sid, ok := mcpSessions.Load(sessionKey); ok {
+		sessionID = sid.(string)
+	}
+
+	start := time.Now()
+	result, newSID, callErr := transport.Call(ctx, body, sessionID)
+
+	if errors.Is(callErr, mcp.ErrSessionExpired) {
+		mcpReInitMu.Lock()
+		// Compare the loaded session with the one we originally used. If it
+		// changed, another goroutine already refreshed it — use the new one.
+		// If it is the same stale session, delete it and re-initialize.
+		if sid, ok := mcpSessions.Load(sessionKey); ok && sid.(string) != sessionID {
+			mcpReInitMu.Unlock()
+			result, newSID, callErr = transport.Call(ctx, body, sid.(string))
+		} else {
+			mcpSessions.Delete(sessionKey)
+			initBody := buildInitializeRequest()
+			_, initSID, initErr := transport.Call(ctx, initBody, "")
+			if initErr != nil {
+				mcpReInitMu.Unlock()
+				return nil, fmt.Errorf("CallMCPTool %s: re-initialize: %w", serverAlias, initErr)
+			}
+			if initSID != "" {
+				mcpSessions.Store(sessionKey, initSID)
+				notifyBody := buildInitializedNotification()
+				transport.Call(ctx, notifyBody, initSID) //nolint:errcheck
+			}
+			mcpReInitMu.Unlock()
+			result, newSID, callErr = transport.Call(ctx, body, initSID)
+		}
+	}
+
+	if newSID != "" {
+		mcpSessions.Store(sessionKey, newSID)
+	}
+
+	duration := time.Since(start)
+
+	status := "success"
+	if callErr != nil {
+		status = "transport_error"
+		metrics.MCPTransportErrorsTotal.WithLabelValues(serverAlias, "call").Inc()
+	}
+	metrics.MCPToolCallsTotal.WithLabelValues(serverAlias, "tools/call", status).Inc()
+	metrics.MCPToolCallDurationSeconds.WithLabelValues(serverAlias, "tools/call").Observe(duration.Seconds())
+
+	if h.MCPLogger != nil {
+		h.MCPLogger.Log(usage.MCPToolCallEvent{
+			KeyID:               ki.ID,
+			KeyType:             ki.KeyType,
+			OrgID:               ki.OrgID,
+			TeamID:              ki.TeamID,
+			UserID:              ki.UserID,
+			ServiceAccountID:    ki.ServiceAccountID,
+			ServerAlias:         serverAlias,
+			ToolName:            toolName,
+			DurationMS:          int(duration.Milliseconds()),
+			Status:              status,
+			CodeMode:            codeMode,
+			CodeModeExecutionID: executionID,
+		})
+	}
+
+	if callErr != nil {
+		return nil, fmt.Errorf("CallMCPTool %s/%s: transport: %w", serverAlias, toolName, callErr)
+	}
+
+	return result, nil
+}
+
+// MakeToolFetcher returns a ToolFetcher that retrieves tool schemas from the
+// upstream MCP server identified by alias. It creates a fresh HTTPTransport,
+// sends initialize + tools/list, and parses the response. The lookup uses
+// GetMCPServerByAliasAny so that org-scoped and team-scoped servers are
+// resolved in addition to global servers. Access control is enforced
+// separately at the call layer; the fetcher only reads URL and auth config.
+func (h *Handler) MakeToolFetcher() mcp.ToolFetcher {
+	return func(ctx context.Context, alias string) ([]mcp.Tool, error) {
+		server, err := h.DB.GetMCPServerByAliasAny(ctx, alias)
+		if err != nil {
+			return nil, fmt.Errorf("tool fetcher %s: lookup: %w", alias, err)
+		}
+
+		var authToken string
+		if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
+			decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
+			if decErr != nil {
+				return nil, fmt.Errorf("tool fetcher %s: decrypt auth token: %w", alias, decErr)
+			}
+			authToken = decrypted
+		}
+
+		timeout := h.MCPCallTimeout
+		if timeout == 0 {
+			timeout = 30 * time.Second
+		}
+		transport := mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
+		defer transport.Close() //nolint:errcheck
+
+		tools, err := transport.ListTools(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("tool fetcher %s: list tools: %w", alias, err)
+		}
+		return tools, nil
+	}
 }

@@ -34,6 +34,11 @@ type MCPToolCallEvent struct {
 	Status string
 	// RequestID is the per-gateway-request trace identifier.
 	RequestID string
+	// CodeMode indicates the call originated from a Code Mode sandboxed execution.
+	CodeMode bool
+	// CodeModeExecutionID groups all tool calls from a single execute_code
+	// invocation. Empty for non-Code-Mode calls.
+	CodeModeExecutionID string
 }
 
 // MCPToolCallLogger logs MCP tool call events asynchronously.
@@ -115,7 +120,7 @@ func (l *MCPLogger) run() {
 				return
 			}
 			durationMS := event.DurationMS
-			batch = append(batch, db.MCPToolCall{
+			call := db.MCPToolCall{
 				KeyID:            event.KeyID,
 				KeyType:          event.KeyType,
 				OrgID:            event.OrgID,
@@ -127,7 +132,12 @@ func (l *MCPLogger) run() {
 				DurationMS:       &durationMS,
 				Status:           event.Status,
 				RequestID:        event.RequestID,
-			})
+				CodeMode:         event.CodeMode,
+			}
+			if event.CodeModeExecutionID != "" {
+				call.CodeModeExecutionID = &event.CodeModeExecutionID
+			}
+			batch = append(batch, call)
 			if len(batch) >= 100 {
 				flush()
 			}

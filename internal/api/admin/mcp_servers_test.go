@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/voidmind-io/voidllm/internal/api/admin"
@@ -17,8 +19,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/config"
 	"github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/license"
-	"log/slog"
-	"time"
+	"github.com/voidmind-io/voidllm/internal/mcp"
 )
 
 // setupMCPServersTestApp builds a Fiber app with the admin routes registered,
@@ -926,5 +927,598 @@ func TestCreateMCPServer_CannotSetSourceYAML(t *testing.T) {
 	// Regardless of what the caller sent, source must always be "api".
 	if got["source"] != "api" {
 		t.Errorf("source = %v, want %q (client cannot set source=yaml via API)", got["source"], "api")
+	}
+}
+
+// setupMCPServersTestAppWithToolCache builds a Fiber app identical to
+// setupMCPServersTestAppAllowPrivate but with a ToolCache wired onto the
+// handler. The ToolCache uses a static fetcher that always returns the
+// provided tools for any alias, so tests can exercise refresh-tools and
+// list-tools handlers without a real upstream MCP server.
+func setupMCPServersTestAppWithToolCache(t *testing.T, dsn string, staticTools []mcp.Tool) (*db.DB, *cache.Cache[string, auth.KeyInfo], *fiber.App) {
+	t.Helper()
+
+	ctx := context.Background()
+	database, err := db.Open(ctx, config.DatabaseConfig{
+		Driver:          "sqlite",
+		DSN:             dsn,
+		MaxOpenConns:    1,
+		MaxIdleConns:    1,
+		ConnMaxLifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("open test DB: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	keyCache := cache.New[string, auth.KeyInfo]()
+
+	fetcher := mcp.ToolFetcher(func(_ context.Context, _ string) ([]mcp.Tool, error) {
+		return staticTools, nil
+	})
+	toolCache := mcp.NewToolCache(fetcher, time.Hour)
+
+	handler := &admin.Handler{
+		DB:                  database,
+		HMACSecret:          testHMACSecret,
+		EncryptionKey:       testEncryptionKey,
+		KeyCache:            keyCache,
+		License:             license.NewHolder(license.Verify("", true)),
+		Log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MCPAllowPrivateURLs: true,
+		ToolCache:           toolCache,
+	}
+
+	app := fiber.New()
+	admin.RegisterRoutes(app, handler, keyCache, testHMACSecret, nil)
+
+	return database, keyCache, app
+}
+
+// ---- GET /api/v1/mcp-servers/:server_id/blocklist ---------------------------
+
+func TestListMCPServerBlocklist_API(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestListMCPServerBlocklist_API?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-blocklist-list")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Blocklist List Server",
+		Alias:    "bl-list-server",
+		URL:      "https://bl-list.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	for _, toolName := range []string{"dangerous-tool", "secret-exfil"} {
+		_, err := database.CreateToolBlocklistEntry(context.Background(), s.ID, toolName, "test reason", "")
+		if err != nil {
+			t.Fatalf("create blocklist entry %q: %v", toolName, err)
+		}
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodGet,
+		"/api/v1/mcp-servers/"+s.ID+"/blocklist", key, nil)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	var list []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode blocklist response: %v", err)
+	}
+	if len(list) != 2 {
+		t.Errorf("blocklist length = %d, want 2", len(list))
+	}
+
+	names := make(map[string]bool, len(list))
+	for _, entry := range list {
+		name, ok := entry["tool_name"].(string)
+		if !ok {
+			t.Errorf("blocklist entry missing tool_name field: %v", entry)
+			continue
+		}
+		names[name] = true
+	}
+	for _, want := range []string{"dangerous-tool", "secret-exfil"} {
+		if !names[want] {
+			t.Errorf("blocklist missing expected tool %q", want)
+		}
+	}
+}
+
+func TestListMCPServerBlocklist_Empty(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestListMCPServerBlocklist_Empty?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-blocklist-empty")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Empty Blocklist Server",
+		Alias:    "bl-empty-server",
+		URL:      "https://bl-empty.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodGet,
+		"/api/v1/mcp-servers/"+s.ID+"/blocklist", key, nil)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	var list []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode blocklist response: %v", err)
+	}
+	if len(list) != 0 {
+		t.Errorf("blocklist length = %d, want 0 (empty array)", len(list))
+	}
+}
+
+// ---- POST /api/v1/mcp-servers/:server_id/blocklist --------------------------
+
+func TestAddMCPServerBlocklist_API(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestAddMCPServerBlocklist_API?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-blocklist-add")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Add Blocklist Server",
+		Alias:    "bl-add-server",
+		URL:      "https://bl-add.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	body := map[string]any{
+		"tool_name": "exec-shell",
+		"reason":    "arbitrary command execution risk",
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodPost,
+		"/api/v1/mcp-servers/"+s.ID+"/blocklist", key, body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusCreated {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 201; body: %s", resp.StatusCode, raw)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+
+	if got["id"] == nil || got["id"] == "" {
+		t.Error("id field missing or empty in blocklist entry response")
+	}
+	if got["tool_name"] != "exec-shell" {
+		t.Errorf("tool_name = %v, want %q", got["tool_name"], "exec-shell")
+	}
+	if got["reason"] != "arbitrary command execution risk" {
+		t.Errorf("reason = %v, want %q", got["reason"], "arbitrary command execution risk")
+	}
+	if got["server_id"] != s.ID {
+		t.Errorf("server_id = %v, want %q", got["server_id"], s.ID)
+	}
+}
+
+func TestAddMCPServerBlocklist_Duplicate(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestAddMCPServerBlocklist_Duplicate?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-blocklist-dup")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Dup Blocklist Server",
+		Alias:    "bl-dup-server",
+		URL:      "https://bl-dup.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	body := map[string]any{"tool_name": "some-tool", "reason": "first add"}
+
+	// First add — must succeed.
+	resp := mcpServerRequest(t, app, http.MethodPost,
+		"/api/v1/mcp-servers/"+s.ID+"/blocklist", key, body)
+	resp.Body.Close()
+	if resp.StatusCode != fiber.StatusCreated {
+		t.Fatalf("first add status = %d, want 201", resp.StatusCode)
+	}
+
+	// Second add of the same tool — must return 409.
+	resp2 := mcpServerRequest(t, app, http.MethodPost,
+		"/api/v1/mcp-servers/"+s.ID+"/blocklist", key, body)
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != fiber.StatusConflict {
+		raw, _ := io.ReadAll(resp2.Body)
+		t.Errorf("second add status = %d, want 409; body: %s", resp2.StatusCode, raw)
+	}
+}
+
+func TestAddMCPServerBlocklist_EmptyToolName(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestAddMCPServerBlocklist_EmptyToolName?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-blocklist-empty-name")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Empty Name Server",
+		Alias:    "bl-empty-name-server",
+		URL:      "https://bl-empty-name.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	body := map[string]any{"tool_name": "", "reason": "empty"}
+
+	resp := mcpServerRequest(t, app, http.MethodPost,
+		"/api/v1/mcp-servers/"+s.ID+"/blocklist", key, body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want 400; body: %s", resp.StatusCode, raw)
+	}
+}
+
+func TestAddMCPServerBlocklist_ToolNameTooLong(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestAddMCPServerBlocklist_ToolNameTooLong?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-blocklist-too-long")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Too Long Server",
+		Alias:    "bl-too-long-server",
+		URL:      "https://bl-too-long.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	// 257 characters — one over the 256-character limit.
+	body := map[string]any{"tool_name": strings.Repeat("x", 257), "reason": "too long"}
+
+	resp := mcpServerRequest(t, app, http.MethodPost,
+		"/api/v1/mcp-servers/"+s.ID+"/blocklist", key, body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want 400; body: %s", resp.StatusCode, raw)
+	}
+}
+
+// ---- DELETE /api/v1/mcp-servers/:server_id/blocklist ------------------------
+
+func TestRemoveMCPServerBlocklist_API(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestRemoveMCPServerBlocklist_API?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-blocklist-remove")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Remove Blocklist Server",
+		Alias:    "bl-remove-server",
+		URL:      "https://bl-remove.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	// Add the entry via the API first.
+	addBody := map[string]any{"tool_name": "to-remove", "reason": "test"}
+	addResp := mcpServerRequest(t, app, http.MethodPost,
+		"/api/v1/mcp-servers/"+s.ID+"/blocklist", key, addBody)
+	addResp.Body.Close()
+	if addResp.StatusCode != fiber.StatusCreated {
+		t.Fatalf("add blocklist status = %d, want 201", addResp.StatusCode)
+	}
+
+	// Remove via DELETE with query parameter.
+	delResp := mcpServerRequest(t, app, http.MethodDelete,
+		"/api/v1/mcp-servers/"+s.ID+"/blocklist?tool_name=to-remove", key, nil)
+	defer delResp.Body.Close()
+
+	if delResp.StatusCode != fiber.StatusNoContent {
+		raw, _ := io.ReadAll(delResp.Body)
+		t.Errorf("delete status = %d, want 204; body: %s", delResp.StatusCode, raw)
+	}
+
+	// Confirm the entry is gone by listing.
+	listResp := mcpServerRequest(t, app, http.MethodGet,
+		"/api/v1/mcp-servers/"+s.ID+"/blocklist", key, nil)
+	defer listResp.Body.Close()
+
+	var list []map[string]any
+	if err := json.NewDecoder(listResp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode blocklist after remove: %v", err)
+	}
+	if len(list) != 0 {
+		t.Errorf("blocklist length after remove = %d, want 0", len(list))
+	}
+}
+
+func TestRemoveMCPServerBlocklist_NotFound(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestRemoveMCPServerBlocklist_NotFound?mode=memory&cache=private"
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-blocklist-notfound")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "NotFound Blocklist Server",
+		Alias:    "bl-notfound-server",
+		URL:      "https://bl-notfound.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodDelete,
+		"/api/v1/mcp-servers/"+s.ID+"/blocklist?tool_name=does-not-exist", key, nil)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusNotFound {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want 404; body: %s", resp.StatusCode, raw)
+	}
+}
+
+// ---- POST /api/v1/mcp-servers/:server_id/refresh-tools ----------------------
+
+func TestHandleRefreshMCPServerTools_API(t *testing.T) {
+	t.Parallel()
+
+	staticTools := []mcp.Tool{
+		{Name: "search", Description: "Search the web"},
+		{Name: "fetch", Description: "Fetch a URL"},
+		{Name: "write-file", Description: "Write a file"},
+	}
+
+	dsn := "file:TestHandleRefreshMCPServerTools_API?mode=memory&cache=private"
+	database, keyCache, app := setupMCPServersTestAppWithToolCache(t, dsn, staticTools)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-refresh-tools")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Refresh Tools Server",
+		Alias:    "refresh-tools-server",
+		URL:      "https://refresh-tools.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodPost,
+		"/api/v1/mcp-servers/"+s.ID+"/refresh-tools", key, nil)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+
+	toolCount, ok := got["tool_count"].(float64)
+	if !ok {
+		t.Fatalf("tool_count field missing or wrong type: %v", got["tool_count"])
+	}
+	if int(toolCount) != len(staticTools) {
+		t.Errorf("tool_count = %d, want %d", int(toolCount), len(staticTools))
+	}
+}
+
+func TestHandleRefreshMCPServerTools_CodeModeDisabled(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestHandleRefreshMCPServerTools_CodeModeDisabled?mode=memory&cache=private"
+	// Use the standard setup — no ToolCache wired in.
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-refresh-disabled")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Disabled Code Mode Server",
+		Alias:    "disabled-cm-server",
+		URL:      "https://disabled-cm.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodPost,
+		"/api/v1/mcp-servers/"+s.ID+"/refresh-tools", key, nil)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusServiceUnavailable {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want 503; body: %s", resp.StatusCode, raw)
+	}
+}
+
+func TestHandleRefreshMCPServerTools_Cooldown(t *testing.T) {
+	t.Parallel()
+
+	staticTools := []mcp.Tool{{Name: "cooldown-tool"}}
+
+	dsn := "file:TestHandleRefreshMCPServerTools_Cooldown?mode=memory&cache=private"
+	database, keyCache, app := setupMCPServersTestAppWithToolCache(t, dsn, staticTools)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-refresh-cooldown")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Cooldown Server",
+		Alias:    "cooldown-server",
+		URL:      "https://cooldown.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	// First refresh — must succeed.
+	resp1 := mcpServerRequest(t, app, http.MethodPost,
+		"/api/v1/mcp-servers/"+s.ID+"/refresh-tools", key, nil)
+	resp1.Body.Close()
+	if resp1.StatusCode != fiber.StatusOK {
+		t.Fatalf("first refresh status = %d, want 200", resp1.StatusCode)
+	}
+
+	// Immediate second refresh — must return 429 because the cooldown (60s) has
+	// not elapsed since the first refresh completed.
+	resp2 := mcpServerRequest(t, app, http.MethodPost,
+		"/api/v1/mcp-servers/"+s.ID+"/refresh-tools", key, nil)
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != fiber.StatusTooManyRequests {
+		raw, _ := io.ReadAll(resp2.Body)
+		t.Errorf("second refresh status = %d, want 429; body: %s", resp2.StatusCode, raw)
+	}
+}
+
+// ---- GET /api/v1/mcp-servers/:server_id/tools -------------------------------
+
+func TestHandleListMCPServerTools_API(t *testing.T) {
+	t.Parallel()
+
+	staticTools := []mcp.Tool{
+		{Name: "allowed-tool", Description: "An allowed tool"},
+		{Name: "blocked-tool", Description: "A blocked tool"},
+	}
+
+	dsn := "file:TestHandleListMCPServerTools_API?mode=memory&cache=private"
+	database, keyCache, app := setupMCPServersTestAppWithToolCache(t, dsn, staticTools)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-list-tools")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "List Tools Server",
+		Alias:    "list-tools-server",
+		URL:      "https://list-tools.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	// Block one of the tools directly in the DB.
+	_, err = database.CreateToolBlocklistEntry(context.Background(), s.ID, "blocked-tool", "test block", "")
+	if err != nil {
+		t.Fatalf("create blocklist entry: %v", err)
+	}
+
+	// Trigger a refresh so the ToolCache has entries for this alias.
+	refreshResp := mcpServerRequest(t, app, http.MethodPost,
+		"/api/v1/mcp-servers/"+s.ID+"/refresh-tools", key, nil)
+	refreshResp.Body.Close()
+	if refreshResp.StatusCode != fiber.StatusOK {
+		t.Fatalf("refresh status = %d, want 200", refreshResp.StatusCode)
+	}
+
+	// Now list tools.
+	resp := mcpServerRequest(t, app, http.MethodGet,
+		"/api/v1/mcp-servers/"+s.ID+"/tools", key, nil)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	var list []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode tools response: %v", err)
+	}
+	if len(list) != 2 {
+		t.Errorf("tools length = %d, want 2", len(list))
+	}
+
+	toolsByName := make(map[string]map[string]any, len(list))
+	for _, tool := range list {
+		name, ok := tool["name"].(string)
+		if !ok {
+			t.Errorf("tool entry missing name field: %v", tool)
+			continue
+		}
+		toolsByName[name] = tool
+	}
+
+	if allowed, ok := toolsByName["allowed-tool"]; ok {
+		if allowed["blocked"] != false {
+			t.Errorf("allowed-tool blocked = %v, want false", allowed["blocked"])
+		}
+	} else {
+		t.Error("allowed-tool missing from tools list")
+	}
+
+	if blocked, ok := toolsByName["blocked-tool"]; ok {
+		if blocked["blocked"] != true {
+			t.Errorf("blocked-tool blocked = %v, want true", blocked["blocked"])
+		}
+	} else {
+		t.Error("blocked-tool missing from tools list")
+	}
+}
+
+func TestHandleListMCPServerTools_CodeModeDisabled(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestHandleListMCPServerTools_CodeModeDisabled?mode=memory&cache=private"
+	// Use the standard setup — no ToolCache wired in.
+	app, database, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-list-tools-disabled")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:     "Disabled CM List Tools Server",
+		Alias:    "disabled-cm-list-server",
+		URL:      "https://disabled-cm-list.example.com",
+		AuthType: "none",
+	})
+	if err != nil {
+		t.Fatalf("create MCP server: %v", err)
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodGet,
+		"/api/v1/mcp-servers/"+s.ID+"/tools", key, nil)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusServiceUnavailable {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want 503; body: %s", resp.StatusCode, raw)
 	}
 }

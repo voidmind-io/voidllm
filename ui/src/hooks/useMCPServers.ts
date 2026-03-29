@@ -14,6 +14,7 @@ export interface MCPServerResponse {
   org_id?: string
   team_id?: string
   is_active: boolean
+  code_mode_enabled: boolean
   created_at: string
   updated_at: string
 }
@@ -34,6 +35,20 @@ export interface UpdateMCPServerParams {
   auth_type?: string
   auth_header?: string
   auth_token?: string
+  code_mode_enabled?: boolean
+}
+
+export interface ToolBlocklistEntry {
+  id: string
+  server_id: string
+  tool_name: string
+  reason: string
+  created_by: string | null
+  created_at: string
+}
+
+export interface RefreshToolsResponse {
+  tool_count: number
 }
 
 export interface TestMCPServerResponse {
@@ -99,5 +114,68 @@ export function useTestMCPServer() {
   return useMutation({
     mutationFn: (serverId: string) =>
       apiClient<TestMCPServerResponse>(`/mcp-servers/${serverId}/test`, { method: 'POST' }),
+  })
+}
+
+export function useMCPServerBlocklist(serverId: string) {
+  return useQuery<ToolBlocklistEntry[]>({
+    queryKey: ['mcp-server-blocklist', serverId],
+    queryFn: () => apiClient<ToolBlocklistEntry[]>(`/mcp-servers/${serverId}/blocklist`),
+    enabled: !!serverId,
+  })
+}
+
+export function useAddBlocklistEntry() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ serverId, toolName, reason }: { serverId: string; toolName: string; reason?: string }) =>
+      apiClient<ToolBlocklistEntry>(`/mcp-servers/${serverId}/blocklist`, {
+        method: 'POST',
+        body: JSON.stringify({ tool_name: toolName, reason: reason ?? '' }),
+      }),
+    onSuccess: (_, vars) => {
+      queryClient.invalidateQueries({ queryKey: ['mcp-server-blocklist', vars.serverId] })
+      queryClient.invalidateQueries({ queryKey: ['mcp-server-tools', vars.serverId] })
+    },
+  })
+}
+
+export function useRemoveBlocklistEntry() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ serverId, toolName }: { serverId: string; toolName: string }) =>
+      apiClient<void>(`/mcp-servers/${serverId}/blocklist?tool_name=${encodeURIComponent(toolName)}`, {
+        method: 'DELETE',
+      }),
+    onSuccess: (_, vars) => {
+      queryClient.invalidateQueries({ queryKey: ['mcp-server-blocklist', vars.serverId] })
+      queryClient.invalidateQueries({ queryKey: ['mcp-server-tools', vars.serverId] })
+    },
+  })
+}
+
+export function useRefreshMCPServerTools() {
+  const queryClient = useQueryClient()
+  return useMutation<RefreshToolsResponse, Error, string>({
+    mutationFn: (serverId: string) =>
+      apiClient<RefreshToolsResponse>(`/mcp-servers/${serverId}/refresh-tools`, { method: 'POST' }),
+    onSuccess: (_, serverId) => {
+      queryClient.invalidateQueries({ queryKey: ['mcp-server-blocklist'] })
+      queryClient.invalidateQueries({ queryKey: ['mcp-server-tools', serverId] })
+    },
+  })
+}
+
+export interface MCPToolResponse {
+  name: string
+  description: string
+  blocked: boolean
+}
+
+export function useMCPServerTools(serverId: string) {
+  return useQuery<MCPToolResponse[]>({
+    queryKey: ['mcp-server-tools', serverId],
+    queryFn: () => apiClient<MCPToolResponse[]>(`/mcp-servers/${serverId}/tools`),
+    enabled: !!serverId,
   })
 }

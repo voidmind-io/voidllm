@@ -23,6 +23,8 @@ const (
 type KeyIdentity struct {
 	// OrgID is the organization the caller belongs to.
 	OrgID string
+	// TeamID is the team this key is scoped to. Empty if not team-scoped.
+	TeamID string
 	// KeyID is the unique identifier of the API key used to authenticate.
 	KeyID string
 	// UserID is the user associated with the key, if any.
@@ -96,11 +98,28 @@ type VoidLLMDeps struct {
 	// ListDeployments returns the deployment records for the given model ID.
 	// Sensitive fields such as API keys must be omitted from the returned maps.
 	ListDeployments func(ctx context.Context, modelID string) ([]map[string]any, error)
+
+	// ExecuteCode runs JavaScript in the Code Mode sandbox with MCP tools
+	// injected as async functions. code is the JS source, serverAliases
+	// optionally restricts which servers' tools are available (nil = all
+	// accessible). Returns nil when Code Mode is disabled.
+	ExecuteCode func(ctx context.Context, code string, serverAliases []string) (*ExecuteResult, error)
+
+	// ListAccessibleMCPServers returns MCP servers the caller can access.
+	// When codeModeOnly is true, only servers with code_mode_enabled are
+	// returned. Returns nil when Code Mode is disabled.
+	ListAccessibleMCPServers func(ctx context.Context, codeModeOnly bool) ([]map[string]any, error)
+
+	// SearchMCPTools searches tool schemas across accessible servers by
+	// keyword. query is matched case-insensitively against tool names and
+	// descriptions. serverAliases optionally restricts the search scope
+	// (nil = all accessible). Returns nil when Code Mode is disabled.
+	SearchMCPTools func(ctx context.Context, query string, serverAliases []string) ([]map[string]any, error)
 }
 
-// RegisterVoidLLMTools registers all built-in VoidLLM management tools on the
-// given MCP server. The tools cover model listing, health inspection, usage
-// statistics, key management, and deployment inspection.
+// RegisterVoidLLMTools registers the VoidLLM management tools on the given MCP
+// server. The tools cover model listing, health inspection, usage statistics,
+// key management, and deployment inspection.
 //
 // Dependencies are injected via deps so the mcp package remains decoupled from
 // VoidLLM internals. All function fields in deps must be non-nil.
@@ -195,6 +214,63 @@ func RegisterVoidLLMTools(s *Server, deps VoidLLMDeps) {
 			Required: []string{"model_id"},
 		},
 	}, makeListDeployments(deps))
+}
+
+// RegisterCodeModeTools registers the Code Mode tools (list_servers,
+// search_tools, execute_code) on the given MCP server. These tools are
+// only registered when deps.ExecuteCode is non-nil (Code Mode enabled).
+func RegisterCodeModeTools(s *Server, deps VoidLLMDeps) {
+	if deps.ExecuteCode == nil {
+		return
+	}
+
+	s.RegisterTool(Tool{
+		Name:        "list_servers",
+		Description: "List MCP servers available for Code Mode execution. Shows server names, aliases, and tool counts.",
+		InputSchema: InputSchema{
+			Type: "object",
+		},
+	}, makeListServers(deps))
+
+	s.RegisterTool(Tool{
+		Name:        "search_tools",
+		Description: "Search for MCP tools across accessible servers by keyword. Returns matching tool names, descriptions, and input schemas for writing Code Mode scripts.",
+		InputSchema: InputSchema{
+			Type: "object",
+			Properties: map[string]Property{
+				"query": {
+					Type:        "string",
+					Description: "Search keyword to match against tool names and descriptions.",
+				},
+				"server": {
+					Type:        "string",
+					Description: "Optional server alias to restrict search scope.",
+				},
+			},
+			Required: []string{"query"},
+		},
+	}, makeSearchTools(deps))
+
+	s.RegisterTool(Tool{
+		Name: "execute_code",
+		Description: "Execute JavaScript code in a sandboxed WASM runtime with MCP tools available as async functions. " +
+			"Tools are accessible via tools.serverAlias.toolName(args). Use await for tool calls. " +
+			"Return a value to send it back as the result.",
+		InputSchema: InputSchema{
+			Type: "object",
+			Properties: map[string]Property{
+				"code": {
+					Type:        "string",
+					Description: "JavaScript code to execute. MCP tools are available as async functions under tools.serverAlias.toolName(args).",
+				},
+				"servers": {
+					Type:        "array",
+					Description: "Optional list of server aliases to include. Omit for all accessible servers.",
+				},
+			},
+			Required: []string{"code"},
+		},
+	}, makeExecuteCode(deps))
 }
 
 // makeListModels returns the handler for the list_models tool. Callers with
@@ -351,6 +427,82 @@ func makeListDeployments(deps VoidLLMDeps) ToolHandler {
 		}
 
 		out, _ := json.MarshalIndent(deployments, "", "  ")
+		return TextResult(string(out)), nil
+	}
+}
+
+// makeListServers returns the handler for the list_servers tool. It returns
+// only servers with Code Mode enabled, as seen by the authenticated caller.
+func makeListServers(deps VoidLLMDeps) ToolHandler {
+	return func(ctx context.Context, _ json.RawMessage) (*ToolResult, error) {
+		servers, err := deps.ListAccessibleMCPServers(ctx, true)
+		if err != nil {
+			return nil, fmt.Errorf("list accessible mcp servers: %w", err)
+		}
+
+		out, _ := json.MarshalIndent(servers, "", "  ")
+		return TextResult(string(out)), nil
+	}
+}
+
+// makeSearchTools returns the handler for the search_tools tool. It searches
+// tool schemas across accessible MCP servers by a caller-supplied keyword.
+func makeSearchTools(deps VoidLLMDeps) ToolHandler {
+	return func(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
+		var input struct {
+			Query  string `json:"query"`
+			Server string `json:"server"`
+		}
+		if err := json.Unmarshal(args, &input); err != nil || input.Query == "" {
+			return ErrorResult("query parameter is required"), nil
+		}
+
+		var serverAliases []string
+		if input.Server != "" {
+			serverAliases = []string{input.Server}
+		}
+
+		tools, err := deps.SearchMCPTools(ctx, input.Query, serverAliases)
+		if err != nil {
+			return nil, fmt.Errorf("search mcp tools: %w", err)
+		}
+
+		out, _ := json.MarshalIndent(tools, "", "  ")
+		return TextResult(string(out)), nil
+	}
+}
+
+// makeExecuteCode returns the handler for the execute_code tool. It runs
+// caller-supplied JavaScript in the Code Mode WASM sandbox with the requested
+// MCP servers' tools injected as async functions.
+// maxCodeSize is the maximum allowed length of JavaScript code submitted to
+// execute_code. This prevents resource exhaustion during string concatenation
+// and WASM compilation before the sandbox memory limit takes effect.
+const maxCodeSize = 256 * 1024 // 256 KB
+
+func makeExecuteCode(deps VoidLLMDeps) ToolHandler {
+	return func(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
+		var input struct {
+			Code    string   `json:"code"`
+			Servers []string `json:"servers"`
+		}
+		if err := json.Unmarshal(args, &input); err != nil || input.Code == "" {
+			return ErrorResult("code parameter is required"), nil
+		}
+		if len(input.Code) > maxCodeSize {
+			return ErrorResult("code exceeds maximum size (256 KB)"), nil
+		}
+
+		result, err := deps.ExecuteCode(ctx, input.Code, input.Servers)
+		if err != nil {
+			return nil, fmt.Errorf("execute code: %w", err)
+		}
+
+		if result.Error != "" {
+			return ErrorResult(result.Error), nil
+		}
+
+		out, _ := json.MarshalIndent(result, "", "  ")
 		return TextResult(string(out)), nil
 	}
 }

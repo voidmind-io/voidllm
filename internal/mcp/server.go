@@ -17,14 +17,21 @@ const protocolVersion = "2025-03-26"
 // not as a Go error.
 type ToolHandler func(ctx context.Context, args json.RawMessage) (*ToolResult, error)
 
+// OnToolsListHook is an optional callback invoked inside tools/list before the
+// tool list is returned to the caller. It receives a copy of the registered
+// tools and may return a modified slice. The hook must not retain references to
+// the slice after it returns.
+type OnToolsListHook func(tools []Tool) []Tool
+
 // Server is an MCP server that handles JSON-RPC 2.0 requests.
 // It is safe for concurrent use.
 type Server struct {
-	name     string
-	version  string
-	mu       sync.RWMutex
-	tools    []Tool
-	handlers map[string]ToolHandler
+	name        string
+	version     string
+	mu          sync.RWMutex
+	tools       []Tool
+	handlers    map[string]ToolHandler
+	onToolsList OnToolsListHook
 }
 
 // NewServer creates a new MCP server with the given name and version.
@@ -44,6 +51,16 @@ func (s *Server) RegisterTool(tool Tool, handler ToolHandler) {
 	defer s.mu.Unlock()
 	s.tools = append(s.tools, tool)
 	s.handlers[tool.Name] = handler
+}
+
+// SetOnToolsList registers a hook that is called inside tools/list before the
+// tool list is returned. The hook receives a shallow copy of the registered
+// tools and may return a modified slice. Setting a nil hook clears any
+// previously registered hook. It is safe to call concurrently with Handle.
+func (s *Server) SetOnToolsList(hook OnToolsListHook) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onToolsList = hook
 }
 
 // Handle processes a raw JSON-RPC 2.0 request and returns the JSON-encoded
@@ -111,12 +128,19 @@ func (s *Server) handleInitialize(_ json.RawMessage) any {
 	}
 }
 
-// handleToolsList returns the list of registered tools.
+// handleToolsList returns the list of registered tools. If an OnToolsListHook
+// has been set via SetOnToolsList, the hook is invoked with a copy of the tool
+// list and its return value is used as the response payload.
 func (s *Server) handleToolsList() any {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	tools := make([]Tool, len(s.tools))
 	copy(tools, s.tools)
+	hook := s.onToolsList
+	s.mu.RUnlock()
+
+	if hook != nil {
+		tools = hook(tools)
+	}
 	return map[string]any{
 		"tools": tools,
 	}

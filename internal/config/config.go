@@ -319,6 +319,39 @@ func (c MCPServerConfig) LogValue() slog.Value {
 	)
 }
 
+// CodeModeConfig controls the sandboxed JavaScript execution runtime used
+// by Code Mode to orchestrate multiple MCP tool calls in a single script.
+type CodeModeConfig struct {
+	// Enabled is the master switch for Code Mode. When false, the execute_code,
+	// list_servers, and search_tools MCP tools are not registered.
+	// A nil pointer means "not configured" and defaults to false at startup —
+	// Code Mode must be explicitly opted in to.
+	Enabled *bool `yaml:"enabled"`
+	// MemoryLimitMB is the maximum memory (in megabytes) a single Code Mode
+	// execution may consume inside the WASM sandbox. Default: 16.
+	MemoryLimitMB int `yaml:"memory_limit_mb"`
+	// Timeout is the maximum wall-clock duration for a single Code Mode
+	// execution, including all tool calls. Default: 30s.
+	Timeout time.Duration `yaml:"timeout"`
+	// PoolSize is the number of pre-warmed QuickJS runtimes kept in the pool.
+	// Each runtime handles one concurrent execution. Default: 4.
+	PoolSize int `yaml:"pool_size"`
+	// MaxToolCalls is the maximum number of MCP tool calls allowed within a
+	// single Code Mode execution. Prevents runaway scripts from making
+	// unbounded upstream calls. Default: 50. Valid range: [1, 1000].
+	MaxToolCalls int `yaml:"max_tool_calls"`
+}
+
+// IsEnabled returns true only when Code Mode has been explicitly enabled via
+// configuration. A nil pointer (field absent from YAML) returns false so that
+// Code Mode is opt-in rather than on by default.
+func (c CodeModeConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return false
+	}
+	return *c.Enabled
+}
+
 // MCPConfig holds configuration for the MCP Gateway subsystem.
 type MCPConfig struct {
 	// CallTimeout is the maximum duration for a single proxied MCP tool call.
@@ -329,6 +362,8 @@ type MCPConfig struct {
 	// deployments where MCP servers run on the same network. Default: false.
 	// This setting is only configurable via YAML/ENV — not via Admin API/UI.
 	AllowPrivateURLs bool `yaml:"allow_private_urls"`
+	// CodeMode holds configuration for the sandboxed JavaScript execution runtime.
+	CodeMode CodeModeConfig `yaml:"code_mode"`
 }
 
 // HealthCheckConfig holds configuration for the upstream model health monitoring subsystem.
@@ -659,6 +694,23 @@ func (c *Config) setDefaults() {
 	// MCP Gateway
 	if c.Settings.MCP.CallTimeout == 0 {
 		c.Settings.MCP.CallTimeout = 30 * time.Second
+	}
+
+	// MCP Code Mode — only apply sub-field defaults when Code Mode is explicitly
+	// enabled. IsEnabled returns false for a nil pointer so Code Mode is opt-in.
+	if c.Settings.MCP.CodeMode.IsEnabled() {
+		if c.Settings.MCP.CodeMode.MemoryLimitMB == 0 {
+			c.Settings.MCP.CodeMode.MemoryLimitMB = 16
+		}
+		if c.Settings.MCP.CodeMode.Timeout == 0 {
+			c.Settings.MCP.CodeMode.Timeout = 30 * time.Second
+		}
+		if c.Settings.MCP.CodeMode.PoolSize == 0 {
+			c.Settings.MCP.CodeMode.PoolSize = 8
+		}
+		if c.Settings.MCP.CodeMode.MaxToolCalls == 0 {
+			c.Settings.MCP.CodeMode.MaxToolCalls = 50
+		}
 	}
 
 	// Logging
