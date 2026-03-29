@@ -2,6 +2,42 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.7] — 2026-03-29
+
+### Code Mode
+
+- **WASM-sandboxed JS execution** — LLMs write JavaScript to orchestrate multiple MCP tool calls in one execution (QuickJS via Wazero, pure Go, no CGO)
+- **3 Code Mode tools** — `list_servers`, `search_tools`, `execute_code` on dedicated `/api/v1/mcp` endpoint
+- **ES6 Proxy dispatch** — dynamic tool routing, any tool name characters supported
+- **TypeScript type declarations** — auto-generated from tool schemas, injected at `tools/list` time
+- **Console capture** — `console.log/warn/error` output returned in execution results
+- **Per-tool blocklist** — admins block specific tools from Code Mode via API and UI
+- **Persistent tool cache** — tool schemas stored in DB, zero HTTP calls on startup, 24h background refresh
+- **Execution history** — UUIDv7 per execution groups tool calls for tracing
+- **SSE transport detection** — deprecated SSE servers auto-detected and deactivated
+- **MCP server split** — Code Mode at `/api/v1/mcp`, management tools at `/api/v1/mcp/voidllm`
+- **Tools list UI** — expanded row shows all tools per server with block/unblock buttons
+- **Code Mode toggle** — per-server enable/disable in UI and API
+- **Refresh tools endpoint** — force re-fetch tool schemas with 60s cooldown
+
+---
+
+## [0.0.6] — 2026-03-28
+
+### MCP Gateway
+
+- **Built-in MCP server** — 6 management tools (list_models, get_model_health, get_usage, list_keys, create_key, list_deployments)
+- **MCP Gateway proxy** — register external MCP servers, proxy tool calls with auth and access control
+- **Scoped access control** — global, org, and team-level MCP server registration
+- **MCP access tables** — org/team/key allowlists (most-restrictive-wins)
+- **Session management** — auto-initialize, Mcp-Session-Id forwarding, session re-init on expiry
+- **YAML config sync** — MCP servers from `voidllm.yaml` synced to DB at startup
+- **Async tool call logging** — fire-and-forget batch writes to `mcp_tool_calls`
+- **MCP Servers UI** — CRUD, scope selector, auth type tabs, test connection, source badges
+- **Prometheus metrics** — tool call counts, duration, transport errors
+
+---
+
 ## [0.0.5] — 2026-03-26
 
 ### Multi-Deployment Load Balancing
