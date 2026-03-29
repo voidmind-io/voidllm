@@ -17,9 +17,11 @@ export PATH=$PATH:~/go/bin
 RPS=${1:-500}
 DURATION=${2:-15s}
 MOCK_PORT=9999
+MCP_MOCK_PORT=9998
 PROXY_PORT=8081
 
 MOCK_PID=""
+MCP_MOCK_PID=""
 PROXY_PID=""
 
 BOLD='\033[1m'
@@ -44,10 +46,11 @@ echo ""
 # ─── Cleanup ──────────────────────────────────────────────────────
 cleanup() {
   [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
+  [ -n "$MCP_MOCK_PID" ] && kill "$MCP_MOCK_PID" 2>/dev/null || true
   [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
-  rm -f /tmp/bench-target-*.txt /tmp/bench-proxy.yaml /tmp/bench-body.json \
-        /tmp/bench-mock-llm /tmp/bench-voidllm-proxy /tmp/bench-voidllm.log \
-        /tmp/bench-calibration.bin /tmp/bench-overhead.bin
+  rm -f /tmp/bench-target-*.txt /tmp/bench-proxy.yaml /tmp/bench-body*.json \
+        /tmp/bench-mock-llm /tmp/bench-mock-mcp /tmp/bench-voidllm-proxy \
+        /tmp/bench-voidllm.log /tmp/bench-calibration*.bin /tmp/bench-overhead*.bin
 }
 trap cleanup EXIT
 
@@ -57,18 +60,29 @@ sleep 1
 
 # ─── Pre-build binaries ──────────────────────────────────────────
 echo -e "${DIM}Building binaries...${RESET}"
-go build -o /tmp/bench-mock-llm scripts/bench/mock-llm.go 2>&1 || { echo "ERROR: mock build failed"; exit 1; }
+go build -o /tmp/bench-mock-llm scripts/bench/mock-llm.go 2>&1 || { echo "ERROR: mock-llm build failed"; exit 1; }
+go build -o /tmp/bench-mock-mcp scripts/bench/mock-mcp.go 2>&1 || { echo "ERROR: mock-mcp build failed"; exit 1; }
 go build -o /tmp/bench-voidllm-proxy ./cmd/voidllm 2>&1 || { echo "ERROR: voidllm build failed"; exit 1; }
 echo -e "${DIM}Built.${RESET}"
 
-# ─── Start Mock LLM ──────────────────────────────────────────────
+# ─── Start Mock Servers ───────────────────────────────────────────
 echo -e "${DIM}Starting mock LLM on :${MOCK_PORT} (10ms latency)...${RESET}"
 /tmp/bench-mock-llm -port $MOCK_PORT -latency 10ms > /dev/null 2>&1 &
 MOCK_PID=$!
+
+echo -e "${DIM}Starting mock MCP on :${MCP_MOCK_PORT} (10ms latency)...${RESET}"
+/tmp/bench-mock-mcp -port $MCP_MOCK_PORT -latency 10ms > /dev/null 2>&1 &
+MCP_MOCK_PID=$!
+
 sleep 2
 
 if ! curl -s http://localhost:$MOCK_PORT/v1/models > /dev/null 2>&1; then
   echo "ERROR: Mock LLM failed to start"
+  exit 1
+fi
+if ! curl -s -X POST http://localhost:$MCP_MOCK_PORT/ -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}' > /dev/null 2>&1; then
+  echo "ERROR: Mock MCP failed to start"
   exit 1
 fi
 
@@ -88,9 +102,17 @@ models:
     base_url: http://localhost:$MOCK_PORT/v1
     aliases: [default]
 
+mcp_servers:
+  - name: bench-mcp
+    alias: bench
+    url: http://localhost:$MCP_MOCK_PORT
+    auth_type: none
+
 settings:
   admin_key: bench-admin-key-12345678901234567890
   encryption_key: bench-encryption-key-1234567890
+  mcp:
+    allow_private_urls: true
   health_check:
     health:
       enabled: false
@@ -176,19 +198,55 @@ vegeta attack -targets=/tmp/bench-target-proxy.txt -rate=$RPS -duration=$DURATIO
 vegeta report -type=text < /tmp/bench-overhead.bin
 echo ""
 
+# ─── Phase 3: MCP Proxy ───────────────────────────────────────────
+echo -e "${CYAN}${BOLD}Phase 3: MCP Calibration (direct → Mock MCP)${RESET}"
+
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mock_tool","arguments":{"input":"bench"}}}' > /tmp/bench-mcp-body.json
+
+cat > /tmp/bench-target-mcp-direct.txt << EOF
+POST http://localhost:$MCP_MOCK_PORT/
+Content-Type: application/json
+@/tmp/bench-mcp-body.json
+EOF
+
+vegeta attack -targets=/tmp/bench-target-mcp-direct.txt -rate=$RPS -duration=$DURATION \
+  > /tmp/bench-calibration-mcp.bin
+vegeta report -type=text < /tmp/bench-calibration-mcp.bin
+echo ""
+
+echo -e "${CYAN}${BOLD}Phase 4: MCP Overhead (Vegeta → VoidLLM → Mock MCP)${RESET}"
+
+cat > /tmp/bench-target-mcp-proxy.txt << EOF
+POST http://localhost:$PROXY_PORT/api/v1/mcp/bench
+Content-Type: application/json
+Authorization: Bearer $API_KEY
+@/tmp/bench-mcp-body.json
+EOF
+
+vegeta attack -targets=/tmp/bench-target-mcp-proxy.txt -rate=$RPS -duration=$DURATION \
+  > /tmp/bench-overhead-mcp.bin
+vegeta report -type=text < /tmp/bench-overhead-mcp.bin
+echo ""
+
 # ─── Summary ─────────────────────────────────────────────────────
 echo -e "${YELLOW}${BOLD}━━━ Summary ━━━${RESET}"
 echo ""
-echo "Calibration (direct):"
+echo "LLM Proxy — Calibration (direct):"
 vegeta report -type=text < /tmp/bench-calibration.bin | grep -E "Latencies|Success"
 echo ""
-echo "With Proxy:"
+echo "LLM Proxy — With Proxy:"
 vegeta report -type=text < /tmp/bench-overhead.bin | grep -E "Latencies|Success"
 echo ""
+echo "MCP Proxy — Calibration (direct):"
+vegeta report -type=text < /tmp/bench-calibration-mcp.bin | grep -E "Latencies|Success"
+echo ""
+echo "MCP Proxy — With Proxy:"
+vegeta report -type=text < /tmp/bench-overhead-mcp.bin | grep -E "Latencies|Success"
+echo ""
 # ─── Compute overhead ─────────────────────────────────────────────
-echo "Proxy Overhead (computed):"
+echo "Overhead (computed):"
 python3 -c "
-import re, sys
+import re, subprocess
 
 def parse_us(s):
     s = s.strip()
@@ -202,26 +260,22 @@ def parse_us(s):
 
 def extract(line):
     m = re.findall(r'[\d.]+(?:ms|µs|us|s)', line)
-    return [parse_us(x) for x in m[:5]]  # mean, 50, 95, 99, max
+    return [parse_us(x) for x in m[:5]]
 
-calib = open('/tmp/bench-calibration.bin', 'rb')
-proxy = open('/tmp/bench-overhead.bin', 'rb')
-import subprocess
-c = subprocess.run(['vegeta', 'report', '-type=text'], stdin=calib, capture_output=True, text=True).stdout
-p = subprocess.run(['vegeta', 'report', '-type=text'], stdin=proxy, capture_output=True, text=True).stdout
+def compute(name, calib_file, proxy_file):
+    c = subprocess.run(['vegeta', 'report', '-type=text'], stdin=open(calib_file,'rb'), capture_output=True, text=True).stdout
+    p = subprocess.run(['vegeta', 'report', '-type=text'], stdin=open(proxy_file,'rb'), capture_output=True, text=True).stdout
+    cl = [l for l in c.split('\n') if 'Latencies' in l][0]
+    pl = [l for l in p.split('\n') if 'Latencies' in l][0]
+    cv, pv = extract(cl), extract(pl)
+    print(f'  {name}:')
+    for i, label in enumerate(['mean', 'p50', 'p95', 'p99', 'max']):
+        diff = pv[i] - cv[i]
+        print(f'    {label:>4}: {diff:>8.0f}µs')
 
-cl = [l for l in c.split('\n') if 'Latencies' in l][0]
-pl = [l for l in p.split('\n') if 'Latencies' in l][0]
-
-cv = extract(cl)
-pv = extract(pl)
-
-labels = ['mean', 'p50', 'p95', 'p99', 'max']
-for i, label in enumerate(labels):
-    diff = pv[i] - cv[i]
-    print(f'  {label:>4}: {diff:>8.0f}µs  (proxy: {pv[i]:.0f}µs - direct: {cv[i]:.0f}µs)')
+compute('LLM Proxy', '/tmp/bench-calibration.bin', '/tmp/bench-overhead.bin')
+compute('MCP Proxy', '/tmp/bench-calibration-mcp.bin', '/tmp/bench-overhead-mcp.bin')
 " 2>/dev/null || echo -e "${DIM}  (install python3 for auto-calculation)${RESET}"
 
 echo ""
-echo -e "${DIM}Raw data: /tmp/bench-calibration.bin, /tmp/bench-overhead.bin${RESET}"
-echo -e "${DIM}HDR histogram: vegeta report -type=hdrplot < /tmp/bench-overhead.bin${RESET}"
+echo -e "${DIM}Raw data in /tmp/bench-*.bin${RESET}"
