@@ -374,6 +374,11 @@ func buildToolCallRequest(toolName string, args json.RawMessage) []byte {
 // all tool calls from a single execute_code invocation; pass an empty string
 // for non-Code-Mode calls.
 func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias, toolName string, args json.RawMessage, codeMode bool, executionID string) (json.RawMessage, error) {
+	// Built-in VoidLLM management server — dispatch in-process instead of HTTP.
+	if serverAlias == "voidllm" && h.MCPServer != nil {
+		return h.callBuiltinTool(ctx, ki, toolName, args)
+	}
+
 	server, err := h.DB.GetMCPServerByAliasScoped(ctx, serverAlias, ki.OrgID, ki.TeamID)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
@@ -485,6 +490,25 @@ func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias
 		return nil, fmt.Errorf("CallMCPTool %s/%s: transport: %w", serverAlias, toolName, callErr)
 	}
 
+	return result, nil
+}
+
+// callBuiltinTool dispatches a tool call to the built-in VoidLLM management
+// MCP server in-process, without HTTP. The caller's identity is injected into
+// the MCP context so tool handlers can enforce RBAC.
+func (h *Handler) callBuiltinTool(ctx context.Context, ki *auth.KeyInfo, toolName string, args json.RawMessage) (json.RawMessage, error) {
+	mcpCtx := mcp.WithKeyIdentity(ctx, mcp.KeyIdentity{
+		OrgID:  ki.OrgID,
+		TeamID: ki.TeamID,
+		KeyID:  ki.ID,
+		UserID: ki.UserID,
+		Role:   ki.Role,
+	})
+	body := buildToolCallRequest(toolName, args)
+	result := h.MCPServer.Handle(mcpCtx, body)
+	if result == nil {
+		return nil, fmt.Errorf("builtin tool %s: no response", toolName)
+	}
 	return result, nil
 }
 

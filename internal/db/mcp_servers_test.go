@@ -1062,3 +1062,135 @@ func TestSyncYAMLMCPServers_Empty(t *testing.T) {
 		t.Errorf("SyncYAMLMCPServers([]) error = %v, want nil", err)
 	}
 }
+
+// ---- EnsureBuiltinMCPServer -------------------------------------------------
+
+// TestEnsureBuiltinMCPServer_CreatesNew verifies that the first call creates a
+// global server with source="builtin" and alias="voidllm".
+func TestEnsureBuiltinMCPServer_CreatesNew(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	got, err := d.EnsureBuiltinMCPServer(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureBuiltinMCPServer() error = %v, want nil", err)
+	}
+	if got == nil {
+		t.Fatal("EnsureBuiltinMCPServer() = nil, want non-nil server")
+	}
+	if got.Alias != "voidllm" {
+		t.Errorf("Alias = %q, want %q", got.Alias, "voidllm")
+	}
+	if got.Source != "builtin" {
+		t.Errorf("Source = %q, want %q", got.Source, "builtin")
+	}
+	if got.Name != "VoidLLM" {
+		t.Errorf("Name = %q, want %q", got.Name, "VoidLLM")
+	}
+	if !got.IsActive {
+		t.Error("IsActive = false, want true")
+	}
+	if got.OrgID != nil {
+		t.Errorf("OrgID = %v, want nil (global server)", got.OrgID)
+	}
+	if got.TeamID != nil {
+		t.Errorf("TeamID = %v, want nil (global server)", got.TeamID)
+	}
+	if got.ID == "" {
+		t.Error("ID is empty, want non-empty UUID")
+	}
+}
+
+// TestEnsureBuiltinMCPServer_Idempotent verifies that calling
+// EnsureBuiltinMCPServer twice returns the same record.
+func TestEnsureBuiltinMCPServer_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	first, err := d.EnsureBuiltinMCPServer(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureBuiltinMCPServer() first call error = %v", err)
+	}
+
+	second, err := d.EnsureBuiltinMCPServer(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureBuiltinMCPServer() second call error = %v", err)
+	}
+
+	if first.ID != second.ID {
+		t.Errorf("second call returned different ID: first=%q second=%q", first.ID, second.ID)
+	}
+	if second.Source != "builtin" {
+		t.Errorf("second call Source = %q, want %q", second.Source, "builtin")
+	}
+}
+
+// TestEnsureBuiltinMCPServer_ReactivatesInactive verifies that when the builtin
+// server has been deactivated, EnsureBuiltinMCPServer reactivates it.
+func TestEnsureBuiltinMCPServer_ReactivatesInactive(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	// Create the builtin server.
+	created, err := d.EnsureBuiltinMCPServer(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureBuiltinMCPServer() create error = %v", err)
+	}
+
+	// Deactivate it.
+	falseVal := false
+	if _, err := d.UpdateMCPServer(context.Background(), created.ID, UpdateMCPServerParams{IsActive: &falseVal}); err != nil {
+		t.Fatalf("UpdateMCPServer(deactivate) error = %v", err)
+	}
+
+	// Calling again should reactivate it.
+	reactivated, err := d.EnsureBuiltinMCPServer(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureBuiltinMCPServer() reactivate error = %v", err)
+	}
+	if !reactivated.IsActive {
+		t.Error("IsActive = false after EnsureBuiltinMCPServer reactivation, want true")
+	}
+	if reactivated.ID != created.ID {
+		t.Errorf("reactivated ID = %q, want original ID %q", reactivated.ID, created.ID)
+	}
+}
+
+// TestEnsureBuiltinMCPServer_DoesNotOverrideAPI verifies that when a server
+// with alias "voidllm" already exists with source="api", EnsureBuiltinMCPServer
+// returns it unchanged and does not overwrite its source.
+func TestEnsureBuiltinMCPServer_DoesNotOverrideAPI(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	// Create an API-sourced server with the same alias first.
+	apiServer, err := d.CreateMCPServer(context.Background(), CreateMCPServerParams{
+		Name:     "Custom VoidLLM",
+		Alias:    "voidllm",
+		URL:      "https://custom.example.com/mcp",
+		AuthType: "none",
+		Source:   "api",
+	})
+	if err != nil {
+		t.Fatalf("CreateMCPServer(api) error = %v", err)
+	}
+
+	// EnsureBuiltinMCPServer must find the existing row and return it as-is.
+	got, err := d.EnsureBuiltinMCPServer(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureBuiltinMCPServer() error = %v", err)
+	}
+	if got.ID != apiServer.ID {
+		t.Errorf("returned ID = %q, want original API server ID %q", got.ID, apiServer.ID)
+	}
+	if got.Source != "api" {
+		t.Errorf("Source = %q, want %q (must not overwrite API server)", got.Source, "api")
+	}
+	if got.URL != "https://custom.example.com/mcp" {
+		t.Errorf("URL = %q, want original URL to be preserved", got.URL)
+	}
+}

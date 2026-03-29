@@ -74,6 +74,13 @@ func (s *codeModeService) accessibleServers(ctx context.Context, codeModeOnly bo
 			}
 			continue
 		}
+		// Built-in server is always accessible — no explicit MCP access entry needed.
+		if sv.Source == "builtin" {
+			if !codeModeOnly || sv.CodeModeEnabled {
+				accessible = append(accessible, sv)
+			}
+			continue
+		}
 		allowed, accessErr := s.db.CheckMCPAccess(ctx, ki.OrgID, ki.TeamID, ki.KeyID, sv.ID)
 		if accessErr != nil {
 			continue

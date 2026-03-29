@@ -210,11 +210,17 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	if err := database.SyncYAMLMCPServers(ctx, cfg.MCPServers, encKey); err != nil {
 		return nil, fmt.Errorf("sync YAML MCP servers: %w", err)
 	}
+	if _, err := database.EnsureBuiltinMCPServer(ctx); err != nil {
+		return nil, fmt.Errorf("ensure builtin MCP server: %w", err)
+	}
 
 	// Probe all active MCP servers to detect deprecated SSE transport.
 	// Servers that only support SSE are auto-deactivated with a warning.
 	if allServers, listErr := database.ListMCPServers(ctx); listErr == nil {
 		for _, s := range allServers {
+			if s.Source == "builtin" {
+				continue // built-in server has no external URL to probe
+			}
 			var token string
 			if s.AuthTokenEnc != nil && *s.AuthTokenEnc != "" {
 				token, _ = crypto.DecryptString(*s.AuthTokenEnc, encKey, []byte("mcp_server:"+s.ID))
@@ -580,6 +586,13 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		adminHandler.HealthChecker = healthChecker
 	}
 
+	// builtinMCPServer is set after RegisterVoidLLMTools below; the ToolFetcher
+	// closure captures this variable so the assignment is visible at call time.
+	// toolStore is also hoisted so the built-in tools can be persisted after
+	// RegisterVoidLLMTools populates the server.
+	var builtinMCPServer *mcp.Server
+	var toolStore mcp.ToolStore
+
 	// Code Mode: create the runtime pool, executor, and tool cache when enabled.
 	// These are assigned to the handler before RegisterVoidLLMTools is called so
 	// that the deps closures below can close over the handler and its fields.
@@ -595,8 +608,14 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		}
 		adminHandler.CodePool = codePool
 		adminHandler.CodeExecutor = mcp.NewExecutor(codePool)
-		toolStore := &dbToolStore{db: database}
-		adminHandler.ToolCache = mcp.NewPersistentToolCache(adminHandler.MakeToolFetcher(), time.Hour, toolStore)
+		toolStore = &dbToolStore{db: database}
+		httpFetcher := adminHandler.MakeToolFetcher()
+		adminHandler.ToolCache = mcp.NewPersistentToolCache(func(fetchCtx context.Context, alias string) ([]mcp.Tool, error) {
+			if alias == "voidllm" && builtinMCPServer != nil {
+				return builtinMCPServer.Tools(), nil
+			}
+			return httpFetcher(fetchCtx, alias)
+		}, time.Hour, toolStore)
 		if loadErr := adminHandler.ToolCache.LoadFromStore(ctx); loadErr != nil {
 			log.WarnContext(ctx, "failed to load cached tools from DB", slog.String("error", loadErr.Error()))
 		}
@@ -808,6 +827,17 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	}
 	mcp.RegisterVoidLLMTools(mcpServer, voidllmDeps)
 	adminHandler.MCPServer = mcpServer
+
+	// Expose the built-in server's tools through the ToolCache so Code Mode
+	// callers can discover and invoke them without an HTTP round-trip.
+	builtinMCPServer = mcpServer
+	if adminHandler.ToolCache != nil {
+		builtinTools := mcpServer.Tools()
+		adminHandler.ToolCache.SetTools("voidllm", builtinTools)
+		if toolStore != nil {
+			toolStore.Save(ctx, "voidllm", builtinTools) //nolint:errcheck
+		}
+	}
 
 	// Wire the Code Mode MCP server when Code Mode is enabled. It exposes only
 	// the list_servers, search_tools, and execute_code tools and is served at

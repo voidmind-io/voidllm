@@ -509,6 +509,80 @@ func TestToolCache_GetTools_ReturnsCopy(t *testing.T) {
 	}
 }
 
+// ---- SetTools ----------------------------------------------------------------
+
+// TestSetTools_PopulatesCache verifies that SetTools writes tools into the
+// cache so that GetAllTools returns them immediately without an upstream fetch.
+func TestSetTools_PopulatesCache(t *testing.T) {
+	t.Parallel()
+
+	tools := []mcp.Tool{
+		{Name: "builtin_tool_a", Description: "First builtin tool"},
+		{Name: "builtin_tool_b", Description: "Second builtin tool"},
+	}
+
+	// Use a fetcher that always fails so any GetTools call would error — only
+	// SetTools should populate the cache.
+	fetcher := func(_ context.Context, _ string) ([]mcp.Tool, error) {
+		return nil, errors.New("should not be called")
+	}
+	cache := mcp.NewToolCache(fetcher, time.Hour)
+
+	cache.SetTools("voidllm", tools)
+
+	all := cache.GetAllTools()
+	got, ok := all["voidllm"]
+	if !ok {
+		t.Fatal("GetAllTools() missing key \"voidllm\" after SetTools")
+	}
+	if len(got) != 2 {
+		t.Fatalf("len(tools) = %d, want 2", len(got))
+	}
+	if got[0].Name != "builtin_tool_a" {
+		t.Errorf("tools[0].Name = %q, want %q", got[0].Name, "builtin_tool_a")
+	}
+	if got[1].Name != "builtin_tool_b" {
+		t.Errorf("tools[1].Name = %q, want %q", got[1].Name, "builtin_tool_b")
+	}
+}
+
+// TestSetTools_OverwritesExisting verifies that calling SetTools a second time
+// for the same alias replaces the previous tools entirely.
+func TestSetTools_OverwritesExisting(t *testing.T) {
+	t.Parallel()
+
+	firstTools := []mcp.Tool{
+		{Name: "v1_tool"},
+	}
+	secondTools := []mcp.Tool{
+		{Name: "v2_tool_a"},
+		{Name: "v2_tool_b"},
+	}
+
+	fetcher := func(_ context.Context, _ string) ([]mcp.Tool, error) {
+		return nil, errors.New("should not be called")
+	}
+	cache := mcp.NewToolCache(fetcher, time.Hour)
+
+	cache.SetTools("voidllm", firstTools)
+	cache.SetTools("voidllm", secondTools)
+
+	all := cache.GetAllTools()
+	got, ok := all["voidllm"]
+	if !ok {
+		t.Fatal("GetAllTools() missing key \"voidllm\" after second SetTools")
+	}
+	if len(got) != 2 {
+		t.Fatalf("len(tools) = %d, want 2 (second set must overwrite first)", len(got))
+	}
+	if got[0].Name != "v2_tool_a" {
+		t.Errorf("tools[0].Name = %q, want %q", got[0].Name, "v2_tool_a")
+	}
+	if got[1].Name != "v2_tool_b" {
+		t.Errorf("tools[1].Name = %q, want %q", got[1].Name, "v2_tool_b")
+	}
+}
+
 // ---- helpers -----------------------------------------------------------------
 
 // containsErrMsg checks whether err's message contains substr.

@@ -205,6 +205,19 @@ func (tc *ToolCache) RefreshAll(ctx context.Context) error {
 	return firstErr
 }
 
+// SetTools manually populates the cache for an alias with the given tools.
+// Used for the built-in server whose tools come from memory, not HTTP.
+// The entry is marked fresh at the current time; it will not be re-fetched
+// from upstream until maxAge has elapsed.
+func (tc *ToolCache) SetTools(alias string, tools []Tool) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	tc.entries[alias] = &cacheEntry{
+		tools:     tools,
+		fetchedAt: time.Now(),
+	}
+}
+
 // Invalidate removes the cached entry for alias. Subsequent calls to GetTools
 // for that alias will trigger a fresh upstream fetch.
 func (tc *ToolCache) Invalidate(alias string) {
