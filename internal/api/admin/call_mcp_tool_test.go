@@ -354,6 +354,41 @@ func TestCallMCPTool_NilLogger(t *testing.T) {
 	}
 }
 
+// ---- TestCallMCPTool_BuiltinServer ------------------------------------------
+
+// TestCallMCPTool_BuiltinServer verifies that CallMCPTool with alias "voidllm"
+// dispatches the tool call in-process via the built-in MCP server rather than
+// making an HTTP request. The response must be a valid JSON-RPC result.
+func TestCallMCPTool_BuiltinServer(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestCallMCPTool_BuiltinServer?mode=memory&cache=private"
+	handler, _ := newCallMCPToolHandler(t, dsn, nil)
+	ki := newTestKeyInfo("org-builtin", "key-builtin")
+
+	// list_models is a real registered tool that requires no arguments and
+	// returns a JSON array. Using it proves the full in-process dispatch path.
+	result, err := handler.CallMCPTool(context.Background(), ki, "voidllm", "list_models", json.RawMessage(`{}`), false, "")
+	if err != nil {
+		t.Fatalf("CallMCPTool(voidllm/list_models) error = %v, want nil", err)
+	}
+	if result == nil {
+		t.Fatal("CallMCPTool(voidllm/list_models) result = nil, want non-nil")
+	}
+	// The response must be valid JSON.
+	var parsed map[string]any
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("result is not valid JSON: %v — raw: %s", err, result)
+	}
+	// A successful JSON-RPC response must carry a "result" key, not "error".
+	if _, hasErr := parsed["error"]; hasErr {
+		t.Errorf("response contains \"error\" key, want successful result: %s", result)
+	}
+	if _, hasResult := parsed["result"]; !hasResult {
+		t.Errorf("response missing \"result\" key: %s", result)
+	}
+}
+
 // ---- TestCallMCPTool_LoggerFields -------------------------------------------
 
 // TestCallMCPTool_LoggerFields verifies that the event emitted to MCPLogger

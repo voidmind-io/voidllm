@@ -31,7 +31,8 @@ type MCPServer struct {
 	IsActive     bool
 	CreatedBy    *string
 	// Source indicates how this server was registered: "api" for Admin API-created
-	// servers, "yaml" for config-file-sourced servers. Defaults to "api".
+	// servers, "yaml" for config-file-sourced servers, or "builtin" for the
+	// built-in VoidLLM management server. Defaults to "api".
 	Source string
 	// CodeModeEnabled controls whether this server's tools are available in
 	// Code Mode sandboxed execution. Default true.
@@ -491,6 +492,47 @@ func scanMCPServer(scanner interface{ Scan(...any) error }) (*MCPServer, error) 
 // against a different row.
 func mcpServerAAD(serverID string) []byte {
 	return []byte("mcp_server:" + serverID)
+}
+
+// EnsureBuiltinMCPServer creates or returns the built-in VoidLLM management
+// MCP server record. It is idempotent — safe to call on every startup.
+// If a server with alias "voidllm" already exists (any source), it is left
+// untouched and returned as-is.
+func (d *DB) EnsureBuiltinMCPServer(ctx context.Context) (*MCPServer, error) {
+	existing, err := d.GetMCPServerByAlias(ctx, "voidllm")
+	if err == nil {
+		return existing, nil // already exists and is active
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, fmt.Errorf("ensure builtin mcp server: %w", err)
+	}
+
+	// Not found (inactive or never created). Try to create.
+	created, createErr := d.CreateMCPServer(ctx, CreateMCPServerParams{
+		Name:     "VoidLLM",
+		Alias:    "voidllm",
+		URL:      "",
+		AuthType: "none",
+		Source:   "builtin",
+	})
+	if createErr == nil {
+		return created, nil
+	}
+
+	// ErrConflict means the row exists but is inactive or soft-deleted.
+	// Re-activate it.
+	if errors.Is(createErr, ErrConflict) {
+		p := d.dialect.Placeholder
+		reactivateQuery := "UPDATE mcp_servers SET is_active = 1, deleted_at = NULL, updated_at = CURRENT_TIMESTAMP" +
+			" WHERE alias = " + p(1) + " AND org_id IS NULL AND team_id IS NULL"
+		if _, execErr := d.sql.ExecContext(ctx, reactivateQuery, "voidllm"); execErr != nil {
+			return nil, fmt.Errorf("ensure builtin mcp server: reactivate: %w", execErr)
+		}
+		// Re-fetch the now-active row.
+		return d.GetMCPServerByAlias(ctx, "voidllm")
+	}
+
+	return nil, fmt.Errorf("ensure builtin mcp server: %w", createErr)
 }
 
 // SyncYAMLMCPServers upserts YAML-configured global MCP servers into the database.

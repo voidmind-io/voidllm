@@ -276,6 +276,90 @@ func TestAccessibleServers_MCPAccessFilter(t *testing.T) {
 	}
 }
 
+// TestAccessibleServers_BuiltinAlwaysIncluded verifies that a global server
+// with source="builtin" is included without requiring a MCP access entry.
+func TestAccessibleServers_BuiltinAlwaysIncluded(t *testing.T) {
+	t.Parallel()
+
+	builtinSv := db.MCPServer{
+		ID:              "sv-builtin",
+		Alias:           "voidllm",
+		Name:            "VoidLLM",
+		Source:          "builtin",
+		CodeModeEnabled: true,
+	}
+	// A regular global server that requires explicit access — denied here.
+	regularSv := db.MCPServer{
+		ID:              "sv-regular",
+		Alias:           "other",
+		Name:            "Other Server",
+		Source:          "api",
+		CodeModeEnabled: true,
+	}
+
+	mock := &mockCodeModeDB{
+		servers:       []db.MCPServer{builtinSv, regularSv},
+		accessAllowed: map[string]bool{
+			// Neither server has explicit access; builtin must bypass this.
+		},
+	}
+	svc := &codeModeService{db: mock, log: newDiscardLogger()}
+
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-builtin-test", Role: "member"})
+	got, err := svc.accessibleServers(ctx, false)
+	if err != nil {
+		t.Fatalf("accessibleServers() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d servers, want 1 (only builtin)", len(got))
+	}
+	if got[0].Source != "builtin" {
+		t.Errorf("got server Source = %q, want %q", got[0].Source, "builtin")
+	}
+	if got[0].Alias != "voidllm" {
+		t.Errorf("got server Alias = %q, want %q", got[0].Alias, "voidllm")
+	}
+}
+
+// TestAccessibleServers_BuiltinRespectsCodeModeFilter verifies that a builtin
+// server with CodeModeEnabled=false is excluded when codeModeOnly=true.
+func TestAccessibleServers_BuiltinRespectsCodeModeFilter(t *testing.T) {
+	t.Parallel()
+
+	builtinDisabled := db.MCPServer{
+		ID:              "sv-builtin-disabled",
+		Alias:           "voidllm",
+		Name:            "VoidLLM",
+		Source:          "builtin",
+		CodeModeEnabled: false,
+	}
+
+	mock := &mockCodeModeDB{
+		servers: []db.MCPServer{builtinDisabled},
+	}
+	svc := &codeModeService{db: mock, log: newDiscardLogger()}
+
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-builtin-cm", Role: "member"})
+
+	// codeModeOnly=true — the disabled builtin server must be excluded.
+	got, err := svc.accessibleServers(ctx, true)
+	if err != nil {
+		t.Fatalf("accessibleServers(codeModeOnly=true) error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d servers with codeModeOnly=true, want 0 (builtin CodeModeEnabled=false)", len(got))
+	}
+
+	// codeModeOnly=false — the disabled builtin server should appear.
+	got2, err := svc.accessibleServers(ctx, false)
+	if err != nil {
+		t.Fatalf("accessibleServers(codeModeOnly=false) error = %v", err)
+	}
+	if len(got2) != 1 {
+		t.Errorf("got %d servers with codeModeOnly=false, want 1", len(got2))
+	}
+}
+
 func TestAccessibleServers_CodeModeDisabled(t *testing.T) {
 	t.Parallel()
 

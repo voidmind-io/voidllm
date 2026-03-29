@@ -144,12 +144,16 @@ function scopeLabel(scope: string): string {
   return scope
 }
 
-function sourceBadgeVariant(source: string): 'muted' | 'warning' {
-  return source === 'yaml' ? 'warning' : 'muted'
+function sourceBadgeVariant(source: string): 'default' | 'muted' | 'warning' {
+  if (source === 'yaml') return 'warning'
+  if (source === 'builtin') return 'default'
+  return 'muted'
 }
 
 function sourceLabel(source: string): string {
-  return source === 'yaml' ? 'YAML' : 'API'
+  if (source === 'yaml') return 'YAML'
+  if (source === 'builtin') return 'Built-in'
+  return 'API'
 }
 
 // ---------------------------------------------------------------------------
@@ -806,7 +810,7 @@ export default function MCPServersPage() {
         // Only allow toggling if the user has permission for that server's scope.
         // yaml-sourced servers cannot be toggled through the Admin API.
         const canToggle =
-          row.source !== 'yaml' &&
+          row.source !== 'yaml' && row.source !== 'builtin' &&
           ((row.scope === 'global' && isSystemAdmin) ||
           (row.scope === 'org' && isOrgAdmin) ||
           (row.scope === 'team' && isTeamAdmin))
@@ -840,7 +844,6 @@ export default function MCPServersPage() {
       header: 'Code Mode',
       render: (row) => {
         const canToggle =
-          row.source !== 'yaml' &&
           ((row.scope === 'global' && isSystemAdmin) ||
           (row.scope === 'org' && isOrgAdmin) ||
           (row.scope === 'team' && isTeamAdmin))
@@ -877,7 +880,7 @@ export default function MCPServersPage() {
         // yaml-sourced servers are managed via config file and cannot be
         // edited or deleted through the Admin API.
         const canModify =
-          row.source !== 'yaml' &&
+          row.source !== 'yaml' && row.source !== 'builtin' &&
           ((row.scope === 'global' && isSystemAdmin) ||
           (row.scope === 'org' && isOrgAdmin) ||
           (row.scope === 'team' && isTeamAdmin))

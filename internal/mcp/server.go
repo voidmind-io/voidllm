@@ -53,6 +53,17 @@ func (s *Server) RegisterTool(tool Tool, handler ToolHandler) {
 	s.handlers[tool.Name] = handler
 }
 
+// Tools returns a copy of the registered tool schemas. The returned slice is
+// safe to use after the call; mutations do not affect the server's internal
+// state. It is safe to call concurrently with Handle and RegisterTool.
+func (s *Server) Tools() []Tool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Tool, len(s.tools))
+	copy(out, s.tools)
+	return out
+}
+
 // SetOnToolsList registers a hook that is called inside tools/list before the
 // tool list is returned. The hook receives a shallow copy of the registered
 // tools and may return a modified slice. Setting a nil hook clears any
