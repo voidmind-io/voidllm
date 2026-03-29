@@ -2,7 +2,6 @@ package admin
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/pkg/crypto"
 )
 
@@ -356,7 +356,7 @@ func marshalStringSlice(s []string) (string, error) {
 	if s == nil {
 		s = []string{}
 	}
-	b, err := json.Marshal(s)
+	b, err := jsonx.Marshal(s)
 	if err != nil {
 		return "", err
 	}

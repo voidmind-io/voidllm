@@ -2,7 +2,6 @@ package admin
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +11,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	"github.com/voidmind-io/voidllm/internal/usage"
@@ -266,7 +266,7 @@ func extractToolNameForLog(body []byte) string {
 			Name string `json:"name"`
 		} `json:"params"`
 	}
-	if json.Unmarshal(body, &req) != nil {
+	if jsonx.Unmarshal(body, &req) != nil {
 		return "unknown"
 	}
 	if req.Method == "tools/call" && req.Params.Name != "" {
@@ -292,7 +292,7 @@ func extractMethodForMetrics(body []byte) string {
 	var req struct {
 		Method string `json:"method"`
 	}
-	if json.Unmarshal(body, &req) != nil {
+	if jsonx.Unmarshal(body, &req) != nil {
 		return "unknown"
 	}
 	if validMCPMethods[req.Method] {
@@ -306,7 +306,7 @@ func isInitializeRequest(body []byte) bool {
 	var req struct {
 		Method string `json:"method"`
 	}
-	json.Unmarshal(body, &req) //nolint:errcheck — best-effort parse
+	jsonx.Unmarshal(body, &req) //nolint:errcheck — best-effort parse
 	return req.Method == "initialize"
 }
 
@@ -327,7 +327,7 @@ func buildInitializeRequest() []byte {
 			},
 		},
 	}
-	b, _ := json.Marshal(req)
+	b, _ := jsonx.Marshal(req)
 	return b
 }
 
@@ -338,7 +338,7 @@ func buildInitializedNotification() []byte {
 		"jsonrpc": "2.0",
 		"method":  "notifications/initialized",
 	}
-	b, _ := json.Marshal(req)
+	b, _ := jsonx.Marshal(req)
 	return b
 }
 
@@ -350,9 +350,9 @@ func mcpServerAAD(serverID string) []byte {
 }
 
 // buildToolCallRequest serialises a JSON-RPC tools/call request body for the
-// given tool name and argument object. The error path of json.Marshal is
+// given tool name and argument object. The error path of jsonx.Marshal is
 // unreachable for the static structure used here; the result is always valid.
-func buildToolCallRequest(toolName string, args json.RawMessage) []byte {
+func buildToolCallRequest(toolName string, args jsonx.RawMessage) []byte {
 	req := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      1,
@@ -362,7 +362,7 @@ func buildToolCallRequest(toolName string, args json.RawMessage) []byte {
 			"arguments": args,
 		},
 	}
-	b, _ := json.Marshal(req)
+	b, _ := jsonx.Marshal(req)
 	return b
 }
 
@@ -373,7 +373,7 @@ func buildToolCallRequest(toolName string, args json.RawMessage) []byte {
 // originates from a Code Mode execution. executionID is the UUIDv7 that groups
 // all tool calls from a single execute_code invocation; pass an empty string
 // for non-Code-Mode calls.
-func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias, toolName string, args json.RawMessage, codeMode bool, executionID string) (json.RawMessage, error) {
+func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias, toolName string, args jsonx.RawMessage, codeMode bool, executionID string) (jsonx.RawMessage, error) {
 	// Built-in VoidLLM management server — dispatch in-process instead of HTTP.
 	if serverAlias == "voidllm" && h.MCPServer != nil {
 		return h.callBuiltinTool(ctx, ki, toolName, args)
@@ -496,7 +496,7 @@ func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias
 // callBuiltinTool dispatches a tool call to the built-in VoidLLM management
 // MCP server in-process, without HTTP. The caller's identity is injected into
 // the MCP context so tool handlers can enforce RBAC.
-func (h *Handler) callBuiltinTool(ctx context.Context, ki *auth.KeyInfo, toolName string, args json.RawMessage) (json.RawMessage, error) {
+func (h *Handler) callBuiltinTool(ctx context.Context, ki *auth.KeyInfo, toolName string, args jsonx.RawMessage) (jsonx.RawMessage, error) {
 	mcpCtx := mcp.WithKeyIdentity(ctx, mcp.KeyIdentity{
 		OrgID:  ki.OrgID,
 		TeamID: ki.TeamID,

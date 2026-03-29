@@ -12,6 +12,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/api/health"
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
 // devCORSMiddleware returns a Fiber handler that sets permissive CORS headers
@@ -42,6 +43,8 @@ func (a *Application) setupRoutes() {
 		IdleTimeout:    a.cfg.Server.Proxy.IdleTimeout,
 		BodyLimit:      a.cfg.Server.Proxy.MaxRequestBody,
 		ReadBufferSize: 16384, // 16 KB — default 4 KB too small for browser headers
+		JSONEncoder:    func(v any) ([]byte, error) { return jsonx.Marshal(v) },
+		JSONDecoder:    func(data []byte, v any) error { return jsonx.Unmarshal(data, v) },
 	})
 
 	// RequestID middleware must be FIRST so that all downstream handlers
@@ -85,6 +88,8 @@ func (a *Application) setupRoutes() {
 		WriteTimeout:   30 * time.Second,
 		IdleTimeout:    60 * time.Second,
 		ReadBufferSize: 16384, // 16 KB — default 4 KB too small for browser headers
+		JSONEncoder:    func(v any) ([]byte, error) { return jsonx.Marshal(v) },
+		JSONDecoder:    func(data []byte, v any) error { return jsonx.Unmarshal(data, v) },
 	})
 
 	// Request ID middleware on the admin app in dual-port mode.

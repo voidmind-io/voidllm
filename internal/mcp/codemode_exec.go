@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -12,6 +11,8 @@ import (
 	"time"
 
 	"github.com/fastschema/qjs"
+
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
 // sandboxPreamble removes dangerous global objects exposed by QuickJS's std
@@ -39,7 +40,7 @@ const sandboxPreamble = "delete globalThis.std;" +
 // preserving authentication, access control, session management, metrics,
 // and usage logging. serverAlias identifies the upstream MCP server, toolName
 // is the tool to invoke, and args is the JSON-encoded arguments object.
-type ToolCaller func(ctx context.Context, serverAlias, toolName string, args json.RawMessage) (json.RawMessage, error)
+type ToolCaller func(ctx context.Context, serverAlias, toolName string, args jsonx.RawMessage) (jsonx.RawMessage, error)
 
 // ExecuteParams holds the input for a Code Mode script execution.
 type ExecuteParams struct {
@@ -65,7 +66,7 @@ type ExecuteResult struct {
 	// groups all tool call log entries for this execution.
 	ExecutionID string `json:"execution_id"`
 	// Result is the final return value of the script, JSON-encoded.
-	Result json.RawMessage `json:"result"`
+	Result jsonx.RawMessage `json:"result"`
 	// ToolCalls records every tool invocation made during execution.
 	ToolCalls []ToolCallLog `json:"tool_calls"`
 	// Logs captures console.log/warn/error/info/debug output from the script.
@@ -143,7 +144,7 @@ func (e *Executor) Execute(ctx context.Context, params ExecuteParams) (res *Exec
 
 	// Build dispatch map keyed by "alias/toolName"
 	dispatchMap := make(map[string]struct {
-		call  func(json.RawMessage) (json.RawMessage, error)
+		call  func(jsonx.RawMessage) (jsonx.RawMessage, error)
 		alias string
 		tool  string
 	})
@@ -152,11 +153,11 @@ func (e *Executor) Execute(ctx context.Context, params ExecuteParams) (res *Exec
 			key := alias + "/" + tool.Name
 			capturedAlias, capturedTool := alias, tool.Name
 			dispatchMap[key] = struct {
-				call  func(json.RawMessage) (json.RawMessage, error)
+				call  func(jsonx.RawMessage) (jsonx.RawMessage, error)
 				alias string
 				tool  string
 			}{
-				call: func(args json.RawMessage) (json.RawMessage, error) {
+				call: func(args jsonx.RawMessage) (jsonx.RawMessage, error) {
 					if params.CallTool != nil {
 						return params.CallTool(ctx, capturedAlias, capturedTool, args)
 					}
@@ -186,12 +187,12 @@ func (e *Executor) Execute(ctx context.Context, params ExecuteParams) (res *Exec
 		}
 		alias := args[0].String()
 		toolName := args[1].String()
-		rawArgs := json.RawMessage(args[2].String())
+		rawArgs := jsonx.RawMessage(args[2].String())
 		for _, a := range args {
 			a.Free()
 		}
 		if len(rawArgs) == 0 {
-			rawArgs = json.RawMessage("{}")
+			rawArgs = jsonx.RawMessage("{}")
 		}
 
 		key := alias + "/" + toolName
@@ -291,7 +292,7 @@ func buildProxyPreamble(serverTools map[string][]Tool) string {
 		if i > 0 {
 			sb.WriteString(",")
 		}
-		b, _ := json.Marshal(alias)
+		b, _ := jsonx.Marshal(alias)
 		sb.Write(b)
 	}
 	sb.WriteString("]);\n")
@@ -312,28 +313,28 @@ func buildProxyPreamble(serverTools map[string][]Tool) string {
 // value is a JS string that is itself valid JSON (as produced by
 // JSON.stringify inside the script), it is returned directly. Otherwise
 // JSONStringify is called on the value to produce its JSON representation.
-func valueToJSON(v *qjs.Value) (json.RawMessage, error) {
+func valueToJSON(v *qjs.Value) (jsonx.RawMessage, error) {
 	if v.IsString() {
 		s := v.String()
-		if json.Valid([]byte(s)) {
-			return json.RawMessage(s), nil
+		if jsonx.Valid([]byte(s)) {
+			return jsonx.RawMessage(s), nil
 		}
 		// The string is not valid JSON on its own — encode it as a JSON string.
-		b, err := json.Marshal(s)
+		b, err := jsonx.Marshal(s)
 		if err != nil {
 			return nil, fmt.Errorf("marshal string result: %w", err)
 		}
-		return json.RawMessage(b), nil
+		return jsonx.RawMessage(b), nil
 	}
 
 	s, err := v.JSONStringify()
 	if err != nil {
 		return nil, fmt.Errorf("JSONStringify result: %w", err)
 	}
-	if !json.Valid([]byte(s)) {
+	if !jsonx.Valid([]byte(s)) {
 		return nil, fmt.Errorf("JSONStringify returned invalid JSON: %s", s)
 	}
-	return json.RawMessage(s), nil
+	return jsonx.RawMessage(s), nil
 }
 
 // snapshotToolLogs returns a copy of the accumulated tool call logs under the
@@ -360,7 +361,7 @@ func extractConsoleLogs(rt *qjs.Runtime) []ConsoleLog {
 
 	var logs []ConsoleLog
 	if logsVal.IsString() {
-		if jsonErr := json.Unmarshal([]byte(logsVal.String()), &logs); jsonErr != nil {
+		if jsonErr := jsonx.Unmarshal([]byte(logsVal.String()), &logs); jsonErr != nil {
 			return []ConsoleLog{}
 		}
 	}

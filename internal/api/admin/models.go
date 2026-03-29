@@ -2,7 +2,6 @@ package admin
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +17,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/config"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/provider"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 	voidredis "github.com/voidmind-io/voidllm/internal/redis"
@@ -947,7 +947,7 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 		} `json:"data"`
 	}
 
-	if err := json.Unmarshal(body, &modelsResp); err == nil && len(modelsResp.Data) > 0 {
+	if err := jsonx.Unmarshal(body, &modelsResp); err == nil && len(modelsResp.Data) > 0 {
 		return c.JSON(testConnectionResponse{
 			Success: true,
 			Message: fmt.Sprintf("connected successfully. %d models available.", len(modelsResp.Data)),

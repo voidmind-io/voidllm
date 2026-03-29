@@ -2,9 +2,9 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/mcp"
 )
 
@@ -27,7 +27,7 @@ func (s *dbToolStore) LoadAll(ctx context.Context) (map[string][]mcp.Tool, error
 		mcpTools := make([]mcp.Tool, 0, len(tools))
 		for _, t := range tools {
 			var schema mcp.InputSchema
-			if err := json.Unmarshal([]byte(t.InputSchema), &schema); err != nil {
+			if err := jsonx.Unmarshal([]byte(t.InputSchema), &schema); err != nil {
 				continue // skip tools with corrupt schemas
 			}
 			mcpTools = append(mcpTools, mcp.Tool{
@@ -50,7 +50,7 @@ func (s *dbToolStore) Save(ctx context.Context, alias string, tools []mcp.Tool) 
 	}
 	dbTools := make([]db.MCPServerTool, 0, len(tools))
 	for _, t := range tools {
-		schemaJSON, _ := json.Marshal(t.InputSchema) //nolint:errcheck
+		schemaJSON, _ := jsonx.Marshal(t.InputSchema) //nolint:errcheck
 		dbTools = append(dbTools, db.MCPServerTool{
 			ServerID:    server.ID,
 			Name:        t.Name,

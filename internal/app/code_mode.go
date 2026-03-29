@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 )
@@ -33,7 +33,7 @@ type codeModeDB interface {
 type codeModeService struct {
 	executor     *mcp.Executor
 	toolCache    *mcp.ToolCache
-	callMCPTool  func(ctx context.Context, ki *auth.KeyInfo, alias, tool string, args json.RawMessage, codeMode bool, execID string) (json.RawMessage, error)
+	callMCPTool  func(ctx context.Context, ki *auth.KeyInfo, alias, tool string, args jsonx.RawMessage, codeMode bool, execID string) (jsonx.RawMessage, error)
 	db           codeModeDB
 	log          *slog.Logger
 	maxToolCalls int
@@ -185,7 +185,7 @@ func (s *codeModeService) ExecuteCode(ctx context.Context, code string, serverAl
 	}
 	executionID := executionUUID.String()
 
-	callTool := mcp.ToolCaller(func(callCtx context.Context, serverAlias, toolName string, args json.RawMessage) (json.RawMessage, error) {
+	callTool := mcp.ToolCaller(func(callCtx context.Context, serverAlias, toolName string, args jsonx.RawMessage) (jsonx.RawMessage, error) {
 		if bs, ok := blockedByServer[serverAlias]; ok && bs[toolName] {
 			return nil, fmt.Errorf("tool %q is blocked on server %q", toolName, serverAlias)
 		}

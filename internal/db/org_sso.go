@@ -2,10 +2,11 @@ package db
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"github.com/google/uuid"
+
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
 // orgSSOSelectColumns is the ordered column list used in all org_sso_config SELECT queries.
@@ -228,10 +229,10 @@ func scanOrgSSOConfig(scanner interface{ Scan(...any) error }) (*OrgSSOConfig, e
 	cfg.AutoProvision = autoProvInt == 1
 	cfg.GroupSync = groupSyncInt == 1
 
-	if err := json.Unmarshal([]byte(scopesJSON), &cfg.Scopes); err != nil {
+	if err := jsonx.Unmarshal([]byte(scopesJSON), &cfg.Scopes); err != nil {
 		return nil, fmt.Errorf("unmarshal scopes: %w", err)
 	}
-	if err := json.Unmarshal([]byte(allowedDomainsJSON), &cfg.AllowedDomains); err != nil {
+	if err := jsonx.Unmarshal([]byte(allowedDomainsJSON), &cfg.AllowedDomains); err != nil {
 		return nil, fmt.Errorf("unmarshal allowed_domains: %w", err)
 	}
 

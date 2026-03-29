@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"time"
@@ -13,12 +12,13 @@ import (
 	"github.com/voidmind-io/voidllm/internal/audit"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/pkg/keygen"
 )
 
 // marshalDescription serializes a map to compact JSON for audit event descriptions.
 func marshalDescription(v any) string {
-	b, err := json.Marshal(v)
+	b, err := jsonx.Marshal(v)
 	if err != nil {
 		return ""
 	}

@@ -3,10 +3,11 @@ package license
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"net/http"
 	"sync"
 	"time"
@@ -242,7 +243,7 @@ func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL string,
 
 // sendVerifyRequest posts the license key to the server and returns the parsed response.
 func sendVerifyRequest(ctx context.Context, serverURL, key string) (*verifyResponse, error) {
-	body, err := json.Marshal(verifyRequest{Key: key})
+	body, err := jsonx.Marshal(verifyRequest{Key: key})
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
@@ -268,7 +269,7 @@ func sendVerifyRequest(ctx context.Context, serverURL, key string) (*verifyRespo
 	}
 
 	var vr verifyResponse
-	if decErr := json.NewDecoder(io.LimitReader(resp.Body, maxResponseSize)).Decode(&vr); decErr != nil {
+	if decErr := jsonx.NewDecoder(io.LimitReader(resp.Body, maxResponseSize)).Decode(&vr); decErr != nil {
 		return nil, fmt.Errorf("decode response: %w", decErr)
 	}
 	return &vr, nil

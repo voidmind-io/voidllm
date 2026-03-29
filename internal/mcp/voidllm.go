@@ -2,9 +2,10 @@ package mcp
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
 // mcpContextKey is a package-private type for context value keys, preventing
@@ -279,7 +280,7 @@ func RegisterCodeModeTools(s *Server, deps VoidLLMDeps) {
 // merged with live health data. All other callers (team_admin, member) receive
 // only name and type for the models accessible to them.
 func makeListModels(deps VoidLLMDeps) ToolHandler {
-	return func(ctx context.Context, _ json.RawMessage) (*ToolResult, error) {
+	return func(ctx context.Context, _ jsonx.RawMessage) (*ToolResult, error) {
 		id := keyIdentityFromCtx(ctx)
 		if id.Role == "system_admin" || id.Role == "org_admin" {
 			models, err := deps.ListModels(ctx)
@@ -302,7 +303,7 @@ func makeListModels(deps VoidLLMDeps) ToolHandler {
 				}
 			}
 
-			out, _ := json.MarshalIndent(models, "", "  ")
+			out, _ := jsonx.MarshalIndent(models, "", "  ")
 			return TextResult(string(out)), nil
 		}
 
@@ -311,18 +312,18 @@ func makeListModels(deps VoidLLMDeps) ToolHandler {
 		if err != nil {
 			return nil, fmt.Errorf("list available models: %w", err)
 		}
-		out, _ := json.MarshalIndent(models, "", "  ")
+		out, _ := jsonx.MarshalIndent(models, "", "  ")
 		return TextResult(string(out)), nil
 	}
 }
 
 // makeGetModelHealth returns the handler for the get_model_health tool.
 func makeGetModelHealth(deps VoidLLMDeps) ToolHandler {
-	return func(_ context.Context, args json.RawMessage) (*ToolResult, error) {
+	return func(_ context.Context, args jsonx.RawMessage) (*ToolResult, error) {
 		var input struct {
 			Model string `json:"model"`
 		}
-		if err := json.Unmarshal(args, &input); err != nil || input.Model == "" {
+		if err := jsonx.Unmarshal(args, &input); err != nil || input.Model == "" {
 			return ErrorResult("model parameter is required"), nil
 		}
 
@@ -331,7 +332,7 @@ func makeGetModelHealth(deps VoidLLMDeps) ToolHandler {
 			return ErrorResult(fmt.Sprintf("no health data for model %q", input.Model)), nil
 		}
 
-		out, _ := json.MarshalIndent(h, "", "  ")
+		out, _ := jsonx.MarshalIndent(h, "", "  ")
 		return TextResult(string(out)), nil
 	}
 }
@@ -340,14 +341,14 @@ func makeGetModelHealth(deps VoidLLMDeps) ToolHandler {
 // optional; the caller's org and key IDs are appended automatically from the
 // request context so results are always scoped to the caller's organization.
 func makeGetUsage(deps VoidLLMDeps) ToolHandler {
-	return func(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
+	return func(ctx context.Context, args jsonx.RawMessage) (*ToolResult, error) {
 		var input struct {
 			From    string `json:"from"`
 			To      string `json:"to"`
 			GroupBy string `json:"group_by"`
 		}
 		// All fields are optional; ignore unmarshal error for empty/null args.
-		_ = json.Unmarshal(args, &input)
+		_ = jsonx.Unmarshal(args, &input)
 
 		id := keyIdentityFromCtx(ctx)
 		data, err := deps.GetUsage(ctx, input.From, input.To, input.GroupBy, id.OrgID, id.KeyID)
@@ -355,33 +356,33 @@ func makeGetUsage(deps VoidLLMDeps) ToolHandler {
 			return nil, fmt.Errorf("get usage: %w", err)
 		}
 
-		out, _ := json.MarshalIndent(data, "", "  ")
+		out, _ := jsonx.MarshalIndent(data, "", "  ")
 		return TextResult(string(out)), nil
 	}
 }
 
 // makeListKeys returns the handler for the list_keys tool.
 func makeListKeys(deps VoidLLMDeps) ToolHandler {
-	return func(ctx context.Context, _ json.RawMessage) (*ToolResult, error) {
+	return func(ctx context.Context, _ jsonx.RawMessage) (*ToolResult, error) {
 		id := keyIdentityFromCtx(ctx)
 		keys, err := deps.ListKeys(ctx, id.OrgID, id.Role)
 		if err != nil {
 			return nil, fmt.Errorf("list keys: %w", err)
 		}
 
-		out, _ := json.MarshalIndent(keys, "", "  ")
+		out, _ := jsonx.MarshalIndent(keys, "", "  ")
 		return TextResult(string(out)), nil
 	}
 }
 
 // makeCreateKey returns the handler for the create_key tool.
 func makeCreateKey(deps VoidLLMDeps) ToolHandler {
-	return func(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
+	return func(ctx context.Context, args jsonx.RawMessage) (*ToolResult, error) {
 		var input struct {
 			Name      string `json:"name"`
 			ExpiresIn string `json:"expires_in"`
 		}
-		if err := json.Unmarshal(args, &input); err != nil || input.Name == "" {
+		if err := jsonx.Unmarshal(args, &input); err != nil || input.Name == "" {
 			return ErrorResult("name parameter is required"), nil
 		}
 
@@ -400,7 +401,7 @@ func makeCreateKey(deps VoidLLMDeps) ToolHandler {
 			return nil, fmt.Errorf("create key: %w", err)
 		}
 
-		out, _ := json.MarshalIndent(result, "", "  ")
+		out, _ := jsonx.MarshalIndent(result, "", "  ")
 		return TextResult(string(out)), nil
 	}
 }
@@ -408,7 +409,7 @@ func makeCreateKey(deps VoidLLMDeps) ToolHandler {
 // makeListDeployments returns the handler for the list_deployments tool.
 // Access is restricted to callers with the system_admin role.
 func makeListDeployments(deps VoidLLMDeps) ToolHandler {
-	return func(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
+	return func(ctx context.Context, args jsonx.RawMessage) (*ToolResult, error) {
 		id := keyIdentityFromCtx(ctx)
 		if id.Role != "system_admin" {
 			return ErrorResult("system_admin role required"), nil
@@ -417,7 +418,7 @@ func makeListDeployments(deps VoidLLMDeps) ToolHandler {
 		var input struct {
 			ModelID string `json:"model_id"`
 		}
-		if err := json.Unmarshal(args, &input); err != nil || input.ModelID == "" {
+		if err := jsonx.Unmarshal(args, &input); err != nil || input.ModelID == "" {
 			return ErrorResult("model_id parameter is required"), nil
 		}
 
@@ -426,7 +427,7 @@ func makeListDeployments(deps VoidLLMDeps) ToolHandler {
 			return nil, fmt.Errorf("list deployments: %w", err)
 		}
 
-		out, _ := json.MarshalIndent(deployments, "", "  ")
+		out, _ := jsonx.MarshalIndent(deployments, "", "  ")
 		return TextResult(string(out)), nil
 	}
 }
@@ -434,13 +435,13 @@ func makeListDeployments(deps VoidLLMDeps) ToolHandler {
 // makeListServers returns the handler for the list_servers tool. It returns
 // only servers with Code Mode enabled, as seen by the authenticated caller.
 func makeListServers(deps VoidLLMDeps) ToolHandler {
-	return func(ctx context.Context, _ json.RawMessage) (*ToolResult, error) {
+	return func(ctx context.Context, _ jsonx.RawMessage) (*ToolResult, error) {
 		servers, err := deps.ListAccessibleMCPServers(ctx, true)
 		if err != nil {
 			return nil, fmt.Errorf("list accessible mcp servers: %w", err)
 		}
 
-		out, _ := json.MarshalIndent(servers, "", "  ")
+		out, _ := jsonx.MarshalIndent(servers, "", "  ")
 		return TextResult(string(out)), nil
 	}
 }
@@ -448,12 +449,12 @@ func makeListServers(deps VoidLLMDeps) ToolHandler {
 // makeSearchTools returns the handler for the search_tools tool. It searches
 // tool schemas across accessible MCP servers by a caller-supplied keyword.
 func makeSearchTools(deps VoidLLMDeps) ToolHandler {
-	return func(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
+	return func(ctx context.Context, args jsonx.RawMessage) (*ToolResult, error) {
 		var input struct {
 			Query  string `json:"query"`
 			Server string `json:"server"`
 		}
-		if err := json.Unmarshal(args, &input); err != nil || input.Query == "" {
+		if err := jsonx.Unmarshal(args, &input); err != nil || input.Query == "" {
 			return ErrorResult("query parameter is required"), nil
 		}
 
@@ -467,7 +468,7 @@ func makeSearchTools(deps VoidLLMDeps) ToolHandler {
 			return nil, fmt.Errorf("search mcp tools: %w", err)
 		}
 
-		out, _ := json.MarshalIndent(tools, "", "  ")
+		out, _ := jsonx.MarshalIndent(tools, "", "  ")
 		return TextResult(string(out)), nil
 	}
 }
@@ -481,12 +482,12 @@ func makeSearchTools(deps VoidLLMDeps) ToolHandler {
 const maxCodeSize = 256 * 1024 // 256 KB
 
 func makeExecuteCode(deps VoidLLMDeps) ToolHandler {
-	return func(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
+	return func(ctx context.Context, args jsonx.RawMessage) (*ToolResult, error) {
 		var input struct {
 			Code    string   `json:"code"`
 			Servers []string `json:"servers"`
 		}
-		if err := json.Unmarshal(args, &input); err != nil || input.Code == "" {
+		if err := jsonx.Unmarshal(args, &input); err != nil || input.Code == "" {
 			return ErrorResult("code parameter is required"), nil
 		}
 		if len(input.Code) > maxCodeSize {
@@ -502,7 +503,7 @@ func makeExecuteCode(deps VoidLLMDeps) ToolHandler {
 			return ErrorResult(result.Error), nil
 		}
 
-		out, _ := json.MarshalIndent(result, "", "  ")
+		out, _ := jsonx.MarshalIndent(result, "", "  ")
 		return TextResult(string(out)), nil
 	}
 }
