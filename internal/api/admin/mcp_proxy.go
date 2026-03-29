@@ -51,17 +51,24 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 			mcp.NewErrorResponse(nil, mcp.CodeInvalidRequest, "missing authentication"))
 	}
 
-	server, err := h.DB.GetMCPServerByAliasScoped(c.Context(), alias, ki.OrgID, ki.TeamID)
-	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			return c.Status(fiber.StatusNotFound).JSON(
-				mcp.NewErrorResponse(nil, mcp.CodeInvalidRequest, "unknown MCP server"))
+	var server *db.MCPServer
+	if h.MCPServerCache != nil {
+		server, _ = h.MCPServerCache.Get(alias, ki.OrgID, ki.TeamID)
+	}
+	if server == nil {
+		var err error
+		server, err = h.DB.GetMCPServerByAliasScoped(c.Context(), alias, ki.OrgID, ki.TeamID)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return c.Status(fiber.StatusNotFound).JSON(
+					mcp.NewErrorResponse(nil, mcp.CodeInvalidRequest, "unknown MCP server"))
+			}
+			h.Log.ErrorContext(c.Context(), "mcp proxy: lookup server",
+				slog.String("alias", alias),
+				slog.String("error", err.Error()))
+			return c.Status(fiber.StatusInternalServerError).JSON(
+				mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
 		}
-		h.Log.ErrorContext(c.Context(), "mcp proxy: lookup server",
-			slog.String("alias", alias),
-			slog.String("error", err.Error()))
-		return c.Status(fiber.StatusInternalServerError).JSON(
-			mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
 	}
 
 	if !server.IsActive {
@@ -74,12 +81,18 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	// servers are implicitly accessible to members of that scope — their
 	// visibility is already enforced by GetMCPServerByAliasScoped.
 	if server.OrgID == nil && server.TeamID == nil {
-		allowed, accessErr := h.DB.CheckMCPAccess(c.Context(), ki.OrgID, ki.TeamID, ki.ID, server.ID)
-		if accessErr != nil {
-			h.Log.ErrorContext(c.Context(), "mcp proxy: check access",
-				slog.String("error", accessErr.Error()))
-			return c.Status(fiber.StatusInternalServerError).JSON(
-				mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
+		var allowed bool
+		if h.MCPAccessCache != nil {
+			allowed = h.MCPAccessCache.Check(ki.OrgID, ki.TeamID, ki.ID, server.ID)
+		} else {
+			var accessErr error
+			allowed, accessErr = h.DB.CheckMCPAccess(c.Context(), ki.OrgID, ki.TeamID, ki.ID, server.ID)
+			if accessErr != nil {
+				h.Log.ErrorContext(c.Context(), "mcp proxy: check access",
+					slog.String("error", accessErr.Error()))
+				return c.Status(fiber.StatusInternalServerError).JSON(
+					mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
+			}
 		}
 		if !allowed {
 			return c.Status(fiber.StatusForbidden).JSON(
@@ -379,12 +392,19 @@ func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias
 		return h.callBuiltinTool(ctx, ki, toolName, args)
 	}
 
-	server, err := h.DB.GetMCPServerByAliasScoped(ctx, serverAlias, ki.OrgID, ki.TeamID)
-	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			return nil, fmt.Errorf("CallMCPTool %s: unknown MCP server", serverAlias)
+	var server *db.MCPServer
+	if h.MCPServerCache != nil {
+		server, _ = h.MCPServerCache.Get(serverAlias, ki.OrgID, ki.TeamID)
+	}
+	if server == nil {
+		var err error
+		server, err = h.DB.GetMCPServerByAliasScoped(ctx, serverAlias, ki.OrgID, ki.TeamID)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return nil, fmt.Errorf("CallMCPTool %s: unknown MCP server", serverAlias)
+			}
+			return nil, fmt.Errorf("CallMCPTool %s: lookup: %w", serverAlias, err)
 		}
-		return nil, fmt.Errorf("CallMCPTool %s: lookup: %w", serverAlias, err)
 	}
 
 	if !server.IsActive {
@@ -393,9 +413,15 @@ func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias
 
 	// Global servers require explicit access control via the access tables.
 	if server.OrgID == nil && server.TeamID == nil {
-		allowed, accessErr := h.DB.CheckMCPAccess(ctx, ki.OrgID, ki.TeamID, ki.ID, server.ID)
-		if accessErr != nil {
-			return nil, fmt.Errorf("CallMCPTool %s: check access: %w", serverAlias, accessErr)
+		var allowed bool
+		if h.MCPAccessCache != nil {
+			allowed = h.MCPAccessCache.Check(ki.OrgID, ki.TeamID, ki.ID, server.ID)
+		} else {
+			var accessErr error
+			allowed, accessErr = h.DB.CheckMCPAccess(ctx, ki.OrgID, ki.TeamID, ki.ID, server.ID)
+			if accessErr != nil {
+				return nil, fmt.Errorf("CallMCPTool %s: check access: %w", serverAlias, accessErr)
+			}
 		}
 		if !allowed {
 			return nil, fmt.Errorf("CallMCPTool %s: access denied", serverAlias)

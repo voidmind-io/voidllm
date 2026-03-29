@@ -402,6 +402,8 @@ func (h *Handler) CreateMCPServer(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to create MCP server")
 	}
 
+	h.refreshMCPServerCache(c.Context())
+
 	if h.ToolCache != nil {
 		alias := s.Alias
 		go func() {
@@ -470,6 +472,8 @@ func (h *Handler) CreateOrgMCPServer(c fiber.Ctx) error {
 		}
 		return apierror.InternalError(c, "failed to create MCP server")
 	}
+
+	h.refreshMCPServerCache(c.Context())
 
 	if h.ToolCache != nil {
 		alias := s.Alias
@@ -542,6 +546,8 @@ func (h *Handler) CreateTeamMCPServer(c fiber.Ctx) error {
 		}
 		return apierror.InternalError(c, "failed to create MCP server")
 	}
+
+	h.refreshMCPServerCache(c.Context())
 
 	if h.ToolCache != nil {
 		alias := s.Alias
@@ -790,6 +796,8 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update MCP server")
 	}
 
+	h.refreshMCPServerCache(ctx)
+
 	return c.JSON(mcpServerToResponse(s))
 }
 
@@ -837,6 +845,8 @@ func (h *Handler) DeleteMCPServer(c fiber.Ctx) error {
 	if h.ToolCache != nil {
 		h.ToolCache.InvalidateWithStore(ctx, existing.Alias, existing.ID)
 	}
+
+	h.refreshMCPServerCache(ctx)
 
 	return c.SendStatus(fiber.StatusNoContent)
 }
@@ -923,6 +933,8 @@ func (h *Handler) setMCPServerActive(c fiber.Ctx, active bool) error {
 			h.ToolCache.InvalidateWithStore(ctx, updated.Alias, updated.ID)
 		}
 	}
+
+	h.refreshMCPServerCache(ctx)
 
 	return c.JSON(mcpServerToResponse(updated))
 }

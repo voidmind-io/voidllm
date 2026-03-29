@@ -32,17 +32,19 @@ type ModelHealthProvider interface {
 
 // Handler holds shared dependencies for all admin API handlers.
 type Handler struct {
-	DB            *db.DB
-	HMACSecret    []byte
-	EncryptionKey []byte // AES-256-GCM key for upstream API key encryption
-	KeyCache      *cache.Cache[string, auth.KeyInfo]
-	Registry      *proxy.Registry
-	AccessCache   *proxy.ModelAccessCache // in-memory model access cache; nil disables refresh
-	AliasCache    *proxy.AliasCache       // in-memory model alias cache; nil disables refresh
-	Redis         *voidredis.Client       // nil when Redis is not configured
-	AuditLogger   *audit.Logger           // nil when audit logging is disabled
-	License       *license.Holder         // thread-safe license holder; Load() never returns nil
-	Log           *slog.Logger
+	DB             *db.DB
+	HMACSecret     []byte
+	EncryptionKey  []byte // AES-256-GCM key for upstream API key encryption
+	KeyCache       *cache.Cache[string, auth.KeyInfo]
+	Registry       *proxy.Registry
+	AccessCache    *proxy.ModelAccessCache // in-memory model access cache; nil disables refresh
+	AliasCache     *proxy.AliasCache       // in-memory model alias cache; nil disables refresh
+	MCPServerCache *proxy.MCPServerCache   // in-memory MCP server cache; nil falls back to DB
+	MCPAccessCache *proxy.MCPAccessCache   // in-memory MCP access cache; nil falls back to DB
+	Redis          *voidredis.Client       // nil when Redis is not configured
+	AuditLogger    *audit.Logger           // nil when audit logging is disabled
+	License        *license.Holder         // thread-safe license holder; Load() never returns nil
+	Log            *slog.Logger
 	// SSOProvider is the OIDC provider used for SSO login. Nil when SSO is
 	// disabled or unlicensed.
 	SSOProvider *sso.Provider
@@ -127,4 +129,36 @@ func (h *Handler) refreshAccessCache(ctx context.Context) {
 		return
 	}
 	h.AccessCache.Load(orgA, teamA, keyA)
+}
+
+// refreshMCPServerCache reloads all active MCP servers from the database into
+// the in-memory MCP server cache. It is called after any MCP server mutation
+// so that the hot path immediately reflects the updated configuration.
+// If MCPServerCache is nil the call is a no-op.
+func (h *Handler) refreshMCPServerCache(ctx context.Context) {
+	if h.MCPServerCache == nil {
+		return
+	}
+	servers, err := h.DB.LoadAllActiveMCPServers(ctx)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "refresh mcp server cache", slog.String("error", err.Error()))
+		return
+	}
+	h.MCPServerCache.LoadAll(servers)
+}
+
+// refreshMCPAccessCache reloads all MCP access allowlists from the database
+// into the in-memory MCP access cache. It is called after any Set*MCPAccess
+// mutation so that the hot path immediately reflects the updated configuration.
+// If MCPAccessCache is nil the call is a no-op.
+func (h *Handler) refreshMCPAccessCache(ctx context.Context) {
+	if h.MCPAccessCache == nil {
+		return
+	}
+	orgA, teamA, keyA, err := h.DB.LoadAllMCPAccess(ctx)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "refresh mcp access cache", slog.String("error", err.Error()))
+		return
+	}
+	h.MCPAccessCache.Load(orgA, teamA, keyA)
 }

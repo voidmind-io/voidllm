@@ -467,6 +467,34 @@ func (d *DB) DeleteMCPServer(ctx context.Context, id string) error {
 	return nil
 }
 
+// LoadAllActiveMCPServers returns all active, non-deleted MCP servers ordered
+// by alias. Used for bulk-loading the in-memory server cache at startup and
+// on periodic refresh.
+func (d *DB) LoadAllActiveMCPServers(ctx context.Context) ([]MCPServer, error) {
+	query := "SELECT " + mcpServerSelectColumns +
+		" FROM mcp_servers WHERE is_active = 1 AND deleted_at IS NULL ORDER BY alias"
+
+	rows, err := d.sql.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("load all active mcp servers query: %w", err)
+	}
+	defer rows.Close()
+
+	var servers []MCPServer
+	for rows.Next() {
+		s, scanErr := scanMCPServer(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("load all active mcp servers scan: %w", scanErr)
+		}
+		servers = append(servers, *s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load all active mcp servers rows: %w", err)
+	}
+
+	return servers, nil
+}
+
 // scanMCPServer scans a single MCP server row. The scanner may be a *sql.Row
 // (from QueryRowContext) or *sql.Rows (from QueryContext); both satisfy the interface.
 func scanMCPServer(scanner interface{ Scan(...any) error }) (*MCPServer, error) {

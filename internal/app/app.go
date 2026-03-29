@@ -65,10 +65,12 @@ type Application struct {
 	encKey     []byte
 	hmacSecret []byte
 
-	registry    *proxy.Registry
-	keyCache    *cache.Cache[string, auth.KeyInfo]
-	accessCache *proxy.ModelAccessCache
-	aliasCache  *proxy.AliasCache
+	registry       *proxy.Registry
+	keyCache       *cache.Cache[string, auth.KeyInfo]
+	accessCache    *proxy.ModelAccessCache
+	aliasCache     *proxy.AliasCache
+	mcpServerCache *proxy.MCPServerCache
+	mcpAccessCache *proxy.MCPAccessCache
 
 	rateLimiter   ratelimit.Checker
 	tokenCounter  *ratelimit.TokenCounter
@@ -401,6 +403,20 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		aliasCache.Load(orgAliases, teamAliases)
 	}
 
+	mcpServerCache := proxy.NewMCPServerCache()
+	if mcpServers, mcpServersErr := database.LoadAllActiveMCPServers(ctx); mcpServersErr == nil {
+		mcpServerCache.LoadAll(mcpServers)
+	} else {
+		log.Error("load mcp server cache", slog.String("error", mcpServersErr.Error()))
+	}
+
+	mcpAccessCache := proxy.NewMCPAccessCache()
+	if mcpOrgA, mcpTeamA, mcpKeyA, mcpAccessErr := database.LoadAllMCPAccess(ctx); mcpAccessErr == nil {
+		mcpAccessCache.Load(mcpOrgA, mcpTeamA, mcpKeyA)
+	} else {
+		log.Error("load mcp access cache", slog.String("error", mcpAccessErr.Error()))
+	}
+
 	// Step 10: connect Redis (optional). On failure, continue without Redis.
 	redisCtx, redisCancel := context.WithCancel(context.Background())
 	var redisClient *voidredis.Client
@@ -565,19 +581,21 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	proxyHandler.MaxStreamDuration = cfg.Server.Proxy.MaxStreamDuration
 
 	adminHandler := &admin.Handler{
-		DB:            database,
-		HMACSecret:    hmacSecret,
-		EncryptionKey: encKey,
-		KeyCache:      keyCache,
-		Registry:      registry,
-		AccessCache:   accessCache,
-		AliasCache:    aliasCache,
-		Redis:         redisClient,
-		AuditLogger:   auditLogger,
-		License:       licHolder,
-		Log:           log,
-		SSOProvider:   ssoProvider,
-		SSOConfig:     cfg.Settings.SSO,
+		DB:             database,
+		HMACSecret:     hmacSecret,
+		EncryptionKey:  encKey,
+		KeyCache:       keyCache,
+		Registry:       registry,
+		AccessCache:    accessCache,
+		AliasCache:     aliasCache,
+		MCPServerCache: mcpServerCache,
+		MCPAccessCache: mcpAccessCache,
+		Redis:          redisClient,
+		AuditLogger:    auditLogger,
+		License:        licHolder,
+		Log:            log,
+		SSOProvider:    ssoProvider,
+		SSOConfig:      cfg.Settings.SSO,
 	}
 	// Only assign the health checker when it was actually created — a typed nil
 	// (*health.Checker)(nil) satisfies the interface but is NOT == nil when
@@ -880,6 +898,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		keyCache:        keyCache,
 		accessCache:     accessCache,
 		aliasCache:      aliasCache,
+		mcpServerCache:  mcpServerCache,
+		mcpAccessCache:  mcpAccessCache,
 		rateLimiter:     rateLimiter,
 		tokenCounter:    tokenCounter,
 		usageLogger:     usageLogger,
@@ -937,6 +957,29 @@ func (a *Application) Start() error {
 			metrics.CacheSize.WithLabelValues("keys").Set(float64(a.keyCache.Len()))
 			metrics.CacheSize.WithLabelValues("access").Set(float64(a.accessCache.Len()))
 			metrics.CacheSize.WithLabelValues("aliases").Set(float64(a.aliasCache.Len()))
+			metrics.CacheSize.WithLabelValues("mcp_servers").Set(float64(a.mcpServerCache.Len()))
+			metrics.CacheSize.WithLabelValues("mcp_access").Set(float64(a.mcpAccessCache.Len()))
+		}),
+		startTicker(30*time.Second, func() {
+			ctx1, cancel1 := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel1()
+			if servers, err := a.database.LoadAllActiveMCPServers(ctx1); err == nil {
+				a.mcpServerCache.LoadAll(servers)
+			} else {
+				a.log.LogAttrs(context.Background(), slog.LevelError, "mcp server cache refresh failed",
+					slog.String("error", err.Error()),
+				)
+			}
+
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel2()
+			if orgA, teamA, keyA, err := a.database.LoadAllMCPAccess(ctx2); err == nil {
+				a.mcpAccessCache.Load(orgA, teamA, keyA)
+			} else {
+				a.log.LogAttrs(context.Background(), slog.LevelError, "mcp access cache refresh failed",
+					slog.String("error", err.Error()),
+				)
+			}
 		}),
 	)
 
