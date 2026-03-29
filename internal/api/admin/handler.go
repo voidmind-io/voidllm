@@ -32,19 +32,20 @@ type ModelHealthProvider interface {
 
 // Handler holds shared dependencies for all admin API handlers.
 type Handler struct {
-	DB             *db.DB
-	HMACSecret     []byte
-	EncryptionKey  []byte // AES-256-GCM key for upstream API key encryption
-	KeyCache       *cache.Cache[string, auth.KeyInfo]
-	Registry       *proxy.Registry
-	AccessCache    *proxy.ModelAccessCache // in-memory model access cache; nil disables refresh
-	AliasCache     *proxy.AliasCache       // in-memory model alias cache; nil disables refresh
-	MCPServerCache *proxy.MCPServerCache   // in-memory MCP server cache; nil falls back to DB
-	MCPAccessCache *proxy.MCPAccessCache   // in-memory MCP access cache; nil falls back to DB
-	Redis          *voidredis.Client       // nil when Redis is not configured
-	AuditLogger    *audit.Logger           // nil when audit logging is disabled
-	License        *license.Holder         // thread-safe license holder; Load() never returns nil
-	Log            *slog.Logger
+	DB                *db.DB
+	HMACSecret        []byte
+	EncryptionKey     []byte // AES-256-GCM key for upstream API key encryption
+	KeyCache          *cache.Cache[string, auth.KeyInfo]
+	Registry          *proxy.Registry
+	AccessCache       *proxy.ModelAccessCache  // in-memory model access cache; nil disables refresh
+	AliasCache        *proxy.AliasCache        // in-memory model alias cache; nil disables refresh
+	MCPServerCache    *proxy.MCPServerCache    // in-memory MCP server cache; nil falls back to DB
+	MCPAccessCache    *proxy.MCPAccessCache    // in-memory MCP access cache; nil falls back to DB
+	MCPTransportCache *proxy.MCPTransportCache // persistent transport + decrypted token cache; nil disables
+	Redis             *voidredis.Client        // nil when Redis is not configured
+	AuditLogger       *audit.Logger            // nil when audit logging is disabled
+	License           *license.Holder          // thread-safe license holder; Load() never returns nil
+	Log               *slog.Logger
 	// SSOProvider is the OIDC provider used for SSO login. Nil when SSO is
 	// disabled or unlicensed.
 	SSOProvider *sso.Provider
@@ -145,6 +146,23 @@ func (h *Handler) refreshMCPServerCache(ctx context.Context) {
 		return
 	}
 	h.MCPServerCache.LoadAll(servers)
+}
+
+// refreshMCPTransportCache reloads all active MCP servers from the database
+// into the transport cache, closing stale transports and creating new ones for
+// changed entries. It is called after any MCP server mutation so that the hot
+// path immediately picks up the updated configuration.
+// If MCPTransportCache is nil the call is a no-op.
+func (h *Handler) refreshMCPTransportCache(ctx context.Context) {
+	if h.MCPTransportCache == nil {
+		return
+	}
+	servers, err := h.DB.LoadAllActiveMCPServers(ctx)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "refresh mcp transport cache", slog.String("error", err.Error()))
+		return
+	}
+	h.MCPTransportCache.LoadAll(servers)
 }
 
 // refreshMCPAccessCache reloads all MCP access allowlists from the database

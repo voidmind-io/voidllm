@@ -403,6 +403,7 @@ func (h *Handler) CreateMCPServer(c fiber.Ctx) error {
 	}
 
 	h.refreshMCPServerCache(c.Context())
+	h.refreshMCPTransportCache(c.Context())
 
 	if h.ToolCache != nil {
 		serverID := s.ID
@@ -474,6 +475,7 @@ func (h *Handler) CreateOrgMCPServer(c fiber.Ctx) error {
 	}
 
 	h.refreshMCPServerCache(c.Context())
+	h.refreshMCPTransportCache(c.Context())
 
 	if h.ToolCache != nil {
 		serverID := s.ID
@@ -548,6 +550,7 @@ func (h *Handler) CreateTeamMCPServer(c fiber.Ctx) error {
 	}
 
 	h.refreshMCPServerCache(c.Context())
+	h.refreshMCPTransportCache(c.Context())
 
 	if h.ToolCache != nil {
 		serverID := s.ID
@@ -797,6 +800,7 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 	}
 
 	h.refreshMCPServerCache(ctx)
+	h.refreshMCPTransportCache(ctx)
 
 	return c.JSON(mcpServerToResponse(s))
 }
@@ -847,6 +851,7 @@ func (h *Handler) DeleteMCPServer(c fiber.Ctx) error {
 	}
 
 	h.refreshMCPServerCache(ctx)
+	h.refreshMCPTransportCache(ctx)
 
 	return c.SendStatus(fiber.StatusNoContent)
 }
@@ -935,6 +940,7 @@ func (h *Handler) setMCPServerActive(c fiber.Ctx, active bool) error {
 	}
 
 	h.refreshMCPServerCache(ctx)
+	h.refreshMCPTransportCache(ctx)
 
 	return c.JSON(mcpServerToResponse(updated))
 }

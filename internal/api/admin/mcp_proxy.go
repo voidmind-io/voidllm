@@ -100,33 +100,46 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 		}
 	}
 
-	var authToken string
-	if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
-		decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
-		if decErr != nil {
-			h.Log.ErrorContext(c.Context(), "mcp proxy: decrypt auth token",
-				slog.String("server", alias),
-				slog.String("error", decErr.Error()))
-			return c.Status(fiber.StatusInternalServerError).JSON(
-				mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
+	// Resolve transport from cache (avoids per-request transport creation and
+	// AES-256-GCM decryption). Fall back to an ad-hoc transport on cache miss
+	// (cold start or server not yet loaded into the cache).
+	var transport *mcp.HTTPTransport
+	var adHoc bool
+	if h.MCPTransportCache != nil {
+		if resolved, ok := h.MCPTransportCache.Get(server.ID); ok {
+			transport = resolved.Transport
 		}
-		authToken = decrypted
 	}
-
-	timeout := h.MCPCallTimeout
-	if timeout == 0 {
-		timeout = 30 * time.Second
+	if transport == nil {
+		adHoc = true
+		var authToken string
+		if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
+			decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
+			if decErr != nil {
+				h.Log.ErrorContext(c.Context(), "mcp proxy: decrypt auth token",
+					slog.String("server", alias),
+					slog.String("error", decErr.Error()))
+				return c.Status(fiber.StatusInternalServerError).JSON(
+					mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
+			}
+			authToken = decrypted
+		}
+		timeout := h.MCPCallTimeout
+		if timeout == 0 {
+			timeout = 30 * time.Second
+		}
+		transport = mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
 	}
-	transport := mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
-	defer transport.Close()
+	if adHoc {
+		defer transport.Close() //nolint:errcheck
+	}
 
 	body := append([]byte{}, c.Body()...)
 	if len(body) == 0 {
 		return c.JSON(mcp.NewErrorResponse(nil, mcp.CodeParseError, "empty request body"))
 	}
 
-	toolName := extractToolNameForLog(body)
-	method := extractMethodForMetrics(body)
+	meta := parseMCPRequestMeta(body)
 
 	// Session key is scoped per (alias, orgID) to prevent cross-org session
 	// confusion when the same alias is registered under different organisations.
@@ -138,8 +151,6 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 		sessionID = sid.(string)
 	}
 
-	isInit := isInitializeRequest(body)
-
 	start := time.Now()
 	result, newSID, callErr := transport.Call(c.Context(), body, sessionID)
 
@@ -148,7 +159,7 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	// mcpReInitMu prevents concurrent goroutines from racing to re-initialize
 	// the same (or any) session simultaneously; re-init is rare so a global
 	// lock is sufficient.
-	if errors.Is(callErr, mcp.ErrSessionExpired) && !isInit {
+	if errors.Is(callErr, mcp.ErrSessionExpired) && !meta.IsInit {
 		mcpReInitMu.Lock()
 		// Double-check: if another goroutine already refreshed the session,
 		// the stored session will differ from the stale one we used — retry
@@ -191,9 +202,10 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 		status = "transport_error"
 		metrics.MCPTransportErrorsTotal.WithLabelValues(alias, "call").Inc()
 	}
-	metrics.MCPToolCallsTotal.WithLabelValues(alias, method, status).Inc()
-	if method != "" {
-		metrics.MCPToolCallDurationSeconds.WithLabelValues(alias, method).Observe(duration.Seconds())
+	metricsMethod := meta.MetricsMethod()
+	metrics.MCPToolCallsTotal.WithLabelValues(alias, metricsMethod, status).Inc()
+	if metricsMethod != "" {
+		metrics.MCPToolCallDurationSeconds.WithLabelValues(alias, metricsMethod).Observe(duration.Seconds())
 	}
 
 	if h.MCPLogger != nil {
@@ -205,7 +217,7 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 			UserID:           ki.UserID,
 			ServiceAccountID: ki.ServiceAccountID,
 			ServerAlias:      alias,
-			ToolName:         toolName,
+			ToolName:         meta.ToolName,
 			DurationMS:       int(duration.Milliseconds()),
 			Status:           status,
 		})
@@ -266,13 +278,36 @@ var validMCPMethods = map[string]bool{
 	"prompts/get":               true,
 }
 
-// extractToolNameForLog parses the MCP tool name from a JSON-RPC request body
-// for use in the async usage logger (DB). For tools/call it returns the tool
-// name (truncated to 64 bytes). For other known MCP methods it returns the
-// method name. Unknown methods and unparseable bodies return "unknown".
-// This function may return user-controlled tool names and must NOT be used as
-// a Prometheus label value.
-func extractToolNameForLog(body []byte) string {
+// mcpRequestMeta holds the parsed metadata from a single MCP JSON-RPC request
+// body. It is produced once per request by parseMCPRequestMeta and consumed by
+// logging, metrics, and session logic, avoiding three separate body parses.
+type mcpRequestMeta struct {
+	// Method is the raw JSON-RPC method string (e.g. "tools/call").
+	Method string
+	// ToolName is a usage-log-safe identifier: the tools/call tool name
+	// (truncated to 64 bytes) for tools/call requests, the method name for
+	// other known MCP methods, or "unknown" otherwise. May contain
+	// user-controlled data — must NOT be used as a Prometheus label.
+	ToolName string
+	// IsInit reports whether the request is an "initialize" call.
+	IsInit bool
+}
+
+// MetricsMethod returns a Prometheus-safe label value derived from the parsed
+// method. Only values present in validMCPMethods are returned as-is; everything
+// else (including unknown methods from user input) maps to "unknown", preventing
+// cardinality explosion in Prometheus metrics.
+func (m mcpRequestMeta) MetricsMethod() string {
+	if validMCPMethods[m.Method] {
+		return m.Method
+	}
+	return "unknown"
+}
+
+// parseMCPRequestMeta parses the JSON-RPC method and params.name fields from
+// body in a single pass and returns an mcpRequestMeta. It is the sole body-
+// parse for all metadata needs in HandleMCPProxy.
+func parseMCPRequestMeta(body []byte) mcpRequestMeta {
 	var req struct {
 		Method string `json:"method"`
 		Params struct {
@@ -280,47 +315,27 @@ func extractToolNameForLog(body []byte) string {
 		} `json:"params"`
 	}
 	if jsonx.Unmarshal(body, &req) != nil {
-		return "unknown"
+		return mcpRequestMeta{Method: "unknown", ToolName: "unknown"}
 	}
+
+	meta := mcpRequestMeta{
+		Method: req.Method,
+		IsInit: req.Method == "initialize",
+	}
+
 	if req.Method == "tools/call" && req.Params.Name != "" {
 		name := req.Params.Name
 		if len(name) > 64 {
 			name = name[:64]
 		}
-		return name
+		meta.ToolName = name
+	} else if validMCPMethods[req.Method] {
+		meta.ToolName = req.Method
+	} else {
+		meta.ToolName = "unknown"
 	}
-	if validMCPMethods[req.Method] {
-		return req.Method
-	}
-	return "unknown"
-}
 
-// extractMethodForMetrics returns a Prometheus-safe label value from an MCP
-// JSON-RPC request body. Only values from the bounded validMCPMethods set are
-// returned as-is. For tools/call the literal string "tools/call" is returned
-// regardless of the tool name, preventing cardinality explosion from arbitrary
-// user-controlled tool names in Prometheus metrics. Unparseable bodies and
-// unknown methods return "unknown".
-func extractMethodForMetrics(body []byte) string {
-	var req struct {
-		Method string `json:"method"`
-	}
-	if jsonx.Unmarshal(body, &req) != nil {
-		return "unknown"
-	}
-	if validMCPMethods[req.Method] {
-		return req.Method
-	}
-	return "unknown"
-}
-
-// isInitializeRequest reports whether body is an MCP initialize JSON-RPC call.
-func isInitializeRequest(body []byte) bool {
-	var req struct {
-		Method string `json:"method"`
-	}
-	jsonx.Unmarshal(body, &req) //nolint:errcheck — best-effort parse
-	return req.Method == "initialize"
+	return meta
 }
 
 // buildInitializeRequest returns a minimal MCP initialize JSON-RPC request
@@ -428,21 +443,32 @@ func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias
 		}
 	}
 
-	var authToken string
-	if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
-		decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
-		if decErr != nil {
-			return nil, fmt.Errorf("CallMCPTool %s: decrypt auth token: %w", serverAlias, decErr)
+	var transport *mcp.HTTPTransport
+	var adHocTool bool
+	if h.MCPTransportCache != nil {
+		if resolved, ok := h.MCPTransportCache.Get(server.ID); ok {
+			transport = resolved.Transport
 		}
-		authToken = decrypted
 	}
-
-	timeout := h.MCPCallTimeout
-	if timeout == 0 {
-		timeout = 30 * time.Second
+	if transport == nil {
+		adHocTool = true
+		var authToken string
+		if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
+			decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
+			if decErr != nil {
+				return nil, fmt.Errorf("CallMCPTool %s: decrypt auth token: %w", serverAlias, decErr)
+			}
+			authToken = decrypted
+		}
+		timeout := h.MCPCallTimeout
+		if timeout == 0 {
+			timeout = 30 * time.Second
+		}
+		transport = mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
 	}
-	transport := mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
-	defer transport.Close() //nolint:errcheck
+	if adHocTool {
+		defer transport.Close() //nolint:errcheck
+	}
 
 	body := buildToolCallRequest(toolName, args)
 
@@ -551,21 +577,32 @@ func (h *Handler) MakeToolFetcher() mcp.ToolFetcher {
 			return nil, fmt.Errorf("tool fetcher %s: lookup: %w", serverID, err)
 		}
 
-		var authToken string
-		if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
-			decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
-			if decErr != nil {
-				return nil, fmt.Errorf("tool fetcher %s: decrypt auth token: %w", serverID, decErr)
+		var transport *mcp.HTTPTransport
+		var adHocFetch bool
+		if h.MCPTransportCache != nil {
+			if resolved, ok := h.MCPTransportCache.Get(server.ID); ok {
+				transport = resolved.Transport
 			}
-			authToken = decrypted
 		}
-
-		timeout := h.MCPCallTimeout
-		if timeout == 0 {
-			timeout = 30 * time.Second
+		if transport == nil {
+			adHocFetch = true
+			var authToken string
+			if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
+				decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
+				if decErr != nil {
+					return nil, fmt.Errorf("tool fetcher %s: decrypt auth token: %w", serverID, decErr)
+				}
+				authToken = decrypted
+			}
+			timeout := h.MCPCallTimeout
+			if timeout == 0 {
+				timeout = 30 * time.Second
+			}
+			transport = mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
 		}
-		transport := mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
-		defer transport.Close() //nolint:errcheck
+		if adHocFetch {
+			defer transport.Close() //nolint:errcheck
+		}
 
 		tools, err := transport.ListTools(ctx)
 		if err != nil {
