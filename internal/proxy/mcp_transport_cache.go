@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 
@@ -10,13 +11,12 @@ import (
 )
 
 // resolvedMCPServer holds a pre-resolved, ready-to-use MCP server configuration
-// with the auth token decrypted once and a persistent HTTP transport.
+// with a persistent HTTP transport.
 type resolvedMCPServer struct {
 	ID           string
 	URL          string
 	AuthType     string
 	AuthHeader   string
-	AuthToken    string             // plaintext, decrypted once at cache load time
 	AuthTokenEnc string             // original encrypted value, used for change detection
 	Transport    *mcp.HTTPTransport // persistent, reusable; closed on eviction
 }
@@ -31,16 +31,18 @@ type resolvedMCPServer struct {
 type MCPTransportCache struct {
 	mu           sync.RWMutex
 	servers      map[string]*resolvedMCPServer // keyed by serverID
+	stale        []*mcp.HTTPTransport          // closed at the start of the next LoadAll
 	encKey       []byte
 	callTimeout  time.Duration
 	allowPrivate bool
+	log          *slog.Logger
 }
 
 // NewMCPTransportCache returns an empty, ready-to-use MCPTransportCache.
 // encKey is the AES-256-GCM key used to decrypt stored auth tokens.
 // callTimeout is passed to mcp.NewHTTPTransport for each persistent transport;
 // a zero value falls back to 30 seconds. allowPrivate disables SSRF protection.
-func NewMCPTransportCache(encKey []byte, allowPrivate bool, callTimeout time.Duration) *MCPTransportCache {
+func NewMCPTransportCache(encKey []byte, allowPrivate bool, callTimeout time.Duration, log *slog.Logger) *MCPTransportCache {
 	if callTimeout == 0 {
 		callTimeout = 30 * time.Second
 	}
@@ -49,6 +51,7 @@ func NewMCPTransportCache(encKey []byte, allowPrivate bool, callTimeout time.Dur
 		encKey:       encKey,
 		callTimeout:  callTimeout,
 		allowPrivate: allowPrivate,
+		log:          log,
 	}
 }
 
@@ -73,10 +76,18 @@ func (c *MCPTransportCache) Get(serverID string) (*resolvedMCPServer, bool) {
 //     transports closed and are evicted.
 //
 // Servers without a URL (builtin) are skipped. LoadAll is safe to call
-// concurrently with Get but must not be called concurrently with itself.
+// concurrently with Get and with itself (serialised by the write lock).
 func (c *MCPTransportCache) LoadAll(servers []db.MCPServer) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Close transports from the previous eviction cycle. The grace period
+	// equals one cache refresh interval, giving in-flight requests time
+	// to complete before the transport is torn down.
+	for _, t := range c.stale {
+		t.Close() //nolint:errcheck
+	}
+	c.stale = c.stale[:0]
 
 	next := make(map[string]*resolvedMCPServer, len(servers))
 
@@ -105,9 +116,9 @@ func (c *MCPTransportCache) LoadAll(servers []db.MCPServer) {
 			continue
 		}
 
-		// Config changed — close the old transport before creating the new one.
+		// Config changed — defer close of the old transport until next LoadAll.
 		if existing != nil && existing.Transport != nil {
-			existing.Transport.Close() //nolint:errcheck
+			c.stale = append(c.stale, existing.Transport)
 		}
 
 		// Decrypt the auth token once.
@@ -116,10 +127,11 @@ func (c *MCPTransportCache) LoadAll(servers []db.MCPServer) {
 			decrypted, err := crypto.DecryptString(encToken, c.encKey, []byte("mcp_server:"+s.ID))
 			if err == nil {
 				plainToken = decrypted
+			} else {
+				c.log.Error("mcp transport cache: decrypt auth token",
+					slog.String("server_id", s.ID),
+					slog.String("error", err.Error()))
 			}
-			// Decryption failure is silently ignored: the transport will still be
-			// created (with an empty token) so that requests reach the upstream and
-			// receive a proper auth error rather than a confusing proxy error.
 		}
 
 		next[s.ID] = &resolvedMCPServer{
@@ -127,41 +139,48 @@ func (c *MCPTransportCache) LoadAll(servers []db.MCPServer) {
 			URL:          s.URL,
 			AuthType:     s.AuthType,
 			AuthHeader:   s.AuthHeader,
-			AuthToken:    plainToken,
 			AuthTokenEnc: encToken,
 			Transport:    mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, plainToken, c.callTimeout, c.allowPrivate),
 		}
 	}
 
-	// Close transports for servers that are no longer present.
+	// Defer close of transports for servers that are no longer present.
 	for id, old := range c.servers {
 		if _, kept := next[id]; !kept && old.Transport != nil {
-			old.Transport.Close() //nolint:errcheck
+			c.stale = append(c.stale, old.Transport)
 		}
 	}
 
 	c.servers = next
 }
 
-// Invalidate closes the transport for serverID and removes it from the cache.
-// It is a no-op when serverID is not cached. After Invalidate the next
-// LoadAll call will re-create the entry from the database.
+// Invalidate moves the transport for serverID to the stale list (closed on the
+// next LoadAll or Close call) and removes the entry from the cache. It is a
+// no-op when serverID is not cached. Callers must ensure LoadAll runs within a
+// bounded time after Invalidate to reclaim the stale transport.
 func (c *MCPTransportCache) Invalidate(serverID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if rs, ok := c.servers[serverID]; ok {
 		if rs.Transport != nil {
-			rs.Transport.Close() //nolint:errcheck
+			c.stale = append(c.stale, rs.Transport)
 		}
 		delete(c.servers, serverID)
 	}
 }
 
-// Close closes all cached transports and empties the cache. It must be called
-// once on application shutdown to release idle HTTP connections.
+// Close closes all cached and stale transports and empties the cache. It must
+// be called once on application shutdown to release idle HTTP connections.
+// Callers should stop routing new requests before calling Close — goroutines
+// that obtained a transport pointer via Get before Close may encounter
+// connection errors on in-flight calls.
 func (c *MCPTransportCache) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	for _, t := range c.stale {
+		t.Close() //nolint:errcheck
+	}
+	c.stale = nil
 	for _, rs := range c.servers {
 		if rs.Transport != nil {
 			rs.Transport.Close() //nolint:errcheck

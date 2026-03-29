@@ -132,37 +132,25 @@ func (h *Handler) refreshAccessCache(ctx context.Context) {
 	h.AccessCache.Load(orgA, teamA, keyA)
 }
 
-// refreshMCPServerCache reloads all active MCP servers from the database into
-// the in-memory MCP server cache. It is called after any MCP server mutation
-// so that the hot path immediately reflects the updated configuration.
-// If MCPServerCache is nil the call is a no-op.
-func (h *Handler) refreshMCPServerCache(ctx context.Context) {
-	if h.MCPServerCache == nil {
+// refreshMCPCaches performs a single LoadAllActiveMCPServers query and feeds
+// the result to both MCPServerCache and MCPTransportCache. It is called after
+// any MCP server mutation so that both hot-path caches are updated atomically
+// from one DB round-trip. If both caches are nil the call is a no-op.
+func (h *Handler) refreshMCPCaches(ctx context.Context) {
+	if h.MCPServerCache == nil && h.MCPTransportCache == nil {
 		return
 	}
 	servers, err := h.DB.LoadAllActiveMCPServers(ctx)
 	if err != nil {
-		h.Log.ErrorContext(ctx, "refresh mcp server cache", slog.String("error", err.Error()))
+		h.Log.ErrorContext(ctx, "refresh mcp caches", slog.String("error", err.Error()))
 		return
 	}
-	h.MCPServerCache.LoadAll(servers)
-}
-
-// refreshMCPTransportCache reloads all active MCP servers from the database
-// into the transport cache, closing stale transports and creating new ones for
-// changed entries. It is called after any MCP server mutation so that the hot
-// path immediately picks up the updated configuration.
-// If MCPTransportCache is nil the call is a no-op.
-func (h *Handler) refreshMCPTransportCache(ctx context.Context) {
-	if h.MCPTransportCache == nil {
-		return
+	if h.MCPServerCache != nil {
+		h.MCPServerCache.LoadAll(servers)
 	}
-	servers, err := h.DB.LoadAllActiveMCPServers(ctx)
-	if err != nil {
-		h.Log.ErrorContext(ctx, "refresh mcp transport cache", slog.String("error", err.Error()))
-		return
+	if h.MCPTransportCache != nil {
+		h.MCPTransportCache.LoadAll(servers)
 	}
-	h.MCPTransportCache.LoadAll(servers)
 }
 
 // refreshMCPAccessCache reloads all MCP access allowlists from the database

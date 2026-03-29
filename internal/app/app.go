@@ -419,7 +419,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		log.Error("load mcp access cache", slog.String("error", mcpAccessErr.Error()))
 	}
 
-	mcpTransportCache := proxy.NewMCPTransportCache(encKey, cfg.Settings.MCP.AllowPrivateURLs, cfg.Settings.MCP.CallTimeout)
+	mcpTransportCache := proxy.NewMCPTransportCache(encKey, cfg.Settings.MCP.AllowPrivateURLs, cfg.Settings.MCP.CallTimeout, log)
 	if mcpServersForTransport, mcpTransportErr := database.LoadAllActiveMCPServers(ctx); mcpTransportErr == nil {
 		mcpTransportCache.LoadAll(mcpServersForTransport)
 	} else {

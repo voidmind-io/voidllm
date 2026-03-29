@@ -204,9 +204,7 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	}
 	metricsMethod := meta.MetricsMethod()
 	metrics.MCPToolCallsTotal.WithLabelValues(alias, metricsMethod, status).Inc()
-	if metricsMethod != "" {
-		metrics.MCPToolCallDurationSeconds.WithLabelValues(alias, metricsMethod).Observe(duration.Seconds())
-	}
+	metrics.MCPToolCallDurationSeconds.WithLabelValues(alias, metricsMethod).Observe(duration.Seconds())
 
 	if h.MCPLogger != nil {
 		h.MCPLogger.Log(usage.MCPToolCallEvent{

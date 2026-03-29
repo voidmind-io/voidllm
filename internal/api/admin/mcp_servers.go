@@ -402,8 +402,7 @@ func (h *Handler) CreateMCPServer(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to create MCP server")
 	}
 
-	h.refreshMCPServerCache(c.Context())
-	h.refreshMCPTransportCache(c.Context())
+	h.refreshMCPCaches(c.Context())
 
 	if h.ToolCache != nil {
 		serverID := s.ID
@@ -474,8 +473,7 @@ func (h *Handler) CreateOrgMCPServer(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to create MCP server")
 	}
 
-	h.refreshMCPServerCache(c.Context())
-	h.refreshMCPTransportCache(c.Context())
+	h.refreshMCPCaches(c.Context())
 
 	if h.ToolCache != nil {
 		serverID := s.ID
@@ -549,8 +547,7 @@ func (h *Handler) CreateTeamMCPServer(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to create MCP server")
 	}
 
-	h.refreshMCPServerCache(c.Context())
-	h.refreshMCPTransportCache(c.Context())
+	h.refreshMCPCaches(c.Context())
 
 	if h.ToolCache != nil {
 		serverID := s.ID
@@ -799,8 +796,7 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update MCP server")
 	}
 
-	h.refreshMCPServerCache(ctx)
-	h.refreshMCPTransportCache(ctx)
+	h.refreshMCPCaches(ctx)
 
 	return c.JSON(mcpServerToResponse(s))
 }
@@ -850,8 +846,7 @@ func (h *Handler) DeleteMCPServer(c fiber.Ctx) error {
 		h.ToolCache.InvalidateWithStore(ctx, existing.ID)
 	}
 
-	h.refreshMCPServerCache(ctx)
-	h.refreshMCPTransportCache(ctx)
+	h.refreshMCPCaches(ctx)
 
 	return c.SendStatus(fiber.StatusNoContent)
 }
@@ -939,8 +934,7 @@ func (h *Handler) setMCPServerActive(c fiber.Ctx, active bool) error {
 		}
 	}
 
-	h.refreshMCPServerCache(ctx)
-	h.refreshMCPTransportCache(ctx)
+	h.refreshMCPCaches(ctx)
 
 	return c.JSON(mcpServerToResponse(updated))
 }
