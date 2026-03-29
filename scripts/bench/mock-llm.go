@@ -47,7 +47,7 @@ func main() {
 	}
 
 	http.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
+		_, _ = io.Copy(io.Discard, r.Body)
 		r.Body.Close()
 		if *latency > 0 {
 			time.Sleep(*latency)
