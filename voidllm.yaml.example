@@ -101,10 +101,13 @@ redis:
 #   custom     — Any OpenAI-compatible endpoint, direct passthrough
 
 models:
+  # --- Simple single-endpoint model ---
   - name: gpt-oss-120b
     provider: vllm
+    type: chat                       # chat (default), image, audio_transcription, tts
     base_url: http://vllm-large:8000/v1
     api_key: ${VLLM_LARGE_KEY}       # Optional, depends on upstream config
+    timeout: 60s                     # Per-model upstream timeout (overrides global)
     aliases:
       - large
       - default
@@ -140,18 +143,47 @@ models:
     provider: azure
     base_url: https://mycompany.openai.azure.com
     api_key: ${AZURE_OPENAI_KEY}
-    # Azure requires deployment name, passed via base_url or model name mapping
     azure_deployment: gpt-4o
     azure_api_version: "2024-02-01"
     max_context_tokens: 128000
 
   - name: text-embedding-3-small
     provider: openai
+    type: embedding
     base_url: https://api.openai.com/v1
     api_key: ${OPENAI_KEY}
     aliases:
       - embedding
       - embed
+
+  # --- Multi-deployment model with load balancing ---
+  - name: gpt-4o
+    type: chat
+    strategy: round-robin            # round-robin, least-latency, weighted, priority
+    max_retries: 2                   # Retry across deployments on failure
+    aliases:
+      - smart
+    max_context_tokens: 128000
+    pricing:
+      input_per_1m:  2.50
+      output_per_1m: 10.00
+    deployments:
+      - name: azure-east
+        provider: azure
+        base_url: https://eastus.openai.azure.com
+        api_key: ${AZURE_EAST_KEY}
+        azure_deployment: gpt-4o
+        azure_api_version: "2024-02-01"
+        weight: 2                    # For weighted strategy
+        priority: 1                  # For priority strategy (lower = higher priority)
+      - name: azure-west
+        provider: azure
+        base_url: https://westus.openai.azure.com
+        api_key: ${AZURE_WEST_KEY}
+        azure_deployment: gpt-4o
+        azure_api_version: "2024-02-01"
+        weight: 1
+        priority: 2
 
 
 # =============================================================================
