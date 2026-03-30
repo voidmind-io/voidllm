@@ -266,13 +266,24 @@ func TestAccessibleServers_MCPAccessFilter(t *testing.T) {
 	}
 	svc := &codeModeService{db: mock, log: newDiscardLogger()}
 
-	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-4", Role: "system_admin"})
+	// Non-admin caller: access denied for global server without explicit grant.
+	ctx := ctxWithIdentity(mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-4", Role: "member"})
 	got, err := svc.accessibleServers(ctx, false)
 	if err != nil {
 		t.Fatalf("accessibleServers() error = %v", err)
 	}
 	if len(got) != 0 {
 		t.Errorf("got %d servers, want 0 (access denied)", len(got))
+	}
+
+	// System admin: bypasses access check, sees all global servers.
+	adminCtx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-5", Role: "system_admin"})
+	adminGot, adminErr := svc.accessibleServers(adminCtx, false)
+	if adminErr != nil {
+		t.Fatalf("accessibleServers(system_admin) error = %v", adminErr)
+	}
+	if len(adminGot) != 1 {
+		t.Errorf("system_admin: got %d servers, want 1 (bypass)", len(adminGot))
 	}
 }
 
