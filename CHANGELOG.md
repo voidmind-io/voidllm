@@ -2,6 +2,33 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.8] — 2026-03-30
+
+### Performance
+
+- **sonic JSON engine** — faster JSON serialization across all hot paths
+- **In-memory caches** — MCP server lookups, access checks, and transport pooling moved out of the DB hot path
+- **MCP Proxy overhead reduced 36%** — 670µs → 427µs P50 at 1000 RPS
+
+### MCP Access Management
+
+- **Closed-by-default for global servers** — organizations must explicitly grant access to global MCP servers (org-scoped and team-scoped servers are unaffected)
+- **MCP Access API** — `GET/PUT /orgs/:org_id/mcp-access` (and team/key variants) for managing server allowlists
+- **Org MCP Access tab** — new tab in Organization settings to toggle global server access
+- **Team MCP Access tab** — restrict MCP access within org allowlist per team
+
+### Benchmark
+
+- **Go benchmark CLI** — 6 scenarios (quick, sustained, burst, large-payload, mixed, endurance) using Vegeta load testing library
+- **Benchmark results** — LLM Proxy 442µs P50, MCP Proxy 427µs P50, Code Mode 3.35ms pure JS / 32µs warm eval
+
+### Breaking Changes
+
+- MCP access at org level is now closed-by-default. Existing installations with global MCP servers must grant org-level access via the new UI or API after upgrading.
+- ToolCache is keyed by server ID instead of alias.
+
+---
+
 ## [0.0.7] — 2026-03-29
 
 ### Code Mode
