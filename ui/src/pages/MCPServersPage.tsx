@@ -114,6 +114,15 @@ function IconRefresh() {
   )
 }
 
+function IconCopy() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -546,6 +555,45 @@ function EditMCPServerDialog({ server, onClose }: EditMCPServerDialogProps) {
 }
 
 // ---------------------------------------------------------------------------
+// ClientConfigSnippet
+// ---------------------------------------------------------------------------
+
+interface ClientConfigSnippetProps {
+  label: string | null
+  config: string
+  onCopy: () => void
+}
+
+function ClientConfigSnippet({ label, config, onCopy }: ClientConfigSnippetProps) {
+  function handleCopy() {
+    navigator.clipboard.writeText(config).then(onCopy).catch(() => {
+      /* clipboard unavailable — fail silently */
+    })
+  }
+
+  return (
+    <div className="space-y-1">
+      {label !== null && (
+        <span className="text-xs text-text-tertiary">{label}</span>
+      )}
+      <div className="relative group">
+        <pre className="bg-bg-tertiary rounded-md px-3 py-2.5 text-xs font-mono text-text-secondary overflow-x-auto leading-relaxed whitespace-pre">
+          {config}
+        </pre>
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="absolute top-2 right-2 p-1.5 rounded-md text-text-tertiary hover:text-text-primary hover:bg-bg-primary/60 transition-colors opacity-0 group-hover:opacity-100 focus:opacity-100"
+          aria-label="Copy config to clipboard"
+        >
+          <IconCopy />
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // ServerExpandedRow
 // ---------------------------------------------------------------------------
 
@@ -563,7 +611,54 @@ function cn(...classes: (string | false | undefined | null)[]): string {
   return classes.filter(Boolean).join(' ')
 }
 
+function getBaseUrl(): string {
+  const origin = window.location.origin
+  if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+    return 'https://your-voidllm-domain'
+  }
+  return origin
+}
+
+function generateMCPConfig(alias: string, isCodeMode?: boolean): string {
+  const base = getBaseUrl()
+  if (isCodeMode) {
+    return JSON.stringify(
+      {
+        mcpServers: {
+          'voidllm-code': {
+            url: `${base}/api/v1/mcp`,
+            headers: { Authorization: 'Bearer <your-api-key>' },
+          },
+        },
+      },
+      null,
+      2,
+    )
+  }
+  return JSON.stringify(
+    {
+      mcpServers: {
+        [alias]: {
+          url: `${base}/api/v1/mcp/${alias}`,
+          headers: { Authorization: 'Bearer <your-api-key>' },
+        },
+      },
+    },
+    null,
+    2,
+  )
+}
+
+function IconChevronDown() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="6 9 12 15 18 9" />
+    </svg>
+  )
+}
+
 function ServerExpandedRow({ server, canModify }: ServerExpandedRowProps) {
+  const [configOpen, setConfigOpen] = useState(false)
   const { data: tools, isLoading: toolsLoading } = useMCPServerTools(server.id)
   const addEntry = useAddBlocklistEntry()
   const removeEntry = useRemoveBlocklistEntry()
@@ -626,10 +721,71 @@ function ServerExpandedRow({ server, canModify }: ServerExpandedRowProps) {
     return addPending || removePending
   }
 
+  function handleCopyConfig(isCodeMode?: boolean) {
+    const config = generateMCPConfig(server.alias, isCodeMode)
+    navigator.clipboard.writeText(config).then(() => {
+      toast({ variant: 'success', message: 'Copied to clipboard' })
+    }).catch(() => {})
+  }
+
   return (
     <div className="px-6 py-4 space-y-3">
-      {/* Header row */}
-      <div className="flex items-center justify-between">
+      {/* Client Config — collapsible, above tools */}
+      <div>
+        <div className="flex items-center justify-between">
+          <button
+            type="button"
+            onClick={() => setConfigOpen(!configOpen)}
+            className="inline-flex items-center gap-1.5 text-xs font-medium uppercase tracking-wider text-text-tertiary hover:text-text-secondary transition-colors"
+          >
+            <span className={cn('transition-transform', configOpen && 'rotate-180')}>
+              <IconChevronDown />
+            </span>
+            Client Config
+          </button>
+          <div className="flex items-center gap-1">
+            {server.alias === 'voidllm' && (
+              <button
+                type="button"
+                onClick={() => handleCopyConfig(true)}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-text-tertiary hover:text-text-primary hover:bg-bg-tertiary transition-colors"
+                title="Copy Code Mode config"
+              >
+                <IconCopy />
+                Code Mode
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => handleCopyConfig()}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-text-tertiary hover:text-text-primary hover:bg-bg-tertiary transition-colors"
+              title="Copy config to clipboard"
+            >
+              <IconCopy />
+              Copy
+            </button>
+          </div>
+        </div>
+        {configOpen && (
+          <div className="mt-2 space-y-2">
+            <ClientConfigSnippet
+              label={null}
+              config={generateMCPConfig(server.alias)}
+              onCopy={() => toast({ variant: 'success', message: 'Copied to clipboard' })}
+            />
+            {server.alias === 'voidllm' && (
+              <ClientConfigSnippet
+                label="Code Mode (all tools)"
+                config={generateMCPConfig(server.alias, true)}
+                onCopy={() => toast({ variant: 'success', message: 'Copied to clipboard' })}
+              />
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Tools header */}
+      <div className="flex items-center justify-between border-t border-border pt-3">
         <span className="text-xs font-medium uppercase tracking-wider text-text-tertiary">
           Tools
         </span>
@@ -693,6 +849,7 @@ function ServerExpandedRow({ server, canModify }: ServerExpandedRowProps) {
           ))}
         </ul>
       )}
+
     </div>
   )
 }
