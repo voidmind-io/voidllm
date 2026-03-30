@@ -2,6 +2,18 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.9] — 2026-03-30
+
+### Docker, Helm & Configuration
+
+- **Fixed image registry** — Docker Compose now uses `ghcr.io/voidmind-io/voidllm`
+- **Helm chart updated** — correct registry, MCP, Code Mode, and health check settings in values + configmap
+- **Istio support** — optional Gateway + VirtualService templates (`istio.enabled: true`)
+- **MCP servers in Helm** — static MCP server definitions via `config.mcpServers`
+- **Example config expanded** — MCP, Code Mode, logging, health check, and enterprise sections
+
+---
+
 ## [0.0.8] — 2026-03-30
 
 ### Performance
