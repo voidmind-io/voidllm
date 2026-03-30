@@ -1,13 +1,13 @@
 package audit
 
 import (
-	"encoding/json"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
 // normalizeResourceType maps plural URL path segments to their canonical
@@ -213,12 +213,12 @@ func buildDescription(body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
-	var raw map[string]json.RawMessage
-	if json.Unmarshal(body, &raw) != nil {
+	var raw map[string]jsonx.RawMessage
+	if jsonx.Unmarshal(body, &raw) != nil {
 		return ""
 	}
 	// Re-marshal only non-null, non-empty fields into compact JSON.
-	clean := make(map[string]json.RawMessage, len(raw))
+	clean := make(map[string]jsonx.RawMessage, len(raw))
 	for k, v := range raw {
 		s := string(v)
 		if s == "null" || s == `""` || s == "0" || s == "false" {
@@ -229,7 +229,7 @@ func buildDescription(body []byte) string {
 	if len(clean) == 0 {
 		return ""
 	}
-	out, err := json.Marshal(clean)
+	out, err := jsonx.Marshal(clean)
 	if err != nil {
 		return ""
 	}

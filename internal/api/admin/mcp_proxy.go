@@ -2,7 +2,6 @@ package admin
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +11,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	"github.com/voidmind-io/voidllm/internal/usage"
@@ -51,17 +51,24 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 			mcp.NewErrorResponse(nil, mcp.CodeInvalidRequest, "missing authentication"))
 	}
 
-	server, err := h.DB.GetMCPServerByAliasScoped(c.Context(), alias, ki.OrgID, ki.TeamID)
-	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			return c.Status(fiber.StatusNotFound).JSON(
-				mcp.NewErrorResponse(nil, mcp.CodeInvalidRequest, "unknown MCP server"))
+	var server *db.MCPServer
+	if h.MCPServerCache != nil {
+		server, _ = h.MCPServerCache.Get(alias, ki.OrgID, ki.TeamID)
+	}
+	if server == nil {
+		var err error
+		server, err = h.DB.GetMCPServerByAliasScoped(c.Context(), alias, ki.OrgID, ki.TeamID)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return c.Status(fiber.StatusNotFound).JSON(
+					mcp.NewErrorResponse(nil, mcp.CodeInvalidRequest, "unknown MCP server"))
+			}
+			h.Log.ErrorContext(c.Context(), "mcp proxy: lookup server",
+				slog.String("alias", alias),
+				slog.String("error", err.Error()))
+			return c.Status(fiber.StatusInternalServerError).JSON(
+				mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
 		}
-		h.Log.ErrorContext(c.Context(), "mcp proxy: lookup server",
-			slog.String("alias", alias),
-			slog.String("error", err.Error()))
-		return c.Status(fiber.StatusInternalServerError).JSON(
-			mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
 	}
 
 	if !server.IsActive {
@@ -73,13 +80,19 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	// control via the org/team/key MCP access tables. Org- and team-scoped
 	// servers are implicitly accessible to members of that scope — their
 	// visibility is already enforced by GetMCPServerByAliasScoped.
-	if server.OrgID == nil && server.TeamID == nil {
-		allowed, accessErr := h.DB.CheckMCPAccess(c.Context(), ki.OrgID, ki.TeamID, ki.ID, server.ID)
-		if accessErr != nil {
-			h.Log.ErrorContext(c.Context(), "mcp proxy: check access",
-				slog.String("error", accessErr.Error()))
-			return c.Status(fiber.StatusInternalServerError).JSON(
-				mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
+	if server.OrgID == nil && server.TeamID == nil && !auth.HasRole(ki.Role, auth.RoleSystemAdmin) {
+		var allowed bool
+		if h.MCPAccessCache != nil {
+			allowed = h.MCPAccessCache.Check(ki.OrgID, ki.TeamID, ki.ID, server.ID)
+		} else {
+			var accessErr error
+			allowed, accessErr = h.DB.CheckMCPAccess(c.Context(), ki.OrgID, ki.TeamID, ki.ID, server.ID)
+			if accessErr != nil {
+				h.Log.ErrorContext(c.Context(), "mcp proxy: check access",
+					slog.String("error", accessErr.Error()))
+				return c.Status(fiber.StatusInternalServerError).JSON(
+					mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
+			}
 		}
 		if !allowed {
 			return c.Status(fiber.StatusForbidden).JSON(
@@ -87,33 +100,46 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 		}
 	}
 
-	var authToken string
-	if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
-		decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
-		if decErr != nil {
-			h.Log.ErrorContext(c.Context(), "mcp proxy: decrypt auth token",
-				slog.String("server", alias),
-				slog.String("error", decErr.Error()))
-			return c.Status(fiber.StatusInternalServerError).JSON(
-				mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
+	// Resolve transport from cache (avoids per-request transport creation and
+	// AES-256-GCM decryption). Fall back to an ad-hoc transport on cache miss
+	// (cold start or server not yet loaded into the cache).
+	var transport *mcp.HTTPTransport
+	var adHoc bool
+	if h.MCPTransportCache != nil {
+		if resolved, ok := h.MCPTransportCache.Get(server.ID); ok {
+			transport = resolved.Transport
 		}
-		authToken = decrypted
 	}
-
-	timeout := h.MCPCallTimeout
-	if timeout == 0 {
-		timeout = 30 * time.Second
+	if transport == nil {
+		adHoc = true
+		var authToken string
+		if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
+			decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
+			if decErr != nil {
+				h.Log.ErrorContext(c.Context(), "mcp proxy: decrypt auth token",
+					slog.String("server", alias),
+					slog.String("error", decErr.Error()))
+				return c.Status(fiber.StatusInternalServerError).JSON(
+					mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
+			}
+			authToken = decrypted
+		}
+		timeout := h.MCPCallTimeout
+		if timeout == 0 {
+			timeout = 30 * time.Second
+		}
+		transport = mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
 	}
-	transport := mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
-	defer transport.Close()
+	if adHoc {
+		defer transport.Close() //nolint:errcheck
+	}
 
 	body := append([]byte{}, c.Body()...)
 	if len(body) == 0 {
 		return c.JSON(mcp.NewErrorResponse(nil, mcp.CodeParseError, "empty request body"))
 	}
 
-	toolName := extractToolNameForLog(body)
-	method := extractMethodForMetrics(body)
+	meta := parseMCPRequestMeta(body)
 
 	// Session key is scoped per (alias, orgID) to prevent cross-org session
 	// confusion when the same alias is registered under different organisations.
@@ -125,8 +151,6 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 		sessionID = sid.(string)
 	}
 
-	isInit := isInitializeRequest(body)
-
 	start := time.Now()
 	result, newSID, callErr := transport.Call(c.Context(), body, sessionID)
 
@@ -135,7 +159,7 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	// mcpReInitMu prevents concurrent goroutines from racing to re-initialize
 	// the same (or any) session simultaneously; re-init is rare so a global
 	// lock is sufficient.
-	if errors.Is(callErr, mcp.ErrSessionExpired) && !isInit {
+	if errors.Is(callErr, mcp.ErrSessionExpired) && !meta.IsInit {
 		mcpReInitMu.Lock()
 		// Double-check: if another goroutine already refreshed the session,
 		// the stored session will differ from the stale one we used — retry
@@ -178,10 +202,9 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 		status = "transport_error"
 		metrics.MCPTransportErrorsTotal.WithLabelValues(alias, "call").Inc()
 	}
-	metrics.MCPToolCallsTotal.WithLabelValues(alias, method, status).Inc()
-	if method != "" {
-		metrics.MCPToolCallDurationSeconds.WithLabelValues(alias, method).Observe(duration.Seconds())
-	}
+	metricsMethod := meta.MetricsMethod()
+	metrics.MCPToolCallsTotal.WithLabelValues(alias, metricsMethod, status).Inc()
+	metrics.MCPToolCallDurationSeconds.WithLabelValues(alias, metricsMethod).Observe(duration.Seconds())
 
 	if h.MCPLogger != nil {
 		h.MCPLogger.Log(usage.MCPToolCallEvent{
@@ -192,7 +215,7 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 			UserID:           ki.UserID,
 			ServiceAccountID: ki.ServiceAccountID,
 			ServerAlias:      alias,
-			ToolName:         toolName,
+			ToolName:         meta.ToolName,
 			DurationMS:       int(duration.Milliseconds()),
 			Status:           status,
 		})
@@ -253,61 +276,64 @@ var validMCPMethods = map[string]bool{
 	"prompts/get":               true,
 }
 
-// extractToolNameForLog parses the MCP tool name from a JSON-RPC request body
-// for use in the async usage logger (DB). For tools/call it returns the tool
-// name (truncated to 64 bytes). For other known MCP methods it returns the
-// method name. Unknown methods and unparseable bodies return "unknown".
-// This function may return user-controlled tool names and must NOT be used as
-// a Prometheus label value.
-func extractToolNameForLog(body []byte) string {
+// mcpRequestMeta holds the parsed metadata from a single MCP JSON-RPC request
+// body. It is produced once per request by parseMCPRequestMeta and consumed by
+// logging, metrics, and session logic, avoiding three separate body parses.
+type mcpRequestMeta struct {
+	// Method is the raw JSON-RPC method string (e.g. "tools/call").
+	Method string
+	// ToolName is a usage-log-safe identifier: the tools/call tool name
+	// (truncated to 64 bytes) for tools/call requests, the method name for
+	// other known MCP methods, or "unknown" otherwise. May contain
+	// user-controlled data — must NOT be used as a Prometheus label.
+	ToolName string
+	// IsInit reports whether the request is an "initialize" call.
+	IsInit bool
+}
+
+// MetricsMethod returns a Prometheus-safe label value derived from the parsed
+// method. Only values present in validMCPMethods are returned as-is; everything
+// else (including unknown methods from user input) maps to "unknown", preventing
+// cardinality explosion in Prometheus metrics.
+func (m mcpRequestMeta) MetricsMethod() string {
+	if validMCPMethods[m.Method] {
+		return m.Method
+	}
+	return "unknown"
+}
+
+// parseMCPRequestMeta parses the JSON-RPC method and params.name fields from
+// body in a single pass and returns an mcpRequestMeta. It is the sole body-
+// parse for all metadata needs in HandleMCPProxy.
+func parseMCPRequestMeta(body []byte) mcpRequestMeta {
 	var req struct {
 		Method string `json:"method"`
 		Params struct {
 			Name string `json:"name"`
 		} `json:"params"`
 	}
-	if json.Unmarshal(body, &req) != nil {
-		return "unknown"
+	if jsonx.Unmarshal(body, &req) != nil {
+		return mcpRequestMeta{Method: "unknown", ToolName: "unknown"}
 	}
+
+	meta := mcpRequestMeta{
+		Method: req.Method,
+		IsInit: req.Method == "initialize",
+	}
+
 	if req.Method == "tools/call" && req.Params.Name != "" {
 		name := req.Params.Name
 		if len(name) > 64 {
 			name = name[:64]
 		}
-		return name
+		meta.ToolName = name
+	} else if validMCPMethods[req.Method] {
+		meta.ToolName = req.Method
+	} else {
+		meta.ToolName = "unknown"
 	}
-	if validMCPMethods[req.Method] {
-		return req.Method
-	}
-	return "unknown"
-}
 
-// extractMethodForMetrics returns a Prometheus-safe label value from an MCP
-// JSON-RPC request body. Only values from the bounded validMCPMethods set are
-// returned as-is. For tools/call the literal string "tools/call" is returned
-// regardless of the tool name, preventing cardinality explosion from arbitrary
-// user-controlled tool names in Prometheus metrics. Unparseable bodies and
-// unknown methods return "unknown".
-func extractMethodForMetrics(body []byte) string {
-	var req struct {
-		Method string `json:"method"`
-	}
-	if json.Unmarshal(body, &req) != nil {
-		return "unknown"
-	}
-	if validMCPMethods[req.Method] {
-		return req.Method
-	}
-	return "unknown"
-}
-
-// isInitializeRequest reports whether body is an MCP initialize JSON-RPC call.
-func isInitializeRequest(body []byte) bool {
-	var req struct {
-		Method string `json:"method"`
-	}
-	json.Unmarshal(body, &req) //nolint:errcheck — best-effort parse
-	return req.Method == "initialize"
+	return meta
 }
 
 // buildInitializeRequest returns a minimal MCP initialize JSON-RPC request
@@ -327,7 +353,7 @@ func buildInitializeRequest() []byte {
 			},
 		},
 	}
-	b, _ := json.Marshal(req)
+	b, _ := jsonx.Marshal(req)
 	return b
 }
 
@@ -338,7 +364,7 @@ func buildInitializedNotification() []byte {
 		"jsonrpc": "2.0",
 		"method":  "notifications/initialized",
 	}
-	b, _ := json.Marshal(req)
+	b, _ := jsonx.Marshal(req)
 	return b
 }
 
@@ -350,9 +376,9 @@ func mcpServerAAD(serverID string) []byte {
 }
 
 // buildToolCallRequest serialises a JSON-RPC tools/call request body for the
-// given tool name and argument object. The error path of json.Marshal is
+// given tool name and argument object. The error path of jsonx.Marshal is
 // unreachable for the static structure used here; the result is always valid.
-func buildToolCallRequest(toolName string, args json.RawMessage) []byte {
+func buildToolCallRequest(toolName string, args jsonx.RawMessage) []byte {
 	req := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      1,
@@ -362,7 +388,7 @@ func buildToolCallRequest(toolName string, args json.RawMessage) []byte {
 			"arguments": args,
 		},
 	}
-	b, _ := json.Marshal(req)
+	b, _ := jsonx.Marshal(req)
 	return b
 }
 
@@ -373,18 +399,25 @@ func buildToolCallRequest(toolName string, args json.RawMessage) []byte {
 // originates from a Code Mode execution. executionID is the UUIDv7 that groups
 // all tool calls from a single execute_code invocation; pass an empty string
 // for non-Code-Mode calls.
-func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias, toolName string, args json.RawMessage, codeMode bool, executionID string) (json.RawMessage, error) {
+func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias, toolName string, args jsonx.RawMessage, codeMode bool, executionID string) (jsonx.RawMessage, error) {
 	// Built-in VoidLLM management server — dispatch in-process instead of HTTP.
 	if serverAlias == "voidllm" && h.MCPServer != nil {
 		return h.callBuiltinTool(ctx, ki, toolName, args)
 	}
 
-	server, err := h.DB.GetMCPServerByAliasScoped(ctx, serverAlias, ki.OrgID, ki.TeamID)
-	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			return nil, fmt.Errorf("CallMCPTool %s: unknown MCP server", serverAlias)
+	var server *db.MCPServer
+	if h.MCPServerCache != nil {
+		server, _ = h.MCPServerCache.Get(serverAlias, ki.OrgID, ki.TeamID)
+	}
+	if server == nil {
+		var err error
+		server, err = h.DB.GetMCPServerByAliasScoped(ctx, serverAlias, ki.OrgID, ki.TeamID)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return nil, fmt.Errorf("CallMCPTool %s: unknown MCP server", serverAlias)
+			}
+			return nil, fmt.Errorf("CallMCPTool %s: lookup: %w", serverAlias, err)
 		}
-		return nil, fmt.Errorf("CallMCPTool %s: lookup: %w", serverAlias, err)
 	}
 
 	if !server.IsActive {
@@ -392,31 +425,49 @@ func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias
 	}
 
 	// Global servers require explicit access control via the access tables.
-	if server.OrgID == nil && server.TeamID == nil {
-		allowed, accessErr := h.DB.CheckMCPAccess(ctx, ki.OrgID, ki.TeamID, ki.ID, server.ID)
-		if accessErr != nil {
-			return nil, fmt.Errorf("CallMCPTool %s: check access: %w", serverAlias, accessErr)
+	// System admins bypass this check — they have unrestricted access.
+	if server.OrgID == nil && server.TeamID == nil && !auth.HasRole(ki.Role, auth.RoleSystemAdmin) {
+		var allowed bool
+		if h.MCPAccessCache != nil {
+			allowed = h.MCPAccessCache.Check(ki.OrgID, ki.TeamID, ki.ID, server.ID)
+		} else {
+			var accessErr error
+			allowed, accessErr = h.DB.CheckMCPAccess(ctx, ki.OrgID, ki.TeamID, ki.ID, server.ID)
+			if accessErr != nil {
+				return nil, fmt.Errorf("CallMCPTool %s: check access: %w", serverAlias, accessErr)
+			}
 		}
 		if !allowed {
 			return nil, fmt.Errorf("CallMCPTool %s: access denied", serverAlias)
 		}
 	}
 
-	var authToken string
-	if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
-		decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
-		if decErr != nil {
-			return nil, fmt.Errorf("CallMCPTool %s: decrypt auth token: %w", serverAlias, decErr)
+	var transport *mcp.HTTPTransport
+	var adHocTool bool
+	if h.MCPTransportCache != nil {
+		if resolved, ok := h.MCPTransportCache.Get(server.ID); ok {
+			transport = resolved.Transport
 		}
-		authToken = decrypted
 	}
-
-	timeout := h.MCPCallTimeout
-	if timeout == 0 {
-		timeout = 30 * time.Second
+	if transport == nil {
+		adHocTool = true
+		var authToken string
+		if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
+			decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
+			if decErr != nil {
+				return nil, fmt.Errorf("CallMCPTool %s: decrypt auth token: %w", serverAlias, decErr)
+			}
+			authToken = decrypted
+		}
+		timeout := h.MCPCallTimeout
+		if timeout == 0 {
+			timeout = 30 * time.Second
+		}
+		transport = mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
 	}
-	transport := mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
-	defer transport.Close() //nolint:errcheck
+	if adHocTool {
+		defer transport.Close() //nolint:errcheck
+	}
 
 	body := buildToolCallRequest(toolName, args)
 
@@ -496,7 +547,7 @@ func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias
 // callBuiltinTool dispatches a tool call to the built-in VoidLLM management
 // MCP server in-process, without HTTP. The caller's identity is injected into
 // the MCP context so tool handlers can enforce RBAC.
-func (h *Handler) callBuiltinTool(ctx context.Context, ki *auth.KeyInfo, toolName string, args json.RawMessage) (json.RawMessage, error) {
+func (h *Handler) callBuiltinTool(ctx context.Context, ki *auth.KeyInfo, toolName string, args jsonx.RawMessage) (jsonx.RawMessage, error) {
 	mcpCtx := mcp.WithKeyIdentity(ctx, mcp.KeyIdentity{
 		OrgID:  ki.OrgID,
 		TeamID: ki.TeamID,
@@ -513,37 +564,48 @@ func (h *Handler) callBuiltinTool(ctx context.Context, ki *auth.KeyInfo, toolNam
 }
 
 // MakeToolFetcher returns a ToolFetcher that retrieves tool schemas from the
-// upstream MCP server identified by alias. It creates a fresh HTTPTransport,
+// upstream MCP server identified by serverID. It creates a fresh HTTPTransport,
 // sends initialize + tools/list, and parses the response. The lookup uses
-// GetMCPServerByAliasAny so that org-scoped and team-scoped servers are
-// resolved in addition to global servers. Access control is enforced
+// GetMCPServer (by database ID) so that org-scoped, team-scoped, and global
+// servers are all resolved without ambiguity. Access control is enforced
 // separately at the call layer; the fetcher only reads URL and auth config.
 func (h *Handler) MakeToolFetcher() mcp.ToolFetcher {
-	return func(ctx context.Context, alias string) ([]mcp.Tool, error) {
-		server, err := h.DB.GetMCPServerByAliasAny(ctx, alias)
+	return func(ctx context.Context, serverID string) ([]mcp.Tool, error) {
+		server, err := h.DB.GetMCPServer(ctx, serverID)
 		if err != nil {
-			return nil, fmt.Errorf("tool fetcher %s: lookup: %w", alias, err)
+			return nil, fmt.Errorf("tool fetcher %s: lookup: %w", serverID, err)
 		}
 
-		var authToken string
-		if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
-			decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
-			if decErr != nil {
-				return nil, fmt.Errorf("tool fetcher %s: decrypt auth token: %w", alias, decErr)
+		var transport *mcp.HTTPTransport
+		var adHocFetch bool
+		if h.MCPTransportCache != nil {
+			if resolved, ok := h.MCPTransportCache.Get(server.ID); ok {
+				transport = resolved.Transport
 			}
-			authToken = decrypted
 		}
-
-		timeout := h.MCPCallTimeout
-		if timeout == 0 {
-			timeout = 30 * time.Second
+		if transport == nil {
+			adHocFetch = true
+			var authToken string
+			if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
+				decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
+				if decErr != nil {
+					return nil, fmt.Errorf("tool fetcher %s: decrypt auth token: %w", serverID, decErr)
+				}
+				authToken = decrypted
+			}
+			timeout := h.MCPCallTimeout
+			if timeout == 0 {
+				timeout = 30 * time.Second
+			}
+			transport = mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
 		}
-		transport := mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
-		defer transport.Close() //nolint:errcheck
+		if adHocFetch {
+			defer transport.Close() //nolint:errcheck
+		}
 
 		tools, err := transport.ListTools(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("tool fetcher %s: list tools: %w", alias, err)
+			return nil, fmt.Errorf("tool fetcher %s: list tools: %w", serverID, err)
 		}
 		return tools, nil
 	}

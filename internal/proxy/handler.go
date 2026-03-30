@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -25,6 +24,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/circuitbreaker"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	"github.com/voidmind-io/voidllm/internal/ratelimit"
 	"github.com/voidmind-io/voidllm/internal/shutdown"
@@ -131,7 +131,7 @@ func (s *streamUsageExtractor) observe(line []byte) {
 			TotalTokens      int `json:"total_tokens"`
 		} `json:"usage"`
 	}
-	if json.Unmarshal(data, &chunk) == nil && chunk.Usage != nil {
+	if jsonx.Unmarshal(data, &chunk) == nil && chunk.Usage != nil {
 		s.lastUsage = UsageInfo{
 			PromptTokens:     chunk.Usage.PromptTokens,
 			CompletionTokens: chunk.Usage.CompletionTokens,
@@ -444,7 +444,7 @@ func (p *ProxyHandler) readAndValidateBody(c fiber.Ctx, maxRequestBody int) ([]b
 	}
 
 	var envelope requestEnvelope
-	if err := json.Unmarshal(body, &envelope); err != nil || envelope.Model == "" {
+	if err := jsonx.Unmarshal(body, &envelope); err != nil || envelope.Model == "" {
 		if err := apierror.Send(c, fiber.StatusBadRequest, "bad_request", "model field is required"); err != nil {
 			return nil, requestEnvelope{}, err
 		}
@@ -959,7 +959,7 @@ func extractUsage(body []byte) UsageInfo {
 			TotalTokens      int `json:"total_tokens"`
 		} `json:"usage"`
 	}
-	if json.Unmarshal(body, &resp) != nil || resp.Usage == nil {
+	if jsonx.Unmarshal(body, &resp) != nil || resp.Usage == nil {
 		return UsageInfo{}
 	}
 	return UsageInfo{
@@ -973,17 +973,17 @@ func extractUsage(body []byte) UsageInfo {
 // injection in a single JSON parse/serialize pass. If the body cannot be parsed
 // or re-serialized, the original bytes are returned unchanged.
 func mutateRequestBody(body []byte, canonicalModel string, injectUsage bool) []byte {
-	var doc map[string]json.RawMessage
-	if json.Unmarshal(body, &doc) != nil {
+	var doc map[string]jsonx.RawMessage
+	if jsonx.Unmarshal(body, &doc) != nil {
 		return body
 	}
-	if nameJSON, err := json.Marshal(canonicalModel); err == nil {
-		doc["model"] = json.RawMessage(nameJSON)
+	if nameJSON, err := jsonx.Marshal(canonicalModel); err == nil {
+		doc["model"] = jsonx.RawMessage(nameJSON)
 	}
 	if injectUsage {
-		doc["stream_options"] = json.RawMessage(`{"include_usage":true}`)
+		doc["stream_options"] = jsonx.RawMessage(`{"include_usage":true}`)
 	}
-	if out, err := json.Marshal(doc); err == nil {
+	if out, err := jsonx.Marshal(doc); err == nil {
 		return out
 	}
 	return body

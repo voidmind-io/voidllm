@@ -2,7 +2,7 @@
 // It has no dependency on VoidLLM internals and can be used standalone.
 package mcp
 
-import "encoding/json"
+import "github.com/voidmind-io/voidllm/internal/jsonx"
 
 // JSON-RPC 2.0 standard error codes.
 const (
@@ -15,10 +15,10 @@ const (
 
 // Request is a JSON-RPC 2.0 request.
 type Request struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params,omitempty"`
+	JSONRPC string           `json:"jsonrpc"`
+	ID      jsonx.RawMessage `json:"id,omitempty"`
+	Method  string           `json:"method"`
+	Params  jsonx.RawMessage `json:"params,omitempty"`
 }
 
 // IsNotification returns true if the request has no ID (JSON-RPC notification).
@@ -28,10 +28,10 @@ func (r *Request) IsNotification() bool {
 
 // Response is a JSON-RPC 2.0 response.
 type Response struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id"`
-	Result  any             `json:"result,omitempty"`
-	Error   *Error          `json:"error,omitempty"`
+	JSONRPC string           `json:"jsonrpc"`
+	ID      jsonx.RawMessage `json:"id"`
+	Result  any              `json:"result,omitempty"`
+	Error   *Error           `json:"error,omitempty"`
 }
 
 // Error is a JSON-RPC 2.0 error object.
@@ -89,11 +89,11 @@ func ErrorResult(msg string) *ToolResult {
 }
 
 // NewResponse creates a success response.
-func NewResponse(id json.RawMessage, result any) Response {
+func NewResponse(id jsonx.RawMessage, result any) Response {
 	return Response{JSONRPC: "2.0", ID: id, Result: result}
 }
 
 // NewErrorResponse creates an error response.
-func NewErrorResponse(id json.RawMessage, code int, message string) Response {
+func NewErrorResponse(id jsonx.RawMessage, code int, message string) Response {
 	return Response{JSONRPC: "2.0", ID: id, Error: &Error{Code: code, Message: message}}
 }

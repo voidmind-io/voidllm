@@ -217,9 +217,13 @@ func TestMCPProxy_ToExternalServer(t *testing.T) {
 
 	dsn := "file:TestMCPProxy_ToExternalServer?mode=memory&cache=private"
 	app, database, keyCache := setupMCPProxyApp(t, dsn)
-	memberKey := addMCPTestKey(t, keyCache, "org-proxy-ext")
+	org := mustCreateTestOrg(t, database, "proxy-ext")
+	memberKey := addMCPTestKey(t, keyCache, org.ID)
 
-	createExternalMCPServer(t, database, "ext-server", upstream.URL)
+	s := createExternalMCPServer(t, database, "ext-server", upstream.URL)
+	if err := database.SetOrgMCPAccess(context.Background(), org.ID, []string{s}); err != nil {
+		t.Fatalf("SetOrgMCPAccess: %v", err)
+	}
 
 	requestBody := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
 	resp := proxyPost(t, app, "ext-server", memberKey, requestBody)
@@ -318,9 +322,13 @@ func TestMCPProxy_MetricsToolCallsIncremented(t *testing.T) {
 
 	dsn := "file:TestMCPProxy_MetricsToolCallsIncremented?mode=memory&cache=private"
 	app, database, keyCache := setupMCPProxyApp(t, dsn)
-	memberKey := addMCPTestKey(t, keyCache, "org-proxy-metrics")
+	org := mustCreateTestOrg(t, database, "proxy-metrics")
+	memberKey := addMCPTestKey(t, keyCache, org.ID)
 
-	createExternalMCPServer(t, database, "metrics-server", upstream.URL)
+	s := createExternalMCPServer(t, database, "metrics-server", upstream.URL)
+	if err := database.SetOrgMCPAccess(context.Background(), org.ID, []string{s}); err != nil {
+		t.Fatalf("SetOrgMCPAccess: %v", err)
+	}
 
 	// The tools/call method exercises the tool-name extraction and the
 	// duration histogram in addition to the counter.
@@ -394,9 +402,13 @@ func TestMCPProxy_LoggerCalled(t *testing.T) {
 	app := fiber.New()
 	admin.RegisterRoutes(app, handler, keyCache, testHMACSecret, nil)
 
-	memberKey := addMCPTestKey(t, keyCache, "org-proxy-logger")
+	org := mustCreateTestOrg(t, database, "proxy-logger")
+	memberKey := addMCPTestKey(t, keyCache, org.ID)
 
-	createExternalMCPServer(t, database, "logger-server", upstream.URL)
+	s := createExternalMCPServer(t, database, "logger-server", upstream.URL)
+	if err := database.SetOrgMCPAccess(ctx, org.ID, []string{s}); err != nil {
+		t.Fatalf("SetOrgMCPAccess: %v", err)
+	}
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{}}}`
 	resp := proxyPost(t, app, "logger-server", memberKey, body)

@@ -2,9 +2,9 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/mcp"
 )
 
@@ -15,7 +15,7 @@ type dbToolStore struct {
 	db *db.DB
 }
 
-// LoadAll returns all cached tool schemas grouped by server alias. Only tools
+// LoadAll returns all cached tool schemas grouped by server ID. Only tools
 // for active, non-deleted servers are returned.
 func (s *dbToolStore) LoadAll(ctx context.Context) (map[string][]mcp.Tool, error) {
 	dbTools, err := s.db.ListAllServerTools(ctx)
@@ -23,11 +23,11 @@ func (s *dbToolStore) LoadAll(ctx context.Context) (map[string][]mcp.Tool, error
 		return nil, err
 	}
 	result := make(map[string][]mcp.Tool, len(dbTools))
-	for alias, tools := range dbTools {
+	for serverID, tools := range dbTools {
 		mcpTools := make([]mcp.Tool, 0, len(tools))
 		for _, t := range tools {
 			var schema mcp.InputSchema
-			if err := json.Unmarshal([]byte(t.InputSchema), &schema); err != nil {
+			if err := jsonx.Unmarshal([]byte(t.InputSchema), &schema); err != nil {
 				continue // skip tools with corrupt schemas
 			}
 			mcpTools = append(mcpTools, mcp.Tool{
@@ -36,29 +36,25 @@ func (s *dbToolStore) LoadAll(ctx context.Context) (map[string][]mcp.Tool, error
 				InputSchema: schema,
 			})
 		}
-		result[alias] = mcpTools
+		result[serverID] = mcpTools
 	}
 	return result, nil
 }
 
-// Save persists the tool schemas for a server alias, replacing any previous
-// entry. It resolves the server ID by alias before writing.
-func (s *dbToolStore) Save(ctx context.Context, alias string, tools []mcp.Tool) error {
-	server, err := s.db.GetMCPServerByAliasAny(ctx, alias)
-	if err != nil {
-		return err
-	}
+// Save persists the tool schemas for a server by its database ID, replacing
+// any previous entry. The serverID is used directly without alias resolution.
+func (s *dbToolStore) Save(ctx context.Context, serverID string, tools []mcp.Tool) error {
 	dbTools := make([]db.MCPServerTool, 0, len(tools))
 	for _, t := range tools {
-		schemaJSON, _ := json.Marshal(t.InputSchema) //nolint:errcheck
+		schemaJSON, _ := jsonx.Marshal(t.InputSchema) //nolint:errcheck
 		dbTools = append(dbTools, db.MCPServerTool{
-			ServerID:    server.ID,
+			ServerID:    serverID,
 			Name:        t.Name,
 			Description: t.Description,
 			InputSchema: string(schemaJSON),
 		})
 	}
-	return s.db.UpsertServerTools(ctx, server.ID, dbTools)
+	return s.db.UpsertServerTools(ctx, serverID, dbTools)
 }
 
 // Delete removes all cached tool schemas for a server by its database ID.

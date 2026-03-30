@@ -253,25 +253,25 @@ func TestListAllServerTools(t *testing.T) {
 		t.Fatalf("ListAllServerTools() error = %v, want nil", err)
 	}
 
-	// Map must be keyed by server alias.
-	toolsA, ok := result["tools-all-alpha"]
+	// Map must be keyed by server ID.
+	toolsA, ok := result[serverA.ID]
 	if !ok {
-		t.Fatalf("ListAllServerTools() missing key %q", "tools-all-alpha")
+		t.Fatalf("ListAllServerTools() missing key for serverA ID %q", serverA.ID)
 	}
 	if len(toolsA) != 2 {
-		t.Errorf("result[%q] len = %d, want 2", "tools-all-alpha", len(toolsA))
+		t.Errorf("result[serverA.ID] len = %d, want 2", len(toolsA))
 	}
 	if toolsA[0].Name != "read_file" || toolsA[1].Name != "write_file" {
-		t.Errorf("result[%q] names = [%q, %q], want [read_file, write_file]",
-			"tools-all-alpha", toolsA[0].Name, toolsA[1].Name)
+		t.Errorf("result[serverA.ID] names = [%q, %q], want [read_file, write_file]",
+			toolsA[0].Name, toolsA[1].Name)
 	}
 
-	toolsB, ok := result["tools-all-beta"]
+	toolsB, ok := result[serverB.ID]
 	if !ok {
-		t.Fatalf("ListAllServerTools() missing key %q", "tools-all-beta")
+		t.Fatalf("ListAllServerTools() missing key for serverB ID %q", serverB.ID)
 	}
 	if len(toolsB) != 1 || toolsB[0].Name != "exec_shell" {
-		t.Errorf("result[%q] = %v, want [{exec_shell}]", "tools-all-beta", toolsB)
+		t.Errorf("result[serverB.ID] = %v, want [{exec_shell}]", toolsB)
 	}
 }
 
@@ -300,10 +300,10 @@ func TestListAllServerTools_OnlyActiveServers(t *testing.T) {
 		t.Fatalf("ListAllServerTools() error = %v", err)
 	}
 
-	if _, found := result["tools-active-server"]; !found {
-		t.Error("ListAllServerTools() missing active server alias")
+	if _, found := result[active.ID]; !found {
+		t.Error("ListAllServerTools() missing active server ID")
 	}
-	if _, found := result["tools-inactive-server"]; found {
+	if _, found := result[inactive.ID]; found {
 		t.Error("ListAllServerTools() returned tools for deactivated server, want excluded")
 	}
 }
@@ -331,10 +331,10 @@ func TestListAllServerTools_DeletedServerExcluded(t *testing.T) {
 		t.Fatalf("ListAllServerTools() error = %v", err)
 	}
 
-	if _, found := result["tools-alive-server"]; !found {
-		t.Error("ListAllServerTools() missing alive server alias")
+	if _, found := result[alive.ID]; !found {
+		t.Error("ListAllServerTools() missing alive server ID")
 	}
-	if _, found := result["tools-deleted-server"]; found {
+	if _, found := result[deleted.ID]; found {
 		t.Error("ListAllServerTools() returned tools for soft-deleted server, want excluded")
 	}
 }

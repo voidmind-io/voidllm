@@ -2,9 +2,10 @@ package mcp
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
+
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
 // protocolVersion is the MCP specification version this server implements.
@@ -15,7 +16,7 @@ const protocolVersion = "2025-03-26"
 // Return a ToolResult on success, or an error for unexpected failures.
 // Tool-level errors (e.g. invalid input) should be returned as ErrorResult,
 // not as a Go error.
-type ToolHandler func(ctx context.Context, args json.RawMessage) (*ToolResult, error)
+type ToolHandler func(ctx context.Context, args jsonx.RawMessage) (*ToolResult, error)
 
 // OnToolsListHook is an optional callback invoked inside tools/list before the
 // tool list is returned to the caller. It receives a copy of the registered
@@ -78,15 +79,15 @@ func (s *Server) SetOnToolsList(hook OnToolsListHook) {
 // response bytes. For notifications (requests with no ID), it returns nil.
 func (s *Server) Handle(ctx context.Context, raw []byte) []byte {
 	var req Request
-	if err := json.Unmarshal(raw, &req); err != nil {
+	if err := jsonx.Unmarshal(raw, &req); err != nil {
 		resp := NewErrorResponse(nil, CodeParseError, "parse error")
-		out, _ := json.Marshal(resp)
+		out, _ := jsonx.Marshal(resp)
 		return out
 	}
 
 	if req.JSONRPC != "2.0" {
 		resp := NewErrorResponse(req.ID, CodeInvalidRequest, "jsonrpc must be \"2.0\"")
-		out, _ := json.Marshal(resp)
+		out, _ := jsonx.Marshal(resp)
 		return out
 	}
 
@@ -121,12 +122,12 @@ func (s *Server) Handle(ctx context.Context, raw []byte) []byte {
 		resp = Response{JSONRPC: "2.0", ID: req.ID, Result: result}
 	}
 
-	out, _ := json.Marshal(resp)
+	out, _ := jsonx.Marshal(resp)
 	return out
 }
 
 // handleInitialize returns the server's capabilities and identity.
-func (s *Server) handleInitialize(_ json.RawMessage) any {
+func (s *Server) handleInitialize(_ jsonx.RawMessage) any {
 	return map[string]any{
 		"protocolVersion": protocolVersion,
 		"capabilities": map[string]any{
@@ -160,12 +161,12 @@ func (s *Server) handleToolsList() any {
 // handleToolsCall dispatches a tools/call request to the registered handler.
 // Unexpected handler errors are converted to tool-level error results rather
 // than JSON-RPC protocol errors, keeping protocol integrity intact.
-func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (any, *Error) {
+func (s *Server) handleToolsCall(ctx context.Context, params jsonx.RawMessage) (any, *Error) {
 	var call struct {
-		Name      string          `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
+		Name      string           `json:"name"`
+		Arguments jsonx.RawMessage `json:"arguments"`
 	}
-	if err := json.Unmarshal(params, &call); err != nil {
+	if err := jsonx.Unmarshal(params, &call); err != nil {
 		return nil, &Error{Code: CodeInvalidParams, Message: "invalid params: expected {name, arguments}"}
 	}
 

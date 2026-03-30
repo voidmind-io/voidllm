@@ -154,7 +154,7 @@ func buildTargeter(p phase, ep *endpointSet) vegeta.Targeter {
 		body = []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mock_tool","arguments":{"input":"bench"}}}`)
 
 	case "mcp-proxy":
-		url = ep.proxy + "/api/v1/mcp/bench"
+		url = ep.proxy + "/api/v1/mcp/bench-org"
 		headers = http.Header{
 			"Content-Type":  []string{"application/json"},
 			"Authorization": []string{"Bearer " + ep.apiKey},

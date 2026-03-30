@@ -65,10 +65,13 @@ type Application struct {
 	encKey     []byte
 	hmacSecret []byte
 
-	registry    *proxy.Registry
-	keyCache    *cache.Cache[string, auth.KeyInfo]
-	accessCache *proxy.ModelAccessCache
-	aliasCache  *proxy.AliasCache
+	registry          *proxy.Registry
+	keyCache          *cache.Cache[string, auth.KeyInfo]
+	accessCache       *proxy.ModelAccessCache
+	aliasCache        *proxy.AliasCache
+	mcpServerCache    *proxy.MCPServerCache
+	mcpAccessCache    *proxy.MCPAccessCache
+	mcpTransportCache *proxy.MCPTransportCache
 
 	rateLimiter   ratelimit.Checker
 	tokenCounter  *ratelimit.TokenCounter
@@ -210,7 +213,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	if err := database.SyncYAMLMCPServers(ctx, cfg.MCPServers, encKey); err != nil {
 		return nil, fmt.Errorf("sync YAML MCP servers: %w", err)
 	}
-	if _, err := database.EnsureBuiltinMCPServer(ctx); err != nil {
+	builtinServer, err := database.EnsureBuiltinMCPServer(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("ensure builtin MCP server: %w", err)
 	}
 
@@ -401,6 +405,27 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		aliasCache.Load(orgAliases, teamAliases)
 	}
 
+	mcpServerCache := proxy.NewMCPServerCache()
+	if mcpServers, mcpServersErr := database.LoadAllActiveMCPServers(ctx); mcpServersErr == nil {
+		mcpServerCache.LoadAll(mcpServers)
+	} else {
+		log.Error("load mcp server cache", slog.String("error", mcpServersErr.Error()))
+	}
+
+	mcpAccessCache := proxy.NewMCPAccessCache()
+	if mcpOrgA, mcpTeamA, mcpKeyA, mcpAccessErr := database.LoadAllMCPAccess(ctx); mcpAccessErr == nil {
+		mcpAccessCache.Load(mcpOrgA, mcpTeamA, mcpKeyA)
+	} else {
+		log.Error("load mcp access cache", slog.String("error", mcpAccessErr.Error()))
+	}
+
+	mcpTransportCache := proxy.NewMCPTransportCache(encKey, cfg.Settings.MCP.AllowPrivateURLs, cfg.Settings.MCP.CallTimeout, log)
+	if mcpServersForTransport, mcpTransportErr := database.LoadAllActiveMCPServers(ctx); mcpTransportErr == nil {
+		mcpTransportCache.LoadAll(mcpServersForTransport)
+	} else {
+		log.Error("load mcp transport cache", slog.String("error", mcpTransportErr.Error()))
+	}
+
 	// Step 10: connect Redis (optional). On failure, continue without Redis.
 	redisCtx, redisCancel := context.WithCancel(context.Background())
 	var redisClient *voidredis.Client
@@ -565,19 +590,22 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	proxyHandler.MaxStreamDuration = cfg.Server.Proxy.MaxStreamDuration
 
 	adminHandler := &admin.Handler{
-		DB:            database,
-		HMACSecret:    hmacSecret,
-		EncryptionKey: encKey,
-		KeyCache:      keyCache,
-		Registry:      registry,
-		AccessCache:   accessCache,
-		AliasCache:    aliasCache,
-		Redis:         redisClient,
-		AuditLogger:   auditLogger,
-		License:       licHolder,
-		Log:           log,
-		SSOProvider:   ssoProvider,
-		SSOConfig:     cfg.Settings.SSO,
+		DB:                database,
+		HMACSecret:        hmacSecret,
+		EncryptionKey:     encKey,
+		KeyCache:          keyCache,
+		Registry:          registry,
+		AccessCache:       accessCache,
+		AliasCache:        aliasCache,
+		MCPServerCache:    mcpServerCache,
+		MCPAccessCache:    mcpAccessCache,
+		MCPTransportCache: mcpTransportCache,
+		Redis:             redisClient,
+		AuditLogger:       auditLogger,
+		License:           licHolder,
+		Log:               log,
+		SSOProvider:       ssoProvider,
+		SSOConfig:         cfg.Settings.SSO,
 	}
 	// Only assign the health checker when it was actually created — a typed nil
 	// (*health.Checker)(nil) satisfies the interface but is NOT == nil when
@@ -610,11 +638,12 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		adminHandler.CodeExecutor = mcp.NewExecutor(codePool)
 		toolStore = &dbToolStore{db: database}
 		httpFetcher := adminHandler.MakeToolFetcher()
-		adminHandler.ToolCache = mcp.NewPersistentToolCache(func(fetchCtx context.Context, alias string) ([]mcp.Tool, error) {
-			if alias == "voidllm" && builtinMCPServer != nil {
+		builtinServerID := builtinServer.ID
+		adminHandler.ToolCache = mcp.NewPersistentToolCache(func(fetchCtx context.Context, serverID string) ([]mcp.Tool, error) {
+			if serverID == builtinServerID && builtinMCPServer != nil {
 				return builtinMCPServer.Tools(), nil
 			}
-			return httpFetcher(fetchCtx, alias)
+			return httpFetcher(fetchCtx, serverID)
 		}, time.Hour, toolStore)
 		if loadErr := adminHandler.ToolCache.LoadFromStore(ctx); loadErr != nil {
 			log.WarnContext(ctx, "failed to load cached tools from DB", slog.String("error", loadErr.Error()))
@@ -641,6 +670,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		db:           database,
 		log:          log,
 		maxToolCalls: cfg.Settings.MCP.CodeMode.MaxToolCalls,
+		serverCache:  mcpServerCache,
 		codePool:     adminHandler.CodePool,
 	}
 
@@ -833,9 +863,9 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	builtinMCPServer = mcpServer
 	if adminHandler.ToolCache != nil {
 		builtinTools := mcpServer.Tools()
-		adminHandler.ToolCache.SetTools("voidllm", builtinTools)
+		adminHandler.ToolCache.SetTools(builtinServer.ID, builtinTools)
 		if toolStore != nil {
-			toolStore.Save(ctx, "voidllm", builtinTools) //nolint:errcheck
+			toolStore.Save(ctx, builtinServer.ID, builtinTools) //nolint:errcheck
 		}
 	}
 
@@ -867,31 +897,34 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 
 	success = true
 	return &Application{
-		cfg:             cfg,
-		log:             log,
-		devMode:         devMode,
-		licHolder:       licHolder,
-		rawLicenseKey:   licenseKey,
-		bootstrapResult: bootstrapResult,
-		database:        database,
-		encKey:          encKey,
-		hmacSecret:      hmacSecret,
-		registry:        registry,
-		keyCache:        keyCache,
-		accessCache:     accessCache,
-		aliasCache:      aliasCache,
-		rateLimiter:     rateLimiter,
-		tokenCounter:    tokenCounter,
-		usageLogger:     usageLogger,
-		mcpLogger:       mcpLogger,
-		auditLogger:     auditLogger,
-		healthChecker:   healthChecker,
-		shutdownState:   shutdownState,
-		proxyHandler:    proxyHandler,
-		adminHandler:    adminHandler,
-		redisClient:     redisClient,
-		redisCancel:     redisCancel,
-		otelShutdown:    otelShutdownFn,
+		cfg:               cfg,
+		log:               log,
+		devMode:           devMode,
+		licHolder:         licHolder,
+		rawLicenseKey:     licenseKey,
+		bootstrapResult:   bootstrapResult,
+		database:          database,
+		encKey:            encKey,
+		hmacSecret:        hmacSecret,
+		registry:          registry,
+		keyCache:          keyCache,
+		accessCache:       accessCache,
+		aliasCache:        aliasCache,
+		mcpServerCache:    mcpServerCache,
+		mcpAccessCache:    mcpAccessCache,
+		mcpTransportCache: mcpTransportCache,
+		rateLimiter:       rateLimiter,
+		tokenCounter:      tokenCounter,
+		usageLogger:       usageLogger,
+		mcpLogger:         mcpLogger,
+		auditLogger:       auditLogger,
+		healthChecker:     healthChecker,
+		shutdownState:     shutdownState,
+		proxyHandler:      proxyHandler,
+		adminHandler:      adminHandler,
+		redisClient:       redisClient,
+		redisCancel:       redisCancel,
+		otelShutdown:      otelShutdownFn,
 	}, nil
 }
 
@@ -937,6 +970,31 @@ func (a *Application) Start() error {
 			metrics.CacheSize.WithLabelValues("keys").Set(float64(a.keyCache.Len()))
 			metrics.CacheSize.WithLabelValues("access").Set(float64(a.accessCache.Len()))
 			metrics.CacheSize.WithLabelValues("aliases").Set(float64(a.aliasCache.Len()))
+			metrics.CacheSize.WithLabelValues("mcp_servers").Set(float64(a.mcpServerCache.Len()))
+			metrics.CacheSize.WithLabelValues("mcp_access").Set(float64(a.mcpAccessCache.Len()))
+			metrics.CacheSize.WithLabelValues("mcp_transports").Set(float64(a.mcpTransportCache.Len()))
+		}),
+		startTicker(30*time.Second, func() {
+			ctx1, cancel1 := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel1()
+			if servers, err := a.database.LoadAllActiveMCPServers(ctx1); err == nil {
+				a.mcpServerCache.LoadAll(servers)
+				a.mcpTransportCache.LoadAll(servers)
+			} else {
+				a.log.LogAttrs(context.Background(), slog.LevelError, "mcp server cache refresh failed",
+					slog.String("error", err.Error()),
+				)
+			}
+
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel2()
+			if orgA, teamA, keyA, err := a.database.LoadAllMCPAccess(ctx2); err == nil {
+				a.mcpAccessCache.Load(orgA, teamA, keyA)
+			} else {
+				a.log.LogAttrs(context.Background(), slog.LevelError, "mcp access cache refresh failed",
+					slog.String("error", err.Error()),
+				)
+			}
 		}),
 	)
 
@@ -1204,6 +1262,9 @@ func (a *Application) cleanup(ctx context.Context) {
 		}
 		shutdownCancel()
 	}
+
+	// Close all persistent MCP transports before closing the database.
+	a.mcpTransportCache.Close()
 
 	if err := a.database.Close(); err != nil {
 		a.log.LogAttrs(ctx, slog.LevelError, "database close error",

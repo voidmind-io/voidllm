@@ -1,10 +1,11 @@
 package proxy
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
 // AnthropicAdapter translates between the OpenAI chat completion wire format
@@ -18,11 +19,11 @@ type AnthropicAdapter struct {
 
 // anthropicMessage is the minimal parsed form of a single message in the
 // OpenAI messages array, used when extracting system prompts. Content is kept
-// as json.RawMessage because it may be either a plain string or a structured
+// as jsonx.RawMessage because it may be either a plain string or a structured
 // content-block array.
 type anthropicMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+	Role    string           `json:"role"`
+	Content jsonx.RawMessage `json:"content"`
 }
 
 // anthropicResponse is the shape of a non-streaming Anthropic Messages API
@@ -119,15 +120,15 @@ var openAIOnlyFields = []string{
 //   - Injects a default max_tokens of 4096 when the field is absent.
 //   - Removes fields that Anthropic does not accept.
 func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error) {
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(body, &doc); err != nil {
+	var doc map[string]jsonx.RawMessage
+	if err := jsonx.Unmarshal(body, &doc); err != nil {
 		return nil, fmt.Errorf("anthropic transform request: unmarshal body: %w", err)
 	}
 
 	// Extract and rewrite messages.
 	if raw, ok := doc["messages"]; ok {
 		var msgs []anthropicMessage
-		if err := json.Unmarshal(raw, &msgs); err != nil {
+		if err := jsonx.Unmarshal(raw, &msgs); err != nil {
 			return nil, fmt.Errorf("anthropic transform request: unmarshal messages: %w", err)
 		}
 
@@ -139,7 +140,7 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 				// Structured content-block arrays are never system messages
 				// and are skipped silently.
 				var textContent string
-				if err := json.Unmarshal(m.Content, &textContent); err == nil {
+				if err := jsonx.Unmarshal(m.Content, &textContent); err == nil {
 					systemParts = append(systemParts, textContent)
 				}
 				continue
@@ -149,18 +150,18 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 
 		if len(systemParts) > 0 {
 			systemText := strings.Join(systemParts, "\n")
-			systemJSON, err := json.Marshal(systemText)
+			systemJSON, err := jsonx.Marshal(systemText)
 			if err != nil {
 				return nil, fmt.Errorf("anthropic transform request: marshal system: %w", err)
 			}
-			doc["system"] = json.RawMessage(systemJSON)
+			doc["system"] = jsonx.RawMessage(systemJSON)
 		}
 
-		remainingJSON, err := json.Marshal(remaining)
+		remainingJSON, err := jsonx.Marshal(remaining)
 		if err != nil {
 			return nil, fmt.Errorf("anthropic transform request: marshal messages: %w", err)
 		}
-		doc["messages"] = json.RawMessage(remainingJSON)
+		doc["messages"] = jsonx.RawMessage(remainingJSON)
 	}
 
 	// Anthropic requires max_tokens. Accept max_completion_tokens as an
@@ -171,7 +172,7 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 			doc["max_tokens"] = mct
 			delete(doc, "max_completion_tokens")
 		} else {
-			doc["max_tokens"] = json.RawMessage("4096")
+			doc["max_tokens"] = jsonx.RawMessage("4096")
 		}
 	} else {
 		// max_tokens already present; remove max_completion_tokens if it
@@ -184,7 +185,7 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 		delete(doc, field)
 	}
 
-	out, err := json.Marshal(doc)
+	out, err := jsonx.Marshal(doc)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic transform request: marshal output: %w", err)
 	}
@@ -217,7 +218,7 @@ func (a *AnthropicAdapter) SetHeaders(req *http.Request, model Model) {
 // into an OpenAI chat completion response body.
 func (a *AnthropicAdapter) TransformResponse(body []byte) ([]byte, error) {
 	var ar anthropicResponse
-	if err := json.Unmarshal(body, &ar); err != nil {
+	if err := jsonx.Unmarshal(body, &ar); err != nil {
 		return nil, fmt.Errorf("anthropic transform response: unmarshal: %w", err)
 	}
 
@@ -251,7 +252,7 @@ func (a *AnthropicAdapter) TransformResponse(body []byte) ([]byte, error) {
 		},
 	}
 
-	out, err := json.Marshal(resp)
+	out, err := jsonx.Marshal(resp)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic transform response: marshal: %w", err)
 	}
@@ -287,15 +288,15 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) []byte {
 
 	payload := []byte(s[len(dataPrefix):])
 
-	var event map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &event); err != nil {
+	var event map[string]jsonx.RawMessage
+	if err := jsonx.Unmarshal(payload, &event); err != nil {
 		// Not valid JSON — pass through unchanged so the client can observe it.
 		return line
 	}
 
 	var eventType string
 	if raw, ok := event["type"]; ok {
-		_ = json.Unmarshal(raw, &eventType)
+		_ = jsonx.Unmarshal(raw, &eventType)
 	}
 
 	switch eventType {
@@ -309,7 +310,7 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) []byte {
 				} `json:"usage"`
 			} `json:"message"`
 		}
-		if err := json.Unmarshal(payload, &ms); err == nil {
+		if err := jsonx.Unmarshal(payload, &ms); err == nil {
 			if ms.Message.ID != "" {
 				a.msgID = ms.Message.ID
 			}
@@ -328,7 +329,7 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) []byte {
 				Text string `json:"text"`
 			} `json:"delta"`
 		}
-		if err := json.Unmarshal(payload, &cbd); err != nil || cbd.Delta.Type != "text_delta" {
+		if err := jsonx.Unmarshal(payload, &cbd); err != nil || cbd.Delta.Type != "text_delta" {
 			return nil
 		}
 		chunk := a.buildChunk(openAIChunkDelta{Content: cbd.Delta.Text}, nil)
@@ -343,7 +344,7 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) []byte {
 				OutputTokens int `json:"output_tokens"`
 			} `json:"usage"`
 		}
-		if err := json.Unmarshal(payload, &md); err != nil {
+		if err := jsonx.Unmarshal(payload, &md); err != nil {
 			return nil
 		}
 		a.outputTokens = md.Usage.OutputTokens
@@ -391,7 +392,7 @@ func (a *AnthropicAdapter) buildChunk(delta openAIChunkDelta, finishReason *stri
 			},
 		},
 	}
-	out, err := json.Marshal(chunk)
+	out, err := jsonx.Marshal(chunk)
 	if err != nil {
 		return nil
 	}

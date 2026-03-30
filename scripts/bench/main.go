@@ -26,9 +26,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	stdjson "encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -125,6 +129,14 @@ func main() {
 		mockMCP: mockMCP.URL(),
 		proxy:   proxyAddr,
 		apiKey:  apiKey,
+	}
+
+	// Grant MCP access: register the bench MCP server as org-scoped via API
+	// (YAML servers are global and require explicit org_mcp_access grants).
+	if err := registerOrgMCPServer(endpoints, mockMCP.URL()); err != nil {
+		if !*jsonOutput {
+			fmt.Fprintf(os.Stderr, "%sWARN: could not register org MCP server: %v%s\n", dim, err, reset)
+		}
 	}
 
 	if !*jsonOutput {
@@ -296,6 +308,70 @@ settings:
 		time.Sleep(2 * time.Second)
 		return addr, key, cmd, nil
 	}
+}
+
+// registerOrgMCPServer creates the bench MCP server as org-scoped via the
+// Admin API. Org-scoped servers don't need explicit org_mcp_access grants
+// (visibility = access), avoiding the closed-by-default restriction on global servers.
+func registerOrgMCPServer(ep *endpointSet, mcpURL string) error {
+	// 1. Get bootstrap org ID
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	req, err := http.NewRequest("GET", ep.proxy+"/api/v1/orgs", nil)
+	if err != nil {
+		return fmt.Errorf("build orgs request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+ep.apiKey)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("list orgs: %w", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("list orgs: status %d: %s", resp.StatusCode, body)
+	}
+
+	var orgsResp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := stdjson.Unmarshal(body, &orgsResp); err != nil {
+		return fmt.Errorf("parse orgs response: %w", err)
+	}
+	if len(orgsResp.Data) == 0 {
+		return fmt.Errorf("no organizations found")
+	}
+	orgID := orgsResp.Data[0].ID
+
+	// 2. Create org-scoped MCP server
+	createBody, _ := stdjson.Marshal(map[string]string{
+		"name":      "bench-mcp",
+		"alias":     "bench-org",
+		"url":       mcpURL,
+		"auth_type": "none",
+	})
+	req, err = http.NewRequest("POST", ep.proxy+"/api/v1/orgs/"+orgID+"/mcp-servers", bytes.NewReader(createBody))
+	if err != nil {
+		return fmt.Errorf("build create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+ep.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = client.Do(req)
+	if err != nil {
+		return fmt.Errorf("create mcp server: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 409 = alias already exists (idempotent re-run), treat as success.
+	if resp.StatusCode != 201 && resp.StatusCode != 409 {
+		body, _ = io.ReadAll(resp.Body)
+		return fmt.Errorf("create mcp server: status %d: %s", resp.StatusCode, body)
+	}
+
+	return nil
 }
 
 func printBanner(scenario string) {

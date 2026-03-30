@@ -181,15 +181,24 @@ func (d *DB) SetKeyMCPAccess(ctx context.Context, keyID string, serverIDs []stri
 }
 
 // CheckMCPAccess reports whether serverID is accessible for the given org, team, and key.
-// An empty allowlist at any level means "not configured" — all servers pass at that level.
-// The most-restrictive-wins rule is applied: org → team → key.
+//
+// Access policy (most-restrictive-wins, org → team → key):
+//   - Org level is CLOSED-by-default: an empty org allowlist means no global MCP
+//     servers are accessible. The org must explicitly list serverID to grant access.
+//   - Team level is OPEN-by-default (inherits from org): a team with no configured
+//     allowlist does not further restrict access. A non-empty team allowlist acts as
+//     an additional restriction — serverID must appear in it.
+//   - Key level is OPEN-by-default (inherits from team): same inheritance rule as
+//     the team level.
+//
 // A non-empty teamID is required for team-level enforcement; pass "" to skip that level.
 func (d *DB) CheckMCPAccess(ctx context.Context, orgID, teamID, keyID, serverID string) (bool, error) {
 	orgAccess, err := d.GetOrgMCPAccess(ctx, orgID)
 	if err != nil {
 		return false, fmt.Errorf("check mcp access: %w", err)
 	}
-	if len(orgAccess) > 0 && !slices.Contains(orgAccess, serverID) {
+	// Org level: CLOSED-by-default — empty allowlist denies access.
+	if len(orgAccess) == 0 || !slices.Contains(orgAccess, serverID) {
 		return false, nil
 	}
 
@@ -198,6 +207,7 @@ func (d *DB) CheckMCPAccess(ctx context.Context, orgID, teamID, keyID, serverID 
 		if err != nil {
 			return false, fmt.Errorf("check mcp access: %w", err)
 		}
+		// Team level: OPEN-by-default — only restrict when explicitly configured.
 		if len(teamAccess) > 0 && !slices.Contains(teamAccess, serverID) {
 			return false, nil
 		}
@@ -207,6 +217,7 @@ func (d *DB) CheckMCPAccess(ctx context.Context, orgID, teamID, keyID, serverID 
 	if err != nil {
 		return false, fmt.Errorf("check mcp access: %w", err)
 	}
+	// Key level: OPEN-by-default — only restrict when explicitly configured.
 	if len(keyAccess) > 0 && !slices.Contains(keyAccess, serverID) {
 		return false, nil
 	}

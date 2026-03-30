@@ -6,7 +6,6 @@ package health
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/voidmind-io/voidllm/internal/config"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 )
@@ -408,7 +408,7 @@ func probeFunctionalChat(ctx context.Context, client *http.Client, t probeTarget
 		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
 		"max_tokens": 1,
 	}
-	body, err := json.Marshal(payload)
+	body, err := jsonx.Marshal(payload)
 	if err != nil {
 		return 0, fmt.Errorf("marshal request: %w", err)
 	}
@@ -445,7 +445,7 @@ func probeEmbedding(ctx context.Context, client *http.Client, t probeTarget) (in
 		"model": t.modelName,
 		"input": "test",
 	}
-	body, err := json.Marshal(payload)
+	body, err := jsonx.Marshal(payload)
 	if err != nil {
 		return 0, fmt.Errorf("marshal request: %w", err)
 	}

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"sync"
 	"syscall"
 	"time"
@@ -204,7 +205,7 @@ func (t *HTTPTransport) ListTools(ctx context.Context) ([]Tool, error) {
 	}
 
 	// Initialize first to establish session
-	initReq, _ := json.Marshal(map[string]any{
+	initReq, _ := jsonx.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      0,
 		"method":  "initialize",
@@ -220,7 +221,7 @@ func (t *HTTPTransport) ListTools(ctx context.Context) ([]Tool, error) {
 	}
 
 	// Send notifications/initialized
-	notifyReq, _ := json.Marshal(map[string]any{
+	notifyReq, _ := jsonx.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"method":  "notifications/initialized",
 	})
@@ -229,10 +230,10 @@ func (t *HTTPTransport) ListTools(ctx context.Context) ([]Tool, error) {
 	// Now send tools/list
 	req := Request{
 		JSONRPC: "2.0",
-		ID:      json.RawMessage(`1`),
+		ID:      jsonx.RawMessage(`1`),
 		Method:  "tools/list",
 	}
-	raw, err := json.Marshal(req)
+	raw, err := jsonx.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal tools/list: %w", err)
 	}
@@ -251,7 +252,7 @@ func (t *HTTPTransport) ListTools(ctx context.Context) ([]Tool, error) {
 		} `json:"result"`
 		Error *Error `json:"error"`
 	}
-	if err := json.Unmarshal(resp, &rpcResp); err != nil {
+	if err := jsonx.Unmarshal(resp, &rpcResp); err != nil {
 		return nil, fmt.Errorf("decode tools/list response: %w", err)
 	}
 	if rpcResp.Error != nil {
@@ -265,7 +266,7 @@ func (t *HTTPTransport) ListTools(ctx context.Context) ([]Tool, error) {
 // Streamable HTTP (MCP 2025-03-26) or the older SSE transport. On success it
 // sets t.postURL and t.sseMode. Called via sync.Once from ListTools.
 func (t *HTTPTransport) detectTransport(ctx context.Context) error {
-	probe, _ := json.Marshal(map[string]any{
+	probe, _ := jsonx.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      0,
 		"method":  "initialize",

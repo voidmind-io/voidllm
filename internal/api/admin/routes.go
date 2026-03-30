@@ -127,6 +127,15 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 	api.Get("/orgs/:org_id/keys/:key_id/model-access", auth.RequireRole(auth.RoleOrgAdmin), handler.GetKeyModelAccess)
 	api.Put("/orgs/:org_id/keys/:key_id/model-access", auth.RequireRole(auth.RoleOrgAdmin), handler.SetKeyModelAccess)
 
+	// MCP Access Control
+	api.Get("/orgs/:org_id/mcp-access", auth.RequireRole(auth.RoleOrgAdmin), handler.GetOrgMCPAccess)
+	api.Put("/orgs/:org_id/mcp-access", auth.RequireRole(auth.RoleOrgAdmin), handler.SetOrgMCPAccess)
+	api.Get("/orgs/:org_id/teams/:team_id/mcp-access", auth.RequireRole(auth.RoleTeamAdmin), handler.GetTeamMCPAccess)
+	api.Put("/orgs/:org_id/teams/:team_id/mcp-access", auth.RequireRole(auth.RoleTeamAdmin), handler.SetTeamMCPAccess)
+	api.Get("/orgs/:org_id/keys/:key_id/mcp-access", auth.RequireRole(auth.RoleOrgAdmin), handler.GetKeyMCPAccess)
+	api.Put("/orgs/:org_id/keys/:key_id/mcp-access", auth.RequireRole(auth.RoleOrgAdmin), handler.SetKeyMCPAccess)
+	api.Get("/orgs/:org_id/available-mcp-servers", auth.RequireRole(auth.RoleOrgAdmin), handler.ListAvailableGlobalMCPServers)
+
 	// Model Aliases
 	api.Post("/orgs/:org_id/model-aliases", auth.RequireRole(auth.RoleOrgAdmin), handler.CreateOrgAlias)
 	api.Get("/orgs/:org_id/model-aliases", auth.RequireRole(auth.RoleOrgAdmin), handler.ListOrgAliases)
