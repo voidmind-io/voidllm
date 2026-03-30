@@ -10,6 +10,7 @@ import TeamDetailPage from './pages/TeamDetailPage'
 import TeamMembersTab from './pages/TeamMembersTab'
 import TeamModelsTab from './pages/TeamModelsTab'
 import TeamSettingsTab from './pages/TeamSettingsTab'
+import TeamMCPAccessTab from './pages/TeamMCPAccessTab'
 import OrganizationPage from './pages/OrganizationPage'
 import OrgUsersPage from './pages/OrgUsersPage'
 import OrganizationsPage from './pages/OrganizationsPage'
@@ -22,6 +23,7 @@ import SSOConfigPage from './pages/SSOConfigPage'
 import ServiceAccountsPage from './pages/ServiceAccountsPage'
 import ModelsLayout from './pages/ModelsLayout'
 import ModelsAccessTab from './pages/ModelsAccessTab'
+import MCPAccessTab from './pages/MCPAccessTab'
 import SettingsPage from './pages/SettingsPage'
 import LicensePage from './pages/LicensePage'
 import UsagePage from './pages/UsagePage'
@@ -80,6 +82,7 @@ export default function App() {
                 <Route index element={<Navigate to="members" replace />} />
                 <Route path="members" element={<TeamMembersTab />} />
                 <Route path="models" element={<TeamModelsTab />} />
+                <Route path="mcp-access" element={<TeamMCPAccessTab />} />
                 <Route path="settings" element={<TeamSettingsTab />} />
               </Route>
               <Route path="org" element={<OrganizationPage />}>
@@ -87,6 +90,7 @@ export default function App() {
                 <Route path="settings" element={<SettingsPage />} />
                 <Route path="users" element={<OrgUsersPage />} />
                 <Route path="models" element={<ModelsAccessTab />} />
+                <Route path="mcp-access" element={<MCPAccessTab />} />
               </Route>
               <Route path="service-accounts" element={<ServiceAccountsPage />} />
               <Route path="models" element={<ModelsLayout />} />

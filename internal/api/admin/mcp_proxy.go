@@ -80,7 +80,7 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	// control via the org/team/key MCP access tables. Org- and team-scoped
 	// servers are implicitly accessible to members of that scope — their
 	// visibility is already enforced by GetMCPServerByAliasScoped.
-	if server.OrgID == nil && server.TeamID == nil {
+	if server.OrgID == nil && server.TeamID == nil && !auth.HasRole(ki.Role, auth.RoleSystemAdmin) {
 		var allowed bool
 		if h.MCPAccessCache != nil {
 			allowed = h.MCPAccessCache.Check(ki.OrgID, ki.TeamID, ki.ID, server.ID)
@@ -425,7 +425,8 @@ func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias
 	}
 
 	// Global servers require explicit access control via the access tables.
-	if server.OrgID == nil && server.TeamID == nil {
+	// System admins bypass this check — they have unrestricted access.
+	if server.OrgID == nil && server.TeamID == nil && !auth.HasRole(ki.Role, auth.RoleSystemAdmin) {
 		var allowed bool
 		if h.MCPAccessCache != nil {
 			allowed = h.MCPAccessCache.Check(ki.OrgID, ki.TeamID, ki.ID, server.ID)

@@ -74,6 +74,8 @@ func (s *codeModeService) accessibleServers(ctx context.Context, codeModeOnly bo
 	// Filter global servers (OrgID == nil && TeamID == nil) to only those
 	// explicitly allowed via org/team/key access tables. Org- and team-scoped
 	// servers are implicitly accessible to members of that org/team.
+	// System admins bypass the access check — they have unrestricted access.
+	isSystemAdmin := ki.Role == auth.RoleSystemAdmin
 	accessible := make([]db.MCPServer, 0, len(servers))
 	for _, sv := range servers {
 		if sv.OrgID != nil || sv.TeamID != nil {
@@ -84,6 +86,12 @@ func (s *codeModeService) accessibleServers(ctx context.Context, codeModeOnly bo
 		}
 		// Built-in server is always accessible — no explicit MCP access entry needed.
 		if sv.Source == "builtin" {
+			if !codeModeOnly || sv.CodeModeEnabled {
+				accessible = append(accessible, sv)
+			}
+			continue
+		}
+		if isSystemAdmin {
 			if !codeModeOnly || sv.CodeModeEnabled {
 				accessible = append(accessible, sv)
 			}

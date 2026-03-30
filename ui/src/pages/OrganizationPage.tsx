@@ -14,6 +14,7 @@ export default function OrganizationPage() {
       ? [
           { label: 'Members', path: '/org/users' },
           { label: 'Models', path: '/org/models' },
+          { label: 'MCP Servers', path: '/org/mcp-access' },
         ]
       : []),
     { label: 'Settings', path: '/org/settings' },
