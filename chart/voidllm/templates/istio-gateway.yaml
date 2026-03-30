@@ -1,0 +1,13 @@
+{{- if and .Values.istio.enabled (not .Values.istio.gateway.name) }}
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: {{ include "voidllm.fullname" . }}
+  labels:
+    {{- include "voidllm.labels" . | nindent 4 }}
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    {{- toYaml .Values.istio.gateway.servers | nindent 4 }}
+{{- end }}

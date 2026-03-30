@@ -188,3 +188,86 @@ settings:
   # Soft limit behavior: warn in logs when a key/team/org is approaching their limit
   # Hard limits are always enforced via DB aggregate
   soft_limit_threshold: 0.9   # Warn at 90% of limit
+
+  # MCP Gateway settings
+  mcp:
+    call_timeout: 30s             # Timeout for proxied MCP tool calls
+    allow_private_urls: false     # Block MCP servers on private/loopback IPs
+    code_mode:
+      enabled: false              # Enable WASM-sandboxed JS execution
+      memory_limit_mb: 16         # Memory limit per execution
+      timeout: 30s                # Execution timeout
+      pool_size: 8                # WASM runtime pool size
+      max_tool_calls: 50          # Max tool calls per execution
+
+  # Health checks
+  health_check:
+    health:
+      enabled: true
+      interval: 30s
+    functional:
+      enabled: true
+      interval: 5m
+
+  # --- Enterprise Features (require license) ---
+
+  # Audit logging
+  # audit:
+  #   enabled: true
+  #   buffer_size: 500
+  #   flush_interval: 5s
+
+  # Circuit breaker for upstream providers
+  # circuit_breaker:
+  #   enabled: true
+  #   threshold: 5
+  #   timeout: 30s
+  #   half_open_max: 1
+
+  # OpenTelemetry tracing
+  # otel:
+  #   enabled: true
+  #   endpoint: "localhost:4317"
+  #   insecure: false
+  #   sample_rate: 1.0
+
+  # SSO/OIDC authentication
+  # sso:
+  #   enabled: true
+  #   issuer: "https://accounts.google.com"
+  #   client_id: ${VOIDLLM_SSO_CLIENT_ID}
+  #   client_secret: ${VOIDLLM_SSO_CLIENT_SECRET}
+  #   redirect_url: "https://voidllm.company.com/api/v1/auth/oidc/callback"
+  #   scopes: ["openid", "email", "profile"]
+  #   allowed_domains: ["company.com"]
+  #   default_role: "member"
+  #   auto_provision: true
+
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+logging:
+  level: info                     # debug, info, warn, error
+  format: json                    # json or text
+
+
+# =============================================================================
+# MCP SERVERS (optional)
+# =============================================================================
+# External MCP servers to register at startup.
+# Servers can also be managed via the Admin API (stored in DB).
+# Global servers require explicit org-level access (closed-by-default).
+
+# mcp_servers:
+#   - name: GitHub
+#     alias: github
+#     url: https://mcp.github.com/sse
+#     auth_type: bearer
+#     auth_token: ${GITHUB_TOKEN}
+#
+#   - name: Internal Tools
+#     alias: tools
+#     url: http://internal-mcp:3000
+#     auth_type: none

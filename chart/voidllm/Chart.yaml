@@ -2,11 +2,11 @@ apiVersion: v2
 name: voidllm
 description: Lightweight, performance-first LLM proxy with org/team/user hierarchy
 type: application
-version: 0.3.0
-appVersion: "0.3.0"
+version: 0.0.8
+appVersion: "0.0.8"
 home: https://voidllm.ai
 sources:
-  - https://github.com/voidmind/voidllm
+  - https://github.com/voidmind-io/voidllm
 maintainers:
   - name: VoidMind
     url: https://voidmind.io

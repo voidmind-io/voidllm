@@ -1,6 +1,6 @@
 services:
   voidllm:
-    image: voidmind/voidllm:latest
+    image: ghcr.io/voidmind-io/voidllm:latest
     ports:
       - "8080:8080"
     volumes:

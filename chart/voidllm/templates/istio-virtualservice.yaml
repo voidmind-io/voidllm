@@ -1,0 +1,23 @@
+{{- if .Values.istio.enabled }}
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: {{ include "voidllm.fullname" . }}
+  labels:
+    {{- include "voidllm.labels" . | nindent 4 }}
+spec:
+  hosts:
+    {{- toYaml .Values.istio.virtualService.hosts | nindent 4 }}
+  gateways:
+    {{- if .Values.istio.gateway.name }}
+    - {{ if .Values.istio.gateway.namespace }}{{ .Values.istio.gateway.namespace }}/{{ end }}{{ .Values.istio.gateway.name }}
+    {{- else }}
+    - {{ include "voidllm.fullname" . }}
+    {{- end }}
+  http:
+    - route:
+        - destination:
+            host: {{ include "voidllm.fullname" . }}
+            port:
+              number: {{ .Values.service.port }}
+{{- end }}

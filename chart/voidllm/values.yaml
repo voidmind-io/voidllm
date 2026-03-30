@@ -2,7 +2,7 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/voidmind/voidllm
+  repository: ghcr.io/voidmind-io/voidllm
   # -- Overrides the image tag (default: Chart appVersion)
   tag: ""
   pullPolicy: IfNotPresent
@@ -105,6 +105,33 @@ config:
       autoProvision: true
       groupSync: false
       groupClaim: "groups"
+    mcp:
+      # -- MCP tool call timeout
+      callTimeout: 30s
+      # -- Allow MCP servers on private/loopback IPs (disable for production)
+      allowPrivateUrls: false
+      codeMode:
+        # -- Enable Code Mode (WASM-sandboxed JS execution for MCP tool orchestration)
+        enabled: false
+        memoryLimitMb: 16
+        timeout: 30s
+        poolSize: 8
+        maxToolCalls: 50
+    healthCheck:
+      health:
+        enabled: true
+        interval: 30s
+      functional:
+        enabled: true
+        interval: 5m
+
+  # -- Static MCP server definitions (optional — can be managed via Admin API)
+  mcpServers: []
+  # - name: GitHub
+  #   alias: github
+  #   url: https://mcp.github.com/sse
+  #   auth_type: bearer
+  #   auth_token: ${GITHUB_TOKEN}
 
   # -- Static model definitions (optional — can be managed via Admin API)
   models: []
@@ -201,6 +228,35 @@ securityContext:
   readOnlyRootFilesystem: true
   capabilities:
     drop: [ALL]
+
+# ---------------------------------------------------------------------------
+# Optional subcharts
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Istio (optional)
+# ---------------------------------------------------------------------------
+istio:
+  # -- Enable Istio VirtualService (and optionally Gateway) resources
+  enabled: false
+  gateway:
+    # -- Name of an existing Gateway. Leave empty to create one.
+    name: ""
+    # -- Namespace of existing Gateway (default: release namespace)
+    namespace: ""
+    servers:
+      - port:
+          number: 443
+          name: https
+          protocol: HTTPS
+        tls:
+          mode: SIMPLE
+          credentialName: voidllm-tls
+        hosts:
+          - voidllm.example.com
+  virtualService:
+    hosts:
+      - voidllm.example.com
 
 # ---------------------------------------------------------------------------
 # Optional subcharts
