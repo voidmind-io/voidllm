@@ -1,0 +1,28 @@
+apiVersion: v1
+entries:
+  voidllm:
+  - apiVersion: v2
+    appVersion: 0.0.9
+    created: "2026-04-01T01:35:22.744062756+02:00"
+    description: Lightweight, performance-first LLM proxy with org/team/user hierarchy
+    digest: 94a37a3faffdca735e7fc761a5582f5c22938384206fe7f42b64119f4e708eb1
+    home: https://voidllm.ai
+    keywords:
+    - llm
+    - proxy
+    - ai
+    - openai
+    - anthropic
+    - vllm
+    - ollama
+    maintainers:
+    - name: VoidMind
+      url: https://voidmind.io
+    name: voidllm
+    sources:
+    - https://github.com/voidmind-io/voidllm
+    type: application
+    urls:
+    - https://voidmind-io.github.io/voidllm/voidllm-0.0.9.tgz
+    version: 0.0.9
+generated: "2026-04-01T01:35:22.743461172+02:00"
