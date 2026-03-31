@@ -95,25 +95,33 @@ Any OpenAI-compatible SDK works out of the box — just change the base URL to y
 - **Code Mode** — LLMs write JavaScript to orchestrate multiple MCP tool calls in one WASM-sandboxed execution
 - **Graceful shutdown** — phased drain, in-flight request tracking, K8s-ready
 
-### Pro ($299/mo)
+### Pro ($49/mo)
 
 - Cost reports with model breakdown and daily trends
 - Usage export (CSV)
 - Extended data retention
 - Priority email support
 
-### Enterprise ($799/mo)
+### Enterprise ($149/mo)
 
-- **SSO / OIDC** — Google, Azure AD, Okta, Keycloak, any OIDC provider
-- **Per-org SSO config** — each organization gets its own Identity Provider
-- **Auto-provisioning** — users created automatically from allowed email domains
-- **Group sync** — OIDC groups → VoidLLM teams
-- **Audit logs** — every admin action logged, filterable API + UI
-- **OpenTelemetry tracing** — OTLP/gRPC export to Jaeger, Tempo, Datadog
-- **Request ID correlation** — trace a single request across the proxy, logs, usage, audit, upstream
+- **SSO / OIDC** - Google, Azure AD, Okta, Keycloak, any OIDC provider
+- **Per-org SSO config** - each organization gets its own Identity Provider
+- **Auto-provisioning** - users created automatically from allowed email domains
+- **Group sync** - OIDC groups -> VoidLLM teams
+- **Audit logs** - every admin action logged, filterable API + UI
+- **OpenTelemetry tracing** - OTLP/gRPC export to Jaeger, Tempo, Datadog
+- **Request ID correlation** - trace a single request across the proxy, logs, usage, audit, upstream
 - Dedicated Slack support
 
-Flat pricing — no per-user fees, no per-request charges. Self-hosted on your infrastructure.
+### Founding Member ($999 one-time)
+
+- All Enterprise features - current and future
+- Lifetime license - no recurring fees
+- Product Advisory Board membership
+- Direct founder access + priority support
+- Limited spots available
+
+Flat pricing - no per-user fees, no per-request charges. Self-hosted on your infrastructure.
 
 ---
 
