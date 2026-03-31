@@ -54,7 +54,19 @@ docker run -p 8080:8080 \
   ghcr.io/voidmind-io/voidllm:latest
 ```
 
-Open `http://localhost:8080` — log in, create API keys, start proxying.
+On first start, VoidLLM prints your credentials to stdout:
+
+```
+========================================
+ BOOTSTRAP COMPLETE - COPY THESE NOW
+========================================
+  API Key:    vl_uk_a3f2...
+  Email:      admin@voidllm.local
+  Password:   <random>
+========================================
+```
+
+Open `http://localhost:8080`, log in with the email and password above, and start proxying. The API key is used for SDK calls (`Authorization: Bearer vl_uk_...`). These credentials are shown once - save them.
 
 ### One-Click Deploy
 
