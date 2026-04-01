@@ -8,7 +8,7 @@ license key — the same binary, just unlocked.
 
 ### Obtain a License
 
-Purchase a Pro or Enterprise subscription at [voidllm.ai/pricing](https://voidllm.ai/pricing).
+Purchase a Pro or Enterprise subscription at [voidllm.ai](https://voidllm.ai/#pricing).
 You'll receive a license key — a signed JWT that encodes your plan, features, and limits.
 
 ### Activate
