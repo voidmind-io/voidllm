@@ -5,6 +5,8 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/voidmind-io/voidllm)](https://goreportcard.com/report/github.com/voidmind-io/voidllm)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/voidllm)](https://artifacthub.io/packages/search?repo=voidllm)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/voidmind-io/voidllm/badge)](https://securityscorecards.dev/viewer/?uri=github.com/voidmind-io/voidllm)
+[![FOSSA License](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fvoidmind-io%2Fvoidllm.svg?type=shield&issueType=license)](https://app.fossa.com/projects/git%2Bgithub.com%2Fvoidmind-io%2Fvoidllm?ref=badge_shield&issueType=license)
+[![FOSSA Security](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fvoidmind-io%2Fvoidllm.svg?type=shield&issueType=security)](https://app.fossa.com/projects/git%2Bgithub.com%2Fvoidmind-io%2Fvoidllm?ref=badge_shield&issueType=security)
 [![Release](https://img.shields.io/github/v/release/voidmind-io/voidllm)](https://github.com/voidmind-io/voidllm/releases/latest)
 [![Go](https://img.shields.io/github/go-mod/go-version/voidmind-io/voidllm)](go.mod)
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL_1.1-blue.svg)](LICENSE)
