@@ -15,6 +15,8 @@ jobs:
       contents: read
       packages: write
       id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -32,7 +34,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -43,3 +47,25 @@ jobs:
             ghcr.io/voidmind-io/voidllm:latest
           cache-from: type=gha
           cache-to: type=gha,mode=min
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign container image
+        run: |
+          cosign sign --yes \
+            ghcr.io/voidmind-io/voidllm@${{ steps.build.outputs.digest }}
+
+  provenance:
+    needs: docker
+    permissions:
+      actions: read
+      id-token: write
+      packages: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
+    with:
+      image: ghcr.io/voidmind-io/voidllm
+      digest: ${{ needs.docker.outputs.digest }}
+    secrets:
+      registry-username: ${{ github.actor }}
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
