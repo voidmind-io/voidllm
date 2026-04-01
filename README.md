@@ -8,6 +8,7 @@
 [![Release](https://img.shields.io/github/v/release/voidmind-io/voidllm)](https://github.com/voidmind-io/voidllm/releases/latest)
 [![Go](https://img.shields.io/github/go-mod/go-version/voidmind-io/voidllm)](go.mod)
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL_1.1-blue.svg)](LICENSE)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fvoidmind-io%2Fvoidllm.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fvoidmind-io%2Fvoidllm?ref=badge_shield)
 
 **A privacy-first LLM proxy and AI gateway for teams that take control seriously.**
 
@@ -324,6 +325,9 @@ voidllm migrate --from sqlite:///data/voidllm.db --to postgres://user:pass@host/
 # License management (for Enterprise)
 voidllm license verify < license.jwt
 ```
+
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fvoidmind-io%2Fvoidllm.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fvoidmind-io%2Fvoidllm?ref=badge_large)
 
 ## License
 
