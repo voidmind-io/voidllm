@@ -1,20 +1,36 @@
 apiVersion: v2
 name: voidllm
-description: Lightweight, performance-first LLM proxy with org/team/user hierarchy
+description: Privacy-first LLM proxy and AI gateway with load balancing, RBAC, MCP gateway, and built-in admin UI. Self-hosted, single binary, sub-500us overhead.
 type: application
-version: 0.0.9
-appVersion: "0.0.9"
+version: 0.0.10
+appVersion: "0.0.10"
 home: https://voidllm.ai
+icon: https://voidllm.ai/logo.svg
 sources:
   - https://github.com/voidmind-io/voidllm
 maintainers:
   - name: VoidMind
+    email: hello@voidmind.io
     url: https://voidmind.io
+annotations:
+  artifacthub.io/license: BUSL-1.1
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://github.com/voidmind-io/voidllm/tree/main/docs
+    - name: Blog
+      url: https://voidllm.ai/blog
+  artifacthub.io/signKey: ""
 keywords:
   - llm
   - proxy
   - ai
   - openai
   - anthropic
+  - azure
   - vllm
   - ollama
+  - ai-gateway
+  - llm-proxy
+  - mcp
+  - privacy
+  - rbac

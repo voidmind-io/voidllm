@@ -213,10 +213,11 @@ This connects your IDE (Claude Code, Cursor, Windsurf) to the Code Mode endpoint
 
 ## Documentation
 
-- **[Configuration Reference](docs/configuration.md)** — all YAML settings with examples
-- **[Deployment Guide](docs/deployment.md)** — Docker, Helm, Kubernetes, PostgreSQL, Redis
-- **[API Reference](docs/api.md)** — all proxy and admin API endpoints
-- **[Enterprise Guide](docs/enterprise.md)** — SSO setup, license activation, audit logs, OTel
+- **[Blog](https://voidllm.ai/blog)** - architecture deep-dives, getting started guides, benchmarks
+- **[Configuration Reference](docs/configuration.md)** - all YAML settings with examples
+- **[Deployment Guide](docs/deployment.md)** - Docker, Helm, Kubernetes, PostgreSQL, Redis
+- **[API Reference](docs/api.md)** - all proxy and admin API endpoints
+- **[Enterprise Guide](docs/enterprise.md)** - SSO setup, license activation, audit logs, OTel
 
 ## Configuration
 

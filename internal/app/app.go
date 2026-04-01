@@ -526,7 +526,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			cfg.Settings.OTel.Endpoint,
 			cfg.Settings.OTel.Insecure,
 			*cfg.Settings.OTel.SampleRate,
-			"voidllm", "0.3.0",
+			"voidllm", apihealth.Version,
 		)
 		if setupErr != nil {
 			log.LogAttrs(ctx, slog.LevelWarn, "otel setup failed, tracing disabled",

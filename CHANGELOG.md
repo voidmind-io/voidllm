@@ -2,7 +2,24 @@
 
 All notable changes to VoidLLM are documented in this file.
 
-## [0.0.9] — 2026-03-30
+## [0.0.10] - 2026-04-01
+
+### Helm Chart
+- Published to [Artifact Hub](https://artifacthub.io/packages/helm/voidllm/voidllm)
+- Chart README with quick start and configuration examples
+- Added icon, keywords, license annotation, documentation links
+
+### Documentation
+- Bootstrap credentials clarified in README Quick Start
+- Artifact Hub badge added to README
+- New pricing: Pro $49/mo, Enterprise $149/mo, Founding Member $999 lifetime
+
+### Fixes
+- OTel service version now uses build-time version instead of hardcoded value
+
+---
+
+## [0.0.9] - 2026-03-30
 
 ### Docker, Helm & Configuration
 
