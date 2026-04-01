@@ -1,3 +1,9 @@
+---
+title: "Configuration Reference"
+description: "All VoidLLM YAML configuration options with examples"
+section: root
+order: 2
+---
 # Configuration Reference
 
 VoidLLM is configured via a YAML file. By default it looks for `voidllm.yaml` in the current directory, or pass `--config /path/to/config.yaml`.
@@ -69,7 +75,7 @@ models:
     provider: azure
     base_url: https://mycompany.openai.azure.com
     api_key: ${AZURE_KEY}
-    azure_deployment: gpt-4o
+    azure_deployment: my-gpt4o-deployment   # your Azure deployment name, not the model name
     azure_api_version: "2024-10-21"
 ```
 
@@ -95,14 +101,14 @@ models:
         provider: azure
         base_url: https://eastus.openai.azure.com
         api_key: ${AZURE_EAST_KEY}
-        azure_deployment: gpt-4o
+        azure_deployment: my-gpt4o-deployment   # your Azure deployment name, not the model name
         weight: 2                # For weighted strategy
         priority: 1              # For priority strategy (lower = higher)
       - name: azure-west
         provider: azure
         base_url: https://westus.openai.azure.com
         api_key: ${AZURE_WEST_KEY}
-        azure_deployment: gpt-4o
+        azure_deployment: my-gpt4o-deployment   # your Azure deployment name, not the model name
         weight: 1
         priority: 2
       - name: openai-fallback
@@ -309,7 +315,7 @@ settings:
 ## Enterprise Features
 
 The following features require a license key. See the
-[Enterprise Guide](enterprise.md) for setup instructions.
+[Enterprise documentation](enterprise/license.md) for setup instructions.
 
 ### Redis (Enterprise)
 

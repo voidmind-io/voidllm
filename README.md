@@ -214,11 +214,22 @@ This connects your IDE (Claude Code, Cursor, Windsurf) to the Code Mode endpoint
 
 ## Documentation
 
-- **[Blog](https://voidllm.ai/blog)** - architecture deep-dives, getting started guides, benchmarks
-- **[Configuration Reference](docs/configuration.md)** - all YAML settings with examples
-- **[Deployment Guide](docs/deployment.md)** - Docker, Helm, Kubernetes, PostgreSQL, Redis
-- **[API Reference](docs/api.md)** - all proxy and admin API endpoints
-- **[Enterprise Guide](docs/enterprise.md)** - SSO setup, license activation, audit logs, OTel
+**[Full documentation](docs/index.md)** | **[Blog](https://voidllm.ai/blog)** | **[FAQ](https://voidllm.ai/faq)**
+
+| Topic | Guide |
+|---|---|
+| Getting Started | [Quick Start](docs/getting-started.md) |
+| Configuration | [All YAML settings](docs/configuration.md) |
+| Docker | [Docker deployment](docs/deployment/docker.md) |
+| Kubernetes | [Helm chart](docs/deployment/kubernetes.md) |
+| Providers | [OpenAI, Anthropic, Azure, Ollama, vLLM](docs/models/providers.md) |
+| Load Balancing | [Strategies, failover, circuit breakers](docs/models/load-balancing.md) |
+| MCP Gateway | [Overview](docs/mcp/overview.md) - [Servers](docs/mcp/servers.md) - [Code Mode](docs/mcp/code-mode.md) - [IDE Setup](docs/mcp/ide-integration.md) |
+| RBAC | [Roles and permissions](docs/security/rbac.md) |
+| Privacy | [Zero-knowledge architecture](docs/security/privacy.md) |
+| API Reference | [Endpoints and error codes](docs/api/overview.md) |
+| Enterprise | [License](docs/enterprise/license.md) - [SSO](docs/enterprise/sso.md) - [Audit](docs/enterprise/audit.md) - [OTel](docs/enterprise/otel.md) - [Pricing](docs/enterprise/pricing.md) |
+| Troubleshooting | [Common issues](docs/troubleshooting.md) |
 
 ## Configuration
 
