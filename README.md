@@ -12,7 +12,7 @@
 
 **A privacy-first LLM proxy and AI gateway for teams that take control seriously.**
 
-VoidLLM is a self-hosted LLM proxy that sits between your applications and LLM providers — OpenAI, Anthropic, Azure, Ollama, vLLM, or any custom endpoint. It gives you organization-wide access control, API key management, usage tracking, rate limiting, and multi-deployment load balancing. One Go binary, sub-2ms proxy overhead, zero knowledge of your prompts.
+VoidLLM is a self-hosted LLM proxy that sits between your applications and LLM providers - OpenAI, Anthropic, Azure, Ollama, vLLM, or any custom endpoint. It gives you organization-wide access control, API key management, usage tracking, rate limiting, and multi-deployment load balancing. One Go binary, sub-2ms proxy overhead, zero knowledge of your prompts.
 
 ![VoidLLM Dashboard](docs/screenshots/VoidLLM-Dashboard.jpg)
 
@@ -25,7 +25,7 @@ VoidLLM is a self-hosted LLM proxy that sits between your applications and LLM p
 
 </details>
 
-> **Privacy-First by Design:** VoidLLM is a zero-knowledge LLM proxy — it never stores, logs, or persists any prompt or response content. Not as a setting you can toggle — by architecture. Only metadata is tracked: who made the request, which model, how many tokens, how long it took. Your data stays yours. GDPR-compliant from day one.
+> **Privacy-First by Design:** VoidLLM is a zero-knowledge LLM proxy - it never stores, logs, or persists any prompt or response content. Not as a setting you can toggle - by architecture. Only metadata is tracked: who made the request, which model, how many tokens, how long it took. Your data stays yours.
 
 ---
 
@@ -36,9 +36,9 @@ VoidLLM is a self-hosted LLM proxy that sits between your applications and LLM p
 | Teams share raw API keys in Slack | Virtual keys with org/team/user scoping and RBAC |
 | No visibility into who's spending what | Per-key, per-team, per-org usage tracking + cost estimation |
 | One runaway script burns the monthly budget | Rate limits + token budgets enforced by the proxy at every level |
-| Switching providers means changing every app | Model aliases — clients call `default`, the proxy routes it anywhere |
+| Switching providers means changing every app | Model aliases - clients call `default`, the proxy routes it anywhere |
 | Provider goes down, everything breaks | Multi-deployment load balancing with automatic failover |
-| Existing proxies log your prompts | Zero-knowledge proxy architecture — content never touches disk |
+| Existing proxies log your prompts | Zero-knowledge proxy architecture - content never touches disk |
 
 ## Quick Start
 
@@ -83,57 +83,44 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model":"default","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Any OpenAI-compatible SDK works out of the box — just change the base URL to your VoidLLM proxy.
+Any OpenAI-compatible SDK works out of the box - just change the base URL to your VoidLLM proxy.
 
 ## Features
 
-### LLM Proxy — Community (free)
+| Feature | Details |
+|---|---|
+| OpenAI-compatible proxy | `/v1/chat/completions`, embeddings, images, audio, streaming |
+| Multi-provider routing | OpenAI, Anthropic, Azure, Ollama, vLLM, any custom endpoint |
+| Load balancing | Round-robin, least-latency, weighted, priority across deployments |
+| Automatic failover | Retry on 5xx/timeout, circuit breakers, health-aware routing |
+| Web UI | Dashboard, playground, API keys, teams, models, usage, settings |
+| RBAC | Org > Team > User > Key hierarchy, 4 roles |
+| Rate limits | Requests per minute/day, most-restrictive-wins across levels |
+| Token budgets | Daily/monthly limits, real-time enforcement |
+| Usage tracking | Tokens, cost, duration, TTFT per request |
+| Model aliases | Clients call `default`, you control where it routes |
+| MCP gateway | Proxy external MCP servers with access control and session management |
+| Code Mode | WASM-sandboxed JS for multi-tool orchestration |
+| Prometheus metrics | Latency, tokens, active streams, routing, health |
+| Database | SQLite (default) or PostgreSQL |
+| Deployment | Docker, Helm chart, graceful shutdown |
+| | |
+| **Pro ($49/mo)** | **Everything above, plus:** |
+| Cost reports | Model breakdown, daily trends |
+| Usage export | CSV download |
+| Data retention | Extended |
+| Support | Priority email |
+| | |
+| **Enterprise ($149/mo)** | **Everything in Pro, plus:** |
+| SSO / OIDC | Google, Azure AD, Okta, Keycloak, any provider |
+| Per-org SSO | Each organization gets its own Identity Provider |
+| Auto-provisioning | Users created from allowed email domains |
+| Group sync | OIDC groups mapped to VoidLLM teams |
+| Audit logs | Every admin action, filterable API + UI |
+| OpenTelemetry | OTLP/gRPC export, request ID correlation |
+| Support | Dedicated Slack |
 
-- **OpenAI-compatible proxy** — `/v1/chat/completions`, embeddings, images, audio
-- **Multi-provider routing** — Anthropic, Azure OpenAI, Ollama, vLLM, OpenAI, any custom endpoint
-- **Load balancing** — multi-deployment models with round-robin, least-latency, weighted, or priority routing
-- **Automatic failover** — retry on 5xx/timeout, per-deployment circuit breakers, health-aware routing
-- **Full Web UI** — dashboard, playground, API key management, teams, models, usage, settings
-- **Org → Team → User → Key hierarchy** with RBAC (system_admin, org_admin, team_admin, member)
-- **Rate limiting** — requests per minute/day, most-restrictive-wins across org/team/key
-- **Token budgets** — daily/monthly limits, enforced in real-time by the proxy
-- **Usage tracking** — tokens, cost, duration, TTFT — async, never blocks the proxy
-- **Model aliases** — clients call `default`, you decide where the proxy routes it
-- **Per-model timeouts** and **circuit breakers** for upstream resilience
-- **Prometheus metrics** — proxy latency, tokens, active streams, routing retries, health status
-- **Streaming (SSE)** — transparent proxy pass-through with per-chunk usage extraction
-- **SQLite or PostgreSQL** — zero-dep default or production-grade
-- **Helm chart** — production-ready Kubernetes deployment
-- **MCP gateway** — proxy and manage external MCP servers with access control, session management, and usage tracking
-- **MCP tools** — built-in management tools for IDE integration (Claude Code, Cursor, Windsurf)
-- **Code Mode** — LLMs write JavaScript to orchestrate multiple MCP tool calls in one WASM-sandboxed execution
-- **Graceful shutdown** — phased drain, in-flight request tracking, K8s-ready
-
-### Pro ($49/mo)
-
-- Cost reports with model breakdown and daily trends
-- Usage export (CSV)
-- Extended data retention
-- Priority email support
-
-### Enterprise ($149/mo)
-
-- **SSO / OIDC** - Google, Azure AD, Okta, Keycloak, any OIDC provider
-- **Per-org SSO config** - each organization gets its own Identity Provider
-- **Auto-provisioning** - users created automatically from allowed email domains
-- **Group sync** - OIDC groups -> VoidLLM teams
-- **Audit logs** - every admin action logged, filterable API + UI
-- **OpenTelemetry tracing** - OTLP/gRPC export to Jaeger, Tempo, Datadog
-- **Request ID correlation** - trace a single request across the proxy, logs, usage, audit, upstream
-- Dedicated Slack support
-
-### Founding Member ($999 one-time)
-
-- All Enterprise features - current and future
-- Lifetime license - no recurring fees
-- Product Advisory Board membership
-- Direct founder access + priority support
-- Limited spots available
+**Founding Member ($999 one-time):** All Enterprise features, lifetime license, Product Advisory Board, direct founder access. Limited spots.
 
 Flat pricing - no per-user fees, no per-request charges. Self-hosted on your infrastructure.
 
@@ -141,7 +128,7 @@ Flat pricing - no per-user fees, no per-request charges. Self-hosted on your inf
 
 ## MCP Gateway
 
-VoidLLM is an [MCP](https://modelcontextprotocol.io) gateway — it exposes built-in management tools and proxies requests to external MCP servers with access control, usage tracking, and automatic session management.
+VoidLLM is an [MCP](https://modelcontextprotocol.io) gateway - it exposes built-in management tools and proxies requests to external MCP servers with access control, usage tracking, and automatic session management.
 
 ### Built-in Tools
 
@@ -156,15 +143,11 @@ VoidLLM is an [MCP](https://modelcontextprotocol.io) gateway — it exposes buil
 
 ### External MCP Servers
 
-Register external MCP servers via the Admin UI or API. VoidLLM proxies tool calls through `/api/v1/mcp/:alias` with:
-- **Scoped access control** — global, org, or team level
-- **Session management** — automatic initialize + session ID forwarding
-- **Usage tracking** — who called which tool, when, how long
-- **Prometheus metrics** — tool call counts, duration, errors
+Register external MCP servers via the Admin UI or API. VoidLLM proxies tool calls through `/api/v1/mcp/:alias` with scoped access control (global, org, or team level), automatic session management, usage tracking, and Prometheus metrics.
 
 ### Code Mode
 
-Code Mode lets LLMs write JavaScript that orchestrates multiple MCP tool calls in a single execution — instead of one tool call per LLM turn. The JS runs in a WASM-sandboxed QuickJS runtime with no filesystem, no network, and no host access. Reduces token usage by 30-80%.
+Code Mode lets LLMs write JavaScript that orchestrates multiple MCP tool calls in a single execution - instead of one tool call per LLM turn. The JS runs in a WASM-sandboxed QuickJS runtime with no filesystem, no network, and no host access. Reduces token usage by 30-80%.
 
 ```yaml
 mcp:
@@ -206,9 +189,9 @@ This connects your IDE (Claude Code, Cursor, Windsurf) to the Code Mode endpoint
 
 ### Known Limitations
 
-- **SSE transport not supported** — MCP servers using the deprecated SSE protocol (pre 2025-03-26 spec) are auto-detected and deactivated. Use servers that support Streamable HTTP.
-- **No OAuth for upstream MCP servers** — servers requiring per-user OAuth (Jira, Slack, Google) are not yet supported. API key and header auth work.
-- **Single instance only** — Code Mode's WASM runtime pool is in-memory. Multi-pod deployments require Redis support (coming soon).
+- **SSE transport not supported** - MCP servers using the deprecated SSE protocol (pre 2025-03-26 spec) are auto-detected and deactivated. Use servers that support Streamable HTTP.
+- **No OAuth for upstream MCP servers** - servers requiring per-user OAuth (Jira, Slack, Google) are not yet supported. API key and header auth work.
+- **Single instance only** - Code Mode's WASM runtime pool is in-memory. Multi-pod deployments require Redis support (coming soon).
 
 ---
 
@@ -249,7 +232,7 @@ models:
       input_per_1m: 0.15
       output_per_1m: 0.60
 
-  # Load balanced — multiple deployments with failover
+  # Load balanced - multiple deployments with failover
   - name: gpt-4o
     strategy: round-robin
     aliases: [smart]
@@ -322,10 +305,10 @@ This is not a feature toggle. It's an architectural decision that makes VoidLLM 
 
 - **No request body** in logs, DB, or any persistent storage
 - **No response body** in logs, DB, or any persistent storage
-- **No prompt caching** — content passes through memory only
+- **No prompt caching** - content passes through memory only
 - **Usage events** contain only: who (key/org/team), what (model), how much (tokens/cost)
 - There is no `enable_content_logging` option. It doesn't exist.
-- **GDPR-compliant** by architecture, not by configuration
+- Designed to support GDPR compliance - no personal data in prompts is stored or processed
 
 ## CLI Tools
 
@@ -339,7 +322,7 @@ voidllm license verify < license.jwt
 
 ## License
 
-[Business Source License 1.1](LICENSE) — source available, self-hosting permitted,
+[Business Source License 1.1](LICENSE) - source available, self-hosting permitted,
 competing hosted services prohibited. Converts to Apache 2.0 four years after each release.
 
 ---
