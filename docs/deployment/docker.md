@@ -85,5 +85,5 @@ This makes the database file visible at `./data/voidllm.db` - easier to back up 
 
 ```bash
 curl http://localhost:8080/healthz
-# {"status":"ok","uptime_seconds":42,"version":"0.0.10"}
+# {"status":"ok","uptime_seconds":42,"version":"0.0.11"}
 ```

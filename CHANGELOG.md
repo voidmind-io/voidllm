@@ -2,6 +2,24 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.11] - 2026-04-02
+
+### Documentation
+- Restructured docs into 24 files with subdirectories (deployment/, models/, mcp/, security/, enterprise/, api/)
+- Added getting-started guide, troubleshooting, and docs index
+- All doc files include Astro frontmatter for website rendering
+- Docs now live at [voidllm.ai/docs](https://voidllm.ai/docs)
+
+### Helm Chart
+- Fixed Artifact Hub indexing (removed empty signKey annotation)
+
+### CI
+- Pinned all GitHub Actions to commit hashes
+- Added Cosign image signing and SLSA provenance
+- Removed unused @astrojs/tailwind dependency conflict
+
+---
+
 ## [0.0.10] - 2026-04-01
 
 ### Helm Chart
