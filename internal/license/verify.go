@@ -17,7 +17,7 @@ var ErrInvalidKey = errors.New("invalid license key")
 // embeddedPublicKeyHex is the hex-encoded Ed25519 public key used to verify
 // license JWTs issued by voidllm.ai. The corresponding private key is held
 // exclusively by the VoidMind platform and is never embedded in this binary.
-const embeddedPublicKeyHex = "75d5b8936bf00245cc0e0d2b1a9457803fa245c6b0c6ae7f74bc9602bd6c1f40"
+const embeddedPublicKeyHex = "94893c54639c3290e38c4ecb33293e86e381b29addcf4372a5a98df7fa81a51f"
 
 // embeddedPublicKey is decoded once at package init and reused for every Verify call.
 var embeddedPublicKey = mustDecodeHexKey(embeddedPublicKeyHex)
