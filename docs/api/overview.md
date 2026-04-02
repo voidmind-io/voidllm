@@ -100,7 +100,7 @@ When VoidLLM is running, the full OpenAPI spec is available at:
 - **Swagger UI:** `http://localhost:8080/api/docs`
 - **OpenAPI JSON:** `http://localhost:8080/api/docs/swagger.json`
 
-A static copy of the spec is also available in the repository: [swagger.yaml](swagger.yaml)
+A static copy of the spec is also available in the repository: [swagger.yaml](https://github.com/voidmind-io/voidllm/blob/main/docs/api/swagger.yaml)
 
 ## Error Responses
 
