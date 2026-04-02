@@ -94,6 +94,11 @@ func (h *Handler) SetLicense(c fiber.Ctx) error {
 
 	h.License.Store(lic)
 
+	// Persist to DB so the license survives restarts.
+	if err := h.DB.SetSetting(c.Context(), "license_jwt", req.Key); err != nil {
+		return apierror.InternalError(c, "failed to persist license")
+	}
+
 	detail := licenseDetail{
 		Plan:     string(lic.Edition()),
 		Features: lic.Features(),

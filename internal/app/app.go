@@ -166,9 +166,16 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	}
 
 	licHolder := license.NewHolder(lic)
+	licenseSource := "none"
+	if cachedKey != "" && licenseKey == cachedKey {
+		licenseSource = "database"
+	} else if configKey != "" {
+		licenseSource = "config"
+	}
 	log.LogAttrs(ctx, slog.LevelInfo, "license loaded",
 		slog.String("edition", string(lic.Edition())),
 		slog.Bool("valid", lic.Valid()),
+		slog.String("source", licenseSource),
 	)
 
 	// Declare variables that the deferred cleanup needs to reference before
