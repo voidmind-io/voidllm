@@ -49,12 +49,21 @@ func (d *DB) GetUsageAggregates(ctx context.Context, orgID string, from, to time
 		return nil, fmt.Errorf("GetUsageAggregates: invalid groupBy %q", groupBy)
 	}
 
+	// selectCol wraps nullable columns with COALESCE so that rows.Scan into a
+	// plain string never receives a NULL value. GROUP BY and ORDER BY keep the
+	// bare column name so that grouping semantics are unchanged.
+	selectCol := groupCol
+	switch groupCol {
+	case "team_id", "key_id", "user_id":
+		selectCol = "COALESCE(" + groupCol + ", '')"
+	}
+
 	fromStr := from.UTC().Format(time.RFC3339)
 	toStr := to.UTC().Format(time.RFC3339)
 
 	var query string
 	if groupCol != "" {
-		query = "SELECT " + groupCol + ", COUNT(*), " +
+		query = "SELECT " + selectCol + ", COUNT(*), " +
 			"COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), " +
 			"COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_estimate), 0), " +
 			"COALESCE(AVG(request_duration_ms), 0) " +
@@ -154,6 +163,15 @@ func (d *DB) GetScopedUsageAggregates(ctx context.Context, filter UsageFilter, f
 		return nil, fmt.Errorf("GetScopedUsageAggregates: invalid groupBy %q", groupBy)
 	}
 
+	// selectCol wraps nullable columns with COALESCE so that rows.Scan into a
+	// plain string never receives a NULL value. GROUP BY and ORDER BY keep the
+	// bare column name so that grouping semantics are unchanged.
+	selectCol := groupCol
+	switch groupCol {
+	case "team_id", "key_id", "user_id":
+		selectCol = "COALESCE(" + groupCol + ", '')"
+	}
+
 	fromStr := from.UTC().Format(time.RFC3339)
 	toStr := to.UTC().Format(time.RFC3339)
 
@@ -198,7 +216,7 @@ func (d *DB) GetScopedUsageAggregates(ctx context.Context, filter UsageFilter, f
 
 	var query string
 	if groupCol != "" {
-		query = "SELECT " + groupCol + ", COUNT(*), " +
+		query = "SELECT " + selectCol + ", COUNT(*), " +
 			"COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), " +
 			"COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_estimate), 0), " +
 			"COALESCE(AVG(request_duration_ms), 0) " +
@@ -271,13 +289,22 @@ func (d *DB) GetCrossOrgUsageAggregates(ctx context.Context, from, to time.Time,
 		return nil, fmt.Errorf("GetCrossOrgUsageAggregates: invalid groupBy %q", groupBy)
 	}
 
+	// selectCol wraps nullable columns with COALESCE so that rows.Scan into a
+	// plain string never receives a NULL value. GROUP BY and ORDER BY keep the
+	// bare column name so that grouping semantics are unchanged.
+	selectCol := groupCol
+	switch groupCol {
+	case "team_id", "key_id", "user_id":
+		selectCol = "COALESCE(" + groupCol + ", '')"
+	}
+
 	fromStr := from.UTC().Format(time.RFC3339)
 	toStr := to.UTC().Format(time.RFC3339)
 	p := d.dialect.Placeholder
 
 	var query string
 	if groupCol != "" {
-		query = "SELECT " + groupCol + ", COUNT(*), " +
+		query = "SELECT " + selectCol + ", COUNT(*), " +
 			"COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), " +
 			"COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_estimate), 0), " +
 			"COALESCE(AVG(request_duration_ms), 0) " +
