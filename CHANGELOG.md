@@ -2,6 +2,21 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.12] - 2026-04-03
+
+### Fixes
+- Usage dashboard: handle NULL team_id/key_id/user_id in aggregation queries (#51)
+- License set via UI now persists to database across restarts
+- License startup log shows source (database, config, or none)
+- Heartbeat User-Agent includes VoidLLM version
+- Updated embedded license public key
+
+### Documentation
+- README feature list as two-column table, removed em dashes
+- Corrected GDPR compliance language
+
+---
+
 ## [0.0.11] - 2026-04-02
 
 ### Documentation
