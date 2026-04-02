@@ -8,6 +8,17 @@ import (
 	"time"
 )
 
+// coalesceSelectCol wraps nullable group columns with COALESCE so that
+// rows.Scan into a plain string never receives a NULL value.
+func coalesceSelectCol(groupCol string) string {
+	switch groupCol {
+	case "team_id", "key_id", "user_id":
+		return "COALESCE(" + groupCol + ", '')"
+	default:
+		return groupCol
+	}
+}
+
 // UsageAggregate holds aggregated usage metrics for a single group key.
 type UsageAggregate struct {
 	// GroupKey is the value of the grouped column (e.g. model name, team ID, date).
@@ -49,14 +60,7 @@ func (d *DB) GetUsageAggregates(ctx context.Context, orgID string, from, to time
 		return nil, fmt.Errorf("GetUsageAggregates: invalid groupBy %q", groupBy)
 	}
 
-	// selectCol wraps nullable columns with COALESCE so that rows.Scan into a
-	// plain string never receives a NULL value. GROUP BY and ORDER BY keep the
-	// bare column name so that grouping semantics are unchanged.
-	selectCol := groupCol
-	switch groupCol {
-	case "team_id", "key_id", "user_id":
-		selectCol = "COALESCE(" + groupCol + ", '')"
-	}
+	selectCol := coalesceSelectCol(groupCol)
 
 	fromStr := from.UTC().Format(time.RFC3339)
 	toStr := to.UTC().Format(time.RFC3339)
@@ -163,14 +167,7 @@ func (d *DB) GetScopedUsageAggregates(ctx context.Context, filter UsageFilter, f
 		return nil, fmt.Errorf("GetScopedUsageAggregates: invalid groupBy %q", groupBy)
 	}
 
-	// selectCol wraps nullable columns with COALESCE so that rows.Scan into a
-	// plain string never receives a NULL value. GROUP BY and ORDER BY keep the
-	// bare column name so that grouping semantics are unchanged.
-	selectCol := groupCol
-	switch groupCol {
-	case "team_id", "key_id", "user_id":
-		selectCol = "COALESCE(" + groupCol + ", '')"
-	}
+	selectCol := coalesceSelectCol(groupCol)
 
 	fromStr := from.UTC().Format(time.RFC3339)
 	toStr := to.UTC().Format(time.RFC3339)
@@ -289,14 +286,7 @@ func (d *DB) GetCrossOrgUsageAggregates(ctx context.Context, from, to time.Time,
 		return nil, fmt.Errorf("GetCrossOrgUsageAggregates: invalid groupBy %q", groupBy)
 	}
 
-	// selectCol wraps nullable columns with COALESCE so that rows.Scan into a
-	// plain string never receives a NULL value. GROUP BY and ORDER BY keep the
-	// bare column name so that grouping semantics are unchanged.
-	selectCol := groupCol
-	switch groupCol {
-	case "team_id", "key_id", "user_id":
-		selectCol = "COALESCE(" + groupCol + ", '')"
-	}
+	selectCol := coalesceSelectCol(groupCol)
 
 	fromStr := from.UTC().Format(time.RFC3339)
 	toStr := to.UTC().Format(time.RFC3339)
