@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/voidmind-io/voidllm/internal/api/health"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"net/http"
 	"sync"
@@ -256,7 +257,7 @@ func sendVerifyRequest(ctx context.Context, serverURL, key string) (*verifyRespo
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "VoidLLM")
+	req.Header.Set("User-Agent", "VoidLLM/"+health.Version)
 
 	resp, err := heartbeatClient.Do(req)
 	if err != nil {
