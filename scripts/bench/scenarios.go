@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ type phase struct {
 	Pacer    vegeta.Pacer
 	Duration time.Duration
 	BodySize int // 0 = default (~64 bytes), >0 = large payload
+	MaxRate  int // peak RPS hint for sizing Workers/Connections (0 = use defaults)
 }
 
 // scenario defines a complete benchmark run with one or more phases.
@@ -72,7 +74,7 @@ func getScenario(name string, rpsOverride int, durationOverride time.Duration) *
 	case "sustained":
 		return scenarioSustained(rpsOverride, durationOverride)
 	case "burst":
-		return scenarioBurst()
+		return scenarioBurst(rpsOverride)
 	case "large-payload":
 		return scenarioLargePayload(rpsOverride, durationOverride)
 	case "mixed":
@@ -137,24 +139,30 @@ func scenarioSustained(rpsOvr int, durOvr time.Duration) *scenario {
 	}
 }
 
-func scenarioBurst() *scenario {
+func scenarioBurst(rpsOvr int) *scenario {
+	peak := rps(5000, rpsOvr)
+	base := peak / 25
+	if base < 50 {
+		base = 50
+	}
 	totalDuration := 90 * time.Second
 	return &scenario{
 		Name:        "burst",
-		Description: "Burst load — 200 RPS → 10k RPS spike → recovery",
+		Description: fmt.Sprintf("Burst load — %d RPS → %d RPS spike → recovery", base, peak),
 		Phases: []phase{
 			{
 				Name:   "LLM Burst",
 				Target: "llm-proxy",
 				Pacer: &burstPacer{
-					lowRate:    vegeta.Rate{Freq: 200, Per: time.Second},
-					highRate:   vegeta.Rate{Freq: 10000, Per: time.Second},
+					lowRate:    vegeta.Rate{Freq: base, Per: time.Second},
+					highRate:   vegeta.Rate{Freq: peak, Per: time.Second},
 					rampUpAt:   30 * time.Second,
 					peakAt:     40 * time.Second,
 					rampDownAt: 50 * time.Second,
 					recoveryAt: 60 * time.Second,
 				},
 				Duration: totalDuration,
+				MaxRate:  peak,
 			},
 		},
 	}

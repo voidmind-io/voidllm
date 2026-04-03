@@ -94,10 +94,24 @@ func runScenario(s *scenario, endpoints *endpointSet) *benchResult {
 func runPhase(p phase, ep *endpointSet) *vegeta.Metrics {
 	targeter := buildTargeter(p, ep)
 
+	// Scale Workers and Connections to the peak rate.
+	// Rule of thumb: maxWorkers = peakRPS * maxLatency(200ms) with a floor of 1000.
+	maxWorkers := uint64(1000)
+	maxConns := 1000
+	if p.MaxRate > 0 {
+		scaled := uint64(p.MaxRate) * 200 / 1000 // peakRPS * 0.2s
+		if scaled > maxWorkers {
+			maxWorkers = scaled
+		}
+		if int(scaled) > maxConns {
+			maxConns = int(scaled)
+		}
+	}
+
 	atk := vegeta.NewAttacker(
 		vegeta.Workers(10),
-		vegeta.MaxWorkers(1000),
-		vegeta.Connections(1000),
+		vegeta.MaxWorkers(maxWorkers),
+		vegeta.Connections(maxConns),
 		vegeta.Timeout(30*time.Second),
 		vegeta.KeepAlive(true),
 	)
