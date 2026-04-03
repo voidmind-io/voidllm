@@ -36,7 +36,7 @@ func openTestDB(t *testing.T, dsn string) *db.DB {
 	}
 	t.Cleanup(func() { _ = d.Close() })
 
-	if err := db.RunMigrations(ctx, d.SQL(), db.SQLiteDialect{}); err != nil {
+	if err := db.RunMigrations(ctx, d.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("openTestDB: RunMigrations() error = %v", err)
 	}
 

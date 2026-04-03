@@ -2,6 +2,7 @@ package admin
 
 import (
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -98,6 +99,19 @@ func (h *Handler) SetLicense(c fiber.Ctx) error {
 	if err := h.DB.SetSetting(c.Context(), "license_jwt", req.Key); err != nil {
 		return apierror.InternalError(c, "failed to persist license")
 	}
+
+	keyInfo := auth.KeyInfoFromCtx(c)
+	actorID := ""
+	orgID := ""
+	if keyInfo != nil {
+		actorID = keyInfo.UserID
+		orgID = keyInfo.OrgID
+	}
+	h.Log.LogAttrs(c.Context(), slog.LevelInfo, "license activated via API",
+		slog.String("edition", string(lic.Edition())),
+		slog.String("actor_id", actorID),
+		slog.String("org_id", orgID),
+	)
 
 	detail := licenseDetail{
 		Plan:     string(lic.Edition()),

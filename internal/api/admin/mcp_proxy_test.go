@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -42,7 +43,7 @@ func setupMCPProxyApp(t *testing.T, dsn string) (*fiber.App, *db.DB, *cache.Cach
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
-	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}); err != nil {
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("run migrations: %v", err)
 	}
 
@@ -377,7 +378,7 @@ func TestMCPProxy_LoggerCalled(t *testing.T) {
 		t.Fatalf("open test DB: %v", err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}); err != nil {
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("run migrations: %v", err)
 	}
 

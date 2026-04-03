@@ -6,6 +6,7 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"sort"
 	"strings"
 )
@@ -22,7 +23,7 @@ var migrationsFS embed.FS
 // and skips any migration whose filename is already recorded in that table.
 // Each migration is applied inside its own transaction. This function is
 // idempotent: calling it multiple times on a fully migrated database is safe.
-func RunMigrations(ctx context.Context, sqlDB *sql.DB, dialect Dialect) error {
+func RunMigrations(ctx context.Context, sqlDB *sql.DB, dialect Dialect, log *slog.Logger) error {
 	// CURRENT_TIMESTAMP is ANSI SQL and is supported by both SQLite and PostgreSQL.
 	const createTable = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -56,9 +57,11 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			continue
 		}
 
+		log.LogAttrs(ctx, slog.LevelInfo, "applying migration", slog.String("file", name))
 		if err := applyMigration(ctx, sqlDB, dialect, name); err != nil {
 			return fmt.Errorf("apply migration %q: %w", name, err)
 		}
+		log.LogAttrs(ctx, slog.LevelInfo, "migration applied", slog.String("file", name))
 	}
 
 	return nil

@@ -486,6 +486,10 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 	if p.RateLimiter != nil {
 		if err := p.RateLimiter.CheckRate(keyInfo.ID, keyInfo.TeamID, keyInfo.OrgID, keyLimits, teamLimits, orgLimits); err != nil {
 			metrics.RateLimitRejectionsTotal.WithLabelValues("request").Inc()
+			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "rate limit exceeded",
+				slog.String("key_id", keyInfo.ID),
+				slog.String("org_id", keyInfo.OrgID),
+			)
 			if err := apierror.Send(c, fiber.StatusTooManyRequests, "rate_limit_exceeded", "rate limit exceeded"); err != nil {
 				return err
 			}
@@ -496,6 +500,10 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 	if p.TokenCounter != nil {
 		if err := p.TokenCounter.CheckTokens(keyInfo.ID, keyInfo.TeamID, keyInfo.OrgID, keyLimits, teamLimits, orgLimits); err != nil {
 			metrics.RateLimitRejectionsTotal.WithLabelValues("token").Inc()
+			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "token budget exceeded",
+				slog.String("key_id", keyInfo.ID),
+				slog.String("org_id", keyInfo.OrgID),
+			)
 			if err := apierror.Send(c, fiber.StatusTooManyRequests, "token_limit_exceeded", "token budget exceeded"); err != nil {
 				return err
 			}

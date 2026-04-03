@@ -30,7 +30,7 @@ func newTestDB(t *testing.T, name string) *db.DB {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
-	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}); err != nil {
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("run migrations: %v", err)
 	}
 	return database

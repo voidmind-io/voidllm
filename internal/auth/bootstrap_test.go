@@ -46,7 +46,7 @@ func setupBootstrapDB(t *testing.T, testName string) *sql.DB {
 	}
 	t.Cleanup(func() { sqlDB.Close() })
 
-	if err := db.RunMigrations(context.Background(), sqlDB, db.SQLiteDialect{}); err != nil {
+	if err := db.RunMigrations(context.Background(), sqlDB, db.SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("run migrations: %v", err)
 	}
 	return sqlDB

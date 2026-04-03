@@ -29,6 +29,22 @@ func marshalDescription(v any) string {
 // timing-based user enumeration (valid email ~100ms vs invalid email ~0ms).
 var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("void-dummy-timing-pad"), bcrypt.DefaultCost)
 
+// auditLoginFailed records a failed login attempt in the audit log.
+func (h *Handler) auditLoginFailed(c fiber.Ctx, email string, statusCode int) {
+	if h.AuditLogger == nil {
+		return
+	}
+	h.AuditLogger.Log(audit.Event{
+		Timestamp:    time.Now().UTC(),
+		Action:       "login_failed",
+		ResourceType: "session",
+		Description:  marshalDescription(map[string]string{"email": email}),
+		IPAddress:    c.IP(),
+		StatusCode:   statusCode,
+		RequestID:    apierror.RequestIDFromCtx(c),
+	})
+}
+
 // loginRequest is the JSON body for POST /api/v1/auth/login.
 type loginRequest struct {
 	Email    string `json:"email"`
@@ -71,12 +87,15 @@ type loginResponse struct {
 func (h *Handler) Login(c fiber.Ctx) error {
 	var req loginRequest
 	if err := c.Bind().JSON(&req); err != nil {
+		h.auditLoginFailed(c, req.Email, fiber.StatusBadRequest)
 		return apierror.BadRequest(c, "invalid request body")
 	}
 	if req.Email == "" {
+		h.auditLoginFailed(c, req.Email, fiber.StatusBadRequest)
 		return apierror.BadRequest(c, "email is required")
 	}
 	if req.Password == "" {
+		h.auditLoginFailed(c, req.Email, fiber.StatusBadRequest)
 		return apierror.BadRequest(c, "password is required")
 	}
 
@@ -87,6 +106,7 @@ func (h *Handler) Login(c fiber.Ctx) error {
 		// Burn bcrypt time to prevent timing-based email enumeration.
 		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(req.Password))
 		if errors.Is(err, db.ErrNotFound) || errors.Is(err, db.ErrNoPassword) {
+			h.auditLoginFailed(c, req.Email, fiber.StatusUnauthorized)
 			return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "invalid email or password")
 		}
 		h.Log.ErrorContext(ctx, "login: get user password hash", slog.String("error", err.Error()))
@@ -94,12 +114,14 @@ func (h *Handler) Login(c fiber.Ctx) error {
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+		h.auditLoginFailed(c, req.Email, fiber.StatusUnauthorized)
 		return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "invalid email or password")
 	}
 
 	role, orgID, err := h.DB.ResolveUserRole(ctx, userID)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
+			h.auditLoginFailed(c, req.Email, fiber.StatusUnauthorized)
 			return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "user has no organization membership")
 		}
 		h.Log.ErrorContext(ctx, "login: resolve user role", slog.String("error", err.Error()))
@@ -167,6 +189,7 @@ func (h *Handler) Login(c fiber.Ctx) error {
 			Description:  marshalDescription(map[string]string{"email": req.Email}),
 			IPAddress:    c.IP(),
 			StatusCode:   fiber.StatusOK,
+			RequestID:    apierror.RequestIDFromCtx(c),
 		})
 	}
 

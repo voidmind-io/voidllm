@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
@@ -94,7 +95,7 @@ func runMigrate(args []string) {
 
 	if !*dryRun {
 		fmt.Print("Running schema migrations on target... ")
-		if err := db.RunMigrations(ctx, dstDB.SQL(), dstDB.Dialect()); err != nil {
+		if err := db.RunMigrations(ctx, dstDB.SQL(), dstDB.Dialect(), slog.Default()); err != nil {
 			fmt.Fprintf(os.Stderr, "failed: %v\n", err)
 			os.Exit(1)
 		}

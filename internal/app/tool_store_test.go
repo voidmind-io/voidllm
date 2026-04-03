@@ -9,6 +9,7 @@ package app
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -40,7 +41,7 @@ func openToolStoreDB(t *testing.T) *db.DB {
 	}
 	t.Cleanup(func() { _ = d.Close() })
 
-	if err := db.RunMigrations(ctx, d.SQL(), db.SQLiteDialect{}); err != nil {
+	if err := db.RunMigrations(ctx, d.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("RunMigrations: %v", err)
 	}
 

@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -47,7 +48,7 @@ func newCallMCPToolHandler(t *testing.T, dsn string, logger admin.MCPToolCallLog
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
-	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}); err != nil {
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("run migrations: %v", err)
 	}
 

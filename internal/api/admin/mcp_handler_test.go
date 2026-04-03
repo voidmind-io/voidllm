@@ -89,7 +89,7 @@ func setupTestAppWithMCP(t *testing.T, dsn string) (*fiber.App, *cache.Cache[str
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
-	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}); err != nil {
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("run migrations: %v", err)
 	}
 
@@ -405,7 +405,7 @@ func TestMCPHandler_KeyIdentityInjected(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
-	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}); err != nil {
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("run migrations: %v", err)
 	}
 
@@ -483,7 +483,7 @@ func TestMCPHandler_ListModels_MemberRBAC(t *testing.T) {
 		t.Fatalf("open test DB: %v", err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}); err != nil {
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("run migrations: %v", err)
 	}
 
@@ -585,7 +585,7 @@ func TestMCPHandler_ListModels_AdminRBAC(t *testing.T) {
 		t.Fatalf("open test DB: %v", err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}); err != nil {
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("run migrations: %v", err)
 	}
 
@@ -686,7 +686,7 @@ func TestMCPHandler_ErrorSanitized(t *testing.T) {
 		t.Fatalf("open test DB: %v", err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}); err != nil {
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("run migrations: %v", err)
 	}
 

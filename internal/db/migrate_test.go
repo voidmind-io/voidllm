@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -36,7 +37,7 @@ func TestRunMigrations_AppliesMigration(t *testing.T) {
 	ctx := context.Background()
 	sqlDB := openTestDB(t, "file:TestRunMigrations_AppliesMigration?mode=memory&cache=private")
 
-	if err := RunMigrations(ctx, sqlDB, SQLiteDialect{}); err != nil {
+	if err := RunMigrations(ctx, sqlDB, SQLiteDialect{}, slog.Default()); err != nil {
 		t.Errorf("RunMigrations() error = %v, want nil", err)
 	}
 }
@@ -47,10 +48,10 @@ func TestRunMigrations_Idempotent(t *testing.T) {
 	ctx := context.Background()
 	sqlDB := openTestDB(t, "file:TestRunMigrations_Idempotent?mode=memory&cache=private")
 
-	if err := RunMigrations(ctx, sqlDB, SQLiteDialect{}); err != nil {
+	if err := RunMigrations(ctx, sqlDB, SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("RunMigrations() first call error = %v", err)
 	}
-	if err := RunMigrations(ctx, sqlDB, SQLiteDialect{}); err != nil {
+	if err := RunMigrations(ctx, sqlDB, SQLiteDialect{}, slog.Default()); err != nil {
 		t.Errorf("RunMigrations() second call error = %v, want nil (idempotent)", err)
 	}
 }
@@ -61,7 +62,7 @@ func TestRunMigrations_CreatesSchemaTable(t *testing.T) {
 	ctx := context.Background()
 	sqlDB := openTestDB(t, "file:TestRunMigrations_CreatesSchemaTable?mode=memory&cache=private")
 
-	if err := RunMigrations(ctx, sqlDB, SQLiteDialect{}); err != nil {
+	if err := RunMigrations(ctx, sqlDB, SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("RunMigrations() error = %v", err)
 	}
 
@@ -79,7 +80,7 @@ func TestRunMigrations_RecordsMigrationFilename(t *testing.T) {
 	ctx := context.Background()
 	sqlDB := openTestDB(t, "file:TestRunMigrations_RecordsMigrationFilename?mode=memory&cache=private")
 
-	if err := RunMigrations(ctx, sqlDB, SQLiteDialect{}); err != nil {
+	if err := RunMigrations(ctx, sqlDB, SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("RunMigrations() error = %v", err)
 	}
 
@@ -102,7 +103,7 @@ func TestRunMigrations_TablesExist(t *testing.T) {
 	ctx := context.Background()
 	sqlDB := openTestDB(t, "file:TestRunMigrations_TablesExist?mode=memory&cache=private")
 
-	if err := RunMigrations(ctx, sqlDB, SQLiteDialect{}); err != nil {
+	if err := RunMigrations(ctx, sqlDB, SQLiteDialect{}, slog.Default()); err != nil {
 		t.Fatalf("RunMigrations() error = %v", err)
 	}
 

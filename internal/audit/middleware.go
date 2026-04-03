@@ -23,6 +23,10 @@ var normalizeResourceType = map[string]string{
 	"invites":          "invite",
 	"model-access":     "model_access",
 	"model-aliases":    "model_alias",
+	"mcp-servers":      "mcp_server",
+	"mcp-access":       "mcp_access",
+	"sso":              "sso_config",
+	"settings":         "setting",
 }
 
 // verbOverrides lists path segments that represent an explicit action verb

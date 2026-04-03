@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -33,7 +34,7 @@ func openMigratedDB(t *testing.T) *DB {
 	}
 	t.Cleanup(func() { _ = d.Close() })
 
-	if err := RunMigrations(ctx, d.SQL(), d.Dialect()); err != nil {
+	if err := RunMigrations(ctx, d.SQL(), d.Dialect(), slog.Default()); err != nil {
 		t.Fatalf("RunMigrations() error = %v", err)
 	}
 	return d

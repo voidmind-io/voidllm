@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -37,7 +38,7 @@ func openLoaderDB(t *testing.T) *db.DB {
 	}
 	t.Cleanup(func() { _ = d.Close() })
 
-	if err := db.RunMigrations(ctx, d.SQL(), d.Dialect()); err != nil {
+	if err := db.RunMigrations(ctx, d.SQL(), d.Dialect(), slog.Default()); err != nil {
 		t.Fatalf("RunMigrations: %v", err)
 	}
 	return d

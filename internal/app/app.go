@@ -140,7 +140,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
-	if err := db.RunMigrations(ctx, database.SQL(), database.Dialect()); err != nil {
+	if err := db.RunMigrations(ctx, database.SQL(), database.Dialect(), log); err != nil {
 		database.Close() //nolint:errcheck // best-effort on error path
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}

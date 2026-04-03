@@ -23,7 +23,7 @@ func LoadKeysIntoCache(ctx context.Context, database *db.DB, keyCache *cache.Cac
 		return fmt.Errorf("load keys into cache: %w", err)
 	}
 	for _, skipErr := range skipErrors {
-		log.LogAttrs(ctx, slog.LevelError, "skipped corrupt key record during cache load",
+		log.LogAttrs(ctx, slog.LevelWarn, "skipped corrupt key record during cache load",
 			slog.String("error", skipErr.Error()),
 		)
 	}
