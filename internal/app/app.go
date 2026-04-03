@@ -376,6 +376,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	if err := auth.LoadKeysIntoCache(ctx, database, keyCache, log); err != nil {
 		return nil, fmt.Errorf("load keys into cache: %w", err)
 	}
+	log.LogAttrs(ctx, slog.LevelInfo, "key cache seeded", slog.Int("keys", keyCache.Len()))
 
 	// Step 7: seed token counter from recent usage events.
 	tokenCounter := ratelimit.NewTokenCounter()

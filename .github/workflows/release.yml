@@ -56,6 +56,64 @@ jobs:
           cosign sign --yes \
             ghcr.io/voidmind-io/voidllm@${{ steps.build.outputs.digest }}
 
+  binaries:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: '20'
+
+      - name: Build UI
+        run: cd ui && npm ci && npm run build
+
+      - name: Build binaries
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          LDFLAGS="-s -w -X 'github.com/voidmind-io/voidllm/internal/api/health.Version=${VERSION}'"
+          declare -A TARGETS=(
+            ["linux/amd64"]="voidllm-linux-amd64.tar.gz"
+            ["linux/arm64"]="voidllm-linux-arm64.tar.gz"
+            ["windows/amd64"]="voidllm-windows-amd64.zip"
+            ["windows/arm64"]="voidllm-windows-arm64.zip"
+            ["darwin/amd64"]="voidllm-darwin-amd64.tar.gz"
+            ["darwin/arm64"]="voidllm-darwin-arm64.tar.gz"
+          )
+          mkdir -p dist
+          for TARGET in "${!TARGETS[@]}"; do
+            OS="${TARGET%/*}"
+            ARCH="${TARGET#*/}"
+            ARCHIVE="${TARGETS[$TARGET]}"
+            BINARY="voidllm"
+            if [ "$OS" = "windows" ]; then
+              BINARY="voidllm.exe"
+            fi
+            BUILDDIR="dist/build-${OS}-${ARCH}"
+            mkdir -p "$BUILDDIR"
+            CGO_ENABLED=0 GOOS="$OS" GOARCH="$ARCH" go build \
+              -ldflags="$LDFLAGS" \
+              -o "$BUILDDIR/$BINARY" ./cmd/voidllm
+            if [[ "$ARCHIVE" == *.tar.gz ]]; then
+              tar -czf "dist/$ARCHIVE" -C "$BUILDDIR" "$BINARY"
+            else
+              (cd "$BUILDDIR" && zip "../$ARCHIVE" "$BINARY")
+            fi
+          done
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes 2>/dev/null || true
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.zip --clobber
+
   provenance:
     needs: docker
     permissions:

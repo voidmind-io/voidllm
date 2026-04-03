@@ -95,7 +95,7 @@ func LoadKeysIntoCache(ctx context.Context, database *db.DB, keyCache *cache.Cac
 
 	keyCache.LoadAll(entries)
 
-	log.LogAttrs(ctx, slog.LevelInfo, "key cache loaded",
+	log.LogAttrs(ctx, slog.LevelDebug, "key cache loaded",
 		slog.Int("keys", len(entries)),
 	)
 

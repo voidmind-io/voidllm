@@ -28,6 +28,7 @@ RUN apk add --no-cache ca-certificates tzdata \
     && mkdir -p /data && chown voidllm:voidllm /data
 COPY --from=go-builder /voidllm /usr/local/bin/voidllm
 VOLUME ["/data"]
+ENV VOIDLLM_DATABASE_DSN=/data/voidllm.db
 EXPOSE 8080 8443
 USER voidllm
 ENTRYPOINT ["voidllm"]
