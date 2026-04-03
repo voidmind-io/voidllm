@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-
-	"github.com/voidmind-io/voidllm/internal/api/health"
-	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/voidmind-io/voidllm/internal/api/health"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
 const (
@@ -34,13 +34,6 @@ const (
 	maxResponseSize = 1 << 20 // 1 MB
 )
 
-// SettingsWriter is the subset of the database interface needed by the heartbeat
-// to persist refreshed license JWTs. Using an interface avoids circular imports
-// with the db package.
-type SettingsWriter interface {
-	SetSetting(ctx context.Context, key, value string) error
-}
-
 // HeartbeatConfig configures the license heartbeat background goroutine.
 type HeartbeatConfig struct {
 	// ServerURL is the base URL of the license server (e.g. "https://license.voidllm.ai").
@@ -49,9 +42,13 @@ type HeartbeatConfig struct {
 	Interval time.Duration
 	// Log is the structured logger for heartbeat events.
 	Log *slog.Logger
-	// DB persists refreshed license JWTs across container restarts.
-	// When nil, refreshed JWTs are stored in memory only.
-	DB SettingsWriter
+	// DB persists refreshed license JWTs and tracks the last heartbeat timestamp.
+	// When nil, refreshed JWTs are stored in memory only and per-pod deduplication
+	// is skipped.
+	DB SettingsReadWriter
+	// InstanceID is the stable UUID for this deployment, included in heartbeat
+	// requests so the license server can track instance count.
+	InstanceID string
 }
 
 var heartbeatClient = &http.Client{
@@ -62,7 +59,8 @@ var heartbeatClient = &http.Client{
 }
 
 type verifyRequest struct {
-	Key string `json:"key"`
+	Key        string `json:"key"`
+	InstanceID string `json:"instance_id,omitempty"`
 }
 
 type verifyResponse struct {
@@ -114,7 +112,7 @@ func StartHeartbeat(holder *Holder, rawKey string, cfg HeartbeatConfig) func() {
 		}
 
 		// Run the first heartbeat immediately after the initial delay.
-		currentKey = runHeartbeat(ctx, holder, currentKey, cfg.ServerURL, log, cfg.DB)
+		currentKey = runHeartbeat(ctx, holder, currentKey, cfg.ServerURL, cfg.InstanceID, log, cfg.DB)
 
 		ticker := time.NewTicker(cfg.Interval)
 		defer ticker.Stop()
@@ -122,7 +120,7 @@ func StartHeartbeat(holder *Holder, rawKey string, cfg HeartbeatConfig) func() {
 		for {
 			select {
 			case <-ticker.C:
-				currentKey = runHeartbeat(ctx, holder, currentKey, cfg.ServerURL, log, cfg.DB)
+				currentKey = runHeartbeat(ctx, holder, currentKey, cfg.ServerURL, cfg.InstanceID, log, cfg.DB)
 			case <-done:
 				return
 			}
@@ -138,11 +136,38 @@ func StartHeartbeat(holder *Holder, rawKey string, cfg HeartbeatConfig) func() {
 
 // runHeartbeat performs a single heartbeat check against the license server.
 // It returns the (possibly updated) raw license key for use in the next heartbeat.
-func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL string, log *slog.Logger, db SettingsWriter) string {
-	resp, err := sendVerifyRequest(ctx, serverURL, rawKey)
+func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL, instanceID string, log *slog.Logger, db SettingsReadWriter) string {
+	// Check if heartbeat was already sent recently (by this or another pod).
+	if db != nil {
+		lastSent, settErr := db.GetSetting(ctx, "heartbeat_last_sent")
+		if settErr != nil {
+			log.LogAttrs(ctx, slog.LevelDebug, "failed to read heartbeat timestamp, proceeding",
+				slog.String("error", settErr.Error()),
+			)
+		}
+		if lastSent != "" {
+			if t, err := time.Parse(time.RFC3339, lastSent); err == nil && time.Since(t) < 23*time.Hour {
+				log.LogAttrs(ctx, slog.LevelDebug, "heartbeat already sent recently, skipping",
+					slog.String("last_sent", lastSent),
+				)
+				return rawKey
+			}
+		}
+	}
+
+	resp, err := sendVerifyRequest(ctx, serverURL, rawKey, instanceID)
 	if err != nil {
 		log.Warn("network error, continuing offline", slog.String("error", err.Error()))
 		return rawKey
+	}
+
+	// Record that we sent a heartbeat (dedup for multi-pod).
+	// Deferred so it fires on every return after this point, regardless of
+	// response processing outcome.
+	if db != nil {
+		defer func() {
+			_ = db.SetSetting(ctx, "heartbeat_last_sent", time.Now().UTC().Format(time.RFC3339))
+		}()
 	}
 
 	switch resp.Status {
@@ -193,7 +218,7 @@ func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL string,
 
 				holder.Store(newLic)
 				if db != nil {
-					if dbErr := db.SetSetting(context.Background(), "license_jwt", resp.Key); dbErr != nil {
+					if dbErr := db.SetSetting(ctx, "license_jwt", resp.Key); dbErr != nil {
 						log.Warn("failed to persist refreshed license to database",
 							slog.String("error", dbErr.Error()),
 						)
@@ -243,8 +268,8 @@ func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL string,
 }
 
 // sendVerifyRequest posts the license key to the server and returns the parsed response.
-func sendVerifyRequest(ctx context.Context, serverURL, key string) (*verifyResponse, error) {
-	body, err := jsonx.Marshal(verifyRequest{Key: key})
+func sendVerifyRequest(ctx context.Context, serverURL, key, instanceID string) (*verifyResponse, error) {
+	body, err := jsonx.Marshal(verifyRequest{Key: key, InstanceID: instanceID})
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}

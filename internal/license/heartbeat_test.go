@@ -58,7 +58,7 @@ func TestHeartbeatActiveStatus(t *testing.T) {
 	const rawKey = "original-key"
 	log := discardLogger()
 
-	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, log, nil)
+	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, "", log, nil)
 
 	if got != rawKey {
 		t.Errorf("runHeartbeat() returned key %q, want %q", got, rawKey)
@@ -85,7 +85,7 @@ func TestHeartbeatActiveNoRefreshNeeded(t *testing.T) {
 	const rawKey = "original-key"
 	log := discardLogger()
 
-	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, log, nil)
+	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, "", log, nil)
 
 	if got != rawKey {
 		t.Errorf("runHeartbeat() returned key %q, want %q (no refresh for community license)", got, rawKey)
@@ -149,7 +149,7 @@ func TestHeartbeatActiveRefreshNeeded(t *testing.T) {
 	holder := NewHolder(expiringSoon)
 	log := discardLogger()
 
-	gotKey := runHeartbeat(context.Background(), holder, expiringSoonJWT, srv.URL, log, nil)
+	gotKey := runHeartbeat(context.Background(), holder, expiringSoonJWT, srv.URL, "", log, nil)
 
 	if gotKey != freshJWT {
 		t.Errorf("runHeartbeat() returned key %q, want fresh JWT", gotKey)
@@ -198,7 +198,7 @@ func TestHeartbeatActiveRefreshInvalidKey(t *testing.T) {
 	holder := NewHolder(expiringSoon)
 	log := discardLogger()
 
-	gotKey := runHeartbeat(context.Background(), holder, expiringSoonJWT, srv.URL, log, nil)
+	gotKey := runHeartbeat(context.Background(), holder, expiringSoonJWT, srv.URL, "", log, nil)
 
 	if gotKey != expiringSoonJWT {
 		t.Errorf("runHeartbeat() returned key %q, want original %q", gotKey, expiringSoonJWT)
@@ -259,7 +259,7 @@ func TestHeartbeatActiveRefreshCustomerMismatch(t *testing.T) {
 	holder := NewHolder(expiringSoon)
 	log := discardLogger()
 
-	gotKey := runHeartbeat(context.Background(), holder, expiringSoonJWT, srv.URL, log, nil)
+	gotKey := runHeartbeat(context.Background(), holder, expiringSoonJWT, srv.URL, "", log, nil)
 
 	if gotKey != expiringSoonJWT {
 		t.Errorf("runHeartbeat() returned key %q, want original (mismatch should be rejected)", gotKey)
@@ -282,7 +282,7 @@ func TestHeartbeatRevokedStatus(t *testing.T) {
 	const rawKey = "original-key"
 	log := discardLogger()
 
-	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, log, nil)
+	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, "", log, nil)
 
 	if got != rawKey {
 		t.Errorf("runHeartbeat() returned key %q, want %q", got, rawKey)
@@ -305,7 +305,7 @@ func TestHeartbeatExpiredStatus(t *testing.T) {
 	const rawKey = "original-key"
 	log := discardLogger()
 
-	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, log, nil)
+	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, "", log, nil)
 
 	if got != rawKey {
 		t.Errorf("runHeartbeat() returned key %q, want %q", got, rawKey)
@@ -325,7 +325,7 @@ func TestHeartbeatNetworkError(t *testing.T) {
 	log := discardLogger()
 
 	// Use a URL that is guaranteed to fail connection.
-	got := runHeartbeat(context.Background(), holder, rawKey, "http://127.0.0.1:1", log, nil)
+	got := runHeartbeat(context.Background(), holder, rawKey, "http://127.0.0.1:1", "", log, nil)
 
 	if got != rawKey {
 		t.Errorf("runHeartbeat() returned key %q, want %q", got, rawKey)
@@ -349,7 +349,7 @@ func TestHeartbeatUnknownStatus(t *testing.T) {
 	const rawKey = "original-key"
 	log := discardLogger()
 
-	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, log, nil)
+	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, "", log, nil)
 
 	if got != rawKey {
 		t.Errorf("runHeartbeat() returned key %q, want %q", got, rawKey)
@@ -370,7 +370,7 @@ func TestHeartbeatErrorStatus(t *testing.T) {
 	const rawKey = "original-key"
 	log := discardLogger()
 
-	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, log, nil)
+	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, "", log, nil)
 
 	if got != rawKey {
 		t.Errorf("runHeartbeat() returned key %q, want %q", got, rawKey)
@@ -393,21 +393,32 @@ func TestHeartbeatDefaultStatus(t *testing.T) {
 	const rawKey = "original-key"
 	log := discardLogger()
 
-	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, log, nil)
+	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, "", log, nil)
 
 	if got != rawKey {
 		t.Errorf("runHeartbeat() returned key %q, want %q", got, rawKey)
 	}
 }
 
-// mockSettingsWriter records every SetSetting call for later inspection.
-type mockSettingsWriter struct {
+// mockSettingsRW implements SettingsReadWriter for testing. It records every
+// SetSetting call and returns empty strings from GetSetting by default.
+type mockSettingsRW struct {
 	calls []struct{ key, value string }
 }
 
+// GetSetting always returns an empty string (no pre-existing settings).
+func (m *mockSettingsRW) GetSetting(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+
 // SetSetting records the call and returns nil.
-func (m *mockSettingsWriter) SetSetting(_ context.Context, key, value string) error {
+func (m *mockSettingsRW) SetSetting(_ context.Context, key, value string) error {
 	m.calls = append(m.calls, struct{ key, value string }{key, value})
+	return nil
+}
+
+// SetSettingIfNotExists is a no-op for test purposes.
+func (m *mockSettingsRW) SetSettingIfNotExists(_ context.Context, _ string, _ string) error {
 	return nil
 }
 
@@ -462,28 +473,30 @@ func TestHeartbeatActiveRefreshPersistsToDB(t *testing.T) {
 
 	holder := NewHolder(expiringSoon)
 	log := discardLogger()
-	sw := &mockSettingsWriter{}
+	sw := &mockSettingsRW{}
 
-	gotKey := runHeartbeat(context.Background(), holder, expiringSoonJWT, srv.URL, log, sw)
+	gotKey := runHeartbeat(context.Background(), holder, expiringSoonJWT, srv.URL, "", log, sw)
 
 	// The returned key must be the fresh JWT.
 	if gotKey != freshJWT {
 		t.Errorf("runHeartbeat() returned key %q, want fresh JWT", gotKey)
 	}
 
-	// SetSetting must have been called exactly once.
-	if len(sw.calls) != 1 {
-		t.Fatalf("SetSetting call count = %d, want 1", len(sw.calls))
+	// SetSetting must have been called at least once with key "license_jwt".
+	var licenseJWTCall *struct{ key, value string }
+	for i := range sw.calls {
+		if sw.calls[i].key == "license_jwt" {
+			licenseJWTCall = &sw.calls[i]
+			break
+		}
 	}
-
-	// The call must use the canonical key "license_jwt".
-	if sw.calls[0].key != "license_jwt" {
-		t.Errorf("SetSetting key = %q, want %q", sw.calls[0].key, "license_jwt")
+	if licenseJWTCall == nil {
+		t.Fatalf("SetSetting was never called with key %q; all calls: %v", "license_jwt", sw.calls)
 	}
 
 	// The value must be the fresh JWT as returned by the server.
-	if sw.calls[0].value != freshJWT {
-		t.Errorf("SetSetting value = %q, want fresh JWT", sw.calls[0].value)
+	if licenseJWTCall.value != freshJWT {
+		t.Errorf("SetSetting value = %q, want fresh JWT", licenseJWTCall.value)
 	}
 }
 
@@ -502,7 +515,7 @@ func TestHeartbeatPaymentWarning(t *testing.T) {
 	const rawKey = "original-key"
 	log := discardLogger()
 
-	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, log, nil)
+	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, "", log, nil)
 
 	if got != rawKey {
 		t.Errorf("runHeartbeat() returned key %q, want %q", got, rawKey)
@@ -527,7 +540,7 @@ func TestHeartbeatHTTPErrorStatus(t *testing.T) {
 	const rawKey = "original-key"
 	log := discardLogger()
 
-	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, log, nil)
+	got := runHeartbeat(context.Background(), holder, rawKey, srv.URL, "", log, nil)
 
 	if got != rawKey {
 		t.Errorf("runHeartbeat() returned key %q, want %q", got, rawKey)

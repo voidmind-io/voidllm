@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -14,7 +15,7 @@ func (d *DB) GetSetting(ctx context.Context, key string) (string, error) {
 		fmt.Sprintf("SELECT value FROM settings WHERE key = %s", d.dialect.Placeholder(1)),
 		key,
 	).Scan(&value)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
@@ -35,6 +36,24 @@ func (d *DB) SetSetting(ctx context.Context, key, value string) error {
 	)
 	if err != nil {
 		return fmt.Errorf("set setting %q: %w", key, err)
+	}
+	return nil
+}
+
+// SetSettingIfNotExists inserts a key-value pair only when the key does not
+// already exist. If the key is already present the existing value is left
+// unchanged. This is used for atomic first-write-wins coordination across
+// concurrent pods (e.g. instance ID generation).
+func (d *DB) SetSettingIfNotExists(ctx context.Context, key, value string) error {
+	_, err := d.sql.ExecContext(ctx,
+		fmt.Sprintf(
+			"INSERT INTO settings (key, value, updated_at) VALUES (%s, %s, CURRENT_TIMESTAMP) ON CONFLICT(key) DO NOTHING",
+			d.dialect.Placeholder(1), d.dialect.Placeholder(2),
+		),
+		key, value,
+	)
+	if err != nil {
+		return fmt.Errorf("set setting if not exists %q: %w", key, err)
 	}
 	return nil
 }

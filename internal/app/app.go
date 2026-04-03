@@ -1042,11 +1042,21 @@ func (a *Application) Start() error {
 	// An expired key falls back to community at startup, but the heartbeat can
 	// recover by requesting a fresh JWT from the license server.
 	if a.rawLicenseKey != "" && !a.devMode {
+		instanceID, err := license.GetOrCreateInstanceID(context.Background(), a.database)
+		if err != nil {
+			a.log.Warn("failed to generate instance ID", slog.String("error", err.Error()))
+			instanceID = ""
+		}
+		if instanceID != "" {
+			a.log.Info("instance ID", slog.String("id", instanceID))
+		}
+
 		stop := license.StartHeartbeat(a.licHolder, a.rawLicenseKey, license.HeartbeatConfig{
-			ServerURL: license.DefaultServerURL,
-			Interval:  license.DefaultInterval,
-			Log:       a.log,
-			DB:        a.database,
+			ServerURL:  license.DefaultServerURL,
+			Interval:   license.DefaultInterval,
+			Log:        a.log,
+			DB:         a.database,
+			InstanceID: instanceID,
 		})
 		a.stopFuncs = append(a.stopFuncs, stop)
 	}
