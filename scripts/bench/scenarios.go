@@ -14,8 +14,9 @@ type phase struct {
 	Target   string // "llm-direct", "llm-proxy", "mcp-direct", "mcp-proxy", "codemode-proxy"
 	Pacer    vegeta.Pacer
 	Duration time.Duration
-	BodySize int // 0 = default (~64 bytes), >0 = large payload
-	MaxRate  int // peak RPS hint for sizing Workers/Connections (0 = use defaults)
+	BodySize int  // 0 = default (~64 bytes), >0 = large payload
+	MaxRate  int  // peak RPS hint for sizing Workers/Connections (0 = use defaults)
+	Stream   bool // when true, request body includes "stream":true for SSE responses
 }
 
 // scenario defines a complete benchmark run with one or more phases.
@@ -81,13 +82,15 @@ func getScenario(name string, rpsOverride int, durationOverride time.Duration) *
 		return scenarioMixed(rpsOverride, durationOverride)
 	case "endurance":
 		return scenarioEndurance(rpsOverride, durationOverride)
+	case "realistic":
+		return scenarioRealistic(rpsOverride, durationOverride)
 	default:
 		return nil
 	}
 }
 
 func allScenarioNames() []string {
-	return []string{"quick", "sustained", "burst", "large-payload", "mixed", "endurance"}
+	return []string{"quick", "sustained", "burst", "large-payload", "mixed", "endurance", "realistic"}
 }
 
 func rps(rate, override int) int {
@@ -209,6 +212,19 @@ func scenarioEndurance(rpsOvr int, durOvr time.Duration) *scenario {
 		Description: "Long-running stability test — goroutine leaks, memory growth",
 		Phases: []phase{
 			{Name: "LLM Endurance", Target: "llm-proxy", Pacer: constantPacer(r), Duration: d},
+		},
+	}
+}
+
+func scenarioRealistic(rpsOvr int, durOvr time.Duration) *scenario {
+	r := rps(50, rpsOvr)
+	d := dur(2*time.Minute, durOvr)
+	return &scenario{
+		Name:        "realistic",
+		Description: "Realistic streaming load - SSE responses with 30-50ms inter-token delay",
+		Phases: []phase{
+			{Name: "LLM Calibration (stream)", Target: "llm-direct", Pacer: constantPacer(r), Duration: d, Stream: true},
+			{Name: "LLM Proxy (stream)", Target: "llm-proxy", Pacer: constantPacer(r), Duration: d, Stream: true},
 		},
 	}
 }

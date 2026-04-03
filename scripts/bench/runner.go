@@ -152,7 +152,11 @@ func buildTargeter(p phase, ep *endpointSet) vegeta.Targeter {
 	case "llm-direct":
 		url = ep.mockLLM + "/v1/chat/completions"
 		headers = http.Header{"Content-Type": []string{"application/json"}}
-		body = makeLLMBody(p.BodySize)
+		if p.Stream {
+			body = []byte(`{"model":"mock","stream":true,"messages":[{"role":"user","content":"Summarize Harry Potter"}]}`)
+		} else {
+			body = makeLLMBody(p.BodySize)
+		}
 
 	case "llm-proxy":
 		url = ep.proxy + "/v1/chat/completions"
@@ -160,7 +164,11 @@ func buildTargeter(p phase, ep *endpointSet) vegeta.Targeter {
 			"Content-Type":  []string{"application/json"},
 			"Authorization": []string{"Bearer " + ep.apiKey},
 		}
-		body = makeLLMBody(p.BodySize)
+		if p.Stream {
+			body = []byte(`{"model":"mock","stream":true,"messages":[{"role":"user","content":"Summarize Harry Potter"}]}`)
+		} else {
+			body = makeLLMBody(p.BodySize)
+		}
 
 	case "mcp-direct":
 		url = ep.mockMCP + "/"

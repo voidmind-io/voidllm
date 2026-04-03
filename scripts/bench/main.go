@@ -15,13 +15,15 @@
 //	large-payload  100KB bodies, 100 RPS — allocation overhead
 //	mixed          60% LLM + 30% MCP + 10% Code Mode (parallel)
 //	endurance      500 RPS, 30 min — long-running stability
+//	realistic      50 RPS, 2 min — SSE streaming with 30-50ms inter-token delay
 //	all            Run all scenarios sequentially
 //
 // Flags:
 //
-//	--rps N        Override default RPS for the scenario
-//	--duration D   Override default duration (e.g. 30s, 5m)
-//	--json         Output JSON report instead of text
+//	--rps N           Override default RPS for the scenario
+//	--duration D      Override default duration (e.g. 30s, 5m)
+//	--json            Output JSON report instead of text
+//	--metrics-out F   Write metrics samples JSON to file F
 package main
 
 import (
@@ -35,6 +37,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -57,6 +60,7 @@ func main() {
 	rpsOverride := fs.Int("rps", 0, "override default RPS")
 	durStr := fs.String("duration", "", "override duration (e.g. 30s, 5m)")
 	jsonOutput := fs.Bool("json", false, "JSON report output")
+	metricsOut := fs.String("metrics-out", "", "path to write metrics JSON (default: no metrics)")
 
 	// Parse flags after scenario name
 	args := os.Args[1:]
@@ -79,12 +83,23 @@ func main() {
 		printBanner(scenarioName)
 	}
 
+	// Resolve the single-scenario case early so mock server selection can
+	// depend on the scenario name. (The "all" path always uses the default mock.)
+	var earlySingle *scenario
+	if scenarioName != "all" {
+		earlySingle = getScenario(scenarioName, *rpsOverride, durationOverride)
+		if earlySingle == nil {
+			fmt.Fprintf(os.Stderr, "unknown scenario: %s\nAvailable: %s\n", scenarioName, strings.Join(allScenarioNames(), ", "))
+			os.Exit(1)
+		}
+	}
+
 	// ─── Start mock servers ──────────────────────────────────────
 	if !*jsonOutput {
 		fmt.Printf("%sStarting mock servers...%s\n", dim, reset)
 	}
 
-	mockLLM, err := startMockLLM(10 * time.Millisecond)
+	mockLLM, err := startMockLLMStreaming(10 * time.Millisecond)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error starting mock LLM: %v\n", err)
 		os.Exit(1)
@@ -154,8 +169,20 @@ func main() {
 			if !*jsonOutput {
 				fmt.Printf("%s%s━━━ %s: %s ━━━%s\n\n", cyan, bold, s.Name, s.Description, reset)
 			}
+
+			var mc *sampler
+			if *metricsOut != "" {
+				mc = startSampler(proxyAddr+"/metrics", 1*time.Second)
+			}
+
 			result := runScenario(s, endpoints)
 			allResults = append(allResults, result)
+
+			if mc != nil {
+				samples := mc.Stop()
+				writeMetricsJSON(*metricsOut, name, samples)
+			}
+
 			if !*jsonOutput {
 				printTextReport(result)
 				fmt.Println()
@@ -169,23 +196,53 @@ func main() {
 		return
 	}
 
-	s := getScenario(scenarioName, *rpsOverride, durationOverride)
-	if s == nil {
-		fmt.Fprintf(os.Stderr, "unknown scenario: %s\nAvailable: %s\n", scenarioName, strings.Join(allScenarioNames(), ", "))
-		os.Exit(1)
-	}
+	s := earlySingle
 
 	if !*jsonOutput {
 		fmt.Printf("%s%s%s\n\n", dim, s.Description, reset)
 	}
 
+	var metricsCollector *sampler
+	if *metricsOut != "" {
+		metricsCollector = startSampler(proxyAddr+"/metrics", 1*time.Second)
+	}
+
 	result := runScenario(s, endpoints)
+
+	if metricsCollector != nil {
+		samples := metricsCollector.Stop()
+		writeMetricsJSON(*metricsOut, s.Name, samples)
+	}
 
 	if *jsonOutput {
 		printJSONReport(result)
 	} else {
 		printTextReport(result)
 	}
+}
+
+// writeMetricsJSON marshals the collected metric samples to a JSON file at path.
+// The output includes the scenario name alongside the sample array for context.
+func writeMetricsJSON(dir, scenario string, samples []metricSample) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "error creating metrics dir %s: %v\n", dir, err)
+		return
+	}
+	path := filepath.Join(dir, scenario+".json")
+	out := struct {
+		Scenario string         `json:"scenario"`
+		Samples  []metricSample `json:"samples"`
+	}{Scenario: scenario, Samples: samples}
+	data, err := stdjson.MarshalIndent(out, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error marshaling metrics: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing metrics to %s: %v\n", path, err)
+		return
+	}
+	fmt.Printf("Metrics written to %s\n", path)
 }
 
 // ─── VoidLLM Proxy Management ────────────────────────────────────
