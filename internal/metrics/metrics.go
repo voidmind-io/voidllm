@@ -148,6 +148,30 @@ func RegisterDBCollectors(sqlDB *sql.DB) {
 	))
 }
 
+// MCPServerHealthStatus tracks the current health status of each registered MCP
+// server as a gauge value: 1 = healthy, 0 = unhealthy or unknown.
+// Labels: server (server name), alias (server alias).
+var MCPServerHealthStatus = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Namespace: "voidllm",
+		Name:      "mcp_server_health_status",
+		Help:      "Current health status of MCP servers (1=healthy, 0=unhealthy).",
+	},
+	[]string{"server", "alias"},
+)
+
+// MCPServerHealthLatency tracks the most recently observed health check
+// round-trip latency in seconds, labelled by server name and alias. Updated
+// after each successful probe cycle.
+var MCPServerHealthLatency = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Namespace: "voidllm",
+		Name:      "mcp_server_health_latency_seconds",
+		Help:      "Last health check latency in seconds per MCP server.",
+	},
+	[]string{"server", "alias"},
+)
+
 // MCPToolCallsTotal counts MCP tool calls proxied to external servers, partitioned
 // by server alias, tool name, and call status ("success", "error", or "timeout").
 var MCPToolCallsTotal = promauto.NewCounterVec(prometheus.CounterOpts{

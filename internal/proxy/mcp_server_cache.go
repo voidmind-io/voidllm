@@ -94,6 +94,19 @@ func (c *MCPServerCache) Len() int {
 	return n
 }
 
+// List returns a snapshot of all server records currently held in the cache.
+// The returned slice contains value copies; callers may safely read the entries
+// without holding any lock. The order of entries is unspecified.
+func (c *MCPServerCache) List() []db.MCPServer {
+	c.mu.RLock()
+	out := make([]db.MCPServer, 0, len(c.servers))
+	for _, s := range c.servers {
+		out = append(out, *s)
+	}
+	c.mu.RUnlock()
+	return out
+}
+
 // mcpServerCacheKey builds the lookup key for an MCPServer record.
 // Key format is "alias:orgID:teamID" with empty strings for absent scopes.
 func mcpServerCacheKey(s *db.MCPServer) string {

@@ -15,6 +15,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/health"
 	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/pkg/crypto"
 )
@@ -1333,4 +1334,27 @@ func (h *Handler) TestMCPServerConnection(c fiber.Ctx) error {
 		Success: true,
 		Tools:   len(tools),
 	})
+}
+
+// ListMCPServerHealth handles GET /api/v1/mcp-servers/health.
+// It returns the most recent health probe results for all registered MCP
+// servers. When health monitoring is not enabled an empty array is returned.
+//
+// @Summary      List MCP server health
+// @Description  Returns the most recent health probe results for all registered MCP servers. Returns an empty array when health monitoring is disabled.
+// @Tags         mcp-servers
+// @Produce      json
+// @Success      200  {array}   health.MCPServerHealth
+// @Failure      401  {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /mcp-servers/health [get]
+func (h *Handler) ListMCPServerHealth(c fiber.Ctx) error {
+	if h.MCPHealthChecker == nil {
+		return c.JSON([]health.MCPServerHealth{})
+	}
+	results := h.MCPHealthChecker.GetAllHealth()
+	if results == nil {
+		results = []health.MCPServerHealth{}
+	}
+	return c.JSON(results)
 }

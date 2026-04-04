@@ -188,8 +188,9 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 
 	// MCP Servers — global resources (system_admin only for write; handler checks
 	// scope permissions for shared read/mutate routes).
-	// Static sub-paths (:server_id/test) are registered before /:server_id
-	// so Fiber does not treat "test" as a server_id parameter value.
+	// Static sub-paths (health, :server_id/test) are registered before /:server_id
+	// so Fiber does not treat "health" or "test" as server_id parameter values.
+	api.Get("/mcp-servers/health", auth.RequireRole(auth.RoleMember), handler.ListMCPServerHealth)
 	api.Post("/mcp-servers", auth.RequireRole(auth.RoleSystemAdmin), handler.CreateMCPServer)
 	api.Get("/mcp-servers", auth.RequireRole(auth.RoleSystemAdmin), handler.ListMCPServers)
 

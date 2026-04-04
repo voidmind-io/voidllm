@@ -31,14 +31,14 @@ var ErrSSENotSupported = errors.New("server uses deprecated SSE transport (not s
 // instance metadata services (AWS, GCP, Azure, DigitalOcean, etc.).
 var cloudMetadataIP = net.ParseIP("169.254.169.254")
 
-// newSSRFSafeTransport returns an http.Transport that, when allowPrivate is
+// NewSSRFSafeTransport returns an http.Transport that, when allowPrivate is
 // false, refuses TCP connections to loopback, private, link-local, and cloud
 // metadata addresses at dial time. This defends against DNS rebinding attacks:
 // even if a hostname resolved to a public IP at registration time, a malicious
 // DNS update cannot redirect traffic to an internal address at call time.
 // When allowPrivate is true the transport is unrestricted (for self-hosted
 // vLLM deployments on private networks).
-func newSSRFSafeTransport(allowPrivate bool) *http.Transport {
+func NewSSRFSafeTransport(allowPrivate bool) *http.Transport {
 	dialer := &net.Dialer{}
 	if !allowPrivate {
 		dialer.Control = func(_, address string, _ syscall.RawConn) error {
@@ -90,7 +90,7 @@ type HTTPTransport struct {
 // loopback, private-range, link-local, and cloud metadata addresses, preventing
 // DNS rebinding SSRF attacks even after the URL has been registered.
 func NewHTTPTransport(endpoint, authType, authHeader, authToken string, timeout time.Duration, allowPrivate bool) *HTTPTransport {
-	t := newSSRFSafeTransport(allowPrivate)
+	t := NewSSRFSafeTransport(allowPrivate)
 	return &HTTPTransport{
 		endpoint:   endpoint,
 		authType:   authType,

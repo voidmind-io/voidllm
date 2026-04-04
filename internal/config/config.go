@@ -352,6 +352,18 @@ func (c CodeModeConfig) IsEnabled() bool {
 	return *c.Enabled
 }
 
+// MCPHealthConfig holds configuration for the MCP server health monitoring subsystem.
+type MCPHealthConfig struct {
+	// Enabled controls whether periodic health probes are sent to registered
+	// MCP servers. Defaults to true when not set. A pointer is used so that an
+	// explicit "enabled: false" in YAML can be distinguished from the zero value
+	// after unmarshalling.
+	Enabled *bool `yaml:"enabled"`
+	// Interval is how often each registered MCP server is probed via a
+	// tools/list JSON-RPC request. Defaults to 60 seconds.
+	Interval time.Duration `yaml:"interval"`
+}
+
 // MCPConfig holds configuration for the MCP Gateway subsystem.
 type MCPConfig struct {
 	// CallTimeout is the maximum duration for a single proxied MCP tool call.
@@ -362,6 +374,8 @@ type MCPConfig struct {
 	// deployments where MCP servers run on the same network. Default: false.
 	// This setting is only configurable via YAML/ENV — not via Admin API/UI.
 	AllowPrivateURLs bool `yaml:"allow_private_urls"`
+	// Health configures periodic health probing for registered MCP servers.
+	Health MCPHealthConfig `yaml:"health"`
 	// CodeMode holds configuration for the sandboxed JavaScript execution runtime.
 	CodeMode CodeModeConfig `yaml:"code_mode"`
 }
@@ -695,6 +709,17 @@ func (c *Config) setDefaults() {
 	// MCP Gateway
 	if c.Settings.MCP.CallTimeout == 0 {
 		c.Settings.MCP.CallTimeout = 30 * time.Second
+	}
+
+	// MCP Health — default on with a 60-second probe interval. The pointer
+	// allows "enabled: false" in YAML to be respected; a nil pointer means the
+	// field was not set, which defaults to enabled.
+	if c.Settings.MCP.Health.Enabled == nil {
+		v := true
+		c.Settings.MCP.Health.Enabled = &v
+	}
+	if c.Settings.MCP.Health.Interval == 0 {
+		c.Settings.MCP.Health.Interval = 60 * time.Second
 	}
 
 	// MCP Code Mode — only apply sub-field defaults when Code Mode is explicitly

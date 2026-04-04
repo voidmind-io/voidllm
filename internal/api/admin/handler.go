@@ -54,6 +54,9 @@ type Handler struct {
 	// HealthChecker provides upstream model health status. Nil when health
 	// monitoring is not enabled.
 	HealthChecker ModelHealthProvider
+	// MCPHealthChecker provides MCP server health status. Nil when MCP health
+	// monitoring is not enabled.
+	MCPHealthChecker *health.MCPHealthChecker
 	// MCPServer is the management MCP server (list_models, get_usage, etc.).
 	// Nil when MCP is not configured — the route is only registered when non-nil.
 	MCPServer *mcp.Server

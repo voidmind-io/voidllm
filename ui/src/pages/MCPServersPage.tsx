@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useMemo } from 'react'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Table } from '../components/ui/Table'
 import type { Column } from '../components/ui/Table'
@@ -22,6 +22,8 @@ import {
   useMCPServerTools,
 } from '../hooks/useMCPServers'
 import type { MCPServerResponse, CreateMCPServerParams, UpdateMCPServerParams } from '../hooks/useMCPServers'
+import { useMCPServerHealth } from '../hooks/useMCPServerHealth'
+import type { MCPServerHealth } from '../hooks/useMCPServerHealth'
 import { useMe } from '../hooks/useMe'
 import { useTeams } from '../hooks/useTeams'
 import { useToast } from '../hooks/useToast'
@@ -114,6 +116,14 @@ function IconRefresh() {
   )
 }
 
+function IconHealthDot() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+    </svg>
+  )
+}
+
 function IconCopy() {
   return (
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -163,6 +173,82 @@ function sourceLabel(source: string): string {
   if (source === 'yaml') return 'YAML'
   if (source === 'builtin') return 'Built-in'
   return 'API'
+}
+
+// ---------------------------------------------------------------------------
+// HealthIndicator
+// ---------------------------------------------------------------------------
+
+function formatRelativeTime(isoString: string): string {
+  const diffMs = Date.now() - new Date(isoString).getTime()
+  const diffS = Math.floor(diffMs / 1000)
+  if (diffS < 60) return `${diffS}s ago`
+  const diffM = Math.floor(diffS / 60)
+  if (diffM < 60) return `${diffM}m ago`
+  const diffH = Math.floor(diffM / 60)
+  return `${diffH}h ago`
+}
+
+interface HealthIndicatorProps {
+  health: MCPServerHealth | undefined
+}
+
+function HealthIndicator({ health }: HealthIndicatorProps) {
+  if (health === undefined) {
+    return (
+      <div className="flex items-center gap-1.5">
+        <span
+          className="w-2 h-2 rounded-full shrink-0"
+          style={{ backgroundColor: '#6b7280' }}
+          aria-hidden="true"
+        />
+        <span className="text-text-tertiary text-sm">...</span>
+      </div>
+    )
+  }
+
+  const dotColor =
+    health.status === 'healthy'
+      ? '#22c55e'
+      : health.status === 'unhealthy'
+      ? '#ef4444'
+      : '#6b7280'
+
+  const label =
+    health.status === 'healthy'
+      ? 'Healthy'
+      : health.status === 'unhealthy'
+      ? 'Unhealthy'
+      : '...'
+
+  const tooltipParts: string[] = []
+  if (health.last_check) tooltipParts.push(`Last check: ${formatRelativeTime(health.last_check)}`)
+  if (health.latency_ms > 0) tooltipParts.push(`Latency: ${health.latency_ms}ms`)
+  if (health.tool_count > 0) tooltipParts.push(`Tools: ${health.tool_count}`)
+  if (health.last_error) tooltipParts.push(`Error: ${health.last_error}`)
+  const tooltip = tooltipParts.join('\n')
+
+  return (
+    <div
+      className="flex items-center gap-1.5"
+      title={tooltip || undefined}
+    >
+      <span
+        className="w-2 h-2 rounded-full shrink-0"
+        style={{ backgroundColor: dotColor }}
+        aria-hidden="true"
+      />
+      <span
+        className="text-sm"
+        style={{ color: health.status === 'healthy' ? '#a1afc4' : health.status === 'unhealthy' ? '#ef4444' : '#8494a8' }}
+      >
+        {label}
+      </span>
+      {health.status === 'healthy' && health.latency_ms > 0 && (
+        <span className="text-text-tertiary text-xs tabular-nums">{health.latency_ms}ms</span>
+      )}
+    </div>
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -600,6 +686,7 @@ function ClientConfigSnippet({ label, config, onCopy }: ClientConfigSnippetProps
 interface ServerExpandedRowProps {
   server: MCPServerResponse
   canModify: boolean
+  health?: MCPServerHealth
 }
 
 function truncateText(text: string, maxLength: number): string {
@@ -657,7 +744,7 @@ function IconChevronDown() {
   )
 }
 
-function ServerExpandedRow({ server, canModify }: ServerExpandedRowProps) {
+function ServerExpandedRow({ server, canModify, health }: ServerExpandedRowProps) {
   const [configOpen, setConfigOpen] = useState(false)
   const { data: tools, isLoading: toolsLoading } = useMCPServerTools(server.id)
   const addEntry = useAddBlocklistEntry()
@@ -730,6 +817,17 @@ function ServerExpandedRow({ server, canModify }: ServerExpandedRowProps) {
 
   return (
     <div className="px-6 py-4 space-y-3">
+      {/* Health error banner */}
+      {health?.status === 'unhealthy' && health.last_error && (
+        <div className="flex items-start gap-2.5 px-3.5 py-2.5 rounded-lg bg-error/10 border border-error/20">
+          <span className="w-2 h-2 rounded-full bg-error shrink-0 mt-1" aria-hidden="true" />
+          <div className="min-w-0">
+            <p className="text-xs font-medium text-error">Last error</p>
+            <p className="text-xs text-error/80 mt-0.5 break-words">{health.last_error}</p>
+          </div>
+        </div>
+      )}
+
       {/* Client Config — collapsible, above tools */}
       <div>
         <div className="flex items-center justify-between">
@@ -902,9 +1000,16 @@ export default function MCPServersPage() {
     })
   }
 
+  const { data: healthData } = useMCPServerHealth()
+  const healthMap = useMemo(
+    () => new Map((healthData ?? []).map((h) => [h.server_id, h])),
+    [healthData],
+  )
+
   const allServers = servers ?? []
   const activeCount = allServers.filter((s) => s.is_active).length
   const inactiveCount = allServers.length - activeCount
+  const healthyCount = allServers.filter((s) => healthMap.get(s.id)?.status === 'healthy').length
 
   const columns: Column<MCPServerResponse>[] = [
     {
@@ -1030,6 +1135,11 @@ export default function MCPServersPage() {
       },
     },
     {
+      key: 'health',
+      header: 'Health',
+      render: (row) => <HealthIndicator health={healthMap.get(row.id)} />,
+    },
+    {
       key: 'actions',
       header: '',
       align: 'right',
@@ -1129,7 +1239,7 @@ export default function MCPServersPage() {
         }
       />
 
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <StatCard
           label="Total Servers"
           value={isLoading ? '—' : allServers.length}
@@ -1147,6 +1257,12 @@ export default function MCPServersPage() {
           value={isLoading ? '—' : inactiveCount}
           icon={<IconPauseCircle />}
           iconColor="yellow"
+        />
+        <StatCard
+          label="Healthy"
+          value={healthData === undefined ? '—' : healthyCount}
+          icon={<IconHealthDot />}
+          iconColor="green"
         />
       </div>
 
@@ -1166,7 +1282,13 @@ export default function MCPServersPage() {
             (row.scope === 'global' && isSystemAdmin) ||
             (row.scope === 'org' && isOrgAdmin) ||
             (row.scope === 'team' && isTeamAdmin)
-          return <ServerExpandedRow server={row} canModify={canBlockTools} />
+          return (
+            <ServerExpandedRow
+              server={row}
+              canModify={canBlockTools}
+              health={healthMap.get(row.id)}
+            />
+          )
         }}
       />
 

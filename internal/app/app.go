@@ -73,12 +73,13 @@ type Application struct {
 	mcpAccessCache    *proxy.MCPAccessCache
 	mcpTransportCache *proxy.MCPTransportCache
 
-	rateLimiter   ratelimit.Checker
-	tokenCounter  *ratelimit.TokenCounter
-	usageLogger   *usage.Logger
-	mcpLogger     *usage.MCPLogger
-	auditLogger   *audit.Logger
-	healthChecker *health.Checker
+	rateLimiter      ratelimit.Checker
+	tokenCounter     *ratelimit.TokenCounter
+	usageLogger      *usage.Logger
+	mcpLogger        *usage.MCPLogger
+	auditLogger      *audit.Logger
+	healthChecker    *health.Checker
+	mcpHealthChecker *health.MCPHealthChecker
 
 	shutdownState *shutdown.State
 	proxyHandler  *proxy.ProxyHandler
@@ -903,6 +904,46 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	mcpLogger := usage.NewMCPLogger(database, 1000, log)
 	adminHandler.MCPLogger = mcpLogger
 
+	// Build the MCP health checker when enabled. The servers callback reads
+	// from the in-memory MCPServerCache so no DB I/O occurs during probe cycles.
+	// Tokens are decrypted on each callback invocation so that key rotations are
+	// picked up without restarting the checker.
+	var mcpHealthChecker *health.MCPHealthChecker
+	if cfg.Settings.MCP.Health.Enabled != nil && *cfg.Settings.MCP.Health.Enabled {
+		mcpHealthChecker = health.NewMCPHealthChecker(
+			func() []health.MCPServerTarget {
+				servers := mcpServerCache.List()
+				targets := make([]health.MCPServerTarget, 0, len(servers))
+				for _, s := range servers {
+					if !s.IsActive {
+						continue
+					}
+					t := health.MCPServerTarget{
+						ID:         s.ID,
+						Name:       s.Name,
+						Alias:      s.Alias,
+						URL:        s.URL,
+						AuthType:   s.AuthType,
+						AuthHeader: s.AuthHeader,
+						Source:     s.Source,
+					}
+					if s.AuthTokenEnc != nil {
+						token, decErr := crypto.DecryptString(*s.AuthTokenEnc, encKey, []byte("mcp_server:"+s.ID))
+						if decErr == nil {
+							t.AuthToken = token
+						}
+					}
+					targets = append(targets, t)
+				}
+				return targets
+			},
+			cfg.Settings.MCP.Health.Interval,
+			cfg.Settings.MCP.AllowPrivateURLs,
+			log.With(slog.String("component", "mcp_health")),
+		)
+		adminHandler.MCPHealthChecker = mcpHealthChecker
+	}
+
 	success = true
 	return &Application{
 		cfg:               cfg,
@@ -927,6 +968,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		mcpLogger:         mcpLogger,
 		auditLogger:       auditLogger,
 		healthChecker:     healthChecker,
+		mcpHealthChecker:  mcpHealthChecker,
 		shutdownState:     shutdownState,
 		proxyHandler:      proxyHandler,
 		adminHandler:      adminHandler,
@@ -1016,6 +1058,11 @@ func (a *Application) Start() error {
 	// Start upstream model health monitoring when at least one probe is enabled.
 	if a.healthChecker != nil {
 		a.stopFuncs = append(a.stopFuncs, a.healthChecker.Start())
+	}
+
+	// Start MCP server health monitoring when enabled.
+	if a.mcpHealthChecker != nil {
+		a.stopFuncs = append(a.stopFuncs, a.mcpHealthChecker.Start())
 	}
 
 	// Register Code Mode pool cleanup. Close must be called after all in-flight
