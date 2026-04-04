@@ -53,6 +53,13 @@ database:
   conn_max_lifetime: 5m
 ```
 
+For config-less startup (no YAML file), these environment variables override the defaults:
+
+| Variable | Default | Description |
+|---|---|---|
+| `VOIDLLM_DATABASE_DSN` | `./voidllm.db` (standalone), `/data/voidllm.db` (Docker) | Database file path or PostgreSQL DSN |
+| `VOIDLLM_DATABASE_DRIVER` | `sqlite` | Database driver - `sqlite` or `postgres` |
+
 ## Models
 
 ```yaml
@@ -227,6 +234,9 @@ settings:
   mcp:
     call_timeout: 30s            # Max duration per proxied tool call (default: 30s)
     allow_private_urls: false     # Allow localhost/private IPs for MCP server URLs
+    health:
+      enabled: true              # Enable MCP server health probing (default: true)
+      interval: 60s              # Probe interval (default: 60s)
 
 mcp_servers:
   - name: GitHub

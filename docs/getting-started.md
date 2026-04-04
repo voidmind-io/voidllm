@@ -18,6 +18,22 @@ docker run -p 8080:8080 \
   ghcr.io/voidmind-io/voidllm:latest
 ```
 
+## Quick Start (Binary)
+
+Download the latest binary for your platform from the [releases page](https://github.com/voidmind-io/voidllm/releases/latest):
+
+```bash
+# Linux (amd64)
+curl -sL https://github.com/voidmind-io/voidllm/releases/latest/download/voidllm-linux-amd64.tar.gz | tar xz
+export VOIDLLM_ADMIN_KEY=$(openssl rand -base64 32)
+export VOIDLLM_ENCRYPTION_KEY=$(openssl rand -base64 32)
+./voidllm
+```
+
+Available for: Linux (amd64, arm64), Windows (amd64, arm64), macOS (amd64, arm64).
+
+The database defaults to `./voidllm.db` in the current directory. No config file required - VoidLLM starts with sensible defaults and the bootstrap wizard handles initial setup.
+
 On first start, VoidLLM prints your credentials to stdout:
 
 ```

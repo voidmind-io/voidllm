@@ -55,6 +55,20 @@ docker run -p 8080:8080 \
   ghcr.io/voidmind-io/voidllm:latest
 ```
 
+### Binary (no Docker needed)
+
+Download the latest binary for your platform from the [releases page](https://github.com/voidmind-io/voidllm/releases/latest):
+
+```bash
+# Linux
+curl -sL https://github.com/voidmind-io/voidllm/releases/latest/download/voidllm-linux-amd64.tar.gz | tar xz
+export VOIDLLM_ADMIN_KEY=$(openssl rand -base64 32)
+export VOIDLLM_ENCRYPTION_KEY=$(openssl rand -base64 32)
+./voidllm
+```
+
+Available for: Linux (amd64, arm64), Windows (amd64, arm64), macOS (amd64, arm64).
+
 On first start, VoidLLM prints your credentials to stdout:
 
 ```

@@ -73,12 +73,16 @@ docker run -p 8080:8080 \
 
 This makes the database file visible at `./data/voidllm.db` - easier to back up and inspect.
 
+The Docker image sets `VOIDLLM_DATABASE_DSN=/data/voidllm.db` by default. Override this environment variable to change the database location.
+
 ## Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
 | `VOIDLLM_ADMIN_KEY` | First start only | Bootstrap admin key (min 32 chars). Ignored after first start. |
 | `VOIDLLM_ENCRYPTION_KEY` | Yes | AES-256-GCM key for upstream API key encryption. |
+| `VOIDLLM_DATABASE_DSN` | No | Override the database path (default: `/data/voidllm.db`). |
+| `VOIDLLM_DATABASE_DRIVER` | No | Override the database driver (default: `sqlite`, alternative: `postgres`). |
 | `VOIDLLM_LICENSE` | No | Enterprise license JWT. |
 
 ## Health Check
