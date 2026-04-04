@@ -2,6 +2,29 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.13] - 2026-04-04
+
+### Features
+- MCP server health indicators in UI with auto-refresh (#43)
+- Standalone binary support for Windows, Linux, macOS (#50)
+- Cross-platform binaries in GitHub Release pipeline
+- License instance identification via heartbeat
+- Bench metrics sampler with realistic streaming scenario
+
+### Improvements
+- Comprehensive logging review: audit coverage for MCP, SSO, license, settings
+- Key cache log noise reduced (INFO to DEBUG)
+- Rate limit and token budget violations now logged
+- Migration execution logged at INFO
+- Failed login attempts audited
+- Default DB path: ./voidllm.db for standalone, /data/voidllm.db for Docker
+- SSRF-safe dialer for MCP health probes
+- Heartbeat dedup via timestamp (replaces lock mechanism)
+- Bounded concurrency for MCP health probes
+- Stale MCP health entries cleaned up automatically
+
+---
+
 ## [0.0.12] - 2026-04-03
 
 ### Fixes
