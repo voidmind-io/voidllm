@@ -26,7 +26,10 @@ import ModelsAccessTab from './pages/ModelsAccessTab'
 import MCPAccessTab from './pages/MCPAccessTab'
 import SettingsPage from './pages/SettingsPage'
 import LicensePage from './pages/LicensePage'
-import UsagePage from './pages/UsagePage'
+import UsageLayout from './pages/usage/UsageLayout'
+import UsageOverviewPage from './pages/usage/UsageOverviewPage'
+import LLMUsagePage from './pages/usage/LLMUsagePage'
+import MCPUsagePage from './pages/usage/MCPUsagePage'
 import CostReportsPage from './pages/CostReportsPage'
 import ProfilePage from './pages/ProfilePage'
 import AuditLogPage from './pages/AuditLogPage'
@@ -94,7 +97,11 @@ export default function App() {
               </Route>
               <Route path="service-accounts" element={<ServiceAccountsPage />} />
               <Route path="models" element={<ModelsLayout />} />
-              <Route path="usage" element={<UsagePage />} />
+              <Route path="usage" element={<UsageLayout />}>
+                <Route index element={<UsageOverviewPage />} />
+                <Route path="llm" element={<LLMUsagePage />} />
+                <Route path="mcp" element={<MCPUsagePage />} />
+              </Route>
               <Route path="cost-reports" element={<CostReportsPage />} />
               <Route path="profile" element={<ProfilePage />} />
               <Route path="license" element={<LicensePage />} />

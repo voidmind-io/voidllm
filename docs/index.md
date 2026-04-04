@@ -15,6 +15,7 @@ Privacy-first LLM proxy and AI gateway. Self-hosted, single binary, sub-500us ov
 
 ## Deployment
 
+- [Binary](deployment/binary.md) - standalone binary, Linux/macOS/Windows
 - [Docker](deployment/docker.md) - Docker and Docker Compose
 - [Kubernetes](deployment/kubernetes.md) - Helm chart, Istio, health probes
 - [Reverse Proxy](deployment/reverse-proxy.md) - Nginx, Caddy, Traefik

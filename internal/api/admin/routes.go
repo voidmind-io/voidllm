@@ -148,6 +148,10 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 	api.Get("/usage", auth.RequireRole(auth.RoleSystemAdmin), handler.SystemAdminUsage)
 	api.Get("/orgs/:org_id/usage", auth.RequireRole(auth.RoleOrgAdmin), handler.GetOrgUsage)
 
+	// MCP Usage
+	api.Get("/mcp-usage", auth.RequireRole(auth.RoleSystemAdmin), handler.GetSystemMCPUsage)
+	api.Get("/orgs/:org_id/mcp-usage", auth.RequireRole(auth.RoleOrgAdmin), handler.GetOrgMCPUsage)
+
 	// Audit logs — org_admin and above; org_admin is scoped to own org in the handler.
 	api.Get("/audit-logs", auth.RequireRole(auth.RoleOrgAdmin), handler.ListAuditLogs)
 

@@ -1,16 +1,15 @@
 import { useMemo, useState } from 'react'
-import { PageHeader } from '../components/ui/PageHeader'
-import { StatCard } from '../components/ui/StatCard'
-import { Table } from '../components/ui/Table'
-import type { Column } from '../components/ui/Table'
-import { Button } from '../components/ui/Button'
-import { Select } from '../components/ui/Select'
-import { AreaChart, DonutChart, HorizontalBar } from '../components/ui/charts'
-import { useMe } from '../hooks/useMe'
-import { useUsage, useCrossOrgUsage } from '../hooks/useUsage'
-import type { UsageDataPoint } from '../hooks/useUsage'
-import { formatNumber, formatTokens, formatCost } from '../lib/utils'
-import { exportData } from '../lib/export'
+import { StatCard } from '../../components/ui/StatCard'
+import { Table } from '../../components/ui/Table'
+import type { Column } from '../../components/ui/Table'
+import { Button } from '../../components/ui/Button'
+import { Select } from '../../components/ui/Select'
+import { AreaChart, DonutChart, HorizontalBar } from '../../components/ui/charts'
+import { useMe } from '../../hooks/useMe'
+import { useUsage, useCrossOrgUsage } from '../../hooks/useUsage'
+import type { UsageDataPoint } from '../../hooks/useUsage'
+import { formatNumber, formatTokens, formatCost } from '../../lib/utils'
+import { exportData } from '../../lib/export'
 
 const TIME_RANGES = ['24h', '7d', '30d', '90d'] as const
 type TimeRange = (typeof TIME_RANGES)[number]
@@ -162,10 +161,10 @@ function DownloadIcon() {
 }
 
 // ---------------------------------------------------------------------------
-// UsagePage
+// LLMUsagePage
 // ---------------------------------------------------------------------------
 
-export default function UsagePage() {
+export default function LLMUsagePage() {
   const [range, setRange] = useState<TimeRange>('24h')
   const [groupBy, setGroupBy] = useState('model')
   const [crossOrg, setCrossOrg] = useState(false)
@@ -183,7 +182,7 @@ export default function UsagePage() {
 
   const { data: usage, isLoading } = activeResult
 
-  // Daily trend data — only when groupBy is not already 'day'/'hour', and not cross-org
+  // Daily trend data - only when groupBy is not already 'day'/'hour', and not cross-org
   const needsDailyTrend = !crossOrg && groupBy !== 'day' && groupBy !== 'hour'
   const dailyUsage = useUsage(orgId, from, to, 'day')
   // Use main data directly when groupBy is already day or hour
@@ -231,11 +230,6 @@ export default function UsagePage() {
 
   return (
     <>
-      <PageHeader
-        title="Usage"
-        description="Track token usage and costs"
-      />
-
       {/* Top controls: scope toggle + time range pills */}
       <div className="flex items-center gap-4 mb-6 flex-wrap">
         {isSystemAdmin && (
@@ -305,7 +299,7 @@ export default function UsagePage() {
         />
       </div>
 
-      {/* Usage over Time chart — not shown in cross-org mode */}
+      {/* Usage over Time chart - not shown in cross-org mode */}
       {!crossOrg && (
         <div className="bg-bg-secondary rounded-xl border border-border p-6 mb-6">
           <h3 className="text-sm font-semibold text-text-primary mb-4">Usage over Time</h3>
@@ -385,7 +379,7 @@ export default function UsagePage() {
         emptyMessage="No usage data for the selected time range"
       />
 
-      {/* Bottom row — Top by Tokens + Token Distribution */}
+      {/* Bottom row - Top by Tokens + Token Distribution */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
         <div className="bg-bg-secondary rounded-xl border border-border p-6">
           <h3 className="text-sm font-semibold text-text-primary mb-4">Top by Tokens</h3>
@@ -415,7 +409,7 @@ export default function UsagePage() {
 }
 
 // ---------------------------------------------------------------------------
-// CrossOrgData helper — kept local to avoid leaking the type
+// CrossOrgData helper - kept local to avoid leaking the type
 // ---------------------------------------------------------------------------
 
 interface CrossOrgDataProps {
