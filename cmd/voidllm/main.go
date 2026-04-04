@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"strconv"
 
 	"github.com/voidmind-io/voidllm/internal/apierror"
@@ -13,6 +15,16 @@ import (
 	"github.com/voidmind-io/voidllm/internal/config"
 	"github.com/voidmind-io/voidllm/internal/logger"
 )
+
+// exitWithPause exits with the given code. On Windows it waits for Enter
+// so the terminal window stays open long enough to read the error message.
+func exitWithPause(code int) {
+	if code != 0 && runtime.GOOS == "windows" {
+		fmt.Fprintln(os.Stderr, "\nPress Enter to exit...")
+		bufio.NewReader(os.Stdin).ReadBytes('\n')
+	}
+	os.Exit(code)
+}
 
 func main() {
 	// Subcommand detection: handle subcommands before flag.Parse so that
@@ -41,7 +53,7 @@ func main() {
 	cfg, fromDefaults, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "voidllm: failed to load config: %v\n", err)
-		os.Exit(1)
+		exitWithPause(1)
 	}
 
 	// Dev mode forces debug log level so all diagnostic output is visible.
@@ -70,12 +82,12 @@ func main() {
 	application, err := app.New(cfg, log, *devMode)
 	if err != nil {
 		log.Error("startup failed", slog.String("error", err.Error()))
-		os.Exit(1)
+		exitWithPause(1)
 	}
 
 	if err := application.Start(); err != nil {
 		log.Error("server start failed", slog.String("error", err.Error()))
-		os.Exit(1)
+		exitWithPause(1)
 	}
 
 	application.PrintBootstrapCredentials()
