@@ -2,6 +2,23 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.14] - 2026-04-05
+
+### Features
+- MCP OAuth Client Credentials auth type with auto-discovery (#49)
+- Google Gemini and Vertex AI provider adapter (8 providers total)
+- MCP usage dashboard with tabbed layout - Overview, LLM, MCP (#44)
+- Binary deployment documentation for Linux, macOS, Windows
+
+### Improvements
+- MCP usage queries with chronological ordering for time-based grouping
+- Cross-org data handling in usage dashboard
+- Shared credentials warning banner in MCP server dialogs
+- Windows binary pauses on error exit to show error message
+- 42 new tests for MCP usage queries, handlers, and health checker
+
+---
+
 ## [0.0.13] - 2026-04-04
 
 ### Features
