@@ -25,9 +25,15 @@ type createMCPServerRequest struct {
 	Name       string `json:"name"`
 	Alias      string `json:"alias"`
 	URL        string `json:"url"`
-	AuthType   string `json:"auth_type"`   // "none", "bearer", or "header"
+	AuthType   string `json:"auth_type"`   // "none", "bearer", "header", or "oauth"
 	AuthHeader string `json:"auth_header"` // header name for "header" auth type
 	AuthToken  string `json:"auth_token"`  // plaintext; encrypted before storage, never returned
+
+	// OAuth Client Credentials Flow fields. Required when auth_type is "oauth".
+	OAuthTokenURL     string `json:"oauth_token_url"`
+	OAuthClientID     string `json:"oauth_client_id"`
+	OAuthClientSecret string `json:"oauth_client_secret"` // plaintext; encrypted before storage, never returned
+	OAuthScopes       string `json:"oauth_scopes"`        // optional space-separated scopes
 }
 
 // updateMCPServerRequest is the JSON body accepted by UpdateMCPServer.
@@ -40,10 +46,16 @@ type updateMCPServerRequest struct {
 	AuthHeader      *string `json:"auth_header"`
 	AuthToken       *string `json:"auth_token"` // plaintext; encrypted before storage, never returned
 	CodeModeEnabled *bool   `json:"code_mode_enabled"`
+
+	// OAuth Client Credentials Flow fields. Non-nil to update the field.
+	OAuthTokenURL     *string `json:"oauth_token_url"`
+	OAuthClientID     *string `json:"oauth_client_id"`
+	OAuthClientSecret *string `json:"oauth_client_secret"` // plaintext; encrypted before storage, never returned
+	OAuthScopes       *string `json:"oauth_scopes"`
 }
 
 // mcpServerResponse is the JSON representation of an MCP server returned by the API.
-// The auth token is never included in the response — it is write-only.
+// Auth tokens and OAuth client secrets are never included in the response — they are write-only.
 type mcpServerResponse struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`
@@ -61,6 +73,12 @@ type mcpServerResponse struct {
 	CodeModeEnabled bool    `json:"code_mode_enabled"`
 	CreatedAt       string  `json:"created_at"`
 	UpdatedAt       string  `json:"updated_at"`
+
+	// OAuth Client Credentials Flow fields. Only present when auth_type is "oauth".
+	// The client secret is never returned.
+	OAuthTokenURL string `json:"oauth_token_url,omitempty"`
+	OAuthClientID string `json:"oauth_client_id,omitempty"`
+	OAuthScopes   string `json:"oauth_scopes,omitempty"`
 }
 
 // testMCPServerResponse is the JSON response from TestMCPServerConnection.
@@ -75,6 +93,7 @@ var validMCPAuthTypes = map[string]bool{
 	"none":   true,
 	"bearer": true,
 	"header": true,
+	"oauth":  true,
 }
 
 // mcpAliasRe matches a valid MCP server alias: lowercase alphanumeric characters
@@ -169,6 +188,9 @@ func mcpServerToResponse(s *db.MCPServer) mcpServerResponse {
 		CodeModeEnabled: s.CodeModeEnabled,
 		CreatedAt:       s.CreatedAt,
 		UpdatedAt:       s.UpdatedAt,
+		OAuthTokenURL:   s.OAuthTokenURL,
+		OAuthClientID:   s.OAuthClientID,
+		OAuthScopes:     s.OAuthScopes,
 	}
 }
 
@@ -182,19 +204,6 @@ func validateMCPAlias(alias string) string {
 		return "alias must contain only lowercase alphanumeric characters and hyphens, and must start with an alphanumeric character"
 	}
 	return ""
-}
-
-// decryptMCPAuthToken decrypts the stored encrypted auth token for server s.
-// It returns an empty string when the server has no auth token set.
-func (h *Handler) decryptMCPAuthToken(s *db.MCPServer) (string, error) {
-	if s.AuthTokenEnc == nil {
-		return "", nil
-	}
-	plaintext, err := crypto.DecryptString(*s.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(s.ID))
-	if err != nil {
-		return "", fmt.Errorf("decrypt mcp auth token: %w", err)
-	}
-	return plaintext, nil
 }
 
 // validateAndNormalizeMCPServerRequest validates the common fields of a create
@@ -228,7 +237,7 @@ func validateAndNormalizeMCPServerRequest(c fiber.Ctx, req *createMCPServerReque
 		at = "none"
 	}
 	if !validMCPAuthTypes[at] {
-		return fail("auth_type must be one of: none, bearer, header")
+		return fail("auth_type must be one of: none, bearer, header, oauth")
 	}
 	if at == "header" && req.AuthHeader == "" {
 		return fail(`auth_header is required when auth_type is "header"`)
@@ -237,6 +246,22 @@ func validateAndNormalizeMCPServerRequest(c fiber.Ctx, req *createMCPServerReque
 		_ = apierror.Send(c, fiber.StatusBadRequest, "invalid_auth_header",
 			"auth_header cannot override structural HTTP headers")
 		return "", false
+	}
+	if at == "oauth" {
+		if req.OAuthClientID == "" {
+			return fail(`oauth_client_id is required when auth_type is "oauth"`)
+		}
+		if req.OAuthClientSecret == "" {
+			return fail(`oauth_client_secret is required when auth_type is "oauth"`)
+		}
+		if req.OAuthTokenURL != "" {
+			if !strings.HasPrefix(req.OAuthTokenURL, "https://") {
+				return fail("oauth_token_url must use HTTPS")
+			}
+			if err := validateMCPServerURL(req.OAuthTokenURL, allowPrivate); err != nil {
+				return fail("oauth_token_url: " + err.Error())
+			}
+		}
 	}
 	return at, true
 }
@@ -247,7 +272,13 @@ func validateAndNormalizeMCPServerRequest(c fiber.Ctx, req *createMCPServerReque
 // On conflict it returns a wrapped db.ErrConflict; on other DB errors it logs
 // and returns the error unwrapped. Callers are responsible for translating
 // errors to HTTP responses.
-func (h *Handler) createMCPServerWithToken(c fiber.Ctx, params db.CreateMCPServerParams, authToken string) (*db.MCPServer, error) {
+// createMCPServerWithTokenAndOAuth inserts the server record (without credentials) and
+// then, if a plaintext auth token or OAuth client secret was provided, encrypts them
+// using the server ID as AAD and writes them back. Returns the final persisted server.
+// On conflict it returns a wrapped db.ErrConflict; on other DB errors it logs
+// and returns the error unwrapped. Callers are responsible for translating
+// errors to HTTP responses.
+func (h *Handler) createMCPServerWithTokenAndOAuth(c fiber.Ctx, params db.CreateMCPServerParams, authToken, oauthClientSecret string) (*db.MCPServer, error) {
 	ctx := c.Context()
 
 	s, err := h.DB.CreateMCPServer(ctx, params)
@@ -258,20 +289,43 @@ func (h *Handler) createMCPServerWithToken(c fiber.Ctx, params db.CreateMCPServe
 		return nil, err
 	}
 
+	var updateParams db.UpdateMCPServerParams
+	needsUpdate := false
+
 	if authToken != "" {
 		enc, encErr := crypto.EncryptString(authToken, h.EncryptionKey, mcpServerAAD(s.ID))
 		if encErr != nil {
 			h.Log.ErrorContext(ctx, "create mcp server: encrypt auth token", slog.String("error", encErr.Error()))
 			return nil, encErr
 		}
-		s, err = h.DB.UpdateMCPServer(ctx, s.ID, db.UpdateMCPServerParams{AuthTokenEnc: &enc})
+		updateParams.AuthTokenEnc = &enc
+		needsUpdate = true
+	}
+	if oauthClientSecret != "" {
+		enc, encErr := crypto.EncryptString(oauthClientSecret, h.EncryptionKey, mcpServerAAD(s.ID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "create mcp server: encrypt oauth client secret", slog.String("error", encErr.Error()))
+			return nil, encErr
+		}
+		updateParams.OAuthClientSecretEnc = &enc
+		needsUpdate = true
+	}
+
+	if needsUpdate {
+		s, err = h.DB.UpdateMCPServer(ctx, s.ID, updateParams)
 		if err != nil {
-			h.Log.ErrorContext(ctx, "create mcp server: store encrypted token", slog.String("error", err.Error()))
+			h.Log.ErrorContext(ctx, "create mcp server: store encrypted credentials", slog.String("error", err.Error()))
 			return nil, err
 		}
 	}
 
 	return s, nil
+}
+
+// createMCPServerWithToken is a backward-compatible wrapper around
+// createMCPServerWithTokenAndOAuth for callers that do not pass an OAuth secret.
+func (h *Handler) createMCPServerWithToken(c fiber.Ctx, params db.CreateMCPServerParams, authToken string) (*db.MCPServer, error) {
+	return h.createMCPServerWithTokenAndOAuth(c, params, authToken, "")
 }
 
 // checkMCPServerReadPermission verifies that the caller may read a server.
@@ -384,18 +438,21 @@ func (h *Handler) CreateMCPServer(c fiber.Ctx) error {
 		createdBy = keyInfo.UserID
 	}
 
-	s, err := h.createMCPServerWithToken(c, db.CreateMCPServerParams{
-		Name:         req.Name,
-		Alias:        req.Alias,
-		URL:          req.URL,
-		AuthType:     authType,
-		AuthHeader:   req.AuthHeader,
-		AuthTokenEnc: nil,
-		OrgID:        nil,
-		TeamID:       nil,
-		CreatedBy:    createdBy,
-		Source:       "api",
-	}, req.AuthToken)
+	s, err := h.createMCPServerWithTokenAndOAuth(c, db.CreateMCPServerParams{
+		Name:          req.Name,
+		Alias:         req.Alias,
+		URL:           req.URL,
+		AuthType:      authType,
+		AuthHeader:    req.AuthHeader,
+		AuthTokenEnc:  nil,
+		OrgID:         nil,
+		TeamID:        nil,
+		CreatedBy:     createdBy,
+		Source:        "api",
+		OAuthTokenURL: req.OAuthTokenURL,
+		OAuthClientID: req.OAuthClientID,
+		OAuthScopes:   req.OAuthScopes,
+	}, req.AuthToken, req.OAuthClientSecret)
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "an MCP server with this alias already exists")
@@ -455,18 +512,21 @@ func (h *Handler) CreateOrgMCPServer(c fiber.Ctx) error {
 
 	createdBy := keyInfo.UserID
 
-	s, err := h.createMCPServerWithToken(c, db.CreateMCPServerParams{
-		Name:         req.Name,
-		Alias:        req.Alias,
-		URL:          req.URL,
-		AuthType:     authType,
-		AuthHeader:   req.AuthHeader,
-		AuthTokenEnc: nil,
-		OrgID:        &orgID,
-		TeamID:       nil,
-		CreatedBy:    createdBy,
-		Source:       "api",
-	}, req.AuthToken)
+	s, err := h.createMCPServerWithTokenAndOAuth(c, db.CreateMCPServerParams{
+		Name:          req.Name,
+		Alias:         req.Alias,
+		URL:           req.URL,
+		AuthType:      authType,
+		AuthHeader:    req.AuthHeader,
+		AuthTokenEnc:  nil,
+		OrgID:         &orgID,
+		TeamID:        nil,
+		CreatedBy:     createdBy,
+		Source:        "api",
+		OAuthTokenURL: req.OAuthTokenURL,
+		OAuthClientID: req.OAuthClientID,
+		OAuthScopes:   req.OAuthScopes,
+	}, req.AuthToken, req.OAuthClientSecret)
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "an MCP server with this alias already exists")
@@ -529,18 +589,21 @@ func (h *Handler) CreateTeamMCPServer(c fiber.Ctx) error {
 		return nil
 	}
 
-	s, createErr := h.createMCPServerWithToken(c, db.CreateMCPServerParams{
-		Name:         req.Name,
-		Alias:        req.Alias,
-		URL:          req.URL,
-		AuthType:     authType,
-		AuthHeader:   req.AuthHeader,
-		AuthTokenEnc: nil,
-		OrgID:        &orgID,
-		TeamID:       &teamID,
-		CreatedBy:    keyInfo.UserID,
-		Source:       "api",
-	}, req.AuthToken)
+	s, createErr := h.createMCPServerWithTokenAndOAuth(c, db.CreateMCPServerParams{
+		Name:          req.Name,
+		Alias:         req.Alias,
+		URL:           req.URL,
+		AuthType:      authType,
+		AuthHeader:    req.AuthHeader,
+		AuthTokenEnc:  nil,
+		OrgID:         &orgID,
+		TeamID:        &teamID,
+		CreatedBy:     keyInfo.UserID,
+		Source:        "api",
+		OAuthTokenURL: req.OAuthTokenURL,
+		OAuthClientID: req.OAuthClientID,
+		OAuthScopes:   req.OAuthScopes,
+	}, req.AuthToken, req.OAuthClientSecret)
 	if createErr != nil {
 		if errors.Is(createErr, db.ErrConflict) {
 			return apierror.Conflict(c, "an MCP server with this alias already exists")
@@ -759,11 +822,37 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 		}
 	}
 	if req.AuthType != nil && !validMCPAuthTypes[*req.AuthType] {
-		return apierror.BadRequest(c, "auth_type must be one of: none, bearer, header")
+		return apierror.BadRequest(c, "auth_type must be one of: none, bearer, header, oauth")
 	}
 	if req.AuthHeader != nil && blockedHeaders[strings.ToLower(*req.AuthHeader)] {
 		return apierror.Send(c, fiber.StatusBadRequest, "invalid_auth_header",
 			"auth_header cannot override structural HTTP headers")
+	}
+	// Validate OAuth fields using the effective auth type — which may come from
+	// the request or the existing server record when auth_type is not being changed.
+	effectiveAuthType := existing.AuthType
+	if req.AuthType != nil {
+		effectiveAuthType = *req.AuthType
+	}
+	if effectiveAuthType == "oauth" {
+		// Require fields when switching TO oauth from a non-oauth auth type.
+		if req.AuthType != nil && existing.AuthType != "oauth" {
+			if req.OAuthClientID == nil || *req.OAuthClientID == "" {
+				return apierror.BadRequest(c, "oauth_client_id is required when switching to oauth")
+			}
+			if req.OAuthClientSecret == nil || *req.OAuthClientSecret == "" {
+				return apierror.BadRequest(c, "oauth_client_secret is required when switching to oauth")
+			}
+		}
+		// Always validate token_url when provided on an oauth server.
+		if req.OAuthTokenURL != nil && *req.OAuthTokenURL != "" {
+			if !strings.HasPrefix(*req.OAuthTokenURL, "https://") {
+				return apierror.BadRequest(c, "oauth_token_url must use HTTPS")
+			}
+			if err := validateMCPServerURL(*req.OAuthTokenURL, h.MCPAllowPrivateURLs); err != nil {
+				return apierror.BadRequest(c, "oauth_token_url: "+err.Error())
+			}
+		}
 	}
 
 	params := db.UpdateMCPServerParams{
@@ -773,6 +862,9 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 		AuthType:        req.AuthType,
 		AuthHeader:      req.AuthHeader,
 		CodeModeEnabled: req.CodeModeEnabled,
+		OAuthTokenURL:   req.OAuthTokenURL,
+		OAuthClientID:   req.OAuthClientID,
+		OAuthScopes:     req.OAuthScopes,
 	}
 
 	// Encrypt the auth token using the immutable server ID as AAD.
@@ -783,6 +875,15 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 			return apierror.InternalError(c, "failed to encrypt auth token")
 		}
 		params.AuthTokenEnc = &enc
+	}
+	// Encrypt the OAuth client secret using the immutable server ID as AAD.
+	if req.OAuthClientSecret != nil {
+		enc, encErr := crypto.EncryptString(*req.OAuthClientSecret, h.EncryptionKey, mcpServerAAD(id))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "update mcp server: encrypt oauth client secret", slog.String("id", id), slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt oauth client secret")
+		}
+		params.OAuthClientSecretEnc = &enc
 	}
 
 	s, err := h.DB.UpdateMCPServer(ctx, id, params)
@@ -1305,17 +1406,13 @@ func (h *Handler) TestMCPServerConnection(c fiber.Ctx) error {
 		return permErr
 	}
 
-	token, err := h.decryptMCPAuthToken(s)
-	if err != nil {
-		h.Log.ErrorContext(ctx, "test mcp server: decrypt token", slog.String("id", id), slog.String("error", err.Error()))
-		return apierror.InternalError(c, "failed to decrypt auth token")
+	// Build a transport using the same helper as the proxy path — handles both
+	// bearer/header auth and OAuth Client Credentials Flow.
+	transport, buildErr := h.buildAdHocTransport(s, mcpTestTimeout)
+	if buildErr != nil {
+		h.Log.ErrorContext(ctx, "test mcp server: build transport", slog.String("id", id), slog.String("error", buildErr.Error()))
+		return apierror.InternalError(c, "failed to prepare transport")
 	}
-
-	// Send a tools/list JSON-RPC 2.0 request to probe the MCP server.
-	// NewHTTPTransport with h.MCPAllowPrivateURLs applies the same SSRF-safe
-	// dialer used by the live proxy path, guarding against DNS rebinding even
-	// when the URL appeared safe at registration time.
-	transport := mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, token, mcpTestTimeout, h.MCPAllowPrivateURLs)
 	defer transport.Close()
 
 	tools, probeErr := transport.ListTools(ctx)

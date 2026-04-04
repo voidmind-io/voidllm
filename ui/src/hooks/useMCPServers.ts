@@ -8,6 +8,10 @@ export interface MCPServerResponse {
   url: string
   auth_type: string
   auth_header?: string
+  oauth_token_url?: string
+  oauth_client_id?: string
+  oauth_scopes?: string
+  // Note: oauth_client_secret is write-only, never returned
   /** source is "api" for Admin API-created servers and "yaml" for config-file-sourced servers. */
   source: string
   scope: string
@@ -26,6 +30,10 @@ export interface CreateMCPServerParams {
   auth_type: string
   auth_header?: string
   auth_token?: string
+  oauth_token_url?: string
+  oauth_client_id?: string
+  oauth_client_secret?: string
+  oauth_scopes?: string
 }
 
 export interface UpdateMCPServerParams {
@@ -35,6 +43,10 @@ export interface UpdateMCPServerParams {
   auth_type?: string
   auth_header?: string
   auth_token?: string
+  oauth_token_url?: string
+  oauth_client_id?: string
+  oauth_client_secret?: string
+  oauth_scopes?: string
   code_mode_enabled?: boolean
 }
 

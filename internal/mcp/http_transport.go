@@ -71,7 +71,7 @@ func NewSSRFSafeTransport(allowPrivate bool) *http.Transport {
 // It is not safe to use concurrently with Close.
 type HTTPTransport struct {
 	endpoint   string
-	authType   string // "none", "bearer", or "header"
+	authType   string // "none", "bearer", "header", or "oauth"
 	authHeader string // header name used when authType is "header"
 	authToken  string // decrypted token value
 	client     *http.Client
@@ -79,23 +79,36 @@ type HTTPTransport struct {
 	sseMode    bool      // true when the upstream uses SSE transport (not Streamable HTTP)
 	detectOnce sync.Once // ensures detectTransport runs exactly once
 	detectErr  error     // cached error from detectTransport
+
+	// OAuth fields — populated only when authType is "oauth".
+	serverID     string             // stable server ID used as OAuthTokenManager cache key
+	oauthManager *OAuthTokenManager // shared manager; nil for non-OAuth transports
+	oauthConfig  *OAuthConfig       // OAuth Client Credentials Flow configuration
 }
 
 // NewHTTPTransport creates a transport for the given endpoint with the
 // supplied authentication configuration and per-call timeout.
-// authType must be one of "none", "bearer", or "header".
+// authType must be one of "none", "bearer", "header", or "oauth".
 // When authType is "bearer", authToken is sent as a Bearer token.
 // When authType is "header", authToken is sent under the authHeader header name.
+// When authType is "oauth", serverID and oauthMgr and oauthCfg must be non-nil;
+// the manager fetches and caches access tokens via the Client Credentials Flow.
 // When allowPrivate is false, the underlying TCP dialer refuses connections to
 // loopback, private-range, link-local, and cloud metadata addresses, preventing
 // DNS rebinding SSRF attacks even after the URL has been registered.
-func NewHTTPTransport(endpoint, authType, authHeader, authToken string, timeout time.Duration, allowPrivate bool) *HTTPTransport {
+// Pass empty serverID, nil oauthMgr, and nil oauthCfg for non-OAuth servers.
+func NewHTTPTransport(endpoint, authType, authHeader, authToken string,
+	timeout time.Duration, allowPrivate bool,
+	serverID string, oauthMgr *OAuthTokenManager, oauthCfg *OAuthConfig) *HTTPTransport {
 	t := NewSSRFSafeTransport(allowPrivate)
 	return &HTTPTransport{
-		endpoint:   endpoint,
-		authType:   authType,
-		authHeader: authHeader,
-		authToken:  authToken,
+		endpoint:     endpoint,
+		authType:     authType,
+		authHeader:   authHeader,
+		authToken:    authToken,
+		serverID:     serverID,
+		oauthManager: oauthMgr,
+		oauthConfig:  oauthCfg,
 		client: &http.Client{
 			Timeout:   timeout,
 			Transport: t,
@@ -141,6 +154,14 @@ func (t *HTTPTransport) Call(ctx context.Context, raw []byte, sessionID string) 
 	case "header":
 		if t.authHeader != "" {
 			req.Header.Set(t.authHeader, t.authToken)
+		}
+	case "oauth":
+		if t.oauthManager != nil && t.oauthConfig != nil {
+			oauthToken, oauthErr := t.oauthManager.GetToken(ctx, t.serverID, *t.oauthConfig)
+			if oauthErr != nil {
+				return nil, "", fmt.Errorf("oauth token: %w", oauthErr)
+			}
+			req.Header.Set("Authorization", "Bearer "+oauthToken)
 		}
 	}
 
@@ -291,6 +312,14 @@ func (t *HTTPTransport) detectTransport(ctx context.Context) error {
 		if t.authHeader != "" {
 			req.Header.Set(t.authHeader, t.authToken)
 		}
+	case "oauth":
+		if t.oauthManager != nil && t.oauthConfig != nil {
+			oauthToken, oauthErr := t.oauthManager.GetToken(ctx, t.serverID, *t.oauthConfig)
+			if oauthErr != nil {
+				return fmt.Errorf("oauth token: %w", oauthErr)
+			}
+			req.Header.Set("Authorization", "Bearer "+oauthToken)
+		}
 	}
 
 	resp, err := t.client.Do(req)
@@ -334,6 +363,14 @@ func (t *HTTPTransport) sseDiscover(ctx context.Context) (string, error) {
 	case "header":
 		if t.authHeader != "" {
 			req.Header.Set(t.authHeader, t.authToken)
+		}
+	case "oauth":
+		if t.oauthManager != nil && t.oauthConfig != nil {
+			oauthToken, oauthErr := t.oauthManager.GetToken(discoverCtx, t.serverID, *t.oauthConfig)
+			if oauthErr != nil {
+				return "", fmt.Errorf("oauth token: %w", oauthErr)
+			}
+			req.Header.Set("Authorization", "Bearer "+oauthToken)
 		}
 	}
 

@@ -237,7 +237,9 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			if s.AuthTokenEnc != nil && *s.AuthTokenEnc != "" {
 				token, _ = crypto.DecryptString(*s.AuthTokenEnc, encKey, []byte("mcp_server:"+s.ID))
 			}
-			transport := mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, token, 10*time.Second, cfg.Settings.MCP.AllowPrivateURLs)
+			// For the startup SSE probe, OAuth is not needed — we pass nil for the
+			// OAuth manager and config. The probe only detects deprecated SSE transport.
+			transport := mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, token, 10*time.Second, cfg.Settings.MCP.AllowPrivateURLs, "", nil, nil)
 			_, probeErr := transport.ListTools(ctx)
 			transport.Close()
 			if errors.Is(probeErr, mcp.ErrSSENotSupported) {
@@ -919,18 +921,27 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 						continue
 					}
 					t := health.MCPServerTarget{
-						ID:         s.ID,
-						Name:       s.Name,
-						Alias:      s.Alias,
-						URL:        s.URL,
-						AuthType:   s.AuthType,
-						AuthHeader: s.AuthHeader,
-						Source:     s.Source,
+						ID:            s.ID,
+						Name:          s.Name,
+						Alias:         s.Alias,
+						URL:           s.URL,
+						AuthType:      s.AuthType,
+						AuthHeader:    s.AuthHeader,
+						Source:        s.Source,
+						OAuthTokenURL: s.OAuthTokenURL,
+						OAuthClientID: s.OAuthClientID,
+						OAuthScopes:   s.OAuthScopes,
 					}
 					if s.AuthTokenEnc != nil {
 						token, decErr := crypto.DecryptString(*s.AuthTokenEnc, encKey, []byte("mcp_server:"+s.ID))
 						if decErr == nil {
 							t.AuthToken = token
+						}
+					}
+					if s.OAuthClientSecretEnc != nil {
+						secret, decErr := crypto.DecryptString(*s.OAuthClientSecretEnc, encKey, []byte("mcp_server:"+s.ID))
+						if decErr == nil {
+							t.OAuthClientSecret = secret
 						}
 					}
 					targets = append(targets, t)
@@ -940,6 +951,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			cfg.Settings.MCP.Health.Interval,
 			cfg.Settings.MCP.AllowPrivateURLs,
 			log.With(slog.String("component", "mcp_health")),
+			mcpTransportCache.OAuthManager(),
 		)
 		adminHandler.MCPHealthChecker = mcpHealthChecker
 	}

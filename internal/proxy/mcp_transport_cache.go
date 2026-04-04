@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -13,12 +14,13 @@ import (
 // resolvedMCPServer holds a pre-resolved, ready-to-use MCP server configuration
 // with a persistent HTTP transport.
 type resolvedMCPServer struct {
-	ID           string
-	URL          string
-	AuthType     string
-	AuthHeader   string
-	AuthTokenEnc string             // original encrypted value, used for change detection
-	Transport    *mcp.HTTPTransport // persistent, reusable; closed on eviction
+	ID                   string
+	URL                  string
+	AuthType             string
+	AuthHeader           string
+	AuthTokenEnc         string             // original encrypted value, used for change detection
+	OAuthClientSecretEnc string             // original encrypted value, used for change detection
+	Transport            *mcp.HTTPTransport // persistent, reusable; closed on eviction
 }
 
 // MCPTransportCache caches persistent HTTP transports and decrypted auth tokens
@@ -36,12 +38,14 @@ type MCPTransportCache struct {
 	callTimeout  time.Duration
 	allowPrivate bool
 	log          *slog.Logger
+	oauthManager *mcp.OAuthTokenManager // shared OAuth token manager; always non-nil
 }
 
 // NewMCPTransportCache returns an empty, ready-to-use MCPTransportCache.
-// encKey is the AES-256-GCM key used to decrypt stored auth tokens.
-// callTimeout is passed to mcp.NewHTTPTransport for each persistent transport;
-// a zero value falls back to 30 seconds. allowPrivate disables SSRF protection.
+// encKey is the AES-256-GCM key used to decrypt stored auth tokens and OAuth
+// client secrets. callTimeout is passed to mcp.NewHTTPTransport for each
+// persistent transport; a zero value falls back to 30 seconds.
+// allowPrivate disables SSRF protection.
 func NewMCPTransportCache(encKey []byte, allowPrivate bool, callTimeout time.Duration, log *slog.Logger) *MCPTransportCache {
 	if callTimeout == 0 {
 		callTimeout = 30 * time.Second
@@ -52,6 +56,10 @@ func NewMCPTransportCache(encKey []byte, allowPrivate bool, callTimeout time.Dur
 		callTimeout:  callTimeout,
 		allowPrivate: allowPrivate,
 		log:          log,
+		oauthManager: mcp.NewOAuthTokenManager(&http.Client{
+			Timeout:   30 * time.Second,
+			Transport: mcp.NewSSRFSafeTransport(allowPrivate),
+		}),
 	}
 }
 
@@ -103,6 +111,10 @@ func (c *MCPTransportCache) LoadAll(servers []db.MCPServer) {
 		if s.AuthTokenEnc != nil {
 			encToken = *s.AuthTokenEnc
 		}
+		encOAuthSecret := ""
+		if s.OAuthClientSecretEnc != nil {
+			encOAuthSecret = *s.OAuthClientSecretEnc
+		}
 
 		existing := c.servers[s.ID]
 
@@ -111,15 +123,18 @@ func (c *MCPTransportCache) LoadAll(servers []db.MCPServer) {
 			existing.URL == s.URL &&
 			existing.AuthType == s.AuthType &&
 			existing.AuthHeader == s.AuthHeader &&
-			existing.AuthTokenEnc == encToken {
+			existing.AuthTokenEnc == encToken &&
+			existing.OAuthClientSecretEnc == encOAuthSecret {
 			next[s.ID] = existing
 			continue
 		}
 
-		// Config changed — defer close of the old transport until next LoadAll.
+		// Config changed — defer close of the old transport until next LoadAll and
+		// evict any cached OAuth token so the next request gets a fresh grant.
 		if existing != nil && existing.Transport != nil {
 			c.stale = append(c.stale, existing.Transport)
 		}
+		c.oauthManager.Evict(s.ID)
 
 		// Decrypt the auth token once.
 		var plainToken string
@@ -134,13 +149,33 @@ func (c *MCPTransportCache) LoadAll(servers []db.MCPServer) {
 			}
 		}
 
+		// Build optional OAuth config for "oauth" auth type.
+		var oauthCfg *mcp.OAuthConfig
+		if s.AuthType == "oauth" && encOAuthSecret != "" {
+			plainSecret, decErr := crypto.DecryptString(encOAuthSecret, c.encKey, []byte("mcp_server:"+s.ID))
+			if decErr != nil {
+				c.log.Error("mcp transport cache: decrypt oauth client secret",
+					slog.String("server_id", s.ID),
+					slog.String("error", decErr.Error()))
+			} else {
+				oauthCfg = &mcp.OAuthConfig{
+					TokenURL:     s.OAuthTokenURL,
+					ServerURL:    s.URL,
+					ClientID:     s.OAuthClientID,
+					ClientSecret: plainSecret,
+					Scopes:       s.OAuthScopes,
+				}
+			}
+		}
+
 		next[s.ID] = &resolvedMCPServer{
-			ID:           s.ID,
-			URL:          s.URL,
-			AuthType:     s.AuthType,
-			AuthHeader:   s.AuthHeader,
-			AuthTokenEnc: encToken,
-			Transport:    mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, plainToken, c.callTimeout, c.allowPrivate),
+			ID:                   s.ID,
+			URL:                  s.URL,
+			AuthType:             s.AuthType,
+			AuthHeader:           s.AuthHeader,
+			AuthTokenEnc:         encToken,
+			OAuthClientSecretEnc: encOAuthSecret,
+			Transport:            mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, plainToken, c.callTimeout, c.allowPrivate, s.ID, c.oauthManager, oauthCfg),
 		}
 	}
 
@@ -160,13 +195,15 @@ func (c *MCPTransportCache) LoadAll(servers []db.MCPServer) {
 // bounded time after Invalidate to reclaim the stale transport.
 func (c *MCPTransportCache) Invalidate(serverID string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if rs, ok := c.servers[serverID]; ok {
 		if rs.Transport != nil {
 			c.stale = append(c.stale, rs.Transport)
 		}
 		delete(c.servers, serverID)
 	}
+	c.mu.Unlock()
+	// Evict cached OAuth token outside the lock — Evict takes its own lock.
+	c.oauthManager.Evict(serverID)
 }
 
 // Close closes all cached and stale transports and empties the cache. It must
@@ -196,4 +233,11 @@ func (c *MCPTransportCache) Len() int {
 	n := len(c.servers)
 	c.mu.RUnlock()
 	return n
+}
+
+// OAuthManager returns the shared OAuthTokenManager owned by this cache.
+// Callers such as the MCP health checker may reuse it to avoid redundant
+// token grants for the same server.
+func (c *MCPTransportCache) OAuthManager() *mcp.OAuthTokenManager {
+	return c.oauthManager
 }

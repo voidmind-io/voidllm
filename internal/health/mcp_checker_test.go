@@ -27,7 +27,7 @@ func newMCPTarget(id, name, alias, url string) health.MCPServerTarget {
 // never fires during tests) using allowPrivateURLs=true so that httptest servers
 // on 127.0.0.1 are reachable.
 func newMCPChecker(servers func() []health.MCPServerTarget) *health.MCPHealthChecker {
-	return health.NewMCPHealthChecker(servers, 24*time.Hour, true, newLogger())
+	return health.NewMCPHealthChecker(servers, 24*time.Hour, true, newLogger(), nil)
 }
 
 // TestMCPHealthChecker_GetHealth_UnknownServerID verifies that GetHealth returns

@@ -23,6 +23,46 @@ import (
 // Concurrent access is safe via sync.Map.
 var mcpSessions sync.Map // map[string]string — "alias:orgID" → Mcp-Session-Id
 
+// buildAdHocTransport creates a one-off HTTPTransport for server s when the
+// persistent transport cache has no entry (cold start or cache miss). It decrypts
+// both the bearer auth token and the OAuth client secret as needed.
+// The caller is responsible for calling Close on the returned transport.
+func (h *Handler) buildAdHocTransport(server *db.MCPServer, timeout time.Duration) (*mcp.HTTPTransport, error) {
+	var authToken string
+	if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
+		decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
+		if decErr != nil {
+			return nil, fmt.Errorf("decrypt auth token: %w", decErr)
+		}
+		authToken = decrypted
+	}
+
+	var oauthMgr *mcp.OAuthTokenManager
+	var oauthCfg *mcp.OAuthConfig
+	if server.AuthType == "oauth" && server.OAuthClientSecretEnc != nil && *server.OAuthClientSecretEnc != "" {
+		plainSecret, decErr := crypto.DecryptString(*server.OAuthClientSecretEnc, h.EncryptionKey, mcpServerAAD(server.ID))
+		if decErr != nil {
+			return nil, fmt.Errorf("decrypt oauth client secret: %w", decErr)
+		}
+		// Use the shared manager from the transport cache when available so token
+		// grants are reused across ad-hoc transports for the same server.
+		if h.MCPTransportCache != nil {
+			oauthMgr = h.MCPTransportCache.OAuthManager()
+		} else {
+			oauthMgr = mcp.NewOAuthTokenManager(nil)
+		}
+		oauthCfg = &mcp.OAuthConfig{
+			TokenURL:     server.OAuthTokenURL,
+			ServerURL:    server.URL,
+			ClientID:     server.OAuthClientID,
+			ClientSecret: plainSecret,
+			Scopes:       server.OAuthScopes,
+		}
+	}
+
+	return mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs, server.ID, oauthMgr, oauthCfg), nil
+}
+
 // mcpReInitMu serialises session re-initialisation. Re-init only happens on
 // ErrSessionExpired which is rare; a global mutex avoids a per-key lock map
 // while still preventing concurrent duplicate re-inits for the same server.
@@ -112,23 +152,19 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	}
 	if transport == nil {
 		adHoc = true
-		var authToken string
-		if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
-			decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
-			if decErr != nil {
-				h.Log.ErrorContext(c.Context(), "mcp proxy: decrypt auth token",
-					slog.String("server", alias),
-					slog.String("error", decErr.Error()))
-				return c.Status(fiber.StatusInternalServerError).JSON(
-					mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
-			}
-			authToken = decrypted
-		}
 		timeout := h.MCPCallTimeout
 		if timeout == 0 {
 			timeout = 30 * time.Second
 		}
-		transport = mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
+		var buildErr error
+		transport, buildErr = h.buildAdHocTransport(server, timeout)
+		if buildErr != nil {
+			h.Log.ErrorContext(c.Context(), "mcp proxy: build ad-hoc transport",
+				slog.String("server", alias),
+				slog.String("error", buildErr.Error()))
+			return c.Status(fiber.StatusInternalServerError).JSON(
+				mcp.NewErrorResponse(nil, mcp.CodeInternalError, "internal error"))
+		}
 	}
 	if adHoc {
 		defer transport.Close() //nolint:errcheck
@@ -451,19 +487,15 @@ func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias
 	}
 	if transport == nil {
 		adHocTool = true
-		var authToken string
-		if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
-			decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
-			if decErr != nil {
-				return nil, fmt.Errorf("CallMCPTool %s: decrypt auth token: %w", serverAlias, decErr)
-			}
-			authToken = decrypted
-		}
 		timeout := h.MCPCallTimeout
 		if timeout == 0 {
 			timeout = 30 * time.Second
 		}
-		transport = mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
+		var buildErr error
+		transport, buildErr = h.buildAdHocTransport(server, timeout)
+		if buildErr != nil {
+			return nil, fmt.Errorf("CallMCPTool %s: build transport: %w", serverAlias, buildErr)
+		}
 	}
 	if adHocTool {
 		defer transport.Close() //nolint:errcheck
@@ -585,19 +617,15 @@ func (h *Handler) MakeToolFetcher() mcp.ToolFetcher {
 		}
 		if transport == nil {
 			adHocFetch = true
-			var authToken string
-			if server.AuthTokenEnc != nil && *server.AuthTokenEnc != "" {
-				decrypted, decErr := crypto.DecryptString(*server.AuthTokenEnc, h.EncryptionKey, mcpServerAAD(server.ID))
-				if decErr != nil {
-					return nil, fmt.Errorf("tool fetcher %s: decrypt auth token: %w", serverID, decErr)
-				}
-				authToken = decrypted
-			}
 			timeout := h.MCPCallTimeout
 			if timeout == 0 {
 				timeout = 30 * time.Second
 			}
-			transport = mcp.NewHTTPTransport(server.URL, server.AuthType, server.AuthHeader, authToken, timeout, h.MCPAllowPrivateURLs)
+			var buildErr error
+			transport, buildErr = h.buildAdHocTransport(server, timeout)
+			if buildErr != nil {
+				return nil, fmt.Errorf("tool fetcher %s: build transport: %w", serverID, buildErr)
+			}
 		}
 		if adHocFetch {
 			defer transport.Close() //nolint:errcheck

@@ -38,6 +38,7 @@ const AUTH_TYPE_OPTIONS = [
   { value: 'none', label: 'None' },
   { value: 'bearer', label: 'Bearer Token' },
   { value: 'header', label: 'Custom Header' },
+  { value: 'oauth', label: 'OAuth (Client Credentials)' },
 ]
 
 // ---------------------------------------------------------------------------
@@ -147,6 +148,7 @@ function authLabel(authType: string): string {
   if (authType === 'none') return 'None'
   if (authType === 'bearer') return 'Bearer'
   if (authType === 'header') return 'Header'
+  if (authType === 'oauth') return 'OAuth'
   return authType
 }
 
@@ -302,6 +304,10 @@ function CreateMCPServerDialog({
   const [authType, setAuthType] = useState('none')
   const [authToken, setAuthToken] = useState('')
   const [authHeader, setAuthHeader] = useState('')
+  const [oauthTokenUrl, setOauthTokenUrl] = useState('')
+  const [oauthClientId, setOauthClientId] = useState('')
+  const [oauthClientSecret, setOauthClientSecret] = useState('')
+  const [oauthScopes, setOauthScopes] = useState('')
   const [errors, setErrors] = useState<CreateFormErrors>({})
 
   const { data: teams } = useTeams(orgId)
@@ -321,6 +327,10 @@ function CreateMCPServerDialog({
     setAuthType('none')
     setAuthToken('')
     setAuthHeader('')
+    setOauthTokenUrl('')
+    setOauthClientId('')
+    setOauthClientSecret('')
+    setOauthScopes('')
     setErrors({})
     onClose()
   }
@@ -350,11 +360,17 @@ function CreateMCPServerDialog({
       url: url.trim(),
       auth_type: authType,
     }
-    if (authType !== 'none' && authToken.trim()) {
+    if ((authType === 'bearer' || authType === 'header') && authToken.trim()) {
       params.auth_token = authToken.trim()
     }
     if (authType === 'header' && authHeader.trim()) {
       params.auth_header = authHeader.trim()
+    }
+    if (authType === 'oauth') {
+      if (oauthTokenUrl.trim()) params.oauth_token_url = oauthTokenUrl.trim()
+      if (oauthClientId.trim()) params.oauth_client_id = oauthClientId.trim()
+      if (oauthClientSecret.trim()) params.oauth_client_secret = oauthClientSecret.trim()
+      if (oauthScopes.trim()) params.oauth_scopes = oauthScopes.trim()
     }
 
     let endpoint: string
@@ -454,11 +470,29 @@ function CreateMCPServerDialog({
           <TabSwitcher
             tabs={AUTH_TYPE_OPTIONS.map(o => ({ key: o.value, label: o.label }))}
             activeKey={authType}
-            onChange={setAuthType}
+            onChange={(val) => {
+              if (val !== 'oauth') {
+                setOauthTokenUrl('')
+                setOauthClientId('')
+                setOauthClientSecret('')
+                setOauthScopes('')
+              }
+              setAuthType(val)
+            }}
             className="mb-0"
           />
         </div>
         {authType !== 'none' && (
+          <div className="flex items-start gap-3 p-3 rounded-lg bg-warning/10 border border-warning/20">
+            <svg className="w-4 h-4 text-warning shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M12 3l9.5 16.5H2.5L12 3z" />
+            </svg>
+            <p className="text-xs text-warning leading-relaxed">
+              Credentials configured here are shared across all users with access to this server. Use service accounts or application credentials, not personal tokens.
+            </p>
+          </div>
+        )}
+        {(authType === 'bearer' || authType === 'header') && (
           <Input
             label="Auth Token"
             type="password"
@@ -477,6 +511,39 @@ function CreateMCPServerDialog({
             error={errors.auth_header}
             disabled={isPending}
           />
+        )}
+        {authType === 'oauth' && (
+          <>
+            <Input
+              label="Token URL"
+              value={oauthTokenUrl}
+              onChange={(e) => setOauthTokenUrl(e.target.value)}
+              placeholder="https://auth.example.com/oauth/token"
+              disabled={isPending}
+            />
+            <Input
+              label="Client ID"
+              value={oauthClientId}
+              onChange={(e) => setOauthClientId(e.target.value)}
+              disabled={isPending}
+            />
+            <Input
+              label="Client Secret"
+              type="password"
+              value={oauthClientSecret}
+              onChange={(e) => setOauthClientSecret(e.target.value)}
+              placeholder="Encrypted at rest, never shown again"
+              disabled={isPending}
+            />
+            <Input
+              label="Scopes"
+              value={oauthScopes}
+              onChange={(e) => setOauthScopes(e.target.value)}
+              placeholder="read write"
+              description="Space-separated"
+              disabled={isPending}
+            />
+          </>
         )}
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="secondary" onClick={handleClose} disabled={isPending}>
@@ -514,6 +581,10 @@ function EditMCPServerDialog({ server, onClose }: EditMCPServerDialogProps) {
   const [authType, setAuthType] = useState(server.auth_type)
   const [authToken, setAuthToken] = useState('')
   const [authHeader, setAuthHeader] = useState(server.auth_header ?? '')
+  const [oauthTokenUrl, setOauthTokenUrl] = useState(server.oauth_token_url ?? '')
+  const [oauthClientId, setOauthClientId] = useState(server.oauth_client_id ?? '')
+  const [oauthClientSecret, setOauthClientSecret] = useState('')
+  const [oauthScopes, setOauthScopes] = useState(server.oauth_scopes ?? '')
   const [errors, setErrors] = useState<EditFormErrors>({})
 
   const updateMCPServer = useUpdateMCPServer()
@@ -543,9 +614,25 @@ function EditMCPServerDialog({ server, onClose }: EditMCPServerDialogProps) {
     if (alias.trim() !== server.alias) params.alias = alias.trim()
     if (url.trim() !== server.url) params.url = url.trim()
     if (authType !== server.auth_type) params.auth_type = authType
-    if (authToken.trim()) params.auth_token = authToken.trim()
-    if (authHeader.trim() !== (server.auth_header ?? '')) {
+    if ((authType === 'bearer' || authType === 'header') && authToken.trim()) {
+      params.auth_token = authToken.trim()
+    }
+    if (authType === 'header' && authHeader.trim() !== (server.auth_header ?? '')) {
       params.auth_header = authHeader.trim() || undefined
+    }
+    if (authType === 'oauth') {
+      if (oauthTokenUrl.trim() !== (server.oauth_token_url ?? '')) {
+        params.oauth_token_url = oauthTokenUrl.trim() || undefined
+      }
+      if (oauthClientId.trim() !== (server.oauth_client_id ?? '')) {
+        params.oauth_client_id = oauthClientId.trim() || undefined
+      }
+      if (oauthClientSecret.trim()) {
+        params.oauth_client_secret = oauthClientSecret.trim()
+      }
+      if (oauthScopes.trim() !== (server.oauth_scopes ?? '')) {
+        params.oauth_scopes = oauthScopes.trim() || undefined
+      }
     }
 
     if (Object.keys(params).length === 0) {
@@ -602,11 +689,29 @@ function EditMCPServerDialog({ server, onClose }: EditMCPServerDialogProps) {
           <TabSwitcher
             tabs={AUTH_TYPE_OPTIONS.map(o => ({ key: o.value, label: o.label }))}
             activeKey={authType}
-            onChange={setAuthType}
+            onChange={(val) => {
+              if (val !== 'oauth') {
+                setOauthTokenUrl('')
+                setOauthClientId('')
+                setOauthClientSecret('')
+                setOauthScopes('')
+              }
+              setAuthType(val)
+            }}
             className="mb-0"
           />
         </div>
         {authType !== 'none' && (
+          <div className="flex items-start gap-3 p-3 rounded-lg bg-warning/10 border border-warning/20">
+            <svg className="w-4 h-4 text-warning shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M12 3l9.5 16.5H2.5L12 3z" />
+            </svg>
+            <p className="text-xs text-warning leading-relaxed">
+              Credentials configured here are shared across all users with access to this server. Use service accounts or application credentials, not personal tokens.
+            </p>
+          </div>
+        )}
+        {(authType === 'bearer' || authType === 'header') && (
           <Input
             label="Auth Token"
             type="password"
@@ -626,6 +731,40 @@ function EditMCPServerDialog({ server, onClose }: EditMCPServerDialogProps) {
             error={errors.auth_header}
             disabled={isPending}
           />
+        )}
+        {authType === 'oauth' && (
+          <>
+            <Input
+              label="Token URL"
+              value={oauthTokenUrl}
+              onChange={(e) => setOauthTokenUrl(e.target.value)}
+              placeholder="https://auth.example.com/oauth/token"
+              disabled={isPending}
+            />
+            <Input
+              label="Client ID"
+              value={oauthClientId}
+              onChange={(e) => setOauthClientId(e.target.value)}
+              disabled={isPending}
+            />
+            <Input
+              label="Client Secret"
+              type="password"
+              value={oauthClientSecret}
+              onChange={(e) => setOauthClientSecret(e.target.value)}
+              placeholder="Leave empty to keep current"
+              description="Leave empty to keep current secret. Enter a new value to replace."
+              disabled={isPending}
+            />
+            <Input
+              label="Scopes"
+              value={oauthScopes}
+              onChange={(e) => setOauthScopes(e.target.value)}
+              placeholder="read write"
+              description="Space-separated"
+              disabled={isPending}
+            />
+          </>
         )}
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="secondary" onClick={onClose} disabled={isPending}>

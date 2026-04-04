@@ -54,7 +54,7 @@ type MCPServerTarget struct {
 	Alias string
 	// URL is the full endpoint URL that receives the JSON-RPC POST.
 	URL string
-	// AuthType is the authentication scheme: "none", "bearer", or "header".
+	// AuthType is the authentication scheme: "none", "bearer", "header", or "oauth".
 	AuthType string
 	// AuthToken is the plaintext (decrypted) authentication token. Empty when
 	// AuthType is "none".
@@ -64,6 +64,12 @@ type MCPServerTarget struct {
 	// Source is the origin of the server definition: "api", "yaml", or "builtin".
 	// Built-in servers are skipped during health probes.
 	Source string
+
+	// OAuth Client Credentials Flow fields. Populated when AuthType is "oauth".
+	OAuthTokenURL     string
+	OAuthClientID     string
+	OAuthClientSecret string // plaintext (decrypted)
+	OAuthScopes       string
 }
 
 // MCPHealthChecker periodically probes registered MCP servers via a
@@ -73,11 +79,12 @@ type MCPHealthChecker struct {
 	// servers is a callback that returns the current list of probe targets.
 	// It is called at the start of every probe cycle so newly added or removed
 	// servers are picked up without restarting the checker.
-	servers  func() []MCPServerTarget
-	results  sync.Map // serverID -> *MCPServerHealth (replaced atomically)
-	interval time.Duration
-	client   *http.Client
-	log      *slog.Logger
+	servers      func() []MCPServerTarget
+	results      sync.Map // serverID -> *MCPServerHealth (replaced atomically)
+	interval     time.Duration
+	client       *http.Client
+	log          *slog.Logger
+	oauthManager *mcp.OAuthTokenManager // shared token manager for OAuth servers; always non-nil
 }
 
 // toolsListPayload is the JSON-RPC 2.0 request body sent to each MCP server.
@@ -92,10 +99,16 @@ var toolsListPayload = []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 // to loopback, private-range, link-local, and cloud metadata addresses,
 // preventing DNS rebinding SSRF attacks. Set allowPrivateURLs to true only
 // when MCP servers run on a private network (mirrors MCPConfig.AllowPrivateURLs).
-func NewMCPHealthChecker(servers func() []MCPServerTarget, interval time.Duration, allowPrivateURLs bool, log *slog.Logger) *MCPHealthChecker {
+//
+// oauthMgr is the shared OAuthTokenManager used when probing OAuth-authenticated
+// servers. When nil a new manager is created internally.
+func NewMCPHealthChecker(servers func() []MCPServerTarget, interval time.Duration, allowPrivateURLs bool, log *slog.Logger, oauthMgr *mcp.OAuthTokenManager) *MCPHealthChecker {
 	transport := mcp.NewSSRFSafeTransport(allowPrivateURLs)
 	transport.TLSHandshakeTimeout = 10 * time.Second
 	transport.IdleConnTimeout = 90 * time.Second
+	if oauthMgr == nil {
+		oauthMgr = mcp.NewOAuthTokenManager(nil)
+	}
 	return &MCPHealthChecker{
 		servers:  servers,
 		interval: interval,
@@ -105,7 +118,8 @@ func NewMCPHealthChecker(servers func() []MCPServerTarget, interval time.Duratio
 				return http.ErrUseLastResponse
 			},
 		},
-		log: log,
+		log:          log,
+		oauthManager: oauthMgr,
 	}
 }
 
@@ -214,7 +228,7 @@ func (c *MCPHealthChecker) runOne(t MCPServerTarget) {
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 
-	latencyMs, toolCount, err := probeMCPServer(ctx, c.client, t)
+	latencyMs, toolCount, err := probeMCPServer(ctx, c.client, c.oauthManager, t)
 
 	// Load existing state or seed a zero value so the copy-on-write always
 	// starts from a consistent base.
@@ -255,14 +269,31 @@ func (c *MCPHealthChecker) runOne(t MCPServerTarget) {
 // URL, parses the response, and returns the round-trip latency in milliseconds
 // and the number of tools reported. It returns a non-nil error on any
 // connection failure or non-2xx HTTP status.
-func probeMCPServer(ctx context.Context, client *http.Client, t MCPServerTarget) (latencyMs int64, toolCount int, err error) {
+func probeMCPServer(ctx context.Context, client *http.Client, oauthMgr *mcp.OAuthTokenManager, t MCPServerTarget) (latencyMs int64, toolCount int, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.URL, bytes.NewReader(toolsListPayload))
 	if err != nil {
 		return 0, 0, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	setMCPAuthHeaders(req, t)
+
+	// Handle OAuth inline since token fetching requires a context.
+	if strings.ToLower(t.AuthType) == "oauth" && oauthMgr != nil {
+		cfg := mcp.OAuthConfig{
+			TokenURL:     t.OAuthTokenURL,
+			ServerURL:    t.URL,
+			ClientID:     t.OAuthClientID,
+			ClientSecret: t.OAuthClientSecret,
+			Scopes:       t.OAuthScopes,
+		}
+		token, tokenErr := oauthMgr.GetToken(ctx, t.ID, cfg)
+		if tokenErr != nil {
+			return 0, 0, fmt.Errorf("oauth token: %w", tokenErr)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		setMCPAuthHeaders(req, t)
+	}
 
 	start := time.Now()
 	resp, err := client.Do(req)

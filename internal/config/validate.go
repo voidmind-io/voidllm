@@ -19,6 +19,7 @@ var validMCPAuthTypes = map[string]bool{
 	"none":   true,
 	"bearer": true,
 	"header": true,
+	"oauth":  true,
 }
 
 // validModelTypes is the set of accepted model type values in the YAML config.
@@ -235,10 +236,21 @@ func (c *Config) validate() error {
 			authType = "none"
 		}
 		if !validMCPAuthTypes[authType] {
-			errs = append(errs, fmt.Errorf(`%s.auth_type: must be one of "none", "bearer", "header"; got %q`, prefix, s.AuthType))
+			errs = append(errs, fmt.Errorf(`%s.auth_type: must be one of "none", "bearer", "header", "oauth"; got %q`, prefix, s.AuthType))
 		}
 		if authType == "header" && s.AuthHeader == "" {
 			errs = append(errs, fmt.Errorf(`%s.auth_header: must not be empty when auth_type is "header"`, prefix))
+		}
+		if authType == "oauth" {
+			if s.OAuthTokenURL != "" && !strings.HasPrefix(s.OAuthTokenURL, "https://") {
+				errs = append(errs, fmt.Errorf(`%s.oauth_token_url: must use HTTPS`, prefix))
+			}
+			if s.OAuthClientID == "" {
+				errs = append(errs, fmt.Errorf(`%s.oauth_client_id: must not be empty when auth_type is "oauth"`, prefix))
+			}
+			if s.OAuthClientSecret == "" {
+				errs = append(errs, fmt.Errorf(`%s.oauth_client_secret: must not be empty when auth_type is "oauth"`, prefix))
+			}
 		}
 	}
 

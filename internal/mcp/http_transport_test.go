@@ -18,7 +18,7 @@ import (
 // newTransport is a convenience constructor that defaults to a 5-second timeout
 // with private addresses allowed (test servers run on loopback).
 func newTransport(endpoint, authType, authHeader, authToken string) *mcp.HTTPTransport {
-	return mcp.NewHTTPTransport(endpoint, authType, authHeader, authToken, 5*time.Second, true)
+	return mcp.NewHTTPTransport(endpoint, authType, authHeader, authToken, 5*time.Second, true, "", nil, nil)
 }
 
 // ---- Call -------------------------------------------------------------------
@@ -142,7 +142,7 @@ func TestHTTPTransport_Call_Timeout(t *testing.T) {
 		srv.Close()
 	})
 
-	tr := mcp.NewHTTPTransport(srv.URL, "none", "", "", 50*time.Millisecond, true)
+	tr := mcp.NewHTTPTransport(srv.URL, "none", "", "", 50*time.Millisecond, true, "", nil, nil)
 	_, _, err := tr.Call(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), "")
 	if err == nil {
 		t.Fatal("Call() error = nil, want timeout error")

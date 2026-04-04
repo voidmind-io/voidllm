@@ -299,23 +299,31 @@ type MCPServerConfig struct {
 	// http:// or https://.
 	URL string `yaml:"url"`
 	// AuthType controls how VoidLLM authenticates to the upstream server.
-	// Valid values: "none", "bearer", "header". Defaults to "none" when empty.
+	// Valid values: "none", "bearer", "header", "oauth". Defaults to "none" when empty.
 	AuthType string `yaml:"auth_type"`
 	// AuthHeader is the HTTP header name used when AuthType is "header".
 	AuthHeader string `yaml:"auth_header"`
 	// AuthToken is the plaintext credential. It is encrypted with AES-256-GCM
 	// before being written to the database and is redacted from all logs.
 	AuthToken string `yaml:"auth_token" json:"-"`
+
+	// OAuth Client Credentials Flow fields. Required when AuthType is "oauth".
+	// OAuthClientSecret is encrypted with AES-256-GCM before storage.
+	OAuthTokenURL     string `yaml:"oauth_token_url"`
+	OAuthClientID     string `yaml:"oauth_client_id"`
+	OAuthClientSecret string `yaml:"oauth_client_secret" json:"-"`
+	OAuthScopes       string `yaml:"oauth_scopes"`
 }
 
-// LogValue implements slog.LogValuer to prevent the auth token from appearing
-// in log output.
+// LogValue implements slog.LogValuer to prevent the auth token and OAuth client
+// secret from appearing in log output.
 func (c MCPServerConfig) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("name", c.Name),
 		slog.String("alias", c.Alias),
 		slog.String("url", c.URL),
 		slog.String("auth_token", "[REDACTED]"),
+		slog.String("oauth_client_secret", "[REDACTED]"),
 	)
 }
 

@@ -15,7 +15,8 @@ import (
 // mcpServerSelectColumns is the ordered column list used in all mcp_servers SELECT queries.
 // It must match the scan order in scanMCPServer exactly.
 const mcpServerSelectColumns = "id, name, alias, url, auth_type, auth_header, " +
-	"auth_token_enc, org_id, team_id, is_active, created_by, source, code_mode_enabled, created_at, updated_at, deleted_at"
+	"auth_token_enc, org_id, team_id, is_active, created_by, source, code_mode_enabled, created_at, updated_at, deleted_at, " +
+	"oauth_token_url, oauth_client_id, oauth_client_secret_enc, oauth_scopes"
 
 // MCPServer represents an external MCP server record in the database.
 type MCPServer struct {
@@ -23,7 +24,7 @@ type MCPServer struct {
 	Name         string
 	Alias        string
 	URL          string
-	AuthType     string  // "none", "bearer", or "header"
+	AuthType     string  // "none", "bearer", "header", or "oauth"
 	AuthHeader   string  // header name used when AuthType is "header"
 	AuthTokenEnc *string // AES-256-GCM encrypted token; nil when AuthType is "none"
 	OrgID        *string // nil for global servers
@@ -40,6 +41,12 @@ type MCPServer struct {
 	CreatedAt       string
 	UpdatedAt       string
 	DeletedAt       *string
+
+	// OAuth Client Credentials Flow fields. Only populated when AuthType is "oauth".
+	OAuthTokenURL        string  `json:"oauth_token_url"`
+	OAuthClientID        string  `json:"oauth_client_id"`
+	OAuthClientSecretEnc *string `json:"-"` // AES-256-GCM encrypted; never returned in API
+	OAuthScopes          string  `json:"oauth_scopes"`
 }
 
 // CreateMCPServerParams holds the input for creating an MCP server record.
@@ -59,6 +66,12 @@ type CreateMCPServerParams struct {
 	// CodeModeEnabled controls whether this server's tools are available in
 	// Code Mode sandboxed execution. Defaults to true when nil.
 	CodeModeEnabled *bool
+
+	// OAuth Client Credentials Flow fields. Only used when AuthType is "oauth".
+	OAuthTokenURL        string
+	OAuthClientID        string
+	OAuthClientSecretEnc *string
+	OAuthScopes          string
 }
 
 // UpdateMCPServerParams holds optional fields for updating an MCP server.
@@ -75,6 +88,12 @@ type UpdateMCPServerParams struct {
 	IsActive *bool
 	// CodeModeEnabled, when non-nil, sets the code_mode_enabled flag.
 	CodeModeEnabled *bool
+
+	// OAuth Client Credentials Flow fields. Only applied when non-nil.
+	OAuthTokenURL        *string
+	OAuthClientID        *string
+	OAuthClientSecretEnc *string
+	OAuthScopes          *string
 }
 
 // CreateMCPServer inserts a new MCP server record and returns the persisted row.
@@ -98,12 +117,15 @@ func (d *DB) CreateMCPServer(ctx context.Context, params CreateMCPServerParams) 
 	p := d.dialect.Placeholder
 	insertQuery := "INSERT INTO mcp_servers " +
 		"(id, name, alias, url, auth_type, auth_header, auth_token_enc, " +
-		"org_id, team_id, is_active, created_by, source, code_mode_enabled, created_at, updated_at) " +
+		"org_id, team_id, is_active, created_by, source, code_mode_enabled, " +
+		"oauth_token_url, oauth_client_id, oauth_client_secret_enc, oauth_scopes, " +
+		"created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " +
 		p(6) + ", " + p(7) + ", " +
 		p(8) + ", " + p(9) + ", " +
 		"1, " + p(10) + ", " + p(11) + ", " + p(12) + ", " +
+		p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + mcpServerSelectColumns +
@@ -129,6 +151,10 @@ func (d *DB) CreateMCPServer(ctx context.Context, params CreateMCPServerParams) 
 			createdBy,
 			source,
 			codeModeEnabled,
+			params.OAuthTokenURL,
+			params.OAuthClientID,
+			params.OAuthClientSecretEnc,
+			params.OAuthScopes,
 		)
 		if execErr != nil {
 			return translateError(execErr)
@@ -377,6 +403,26 @@ func (d *DB) UpdateMCPServer(ctx context.Context, id string, params UpdateMCPSer
 		args = append(args, val)
 		argN++
 	}
+	if params.OAuthTokenURL != nil {
+		setClauses = append(setClauses, "oauth_token_url = "+p(argN))
+		args = append(args, *params.OAuthTokenURL)
+		argN++
+	}
+	if params.OAuthClientID != nil {
+		setClauses = append(setClauses, "oauth_client_id = "+p(argN))
+		args = append(args, *params.OAuthClientID)
+		argN++
+	}
+	if params.OAuthClientSecretEnc != nil {
+		setClauses = append(setClauses, "oauth_client_secret_enc = "+p(argN))
+		args = append(args, *params.OAuthClientSecretEnc)
+		argN++
+	}
+	if params.OAuthScopes != nil {
+		setClauses = append(setClauses, "oauth_scopes = "+p(argN))
+		args = append(args, *params.OAuthScopes)
+		argN++
+	}
 
 	if len(setClauses) == 0 {
 		return d.GetMCPServer(ctx, id)
@@ -474,16 +520,23 @@ func scanMCPServer(scanner interface{ Scan(...any) error }) (*MCPServer, error) 
 	var s MCPServer
 	var isActiveInt int
 	var codeModeEnabledInt int
+	// oauthTokenURL and oauthClientID may be empty strings (DEFAULT '') when the
+	// server is not OAuth-authenticated; nullable columns use a pointer.
+	var oauthTokenURL, oauthClientID, oauthScopes string
 	err := scanner.Scan(
 		&s.ID, &s.Name, &s.Alias, &s.URL, &s.AuthType, &s.AuthHeader,
 		&s.AuthTokenEnc, &s.OrgID, &s.TeamID, &isActiveInt, &s.CreatedBy,
 		&s.Source, &codeModeEnabledInt, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt,
+		&oauthTokenURL, &oauthClientID, &s.OAuthClientSecretEnc, &oauthScopes,
 	)
 	if err != nil {
 		return nil, err
 	}
 	s.IsActive = isActiveInt == 1
 	s.CodeModeEnabled = codeModeEnabledInt == 1
+	s.OAuthTokenURL = oauthTokenURL
+	s.OAuthClientID = oauthClientID
+	s.OAuthScopes = oauthScopes
 	return &s, nil
 }
 
@@ -566,28 +619,44 @@ func (d *DB) SyncYAMLMCPServers(ctx context.Context, servers []config.MCPServerC
 		if errors.Is(err, ErrNotFound) {
 			// Server is not in the DB — create it with source="yaml".
 			created, createErr := d.CreateMCPServer(ctx, CreateMCPServerParams{
-				Name:       s.Name,
-				Alias:      s.Alias,
-				URL:        s.URL,
-				AuthType:   authType,
-				AuthHeader: s.AuthHeader,
-				Source:     "yaml",
+				Name:          s.Name,
+				Alias:         s.Alias,
+				URL:           s.URL,
+				AuthType:      authType,
+				AuthHeader:    s.AuthHeader,
+				Source:        "yaml",
+				OAuthTokenURL: s.OAuthTokenURL,
+				OAuthClientID: s.OAuthClientID,
+				OAuthScopes:   s.OAuthScopes,
 			})
 			if createErr != nil {
 				return fmt.Errorf("sync yaml mcp servers: create %s: %w", s.Alias, createErr)
 			}
 
-			// Encrypt the auth token now that we have the server ID to use as AAD,
-			// then store it in a follow-up UPDATE.
+			// Encrypt credentials now that we have the server ID to use as AAD,
+			// then store them in a follow-up UPDATE.
+			var updateParams UpdateMCPServerParams
+			needsUpdate := false
+
 			if s.AuthToken != "" {
 				enc, encErr := crypto.EncryptString(s.AuthToken, encKey, mcpServerAAD(created.ID))
 				if encErr != nil {
 					return fmt.Errorf("sync yaml mcp servers: encrypt token for %s: %w", s.Alias, encErr)
 				}
-				if _, updateErr := d.UpdateMCPServer(ctx, created.ID, UpdateMCPServerParams{
-					AuthTokenEnc: &enc,
-				}); updateErr != nil {
-					return fmt.Errorf("sync yaml mcp servers: set token for %s: %w", s.Alias, updateErr)
+				updateParams.AuthTokenEnc = &enc
+				needsUpdate = true
+			}
+			if authType == "oauth" && s.OAuthClientSecret != "" {
+				enc, encErr := crypto.EncryptString(s.OAuthClientSecret, encKey, mcpServerAAD(created.ID))
+				if encErr != nil {
+					return fmt.Errorf("sync yaml mcp servers: encrypt oauth secret for %s: %w", s.Alias, encErr)
+				}
+				updateParams.OAuthClientSecretEnc = &enc
+				needsUpdate = true
+			}
+			if needsUpdate {
+				if _, updateErr := d.UpdateMCPServer(ctx, created.ID, updateParams); updateErr != nil {
+					return fmt.Errorf("sync yaml mcp servers: set credentials for %s: %w", s.Alias, updateErr)
 				}
 			}
 			continue
@@ -603,12 +672,18 @@ func (d *DB) SyncYAMLMCPServers(ctx context.Context, servers []config.MCPServerC
 		url := s.URL
 		authTypeVal := authType
 		authHeader := s.AuthHeader
+		oauthTokenURL := s.OAuthTokenURL
+		oauthClientID := s.OAuthClientID
+		oauthScopes := s.OAuthScopes
 
 		updateParams := UpdateMCPServerParams{
-			Name:       &name,
-			URL:        &url,
-			AuthType:   &authTypeVal,
-			AuthHeader: &authHeader,
+			Name:          &name,
+			URL:           &url,
+			AuthType:      &authTypeVal,
+			AuthHeader:    &authHeader,
+			OAuthTokenURL: &oauthTokenURL,
+			OAuthClientID: &oauthClientID,
+			OAuthScopes:   &oauthScopes,
 		}
 
 		if s.AuthToken != "" {
@@ -617,6 +692,13 @@ func (d *DB) SyncYAMLMCPServers(ctx context.Context, servers []config.MCPServerC
 				return fmt.Errorf("sync yaml mcp servers: encrypt token for %s: %w", s.Alias, encErr)
 			}
 			updateParams.AuthTokenEnc = &enc
+		}
+		if authType == "oauth" && s.OAuthClientSecret != "" {
+			enc, encErr := crypto.EncryptString(s.OAuthClientSecret, encKey, mcpServerAAD(existing.ID))
+			if encErr != nil {
+				return fmt.Errorf("sync yaml mcp servers: encrypt oauth secret for %s: %w", s.Alias, encErr)
+			}
+			updateParams.OAuthClientSecretEnc = &enc
 		}
 
 		if _, updateErr := d.UpdateMCPServer(ctx, existing.ID, updateParams); updateErr != nil {

@@ -864,15 +864,68 @@ func TestValidate_MCPServer(t *testing.T) {
 			errContains: "mcp_servers[0].url",
 		},
 		{
-			name: "invalid auth_type oauth returns error",
+			name: "auth_type oauth without token_url is valid (auto-discovery)",
 			yaml: minimalValidYAMLWithMCPServers(`
   - name: "OAuth MCP"
     alias: "oauthserver"
     url: "https://mcp.example.com"
     auth_type: "oauth"
+    oauth_client_id: "clientid"
+    oauth_client_secret: "secret"
+`),
+			wantErr: false,
+		},
+		{
+			name: "auth_type oauth without client_id returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "OAuth MCP"
+    alias: "oauthserver"
+    url: "https://mcp.example.com"
+    auth_type: "oauth"
+    oauth_token_url: "https://auth.example.com/token"
+    oauth_client_secret: "secret"
 `),
 			wantErr:     true,
-			errContains: "mcp_servers[0].auth_type",
+			errContains: "mcp_servers[0].oauth_client_id",
+		},
+		{
+			name: "auth_type oauth without client_secret returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "OAuth MCP"
+    alias: "oauthserver"
+    url: "https://mcp.example.com"
+    auth_type: "oauth"
+    oauth_token_url: "https://auth.example.com/token"
+    oauth_client_id: "clientid"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].oauth_client_secret",
+		},
+		{
+			name: "auth_type oauth token_url must be https",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "OAuth MCP"
+    alias: "oauthserver"
+    url: "https://mcp.example.com"
+    auth_type: "oauth"
+    oauth_token_url: "http://auth.example.com/token"
+    oauth_client_id: "clientid"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].oauth_token_url",
+		},
+		{
+			name: "valid auth_type oauth",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "OAuth MCP"
+    alias: "oauthserver"
+    url: "https://mcp.example.com"
+    auth_type: "oauth"
+    oauth_token_url: "https://auth.example.com/token"
+    oauth_client_id: "clientid"
+    oauth_client_secret: "secret"
+`),
+			wantErr: false,
 		},
 		{
 			name: "auth_type header without auth_header returns error",
