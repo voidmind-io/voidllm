@@ -11,7 +11,8 @@ import (
 // deploymentSelectColumns is the ordered column list used in all model_deployments
 // SELECT queries. It must match the scan order in scanDeployment exactly.
 const deploymentSelectColumns = "id, model_id, name, provider, base_url, api_key_encrypted, " +
-	"azure_deployment, azure_api_version, weight, priority, is_active, " +
+	"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
+	"weight, priority, is_active, " +
 	"created_at, updated_at, deleted_at"
 
 // Deployment represents a row in the model_deployments table.
@@ -26,12 +27,16 @@ type Deployment struct {
 	APIKeyEncrypted *string
 	AzureDeployment string
 	AzureAPIVersion string
-	Weight          int
-	Priority        int
-	IsActive        bool
-	CreatedAt       string
-	UpdatedAt       string
-	DeletedAt       *string
+	// GCPProject is the Google Cloud project ID. Non-empty only for provider "vertex".
+	GCPProject string
+	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
+	GCPLocation string
+	Weight      int
+	Priority    int
+	IsActive    bool
+	CreatedAt   string
+	UpdatedAt   string
+	DeletedAt   *string
 }
 
 // CreateDeploymentParams holds the input for creating a deployment.
@@ -43,6 +48,10 @@ type CreateDeploymentParams struct {
 	APIKeyEncrypted *string
 	AzureDeployment string
 	AzureAPIVersion string
+	// GCPProject is the Google Cloud project ID. Required when Provider is "vertex".
+	GCPProject string
+	// GCPLocation is the Google Cloud region. Required when Provider is "vertex".
+	GCPLocation string
 	// Weight is the relative probability used for weighted routing. Must be >= 1.
 	Weight int
 	// Priority is the routing preference for the priority strategy; lower value
@@ -59,6 +68,10 @@ type UpdateDeploymentParams struct {
 	APIKeyEncrypted *string
 	AzureDeployment *string
 	AzureAPIVersion *string
+	// GCPProject, when non-nil, replaces the stored Google Cloud project ID.
+	GCPProject *string
+	// GCPLocation, when non-nil, replaces the stored Google Cloud region.
+	GCPLocation *string
 	// Weight, when non-nil, replaces the stored routing weight.
 	Weight *int
 	// Priority, when non-nil, replaces the stored routing priority.
@@ -81,11 +94,12 @@ func (d *DB) CreateDeployment(ctx context.Context, params CreateDeploymentParams
 	p := d.dialect.Placeholder
 	insertQuery := "INSERT INTO model_deployments " +
 		"(id, model_id, name, provider, base_url, api_key_encrypted, " +
-		"azure_deployment, azure_api_version, weight, priority, is_active, " +
+		"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
+		"weight, priority, is_active, " +
 		"created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
-		p(7) + ", " + p(8) + ", " + p(9) + ", " + p(10) + ", " +
+		p(7) + ", " + p(8) + ", " + p(9) + ", " + p(10) + ", " + p(11) + ", " + p(12) + ", " +
 		"1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + deploymentSelectColumns +
@@ -102,6 +116,8 @@ func (d *DB) CreateDeployment(ctx context.Context, params CreateDeploymentParams
 			params.APIKeyEncrypted,
 			params.AzureDeployment,
 			params.AzureAPIVersion,
+			params.GCPProject,
+			params.GCPLocation,
 			weight,
 			params.Priority,
 		)
@@ -236,6 +252,16 @@ func (d *DB) UpdateDeployment(ctx context.Context, id string, params UpdateDeplo
 		args = append(args, *params.AzureAPIVersion)
 		argN++
 	}
+	if params.GCPProject != nil {
+		setClauses = append(setClauses, "gcp_project = "+p(argN))
+		args = append(args, *params.GCPProject)
+		argN++
+	}
+	if params.GCPLocation != nil {
+		setClauses = append(setClauses, "gcp_location = "+p(argN))
+		args = append(args, *params.GCPLocation)
+		argN++
+	}
 	if params.Weight != nil {
 		setClauses = append(setClauses, "weight = "+p(argN))
 		args = append(args, *params.Weight)
@@ -355,7 +381,8 @@ func scanDeployment(scanner interface{ Scan(...any) error }) (*Deployment, error
 	var isActiveInt int
 	err := scanner.Scan(
 		&dep.ID, &dep.ModelID, &dep.Name, &dep.Provider, &dep.BaseURL, &dep.APIKeyEncrypted,
-		&dep.AzureDeployment, &dep.AzureAPIVersion, &dep.Weight, &dep.Priority,
+		&dep.AzureDeployment, &dep.AzureAPIVersion, &dep.GCPProject, &dep.GCPLocation,
+		&dep.Weight, &dep.Priority,
 		&isActiveInt, &dep.CreatedAt, &dep.UpdatedAt, &dep.DeletedAt,
 	)
 	if err != nil {

@@ -49,6 +49,10 @@ type probeTarget struct {
 	modelType       string
 	azureDeployment string
 	azureAPIVersion string
+	// gcpProject is the Google Cloud project ID. Non-empty only for provider "vertex".
+	gcpProject string
+	// gcpLocation is the Google Cloud region. Non-empty only for provider "vertex".
+	gcpLocation string
 }
 
 // ModelHealth holds the most recent health state for a single upstream model.
@@ -200,6 +204,8 @@ func (c *Checker) runAll(level probeLevel) {
 				modelType:       m.Type,
 				azureDeployment: m.AzureDeployment,
 				azureAPIVersion: m.AzureAPIVersion,
+				gcpProject:      m.GCPProject,
+				gcpLocation:     m.GCPLocation,
 			}
 			c.runOne(t, level)
 			continue
@@ -215,6 +221,8 @@ func (c *Checker) runAll(level probeLevel) {
 				modelType:       m.Type,
 				azureDeployment: d.AzureDeployment,
 				azureAPIVersion: d.AzureAPIVersion,
+				gcpProject:      d.GCPProject,
+				gcpLocation:     d.GCPLocation,
 			}
 			c.runOne(t, level)
 		}

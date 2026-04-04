@@ -147,6 +147,15 @@ func (c *Config) validate() error {
 				errs = append(errs, fmt.Errorf("%s.azure_deployment: must not be empty for azure provider", prefix))
 			}
 
+			if m.Provider == "vertex" {
+				if m.GCPProject == "" {
+					errs = append(errs, fmt.Errorf("%s.gcp_project: must not be empty for vertex provider", prefix))
+				}
+				if m.GCPLocation == "" {
+					errs = append(errs, fmt.Errorf("%s.gcp_location: must not be empty for vertex provider", prefix))
+				}
+			}
+
 			if m.Strategy != "" {
 				errs = append(errs, fmt.Errorf("%s.strategy: must be empty when deployments is not set", prefix))
 			}
@@ -181,6 +190,15 @@ func (c *Config) validate() error {
 
 				if d.Provider == "azure" && d.AzureDeployment == "" {
 					errs = append(errs, fmt.Errorf("%s.azure_deployment: must not be empty for azure provider", dprefix))
+				}
+
+				if d.Provider == "vertex" {
+					if d.GCPProject == "" {
+						errs = append(errs, fmt.Errorf("%s.gcp_project: must not be empty for vertex provider", dprefix))
+					}
+					if d.GCPLocation == "" {
+						errs = append(errs, fmt.Errorf("%s.gcp_location: must not be empty for vertex provider", dprefix))
+					}
 				}
 
 				if d.Weight < 0 {

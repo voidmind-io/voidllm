@@ -16,7 +16,7 @@ import (
 // It must match the scan order in scanModel exactly.
 const modelSelectColumns = "id, name, provider, model_type, base_url, api_key_encrypted, " +
 	"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
-	"azure_deployment, azure_api_version, " +
+	"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
 	"is_active, source, created_by, created_at, updated_at, deleted_at, aliases, timeout, " +
 	"strategy, max_retries"
 
@@ -35,12 +35,16 @@ type Model struct {
 	OutputPricePer1M float64
 	AzureDeployment  string
 	AzureAPIVersion  string
-	IsActive         bool
-	Source           string
-	CreatedBy        *string
-	CreatedAt        string
-	UpdatedAt        string
-	DeletedAt        *string
+	// GCPProject is the Google Cloud project ID. Non-empty only for provider "vertex".
+	GCPProject string
+	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
+	GCPLocation string
+	IsActive    bool
+	Source      string
+	CreatedBy   *string
+	CreatedAt   string
+	UpdatedAt   string
+	DeletedAt   *string
 	// Aliases is a comma-separated list of alias names, e.g. "default,gpt4".
 	// An empty string means no aliases are configured.
 	Aliases string
@@ -68,6 +72,10 @@ type CreateModelParams struct {
 	OutputPricePer1M float64
 	AzureDeployment  string
 	AzureAPIVersion  string
+	// GCPProject is the Google Cloud project ID. Required when Provider is "vertex".
+	GCPProject string
+	// GCPLocation is the Google Cloud region. Required when Provider is "vertex".
+	GCPLocation string
 	// Source is "yaml" for config-file-sourced models or "api" for Admin API-created models.
 	Source    string
 	CreatedBy *string
@@ -97,6 +105,10 @@ type UpdateModelParams struct {
 	OutputPricePer1M *float64
 	AzureDeployment  *string
 	AzureAPIVersion  *string
+	// GCPProject, when non-nil, replaces the stored Google Cloud project ID.
+	GCPProject *string
+	// GCPLocation, when non-nil, replaces the stored Google Cloud region.
+	GCPLocation *string
 	// Aliases, when non-nil, replaces the stored comma-separated alias list.
 	// Set to a pointer to an empty string to clear all aliases.
 	Aliases *string
@@ -136,14 +148,14 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 	insertQuery := "INSERT INTO models " +
 		"(id, name, provider, model_type, base_url, api_key_encrypted, " +
 		"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
-		"azure_deployment, azure_api_version, " +
+		"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
 		"is_active, source, created_by, aliases, timeout, strategy, max_retries, " +
 		"created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
 		p(7) + ", " + p(8) + ", " + p(9) + ", " +
-		p(10) + ", " + p(11) + ", " +
-		"1, " + p(12) + ", " + p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " +
+		p(10) + ", " + p(11) + ", " + p(12) + ", " + p(13) + ", " +
+		"1, " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " + p(18) + ", " + p(19) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + modelSelectColumns +
@@ -163,6 +175,8 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 			params.OutputPricePer1M,
 			params.AzureDeployment,
 			params.AzureAPIVersion,
+			params.GCPProject,
+			params.GCPLocation,
 			params.Source,
 			params.CreatedBy,
 			params.Aliases,
@@ -320,6 +334,16 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 	if params.AzureAPIVersion != nil {
 		setClauses = append(setClauses, "azure_api_version = "+p(argN))
 		args = append(args, *params.AzureAPIVersion)
+		argN++
+	}
+	if params.GCPProject != nil {
+		setClauses = append(setClauses, "gcp_project = "+p(argN))
+		args = append(args, *params.GCPProject)
+		argN++
+	}
+	if params.GCPLocation != nil {
+		setClauses = append(setClauses, "gcp_location = "+p(argN))
+		args = append(args, *params.GCPLocation)
 		argN++
 	}
 	if params.Aliases != nil {
@@ -487,7 +511,7 @@ func scanModel(scanner interface{ Scan(...any) error }) (*Model, error) {
 	err := scanner.Scan(
 		&m.ID, &m.Name, &m.Provider, &m.ModelType, &m.BaseURL, &m.APIKeyEncrypted,
 		&m.MaxContextTokens, &m.InputPricePer1M, &m.OutputPricePer1M,
-		&m.AzureDeployment, &m.AzureAPIVersion,
+		&m.AzureDeployment, &m.AzureAPIVersion, &m.GCPProject, &m.GCPLocation,
 		&isActiveInt, &m.Source, &m.CreatedBy,
 		&m.CreatedAt, &m.UpdatedAt, &m.DeletedAt, &m.Aliases, &m.Timeout,
 		&m.Strategy, &m.MaxRetries,
@@ -551,6 +575,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 				OutputPricePer1M: m.Pricing.OutputPer1M,
 				AzureDeployment:  m.AzureDeployment,
 				AzureAPIVersion:  m.AzureAPIVersion,
+				GCPProject:       m.GCPProject,
+				GCPLocation:      m.GCPLocation,
 				Source:           "yaml",
 				Aliases:          aliases,
 				Timeout:          m.Timeout,
@@ -601,6 +627,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 		outputPrice := m.Pricing.OutputPer1M
 		azureDeploy := m.AzureDeployment
 		azureVersion := m.AzureAPIVersion
+		gcpProject := m.GCPProject
+		gcpLocation := m.GCPLocation
 		timeout := m.Timeout
 		strategy := m.Strategy
 		maxRetries := m.MaxRetries
@@ -615,6 +643,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 			OutputPricePer1M: &outputPrice,
 			AzureDeployment:  &azureDeploy,
 			AzureAPIVersion:  &azureVersion,
+			GCPProject:       &gcpProject,
+			GCPLocation:      &gcpLocation,
 			Aliases:          &aliases,
 			Timeout:          &timeout,
 			Strategy:         &strategy,
@@ -681,6 +711,8 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 				BaseURL:         cd.BaseURL,
 				AzureDeployment: cd.AzureDeployment,
 				AzureAPIVersion: cd.AzureAPIVersion,
+				GCPProject:      cd.GCPProject,
+				GCPLocation:     cd.GCPLocation,
 				Weight:          weight,
 				Priority:        cd.Priority,
 			})
@@ -706,6 +738,8 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 		baseURL := cd.BaseURL
 		azureDeploy := cd.AzureDeployment
 		azureVersion := cd.AzureAPIVersion
+		gcpProject := cd.GCPProject
+		gcpLocation := cd.GCPLocation
 		weight := cd.Weight
 		if weight < 1 {
 			weight = 1
@@ -717,6 +751,8 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 			BaseURL:         &baseURL,
 			AzureDeployment: &azureDeploy,
 			AzureAPIVersion: &azureVersion,
+			GCPProject:      &gcpProject,
+			GCPLocation:     &gcpLocation,
 			Weight:          &weight,
 			Priority:        &priority,
 		}

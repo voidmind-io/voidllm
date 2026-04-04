@@ -59,6 +59,8 @@ func GetAdapter(provider string) Adapter {
 		return &AnthropicAdapter{}
 	case "azure":
 		return &AzureAdapter{}
+	case "gemini", "vertex":
+		return &GeminiAdapter{}
 	default:
 		return nil
 	}

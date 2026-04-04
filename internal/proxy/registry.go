@@ -25,8 +25,12 @@ type Deployment struct {
 	APIKey          string
 	AzureDeployment string
 	AzureAPIVersion string
-	Weight          int
-	Priority        int
+	// GCPProject is the Google Cloud project ID. Required when Provider is "vertex".
+	GCPProject string
+	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when Provider is "vertex".
+	GCPLocation string
+	Weight      int
+	Priority    int
 }
 
 // LogValue implements slog.LogValuer to prevent the upstream API key from
@@ -53,6 +57,10 @@ type Model struct {
 	Pricing          config.PricingConfig
 	AzureDeployment  string
 	AzureAPIVersion  string
+	// GCPProject is the Google Cloud project ID. Required when Provider is "vertex".
+	GCPProject string
+	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when Provider is "vertex".
+	GCPLocation string
 	// Timeout is the per-model upstream timeout. When non-zero it overrides the
 	// global MaxStreamDuration and the context deadline used for non-streaming
 	// requests. Zero means use the global default.
@@ -136,6 +144,8 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 				APIKey:          d.APIKey,
 				AzureDeployment: d.AzureDeployment,
 				AzureAPIVersion: d.AzureAPIVersion,
+				GCPProject:      d.GCPProject,
+				GCPLocation:     d.GCPLocation,
 				Weight:          d.Weight,
 				Priority:        d.Priority,
 			}
@@ -152,6 +162,8 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 			Pricing:          mc.Pricing,
 			AzureDeployment:  mc.AzureDeployment,
 			AzureAPIVersion:  mc.AzureAPIVersion,
+			GCPProject:       mc.GCPProject,
+			GCPLocation:      mc.GCPLocation,
 			Timeout:          timeout,
 			Strategy:         mc.Strategy,
 			MaxRetries:       mc.MaxRetries,
@@ -281,6 +293,8 @@ func (r *Registry) AddModel(m Model) {
 		Pricing:          m.Pricing,
 		AzureDeployment:  m.AzureDeployment,
 		AzureAPIVersion:  m.AzureAPIVersion,
+		GCPProject:       m.GCPProject,
+		GCPLocation:      m.GCPLocation,
 		Timeout:          m.Timeout,
 		Strategy:         m.Strategy,
 		MaxRetries:       m.MaxRetries,

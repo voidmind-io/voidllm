@@ -329,6 +329,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 					APIKey:          depAPIKey,
 					AzureDeployment: dep.AzureDeployment,
 					AzureAPIVersion: dep.AzureAPIVersion,
+					GCPProject:      dep.GCPProject,
+					GCPLocation:     dep.GCPLocation,
 					Weight:          dep.Weight,
 					Priority:        dep.Priority,
 				})
@@ -345,6 +347,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 				Pricing:          config.PricingConfig{InputPer1M: m.InputPricePer1M, OutputPer1M: m.OutputPricePer1M},
 				AzureDeployment:  m.AzureDeployment,
 				AzureAPIVersion:  m.AzureAPIVersion,
+				GCPProject:       m.GCPProject,
+				GCPLocation:      m.GCPLocation,
 				Timeout:          timeout,
 				Strategy:         m.Strategy,
 				MaxRetries:       m.MaxRetries,

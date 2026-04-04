@@ -36,6 +36,10 @@ type createModelRequest struct {
 	OutputPricePer1M float64 `json:"output_price_per_1m"`
 	AzureDeployment  string  `json:"azure_deployment,omitempty"`
 	AzureAPIVersion  string  `json:"azure_api_version,omitempty"`
+	// GCPProject is the Google Cloud project ID. Required when provider is "vertex".
+	GCPProject string `json:"gcp_project,omitempty"`
+	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when provider is "vertex".
+	GCPLocation string `json:"gcp_location,omitempty"`
 	// Aliases are optional short names that resolve to this model in proxy requests.
 	Aliases []string `json:"aliases"`
 	// Timeout is the per-model upstream timeout as a Go duration string (e.g. "30s",
@@ -64,6 +68,10 @@ type updateModelRequest struct {
 	OutputPricePer1M *float64 `json:"output_price_per_1m"`
 	AzureDeployment  *string  `json:"azure_deployment"`
 	AzureAPIVersion  *string  `json:"azure_api_version"`
+	// GCPProject, when non-nil, replaces the Google Cloud project ID.
+	GCPProject *string `json:"gcp_project"`
+	// GCPLocation, when non-nil, replaces the Google Cloud region.
+	GCPLocation *string `json:"gcp_location"`
 	// Aliases, when non-nil, replaces the full set of aliases for the model.
 	// Pass an empty slice to remove all aliases.
 	Aliases *[]string `json:"aliases"`
@@ -80,19 +88,23 @@ type updateModelRequest struct {
 // modelResponse is the JSON representation of a model returned by the API.
 // It omits the encrypted API key; the plaintext is never returned after creation.
 type modelResponse struct {
-	ID               string   `json:"id"`
-	Name             string   `json:"name"`
-	Provider         string   `json:"provider"`
-	Type             string   `json:"type"`
-	BaseURL          string   `json:"base_url"`
-	MaxContextTokens int      `json:"max_context_tokens"`
-	InputPricePer1M  float64  `json:"input_price_per_1m"`
-	OutputPricePer1M float64  `json:"output_price_per_1m"`
-	AzureDeployment  string   `json:"azure_deployment,omitempty"`
-	AzureAPIVersion  string   `json:"azure_api_version,omitempty"`
-	IsActive         bool     `json:"is_active"`
-	Source           string   `json:"source"`
-	Aliases          []string `json:"aliases"`
+	ID               string  `json:"id"`
+	Name             string  `json:"name"`
+	Provider         string  `json:"provider"`
+	Type             string  `json:"type"`
+	BaseURL          string  `json:"base_url"`
+	MaxContextTokens int     `json:"max_context_tokens"`
+	InputPricePer1M  float64 `json:"input_price_per_1m"`
+	OutputPricePer1M float64 `json:"output_price_per_1m"`
+	AzureDeployment  string  `json:"azure_deployment,omitempty"`
+	AzureAPIVersion  string  `json:"azure_api_version,omitempty"`
+	// GCPProject is the Google Cloud project ID. Non-empty only for provider "vertex".
+	GCPProject string `json:"gcp_project,omitempty"`
+	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
+	GCPLocation string   `json:"gcp_location,omitempty"`
+	IsActive    bool     `json:"is_active"`
+	Source      string   `json:"source"`
+	Aliases     []string `json:"aliases"`
 	// Timeout is the per-model upstream timeout (e.g. "30s", "2m").
 	// An empty string means the global default is used.
 	Timeout string `json:"timeout,omitempty"`
@@ -158,6 +170,8 @@ func modelToResponse(m *db.Model) modelResponse {
 		OutputPricePer1M: m.OutputPricePer1M,
 		AzureDeployment:  m.AzureDeployment,
 		AzureAPIVersion:  m.AzureAPIVersion,
+		GCPProject:       m.GCPProject,
+		GCPLocation:      m.GCPLocation,
 		IsActive:         m.IsActive,
 		Source:           m.Source,
 		Aliases:          aliases,
@@ -200,6 +214,8 @@ func dbModelToProxy(m *db.Model, apiKeyPlaintext string) proxy.Model {
 		},
 		AzureDeployment: m.AzureDeployment,
 		AzureAPIVersion: m.AzureAPIVersion,
+		GCPProject:      m.GCPProject,
+		GCPLocation:     m.GCPLocation,
 		Timeout:         timeout,
 	}
 }
@@ -357,6 +373,8 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		OutputPricePer1M: req.OutputPricePer1M,
 		AzureDeployment:  req.AzureDeployment,
 		AzureAPIVersion:  req.AzureAPIVersion,
+		GCPProject:       req.GCPProject,
+		GCPLocation:      req.GCPLocation,
 		Source:           "api",
 		CreatedBy:        createdBy,
 		Aliases:          aliasStr,
@@ -598,6 +616,8 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		OutputPricePer1M: req.OutputPricePer1M,
 		AzureDeployment:  req.AzureDeployment,
 		AzureAPIVersion:  req.AzureAPIVersion,
+		GCPProject:       req.GCPProject,
+		GCPLocation:      req.GCPLocation,
 		Timeout:          req.Timeout,
 		Strategy:         req.Strategy,
 		MaxRetries:       req.MaxRetries,

@@ -22,8 +22,12 @@ type createDeploymentRequest struct {
 	APIKey          string `json:"api_key"`
 	AzureDeployment string `json:"azure_deployment"`
 	AzureAPIVersion string `json:"azure_api_version"`
-	Weight          int    `json:"weight"`
-	Priority        int    `json:"priority"`
+	// GCPProject is the Google Cloud project ID. Required when provider is "vertex".
+	GCPProject string `json:"gcp_project"`
+	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when provider is "vertex".
+	GCPLocation string `json:"gcp_location"`
+	Weight      int    `json:"weight"`
+	Priority    int    `json:"priority"`
 }
 
 // updateDeploymentRequest is the JSON body accepted by updateDeployment.
@@ -35,8 +39,12 @@ type updateDeploymentRequest struct {
 	APIKey          *string `json:"api_key"`
 	AzureDeployment *string `json:"azure_deployment"`
 	AzureAPIVersion *string `json:"azure_api_version"`
-	Weight          *int    `json:"weight"`
-	Priority        *int    `json:"priority"`
+	// GCPProject, when non-nil, replaces the stored Google Cloud project ID.
+	GCPProject *string `json:"gcp_project"`
+	// GCPLocation, when non-nil, replaces the stored Google Cloud region.
+	GCPLocation *string `json:"gcp_location"`
+	Weight      *int    `json:"weight"`
+	Priority    *int    `json:"priority"`
 }
 
 // deploymentResponse is the JSON representation of a deployment returned by the API.
@@ -49,11 +57,15 @@ type deploymentResponse struct {
 	BaseURL         string `json:"base_url"`
 	AzureDeployment string `json:"azure_deployment,omitempty"`
 	AzureAPIVersion string `json:"azure_api_version,omitempty"`
-	Weight          int    `json:"weight"`
-	Priority        int    `json:"priority"`
-	IsActive        bool   `json:"is_active"`
-	CreatedAt       string `json:"created_at"`
-	UpdatedAt       string `json:"updated_at"`
+	// GCPProject is the Google Cloud project ID. Non-empty only for provider "vertex".
+	GCPProject string `json:"gcp_project,omitempty"`
+	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
+	GCPLocation string `json:"gcp_location,omitempty"`
+	Weight      int    `json:"weight"`
+	Priority    int    `json:"priority"`
+	IsActive    bool   `json:"is_active"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
 }
 
 // deploymentAAD returns the additional authenticated data used when encrypting
@@ -73,6 +85,8 @@ func deploymentToResponse(d *db.Deployment) deploymentResponse {
 		BaseURL:         d.BaseURL,
 		AzureDeployment: d.AzureDeployment,
 		AzureAPIVersion: d.AzureAPIVersion,
+		GCPProject:      d.GCPProject,
+		GCPLocation:     d.GCPLocation,
 		Weight:          d.Weight,
 		Priority:        d.Priority,
 		IsActive:        d.IsActive,
@@ -155,6 +169,8 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 		APIKeyEncrypted: nil,
 		AzureDeployment: req.AzureDeployment,
 		AzureAPIVersion: req.AzureAPIVersion,
+		GCPProject:      req.GCPProject,
+		GCPLocation:     req.GCPLocation,
 		Weight:          req.Weight,
 		Priority:        req.Priority,
 	})
@@ -295,6 +311,8 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 		BaseURL:         req.BaseURL,
 		AzureDeployment: req.AzureDeployment,
 		AzureAPIVersion: req.AzureAPIVersion,
+		GCPProject:      req.GCPProject,
+		GCPLocation:     req.GCPLocation,
 		Weight:          req.Weight,
 		Priority:        req.Priority,
 	}

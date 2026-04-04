@@ -1,0 +1,11 @@
+-- Migration: 0009_gcp_fields.down.sql
+-- Description: Remove gcp_project and gcp_location columns added in 0009_gcp_fields.up.sql.
+-- SQLite does not support DROP COLUMN in versions before 3.35.0; this down migration
+-- is intentionally left as a no-op comment for SQLite and is only meaningful on
+-- PostgreSQL deployments where column removal is standard.
+
+-- PostgreSQL:
+-- ALTER TABLE models DROP COLUMN IF EXISTS gcp_project;
+-- ALTER TABLE models DROP COLUMN IF EXISTS gcp_location;
+-- ALTER TABLE model_deployments DROP COLUMN IF EXISTS gcp_project;
+-- ALTER TABLE model_deployments DROP COLUMN IF EXISTS gcp_location;

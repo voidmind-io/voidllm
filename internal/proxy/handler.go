@@ -221,6 +221,8 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			APIKey:          model.APIKey,
 			AzureDeployment: model.AzureDeployment,
 			AzureAPIVersion: model.AzureAPIVersion,
+			GCPProject:      model.GCPProject,
+			GCPLocation:     model.GCPLocation,
 			Weight:          1,
 		}}
 	}
@@ -942,6 +944,8 @@ func applyDeployment(model *Model, dep Deployment) {
 	model.APIKey = dep.APIKey
 	model.AzureDeployment = dep.AzureDeployment
 	model.AzureAPIVersion = dep.AzureAPIVersion
+	model.GCPProject = dep.GCPProject
+	model.GCPLocation = dep.GCPLocation
 }
 
 // isRetryable reports whether an HTTP status code from an upstream response

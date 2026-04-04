@@ -10,6 +10,8 @@ var ValidProviders = map[string]bool{
 	"openai":    true,
 	"anthropic": true,
 	"azure":     true,
+	"gemini":    true,
+	"vertex":    true,
 	"vllm":      true,
 	"ollama":    true,
 	"custom":    true,
