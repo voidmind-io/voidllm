@@ -21,6 +21,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/proxy"
 	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 	"github.com/voidmind-io/voidllm/internal/sso"
+	"github.com/voidmind-io/voidllm/internal/update"
 )
 
 // ModelHealthProvider provides upstream model health status for the admin API.
@@ -83,6 +84,10 @@ type Handler struct {
 	// app.cleanup can drain and close the pool on graceful shutdown.
 	// Nil when Code Mode is disabled.
 	CodePool *mcp.RuntimePool
+	// UpdateChecker provides cached update status read from the settings table.
+	// Nil in dev builds (Version == "dev") — GetUpdateStatus returns a static
+	// response in that case.
+	UpdateChecker *update.Checker
 }
 
 // swaggerErrorResponse is the standard API error envelope used in OpenAPI docs.

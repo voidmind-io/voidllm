@@ -1,7 +1,9 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { PageHeader } from '../components/ui/PageHeader'
 import { StatCard } from '../components/ui/StatCard'
 import { Banner } from '../components/ui/Banner'
+import { Dialog } from '../components/ui/Dialog'
+import { Button } from '../components/ui/Button'
 import { AreaChart } from '../components/ui/charts/AreaChart'
 import { DonutChart } from '../components/ui/charts/DonutChart'
 import { HorizontalBar } from '../components/ui/charts/HorizontalBar'
@@ -16,6 +18,7 @@ import { useUsage } from '../hooks/useUsage'
 import { useOrg } from '../hooks/useOrg'
 import { useModelHealth } from '../hooks/useModelHealth'
 import type { ModelHealthInfo } from '../hooks/useModelHealth'
+import { useUpdateCheck } from '../hooks/useUpdateCheck'
 import { formatTokens, formatCost, formatNumber } from '../lib/utils'
 
 // ---------------------------------------------------------------------------
@@ -290,7 +293,30 @@ const scopeDescriptions: Record<string, string> = {
 export default function DashboardPage() {
   const { data: me } = useMe()
   const { data: stats, isLoading: statsLoading } = useDashboardStats()
+  const { data: updateInfo } = useUpdateCheck()
   const [timeRange, setTimeRange] = useState<TimeRange>('7d')
+  const [showUpdateDialog, setShowUpdateDialog] = useState(false)
+
+  const availableVersion = updateInfo?.available_version
+  const [updateDismissed, setUpdateDismissed] = useState(true)
+
+  useEffect(() => {
+    if (!availableVersion) {
+      setUpdateDismissed(true)
+      return
+    }
+    setUpdateDismissed(
+      localStorage.getItem(`update_dismissed_${availableVersion}`) === 'true'
+    )
+  }, [availableVersion])
+
+  function dismissUpdate() {
+    if (updateInfo?.available_version) {
+      localStorage.setItem(`update_dismissed_${updateInfo.available_version}`, 'true')
+    }
+    setUpdateDismissed(true)
+    setShowUpdateDialog(false)
+  }
 
   const canViewOrgUsage = me?.role === 'system_admin' || me?.role === 'org_admin'
   const orgId = me?.org_id ?? ''
@@ -381,6 +407,20 @@ export default function DashboardPage() {
         {/* Budget warnings */}
         {(stats?.budget_warnings?.length ?? 0) > 0 && (
           <BudgetWarningBanners warnings={stats?.budget_warnings ?? []} />
+        )}
+
+        {/* Update notification */}
+        {updateInfo?.needs_update && !updateDismissed && (
+          <div onClick={() => setShowUpdateDialog(true)} className="cursor-pointer">
+            <Banner
+              variant="info"
+              title={`VoidLLM ${updateInfo.available_version} is available (current: ${updateInfo.current_version})`}
+              onDismiss={(e) => {
+                e.stopPropagation()
+                dismissUpdate()
+              }}
+            />
+          </div>
         )}
 
         {/* Stat cards */}
@@ -568,6 +608,47 @@ export default function DashboardPage() {
           </div>
         )}
       </div>
+
+      {/* Update detail dialog */}
+      {updateInfo != null && (
+        <Dialog
+          open={showUpdateDialog}
+          onClose={() => setShowUpdateDialog(false)}
+          title={`VoidLLM ${updateInfo.available_version ?? ''}`}
+          footer={
+            <div className="flex gap-3">
+              {updateInfo.release_url != null && (
+                <a
+                  href={updateInfo.release_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-2 text-sm font-bold bg-accent hover:bg-accent/90 text-white px-4 py-2 rounded-lg transition-all duration-200"
+                >
+                  View on GitHub
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                  </svg>
+                </a>
+              )}
+              <Button
+                variant="secondary"
+                onClick={dismissUpdate}
+              >
+                Dismiss
+              </Button>
+            </div>
+          }
+        >
+          <p className="text-xs text-text-tertiary mb-4">
+            You are running {updateInfo.current_version}
+          </p>
+          {updateInfo.release_notes != null && (
+            <div className="text-sm text-text-secondary whitespace-pre-wrap">
+              {updateInfo.release_notes}
+            </div>
+          )}
+        </Dialog>
+      )}
     </>
   )
 }

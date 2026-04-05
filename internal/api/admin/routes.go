@@ -170,6 +170,10 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 	// License — any authenticated user may inspect the current license.
 	api.Get("/license", auth.RequireRole(auth.RoleMember), handler.GetLicense)
 
+	// Update check — any authenticated user may read the cached update status.
+	// Version info is not sensitive; no additional role gate required.
+	api.Get("/system/update-check", handler.GetUpdateStatus)
+
 	// Code Mode MCP server — aggregated code execution tools (list_servers,
 	// search_tools, execute_code). These routes MUST be registered before the
 	// /mcp/:alias routes so that Fiber does not treat the bare /mcp path as

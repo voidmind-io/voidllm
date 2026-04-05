@@ -4,7 +4,7 @@ export interface BannerProps {
   variant: 'info' | 'warning' | 'error' | 'success'
   title: string
   description?: string
-  onDismiss?: () => void
+  onDismiss?: (e: React.MouseEvent) => void
   className?: string
 }
 
@@ -55,7 +55,7 @@ export function Banner({ variant, title, description, onDismiss, className }: Ba
       {onDismiss !== undefined && (
         <button
           type="button"
-          onClick={onDismiss}
+          onClick={(e) => onDismiss?.(e)}
           aria-label="Dismiss"
           className={cn(
             'shrink-0 -mt-0.5 -mr-1 p-1 rounded transition-colors',

@@ -44,6 +44,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/router"
 	"github.com/voidmind-io/voidllm/internal/shutdown"
 	"github.com/voidmind-io/voidllm/internal/sso"
+	"github.com/voidmind-io/voidllm/internal/update"
 	"github.com/voidmind-io/voidllm/internal/usage"
 	"github.com/voidmind-io/voidllm/pkg/crypto"
 	"github.com/voidmind-io/voidllm/pkg/keygen"
@@ -1122,6 +1123,14 @@ func (a *Application) Start() error {
 			InstanceID: instanceID,
 		})
 		a.stopFuncs = append(a.stopFuncs, stop)
+	}
+
+	// Start update checker when running a real build (not dev).
+	// The checker fires after a 5-minute initial delay to keep startup fast.
+	if apihealth.Version != "dev" {
+		updateChecker := update.NewChecker(apihealth.Version, a.database, a.log)
+		a.stopFuncs = append(a.stopFuncs, updateChecker.Start())
+		a.adminHandler.UpdateChecker = updateChecker
 	}
 
 	// pprof profiling is enabled in dev mode. Handlers are registered on a
