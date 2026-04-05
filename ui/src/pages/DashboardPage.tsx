@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo } from 'react'
 import { PageHeader } from '../components/ui/PageHeader'
 import { StatCard } from '../components/ui/StatCard'
 import { Banner } from '../components/ui/Banner'
@@ -298,23 +298,16 @@ export default function DashboardPage() {
   const [showUpdateDialog, setShowUpdateDialog] = useState(false)
 
   const availableVersion = updateInfo?.available_version
-  const [updateDismissed, setUpdateDismissed] = useState(true)
+  const [manualDismiss, setManualDismiss] = useState(false)
 
-  useEffect(() => {
-    if (!availableVersion) {
-      setUpdateDismissed(true)
-      return
-    }
-    setUpdateDismissed(
-      localStorage.getItem(`update_dismissed_${availableVersion}`) === 'true'
-    )
-  }, [availableVersion])
+  const updateDismissed = manualDismiss || !availableVersion ||
+    localStorage.getItem(`update_dismissed_${availableVersion}`) === 'true'
 
   function dismissUpdate() {
     if (updateInfo?.available_version) {
       localStorage.setItem(`update_dismissed_${updateInfo.available_version}`, 'true')
     }
-    setUpdateDismissed(true)
+    setManualDismiss(true)
     setShowUpdateDialog(false)
   }
 
