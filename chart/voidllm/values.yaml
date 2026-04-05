@@ -279,3 +279,14 @@ redis:
   auth:
     password: ""
   architecture: standalone
+
+# ---------------------------------------------------------------------------
+# Schema migration pre-upgrade hook (PostgreSQL multi-replica deployments)
+# ---------------------------------------------------------------------------
+# When enabled, a Helm pre-upgrade Job runs "voidllm migrate-schema" before
+# the Deployment is updated. PostgreSQL advisory locking ensures the job runs
+# exactly once even if the Job pod is restarted. Recommended when
+# replicaCount > 1 and database.driver is postgres.
+migrations:
+  hook:
+    enabled: false

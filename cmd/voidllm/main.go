@@ -34,6 +34,9 @@ func main() {
 		case "migrate":
 			runMigrate(os.Args[2:])
 			return
+		case "migrate-schema":
+			runMigrateSchema(os.Args[2:])
+			return
 		case "license":
 			runLicense(os.Args[2:])
 			return

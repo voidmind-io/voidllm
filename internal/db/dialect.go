@@ -10,6 +10,9 @@ type Dialect interface {
 	// HourTrunc returns a SQL expression that truncates a timestamp column named
 	// created_at to the nearest hour, producing an ISO-8601 string result.
 	HourTrunc() string
+	// SupportsMigrationLock reports whether the dialect supports advisory locking
+	// during schema migrations. PostgreSQL supports pg_advisory_lock; SQLite does not.
+	SupportsMigrationLock() bool
 }
 
 // SQLiteDialect implements Dialect for SQLite.
@@ -24,6 +27,10 @@ func (SQLiteDialect) HourTrunc() string {
 	return "strftime('%Y-%m-%dT%H:00:00Z', created_at)"
 }
 
+// SupportsMigrationLock returns false because SQLite does not support advisory
+// locks. SQLite's single-writer model makes migration locking unnecessary.
+func (SQLiteDialect) SupportsMigrationLock() bool { return false }
+
 // PostgresDialect implements Dialect for PostgreSQL.
 type PostgresDialect struct{}
 
@@ -37,3 +44,8 @@ func (PostgresDialect) Placeholder(n int) string { return "$" + strconv.Itoa(n) 
 func (PostgresDialect) HourTrunc() string {
 	return "to_char(date_trunc('hour', created_at), 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
 }
+
+// SupportsMigrationLock returns true because PostgreSQL supports advisory locks
+// via pg_advisory_lock, which prevents concurrent migration runs in multi-replica
+// deployments.
+func (PostgresDialect) SupportsMigrationLock() bool { return true }
