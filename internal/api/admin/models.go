@@ -40,6 +40,14 @@ type createModelRequest struct {
 	GCPProject string `json:"gcp_project,omitempty"`
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when provider is "vertex".
 	GCPLocation string `json:"gcp_location,omitempty"`
+	// AWSRegion is the AWS region (e.g. "us-east-1"). Required when provider is "bedrock-converse".
+	AWSRegion string `json:"aws_region,omitempty"`
+	// AWSAccessKey is the AWS IAM access key ID. Required when provider is "bedrock-converse".
+	AWSAccessKey string `json:"aws_access_key,omitempty"`
+	// AWSSecretKey is the AWS IAM secret access key. Required when provider is "bedrock-converse".
+	AWSSecretKey string `json:"aws_secret_key,omitempty"`
+	// AWSSessionToken is an optional AWS STS session token for temporary credentials.
+	AWSSessionToken string `json:"aws_session_token,omitempty"`
 	// Aliases are optional short names that resolve to this model in proxy requests.
 	Aliases []string `json:"aliases"`
 	// Timeout is the per-model upstream timeout as a Go duration string (e.g. "30s",
@@ -72,6 +80,14 @@ type updateModelRequest struct {
 	GCPProject *string `json:"gcp_project"`
 	// GCPLocation, when non-nil, replaces the Google Cloud region.
 	GCPLocation *string `json:"gcp_location"`
+	// AWSRegion, when non-nil, replaces the AWS region.
+	AWSRegion *string `json:"aws_region"`
+	// AWSAccessKey, when non-nil, replaces the AWS IAM access key ID.
+	AWSAccessKey *string `json:"aws_access_key"`
+	// AWSSecretKey, when non-nil, replaces the AWS IAM secret access key.
+	AWSSecretKey *string `json:"aws_secret_key"`
+	// AWSSessionToken, when non-nil, replaces the AWS STS session token.
+	AWSSessionToken *string `json:"aws_session_token"`
 	// Aliases, when non-nil, replaces the full set of aliases for the model.
 	// Pass an empty slice to remove all aliases.
 	Aliases *[]string `json:"aliases"`
@@ -101,10 +117,12 @@ type modelResponse struct {
 	// GCPProject is the Google Cloud project ID. Non-empty only for provider "vertex".
 	GCPProject string `json:"gcp_project,omitempty"`
 	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
-	GCPLocation string   `json:"gcp_location,omitempty"`
-	IsActive    bool     `json:"is_active"`
-	Source      string   `json:"source"`
-	Aliases     []string `json:"aliases"`
+	GCPLocation string `json:"gcp_location,omitempty"`
+	// AWSRegion is the AWS region. Non-empty only for provider "bedrock-converse".
+	AWSRegion string   `json:"aws_region,omitempty"`
+	IsActive  bool     `json:"is_active"`
+	Source    string   `json:"source"`
+	Aliases   []string `json:"aliases"`
 	// Timeout is the per-model upstream timeout (e.g. "30s", "2m").
 	// An empty string means the global default is used.
 	Timeout string `json:"timeout,omitempty"`
@@ -172,6 +190,7 @@ func modelToResponse(m *db.Model) modelResponse {
 		AzureAPIVersion:  m.AzureAPIVersion,
 		GCPProject:       m.GCPProject,
 		GCPLocation:      m.GCPLocation,
+		AWSRegion:        m.AWSRegion,
 		IsActive:         m.IsActive,
 		Source:           m.Source,
 		Aliases:          aliases,
@@ -184,8 +203,10 @@ func modelToResponse(m *db.Model) modelResponse {
 }
 
 // dbModelToProxy converts a db.Model to a proxy.Model for registry insertion.
-// apiKeyPlaintext is the decrypted API key; pass an empty string when no key is set.
-func dbModelToProxy(m *db.Model, apiKeyPlaintext string) proxy.Model {
+// apiKeyPlaintext is the decrypted upstream API key; pass an empty string when
+// no key is set. awsSecrets carries the decrypted AWS credentials in the order
+// [accessKey, secretKey, sessionToken]; pass zero-value strings when not needed.
+func dbModelToProxy(m *db.Model, apiKeyPlaintext string, awsSecrets ...string) proxy.Model {
 	var aliases []string
 	if m.Aliases != "" {
 		aliases = strings.Split(m.Aliases, ",")
@@ -199,6 +220,16 @@ func dbModelToProxy(m *db.Model, apiKeyPlaintext string) proxy.Model {
 	modelType := m.ModelType
 	if modelType == "" {
 		modelType = "chat"
+	}
+	var awsAccessKey, awsSecretKey, awsSessionToken string
+	if len(awsSecrets) > 0 {
+		awsAccessKey = awsSecrets[0]
+	}
+	if len(awsSecrets) > 1 {
+		awsSecretKey = awsSecrets[1]
+	}
+	if len(awsSecrets) > 2 {
+		awsSessionToken = awsSecrets[2]
 	}
 	return proxy.Model{
 		Name:             m.Name,
@@ -216,6 +247,10 @@ func dbModelToProxy(m *db.Model, apiKeyPlaintext string) proxy.Model {
 		AzureAPIVersion: m.AzureAPIVersion,
 		GCPProject:      m.GCPProject,
 		GCPLocation:     m.GCPLocation,
+		AWSRegion:       m.AWSRegion,
+		AWSAccessKey:    awsAccessKey,
+		AWSSecretKey:    awsSecretKey,
+		AWSSessionToken: awsSessionToken,
 		Timeout:         timeout,
 	}
 }
@@ -280,6 +315,27 @@ func (h *Handler) decryptModelAPIKey(m *db.Model) (string, error) {
 		return "", err
 	}
 	return plaintext, nil
+}
+
+// decryptModelAWSSecrets decrypts and returns the three AWS credential fields for m.
+// Any field that is nil or fails to decrypt is returned as an empty string.
+func (h *Handler) decryptModelAWSSecrets(m *db.Model) (accessKey, secretKey, sessionToken string) {
+	if m.AWSAccessKeyEnc != nil {
+		if v, err := crypto.DecryptString(*m.AWSAccessKeyEnc, h.EncryptionKey, []byte("model-aws-access:"+m.ID)); err == nil {
+			accessKey = v
+		}
+	}
+	if m.AWSSecretKeyEnc != nil {
+		if v, err := crypto.DecryptString(*m.AWSSecretKeyEnc, h.EncryptionKey, []byte("model-aws-secret:"+m.ID)); err == nil {
+			secretKey = v
+		}
+	}
+	if m.AWSSessionTokenEnc != nil {
+		if v, err := crypto.DecryptString(*m.AWSSessionTokenEnc, h.EncryptionKey, []byte("model-aws-session:"+m.ID)); err == nil {
+			sessionToken = v
+		}
+	}
+	return accessKey, secretKey, sessionToken
 }
 
 // CreateModel handles POST /api/v1/models.
@@ -348,6 +404,17 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 				"strategy must be one of: round-robin, least-latency, weighted, priority")
 		}
 	}
+	if req.Provider == "bedrock-converse" {
+		if req.AWSRegion == "" {
+			return apierror.BadRequest(c, "aws_region is required for bedrock-converse provider")
+		}
+		if req.AWSAccessKey == "" {
+			return apierror.BadRequest(c, "aws_access_key is required for bedrock-converse provider")
+		}
+		if req.AWSSecretKey == "" {
+			return apierror.BadRequest(c, "aws_secret_key is required for bedrock-converse provider")
+		}
+	}
 
 	aliasStr, aliasMsg := h.validateAndJoinAliases(ctx, req.Aliases, "")
 	if aliasMsg != "" {
@@ -361,7 +428,7 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 	}
 
 	reqType := req.Type
-	// Insert without the API key so we have the model ID available as AAD.
+	// Insert without secrets so we have the model ID available as AAD.
 	m, err := h.DB.CreateModel(ctx, db.CreateModelParams{
 		Name:             req.Name,
 		Provider:         req.Provider,
@@ -375,6 +442,7 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		AzureAPIVersion:  req.AzureAPIVersion,
 		GCPProject:       req.GCPProject,
 		GCPLocation:      req.GCPLocation,
+		AWSRegion:        req.AWSRegion,
 		Source:           "api",
 		CreatedBy:        createdBy,
 		Aliases:          aliasStr,
@@ -390,22 +458,55 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to create model")
 	}
 
-	// Encrypt the API key using the immutable model ID as AAD and persist it.
+	// Encrypt secrets using the immutable model ID as AAD and persist them.
+	secretsUpdate := db.UpdateModelParams{}
+	needsSecretsUpdate := false
 	if req.APIKey != "" {
 		enc, encErr := crypto.EncryptString(req.APIKey, h.EncryptionKey, modelAAD(m.ID))
 		if encErr != nil {
 			h.Log.ErrorContext(ctx, "create model: encrypt api key", slog.String("error", encErr.Error()))
 			return apierror.InternalError(c, "failed to encrypt api key")
 		}
-		m, err = h.DB.UpdateModel(ctx, m.ID, db.UpdateModelParams{APIKeyEncrypted: &enc})
+		secretsUpdate.APIKeyEncrypted = &enc
+		needsSecretsUpdate = true
+	}
+	if req.AWSAccessKey != "" {
+		enc, encErr := crypto.EncryptString(req.AWSAccessKey, h.EncryptionKey, []byte("model-aws-access:"+m.ID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "create model: encrypt aws access key", slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt aws access key")
+		}
+		secretsUpdate.AWSAccessKeyEnc = &enc
+		needsSecretsUpdate = true
+	}
+	if req.AWSSecretKey != "" {
+		enc, encErr := crypto.EncryptString(req.AWSSecretKey, h.EncryptionKey, []byte("model-aws-secret:"+m.ID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "create model: encrypt aws secret key", slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt aws secret key")
+		}
+		secretsUpdate.AWSSecretKeyEnc = &enc
+		needsSecretsUpdate = true
+	}
+	if req.AWSSessionToken != "" {
+		enc, encErr := crypto.EncryptString(req.AWSSessionToken, h.EncryptionKey, []byte("model-aws-session:"+m.ID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "create model: encrypt aws session token", slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt aws session token")
+		}
+		secretsUpdate.AWSSessionTokenEnc = &enc
+		needsSecretsUpdate = true
+	}
+	if needsSecretsUpdate {
+		m, err = h.DB.UpdateModel(ctx, m.ID, secretsUpdate)
 		if err != nil {
-			h.Log.ErrorContext(ctx, "create model: store encrypted key", slog.String("error", err.Error()))
-			return apierror.InternalError(c, "failed to store api key")
+			h.Log.ErrorContext(ctx, "create model: store secrets", slog.String("error", err.Error()))
+			return apierror.InternalError(c, "failed to store model secrets")
 		}
 	}
 
 	if m.IsActive {
-		h.Registry.AddModel(dbModelToProxy(m, req.APIKey))
+		h.Registry.AddModel(dbModelToProxy(m, req.APIKey, req.AWSAccessKey, req.AWSSecretKey, req.AWSSessionToken))
 	}
 
 	if h.Redis != nil {
@@ -618,6 +719,7 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		AzureAPIVersion:  req.AzureAPIVersion,
 		GCPProject:       req.GCPProject,
 		GCPLocation:      req.GCPLocation,
+		AWSRegion:        req.AWSRegion,
 		Timeout:          req.Timeout,
 		Strategy:         req.Strategy,
 		MaxRetries:       req.MaxRetries,
@@ -639,6 +741,30 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 			return apierror.InternalError(c, "failed to encrypt api key")
 		}
 		params.APIKeyEncrypted = &enc
+	}
+	if req.AWSAccessKey != nil {
+		enc, encErr := crypto.EncryptString(*req.AWSAccessKey, h.EncryptionKey, []byte("model-aws-access:"+modelID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "update model: encrypt aws access key", slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt aws access key")
+		}
+		params.AWSAccessKeyEnc = &enc
+	}
+	if req.AWSSecretKey != nil {
+		enc, encErr := crypto.EncryptString(*req.AWSSecretKey, h.EncryptionKey, []byte("model-aws-secret:"+modelID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "update model: encrypt aws secret key", slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt aws secret key")
+		}
+		params.AWSSecretKeyEnc = &enc
+	}
+	if req.AWSSessionToken != nil {
+		enc, encErr := crypto.EncryptString(*req.AWSSessionToken, h.EncryptionKey, []byte("model-aws-session:"+modelID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "update model: encrypt aws session token", slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt aws session token")
+		}
+		params.AWSSessionTokenEnc = &enc
 	}
 
 	updated, err := h.DB.UpdateModel(ctx, modelID, params)
@@ -666,7 +792,8 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 			// updated record and log the inconsistency. A process restart will
 			// reconcile the registry from the database.
 		} else {
-			h.Registry.AddModel(dbModelToProxy(updated, plaintext))
+			awsAccess, awsSecret, awsSession := h.decryptModelAWSSecrets(updated)
+			h.Registry.AddModel(dbModelToProxy(updated, plaintext, awsAccess, awsSecret, awsSession))
 		}
 	} else {
 		h.Registry.RemoveModel(existing.Name)
@@ -767,7 +894,8 @@ func (h *Handler) ActivateModel(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to decrypt model api key")
 	}
 
-	h.Registry.AddModel(dbModelToProxy(m, plaintext))
+	awsAccess, awsSecret, awsSession := h.decryptModelAWSSecrets(m)
+	h.Registry.AddModel(dbModelToProxy(m, plaintext, awsAccess, awsSecret, awsSession))
 
 	if h.Redis != nil {
 		if pubErr := h.Redis.PublishInvalidation(ctx, voidredis.ChannelModels, "reload"); pubErr != nil {

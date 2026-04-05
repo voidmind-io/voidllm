@@ -9,6 +9,8 @@ export interface DeploymentResponse {
   base_url: string
   azure_deployment?: string
   azure_api_version?: string
+  aws_region?: string
+  bedrock_model_id?: string
   weight: number
   priority: number
   is_active: boolean
@@ -27,6 +29,8 @@ export interface ModelResponse {
   output_price_per_1m: number
   azure_deployment?: string
   azure_api_version?: string
+  aws_region?: string
+  bedrock_model_id?: string
   timeout?: string
   is_active: boolean
   source: string
@@ -55,6 +59,11 @@ export interface CreateModelParams {
   output_price_per_1m?: number
   azure_deployment?: string
   azure_api_version?: string
+  aws_access_key?: string
+  aws_secret_key?: string
+  aws_session_token?: string
+  aws_region?: string
+  bedrock_model_id?: string
   timeout?: string
   aliases?: string[]
   strategy?: string
@@ -68,6 +77,11 @@ export interface CreateDeploymentParams {
   api_key?: string
   azure_deployment?: string
   azure_api_version?: string
+  aws_access_key?: string
+  aws_secret_key?: string
+  aws_session_token?: string
+  aws_region?: string
+  bedrock_model_id?: string
   weight?: number
   priority?: number
 }
@@ -79,6 +93,11 @@ export interface UpdateDeploymentParams {
   api_key?: string
   azure_deployment?: string
   azure_api_version?: string
+  aws_access_key?: string
+  aws_secret_key?: string
+  aws_session_token?: string
+  aws_region?: string
+  bedrock_model_id?: string
   weight?: number
   priority?: number
 }
@@ -94,6 +113,11 @@ export interface UpdateModelParams {
   output_price_per_1m?: number
   azure_deployment?: string
   azure_api_version?: string
+  aws_access_key?: string
+  aws_secret_key?: string
+  aws_session_token?: string
+  aws_region?: string
+  bedrock_model_id?: string
   timeout?: string
   aliases?: string[]
 }

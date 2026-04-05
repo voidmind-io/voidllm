@@ -26,8 +26,16 @@ type createDeploymentRequest struct {
 	GCPProject string `json:"gcp_project"`
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when provider is "vertex".
 	GCPLocation string `json:"gcp_location"`
-	Weight      int    `json:"weight"`
-	Priority    int    `json:"priority"`
+	// AWSRegion is the AWS region (e.g. "us-east-1"). Required when provider is "bedrock-converse".
+	AWSRegion string `json:"aws_region"`
+	// AWSAccessKey is the AWS IAM access key ID. Required when provider is "bedrock-converse".
+	AWSAccessKey string `json:"aws_access_key"`
+	// AWSSecretKey is the AWS IAM secret access key. Required when provider is "bedrock-converse".
+	AWSSecretKey string `json:"aws_secret_key"`
+	// AWSSessionToken is an optional AWS STS session token for temporary credentials.
+	AWSSessionToken string `json:"aws_session_token"`
+	Weight          int    `json:"weight"`
+	Priority        int    `json:"priority"`
 }
 
 // updateDeploymentRequest is the JSON body accepted by updateDeployment.
@@ -43,12 +51,20 @@ type updateDeploymentRequest struct {
 	GCPProject *string `json:"gcp_project"`
 	// GCPLocation, when non-nil, replaces the stored Google Cloud region.
 	GCPLocation *string `json:"gcp_location"`
-	Weight      *int    `json:"weight"`
-	Priority    *int    `json:"priority"`
+	// AWSRegion, when non-nil, replaces the stored AWS region.
+	AWSRegion *string `json:"aws_region"`
+	// AWSAccessKey, when non-nil, replaces the stored AWS IAM access key ID.
+	AWSAccessKey *string `json:"aws_access_key"`
+	// AWSSecretKey, when non-nil, replaces the stored AWS IAM secret access key.
+	AWSSecretKey *string `json:"aws_secret_key"`
+	// AWSSessionToken, when non-nil, replaces the stored AWS STS session token.
+	AWSSessionToken *string `json:"aws_session_token"`
+	Weight          *int    `json:"weight"`
+	Priority        *int    `json:"priority"`
 }
 
 // deploymentResponse is the JSON representation of a deployment returned by the API.
-// The API key is write-only and is never included in responses.
+// The API key and AWS credentials are write-only and are never included in responses.
 type deploymentResponse struct {
 	ID              string `json:"id"`
 	ModelID         string `json:"model_id"`
@@ -61,11 +77,13 @@ type deploymentResponse struct {
 	GCPProject string `json:"gcp_project,omitempty"`
 	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
 	GCPLocation string `json:"gcp_location,omitempty"`
-	Weight      int    `json:"weight"`
-	Priority    int    `json:"priority"`
-	IsActive    bool   `json:"is_active"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
+	// AWSRegion is the AWS region. Non-empty only for provider "bedrock-converse".
+	AWSRegion string `json:"aws_region,omitempty"`
+	Weight    int    `json:"weight"`
+	Priority  int    `json:"priority"`
+	IsActive  bool   `json:"is_active"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 // deploymentAAD returns the additional authenticated data used when encrypting
@@ -87,6 +105,7 @@ func deploymentToResponse(d *db.Deployment) deploymentResponse {
 		AzureAPIVersion: d.AzureAPIVersion,
 		GCPProject:      d.GCPProject,
 		GCPLocation:     d.GCPLocation,
+		AWSRegion:       d.AWSRegion,
 		Weight:          d.Weight,
 		Priority:        d.Priority,
 		IsActive:        d.IsActive,
@@ -159,8 +178,19 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 	if msg := validateDeploymentBaseURL(req.BaseURL); msg != "" {
 		return apierror.BadRequest(c, msg)
 	}
+	if req.Provider == "bedrock-converse" {
+		if req.AWSRegion == "" {
+			return apierror.BadRequest(c, "aws_region is required for bedrock-converse provider")
+		}
+		if req.AWSAccessKey == "" {
+			return apierror.BadRequest(c, "aws_access_key is required for bedrock-converse provider")
+		}
+		if req.AWSSecretKey == "" {
+			return apierror.BadRequest(c, "aws_secret_key is required for bedrock-converse provider")
+		}
+	}
 
-	// Insert without API key to obtain the stable deployment ID used as AAD.
+	// Insert without secrets to obtain the stable deployment ID used as AAD.
 	dep, err := h.DB.CreateDeployment(ctx, db.CreateDeploymentParams{
 		ModelID:         modelID,
 		Name:            req.Name,
@@ -171,6 +201,7 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 		AzureAPIVersion: req.AzureAPIVersion,
 		GCPProject:      req.GCPProject,
 		GCPLocation:     req.GCPLocation,
+		AWSRegion:       req.AWSRegion,
 		Weight:          req.Weight,
 		Priority:        req.Priority,
 	})
@@ -182,17 +213,50 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to create deployment")
 	}
 
-	// Encrypt the API key using the immutable deployment ID as AAD and persist it.
+	// Encrypt secrets using the immutable deployment ID as AAD and persist them.
+	depSecretsUpdate := db.UpdateDeploymentParams{}
+	depNeedsSecretsUpdate := false
 	if req.APIKey != "" {
 		enc, encErr := crypto.EncryptString(req.APIKey, h.EncryptionKey, deploymentAAD(dep.ID))
 		if encErr != nil {
 			h.Log.ErrorContext(ctx, "create deployment: encrypt api key", slog.String("error", encErr.Error()))
 			return apierror.InternalError(c, "failed to encrypt api key")
 		}
-		dep, err = h.DB.UpdateDeployment(ctx, dep.ID, db.UpdateDeploymentParams{APIKeyEncrypted: &enc})
+		depSecretsUpdate.APIKeyEncrypted = &enc
+		depNeedsSecretsUpdate = true
+	}
+	if req.AWSAccessKey != "" {
+		enc, encErr := crypto.EncryptString(req.AWSAccessKey, h.EncryptionKey, []byte("dep-aws-access:"+dep.ID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "create deployment: encrypt aws access key", slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt aws access key")
+		}
+		depSecretsUpdate.AWSAccessKeyEnc = &enc
+		depNeedsSecretsUpdate = true
+	}
+	if req.AWSSecretKey != "" {
+		enc, encErr := crypto.EncryptString(req.AWSSecretKey, h.EncryptionKey, []byte("dep-aws-secret:"+dep.ID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "create deployment: encrypt aws secret key", slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt aws secret key")
+		}
+		depSecretsUpdate.AWSSecretKeyEnc = &enc
+		depNeedsSecretsUpdate = true
+	}
+	if req.AWSSessionToken != "" {
+		enc, encErr := crypto.EncryptString(req.AWSSessionToken, h.EncryptionKey, []byte("dep-aws-session:"+dep.ID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "create deployment: encrypt aws session token", slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt aws session token")
+		}
+		depSecretsUpdate.AWSSessionTokenEnc = &enc
+		depNeedsSecretsUpdate = true
+	}
+	if depNeedsSecretsUpdate {
+		dep, err = h.DB.UpdateDeployment(ctx, dep.ID, depSecretsUpdate)
 		if err != nil {
-			h.Log.ErrorContext(ctx, "create deployment: store encrypted key", slog.String("error", err.Error()))
-			return apierror.InternalError(c, "failed to store api key")
+			h.Log.ErrorContext(ctx, "create deployment: store secrets", slog.String("error", err.Error()))
+			return apierror.InternalError(c, "failed to store deployment secrets")
 		}
 	}
 
@@ -313,6 +377,7 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 		AzureAPIVersion: req.AzureAPIVersion,
 		GCPProject:      req.GCPProject,
 		GCPLocation:     req.GCPLocation,
+		AWSRegion:       req.AWSRegion,
 		Weight:          req.Weight,
 		Priority:        req.Priority,
 	}
@@ -324,6 +389,30 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 			return apierror.InternalError(c, "failed to encrypt api key")
 		}
 		params.APIKeyEncrypted = &enc
+	}
+	if req.AWSAccessKey != nil {
+		enc, encErr := crypto.EncryptString(*req.AWSAccessKey, h.EncryptionKey, []byte("dep-aws-access:"+deploymentID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "update deployment: encrypt aws access key", slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt aws access key")
+		}
+		params.AWSAccessKeyEnc = &enc
+	}
+	if req.AWSSecretKey != nil {
+		enc, encErr := crypto.EncryptString(*req.AWSSecretKey, h.EncryptionKey, []byte("dep-aws-secret:"+deploymentID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "update deployment: encrypt aws secret key", slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt aws secret key")
+		}
+		params.AWSSecretKeyEnc = &enc
+	}
+	if req.AWSSessionToken != nil {
+		enc, encErr := crypto.EncryptString(*req.AWSSessionToken, h.EncryptionKey, []byte("dep-aws-session:"+deploymentID))
+		if encErr != nil {
+			h.Log.ErrorContext(ctx, "update deployment: encrypt aws session token", slog.String("error", encErr.Error()))
+			return apierror.InternalError(c, "failed to encrypt aws session token")
+		}
+		params.AWSSessionTokenEnc = &enc
 	}
 
 	dep, err = h.DB.UpdateDeployment(ctx, deploymentID, params)

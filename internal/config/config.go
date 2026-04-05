@@ -109,6 +109,14 @@ type DeploymentConfig struct {
 	GCPProject string `yaml:"gcp_project" json:"gcp_project,omitempty"`
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when provider is "vertex".
 	GCPLocation string `yaml:"gcp_location" json:"gcp_location,omitempty"`
+	// AWSRegion is the AWS region (e.g. "us-east-1"). Required when provider is "bedrock-converse".
+	AWSRegion string `yaml:"aws_region" json:"aws_region,omitempty"`
+	// AWSAccessKey is the AWS IAM access key ID. Required when provider is "bedrock-converse".
+	AWSAccessKey string `yaml:"aws_access_key" json:"-"`
+	// AWSSecretKey is the AWS IAM secret access key. Required when provider is "bedrock-converse".
+	AWSSecretKey string `yaml:"aws_secret_key" json:"-"`
+	// AWSSessionToken is an optional AWS STS session token for temporary credentials.
+	AWSSessionToken string `yaml:"aws_session_token" json:"-"`
 	// Weight is the relative routing weight for the "weighted" strategy.
 	// A value of 0 means this deployment is only used as a fallback when all
 	// weighted deployments are unavailable.
@@ -118,13 +126,17 @@ type DeploymentConfig struct {
 	Priority int `yaml:"priority"`
 }
 
-// LogValue implements slog.LogValuer to prevent API keys from appearing in logs.
+// LogValue implements slog.LogValuer to prevent API keys and AWS credentials
+// from appearing in logs.
 func (d DeploymentConfig) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("name", d.Name),
 		slog.String("provider", d.Provider),
 		slog.String("base_url", d.BaseURL),
 		slog.String("api_key", "[REDACTED]"),
+		slog.String("aws_access_key", "[REDACTED]"),
+		slog.String("aws_secret_key", "[REDACTED]"),
+		slog.String("aws_session_token", "[REDACTED]"),
 	)
 }
 
@@ -145,6 +157,14 @@ type ModelConfig struct {
 	GCPProject string `yaml:"gcp_project" json:"gcp_project,omitempty"`
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when provider is "vertex".
 	GCPLocation string `yaml:"gcp_location" json:"gcp_location,omitempty"`
+	// AWSRegion is the AWS region (e.g. "us-east-1"). Required when provider is "bedrock-converse".
+	AWSRegion string `yaml:"aws_region" json:"aws_region,omitempty"`
+	// AWSAccessKey is the AWS IAM access key ID. Required when provider is "bedrock-converse".
+	AWSAccessKey string `yaml:"aws_access_key" json:"-"`
+	// AWSSecretKey is the AWS IAM secret access key. Required when provider is "bedrock-converse".
+	AWSSecretKey string `yaml:"aws_secret_key" json:"-"`
+	// AWSSessionToken is an optional AWS STS session token for temporary credentials.
+	AWSSessionToken string `yaml:"aws_session_token" json:"-"`
 	// Timeout is the per-model upstream timeout as a duration string (e.g. "30s",
 	// "2m"). When non-empty it overrides the global stream/response timeout for
 	// this model. Zero or empty means use the global default.
@@ -161,13 +181,17 @@ type ModelConfig struct {
 	Deployments []DeploymentConfig `yaml:"deployments"`
 }
 
-// LogValue implements slog.LogValuer to prevent API keys from appearing in logs.
+// LogValue implements slog.LogValuer to prevent API keys and AWS credentials
+// from appearing in logs.
 func (m ModelConfig) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("name", m.Name),
 		slog.String("provider", m.Provider),
 		slog.String("base_url", m.BaseURL),
 		slog.String("api_key", "[REDACTED]"),
+		slog.String("aws_access_key", "[REDACTED]"),
+		slog.String("aws_secret_key", "[REDACTED]"),
+		slog.String("aws_session_token", "[REDACTED]"),
 	)
 }
 

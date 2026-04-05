@@ -223,6 +223,10 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			AzureAPIVersion: model.AzureAPIVersion,
 			GCPProject:      model.GCPProject,
 			GCPLocation:     model.GCPLocation,
+			AWSRegion:       model.AWSRegion,
+			AWSAccessKey:    model.AWSAccessKey,
+			AWSSecretKey:    model.AWSSecretKey,
+			AWSSessionToken: model.AWSSessionToken,
 			Weight:          1,
 		}}
 	}
@@ -382,6 +386,12 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 	_ = usedDep // deployment name available for future usage event enrichment
 
 	if isStreamingResponse(resp) {
+		// For providers that use a binary wire format (e.g. AWS Event Stream),
+		// wrap the response body with a reader that converts it to OpenAI SSE
+		// before the SSE scanner processes it.
+		if wrapper, ok := adapter.(StreamWrapper); ok {
+			resp.Body = wrapper.WrapStream(resp.Body)
+		}
 		var breaker *circuitbreaker.Breaker
 		if p.CircuitBreakers != nil {
 			breaker = p.CircuitBreakers.Get(deploymentKey(model.Name, usedDep.Name))
@@ -946,6 +956,10 @@ func applyDeployment(model *Model, dep Deployment) {
 	model.AzureAPIVersion = dep.AzureAPIVersion
 	model.GCPProject = dep.GCPProject
 	model.GCPLocation = dep.GCPLocation
+	model.AWSRegion = dep.AWSRegion
+	model.AWSAccessKey = dep.AWSAccessKey
+	model.AWSSecretKey = dep.AWSSecretKey
+	model.AWSSessionToken = dep.AWSSessionToken
 }
 
 // isRetryable reports whether an HTTP status code from an upstream response
@@ -1021,8 +1035,9 @@ func isAllowedPath(p string) bool {
 }
 
 // isStreamingResponse reports whether the upstream response is a server-sent
-// event stream by inspecting the Content-Type header.
+// event stream or an AWS Event Stream by inspecting the Content-Type header.
 func isStreamingResponse(resp *http.Response) bool {
 	ct := resp.Header.Get("Content-Type")
-	return strings.Contains(ct, "text/event-stream")
+	return strings.Contains(ct, "text/event-stream") ||
+		strings.Contains(ct, "application/vnd.amazon.eventstream")
 }

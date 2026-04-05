@@ -323,6 +323,40 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 						)
 					}
 				}
+				var depAWSAccessKey, depAWSSecretKey, depAWSSessionToken string
+				if dep.AWSAccessKeyEnc != nil {
+					if v, decErr := crypto.DecryptString(*dep.AWSAccessKeyEnc, encKey, []byte("dep-aws-access:"+dep.ID)); decErr == nil {
+						depAWSAccessKey = v
+					} else {
+						log.LogAttrs(loadCtx, slog.LevelError, "failed to decrypt deployment aws access key",
+							slog.String("model", m.Name),
+							slog.String("deployment", dep.Name),
+							slog.String("error", decErr.Error()),
+						)
+					}
+				}
+				if dep.AWSSecretKeyEnc != nil {
+					if v, decErr := crypto.DecryptString(*dep.AWSSecretKeyEnc, encKey, []byte("dep-aws-secret:"+dep.ID)); decErr == nil {
+						depAWSSecretKey = v
+					} else {
+						log.LogAttrs(loadCtx, slog.LevelError, "failed to decrypt deployment aws secret key",
+							slog.String("model", m.Name),
+							slog.String("deployment", dep.Name),
+							slog.String("error", decErr.Error()),
+						)
+					}
+				}
+				if dep.AWSSessionTokenEnc != nil {
+					if v, decErr := crypto.DecryptString(*dep.AWSSessionTokenEnc, encKey, []byte("dep-aws-session:"+dep.ID)); decErr == nil {
+						depAWSSessionToken = v
+					} else {
+						log.LogAttrs(loadCtx, slog.LevelError, "failed to decrypt deployment aws session token",
+							slog.String("model", m.Name),
+							slog.String("deployment", dep.Name),
+							slog.String("error", decErr.Error()),
+						)
+					}
+				}
 				deployments = append(deployments, proxy.Deployment{
 					Name:            dep.Name,
 					Provider:        dep.Provider,
@@ -332,9 +366,45 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 					AzureAPIVersion: dep.AzureAPIVersion,
 					GCPProject:      dep.GCPProject,
 					GCPLocation:     dep.GCPLocation,
+					AWSRegion:       dep.AWSRegion,
+					AWSAccessKey:    depAWSAccessKey,
+					AWSSecretKey:    depAWSSecretKey,
+					AWSSessionToken: depAWSSessionToken,
 					Weight:          dep.Weight,
 					Priority:        dep.Priority,
 				})
+			}
+
+			var awsAccessKey, awsSecretKey, awsSessionToken string
+			if m.AWSAccessKeyEnc != nil {
+				if v, decErr := crypto.DecryptString(*m.AWSAccessKeyEnc, encKey, []byte("model-aws-access:"+m.ID)); decErr == nil {
+					awsAccessKey = v
+				} else {
+					log.LogAttrs(loadCtx, slog.LevelError, "failed to decrypt model aws access key",
+						slog.String("model", m.Name),
+						slog.String("error", decErr.Error()),
+					)
+				}
+			}
+			if m.AWSSecretKeyEnc != nil {
+				if v, decErr := crypto.DecryptString(*m.AWSSecretKeyEnc, encKey, []byte("model-aws-secret:"+m.ID)); decErr == nil {
+					awsSecretKey = v
+				} else {
+					log.LogAttrs(loadCtx, slog.LevelError, "failed to decrypt model aws secret key",
+						slog.String("model", m.Name),
+						slog.String("error", decErr.Error()),
+					)
+				}
+			}
+			if m.AWSSessionTokenEnc != nil {
+				if v, decErr := crypto.DecryptString(*m.AWSSessionTokenEnc, encKey, []byte("model-aws-session:"+m.ID)); decErr == nil {
+					awsSessionToken = v
+				} else {
+					log.LogAttrs(loadCtx, slog.LevelError, "failed to decrypt model aws session token",
+						slog.String("model", m.Name),
+						slog.String("error", decErr.Error()),
+					)
+				}
 			}
 
 			registry.AddModel(proxy.Model{
@@ -350,6 +420,10 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 				AzureAPIVersion:  m.AzureAPIVersion,
 				GCPProject:       m.GCPProject,
 				GCPLocation:      m.GCPLocation,
+				AWSRegion:        m.AWSRegion,
+				AWSAccessKey:     awsAccessKey,
+				AWSSecretKey:     awsSecretKey,
+				AWSSessionToken:  awsSessionToken,
 				Timeout:          timeout,
 				Strategy:         m.Strategy,
 				MaxRetries:       m.MaxRetries,

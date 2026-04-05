@@ -57,6 +57,10 @@ func (r *Router) Pick(model proxy.Model) []proxy.Deployment {
 			AzureAPIVersion: model.AzureAPIVersion,
 			GCPProject:      model.GCPProject,
 			GCPLocation:     model.GCPLocation,
+			AWSRegion:       model.AWSRegion,
+			AWSAccessKey:    model.AWSAccessKey,
+			AWSSecretKey:    model.AWSSecretKey,
+			AWSSessionToken: model.AWSSessionToken,
 			Weight:          1,
 			Priority:        0,
 		}}

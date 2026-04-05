@@ -12,6 +12,7 @@ import (
 // SELECT queries. It must match the scan order in scanDeployment exactly.
 const deploymentSelectColumns = "id, model_id, name, provider, base_url, api_key_encrypted, " +
 	"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
+	"aws_region, aws_access_key_enc, aws_secret_key_enc, aws_session_token_enc, " +
 	"weight, priority, is_active, " +
 	"created_at, updated_at, deleted_at"
 
@@ -31,12 +32,20 @@ type Deployment struct {
 	GCPProject string
 	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
 	GCPLocation string
-	Weight      int
-	Priority    int
-	IsActive    bool
-	CreatedAt   string
-	UpdatedAt   string
-	DeletedAt   *string
+	// AWSRegion is the AWS region. Non-empty only for provider "bedrock-converse".
+	AWSRegion string
+	// AWSAccessKeyEnc is the AES-256-GCM encrypted AWS IAM access key ID.
+	AWSAccessKeyEnc *string
+	// AWSSecretKeyEnc is the AES-256-GCM encrypted AWS IAM secret access key.
+	AWSSecretKeyEnc *string
+	// AWSSessionTokenEnc is the AES-256-GCM encrypted AWS STS session token.
+	AWSSessionTokenEnc *string
+	Weight             int
+	Priority           int
+	IsActive           bool
+	CreatedAt          string
+	UpdatedAt          string
+	DeletedAt          *string
 }
 
 // CreateDeploymentParams holds the input for creating a deployment.
@@ -52,6 +61,14 @@ type CreateDeploymentParams struct {
 	GCPProject string
 	// GCPLocation is the Google Cloud region. Required when Provider is "vertex".
 	GCPLocation string
+	// AWSRegion is the AWS region. Required when Provider is "bedrock-converse".
+	AWSRegion string
+	// AWSAccessKeyEnc is the AES-256-GCM encrypted AWS IAM access key ID.
+	AWSAccessKeyEnc *string
+	// AWSSecretKeyEnc is the AES-256-GCM encrypted AWS IAM secret access key.
+	AWSSecretKeyEnc *string
+	// AWSSessionTokenEnc is the AES-256-GCM encrypted AWS STS session token.
+	AWSSessionTokenEnc *string
 	// Weight is the relative probability used for weighted routing. Must be >= 1.
 	Weight int
 	// Priority is the routing preference for the priority strategy; lower value
@@ -72,6 +89,14 @@ type UpdateDeploymentParams struct {
 	GCPProject *string
 	// GCPLocation, when non-nil, replaces the stored Google Cloud region.
 	GCPLocation *string
+	// AWSRegion, when non-nil, replaces the stored AWS region.
+	AWSRegion *string
+	// AWSAccessKeyEnc, when non-nil, replaces the stored encrypted AWS access key.
+	AWSAccessKeyEnc *string
+	// AWSSecretKeyEnc, when non-nil, replaces the stored encrypted AWS secret key.
+	AWSSecretKeyEnc *string
+	// AWSSessionTokenEnc, when non-nil, replaces the stored encrypted session token.
+	AWSSessionTokenEnc *string
 	// Weight, when non-nil, replaces the stored routing weight.
 	Weight *int
 	// Priority, when non-nil, replaces the stored routing priority.
@@ -95,11 +120,14 @@ func (d *DB) CreateDeployment(ctx context.Context, params CreateDeploymentParams
 	insertQuery := "INSERT INTO model_deployments " +
 		"(id, model_id, name, provider, base_url, api_key_encrypted, " +
 		"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
+		"aws_region, aws_access_key_enc, aws_secret_key_enc, aws_session_token_enc, " +
 		"weight, priority, is_active, " +
 		"created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
-		p(7) + ", " + p(8) + ", " + p(9) + ", " + p(10) + ", " + p(11) + ", " + p(12) + ", " +
+		p(7) + ", " + p(8) + ", " + p(9) + ", " + p(10) + ", " +
+		p(11) + ", " + p(12) + ", " + p(13) + ", " + p(14) + ", " +
+		p(15) + ", " + p(16) + ", " +
 		"1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + deploymentSelectColumns +
@@ -118,6 +146,10 @@ func (d *DB) CreateDeployment(ctx context.Context, params CreateDeploymentParams
 			params.AzureAPIVersion,
 			params.GCPProject,
 			params.GCPLocation,
+			params.AWSRegion,
+			params.AWSAccessKeyEnc,
+			params.AWSSecretKeyEnc,
+			params.AWSSessionTokenEnc,
 			weight,
 			params.Priority,
 		)
@@ -262,6 +294,26 @@ func (d *DB) UpdateDeployment(ctx context.Context, id string, params UpdateDeplo
 		args = append(args, *params.GCPLocation)
 		argN++
 	}
+	if params.AWSRegion != nil {
+		setClauses = append(setClauses, "aws_region = "+p(argN))
+		args = append(args, *params.AWSRegion)
+		argN++
+	}
+	if params.AWSAccessKeyEnc != nil {
+		setClauses = append(setClauses, "aws_access_key_enc = "+p(argN))
+		args = append(args, *params.AWSAccessKeyEnc)
+		argN++
+	}
+	if params.AWSSecretKeyEnc != nil {
+		setClauses = append(setClauses, "aws_secret_key_enc = "+p(argN))
+		args = append(args, *params.AWSSecretKeyEnc)
+		argN++
+	}
+	if params.AWSSessionTokenEnc != nil {
+		setClauses = append(setClauses, "aws_session_token_enc = "+p(argN))
+		args = append(args, *params.AWSSessionTokenEnc)
+		argN++
+	}
 	if params.Weight != nil {
 		setClauses = append(setClauses, "weight = "+p(argN))
 		args = append(args, *params.Weight)
@@ -382,6 +434,7 @@ func scanDeployment(scanner interface{ Scan(...any) error }) (*Deployment, error
 	err := scanner.Scan(
 		&dep.ID, &dep.ModelID, &dep.Name, &dep.Provider, &dep.BaseURL, &dep.APIKeyEncrypted,
 		&dep.AzureDeployment, &dep.AzureAPIVersion, &dep.GCPProject, &dep.GCPLocation,
+		&dep.AWSRegion, &dep.AWSAccessKeyEnc, &dep.AWSSecretKeyEnc, &dep.AWSSessionTokenEnc,
 		&dep.Weight, &dep.Priority,
 		&isActiveInt, &dep.CreatedAt, &dep.UpdatedAt, &dep.DeletedAt,
 	)

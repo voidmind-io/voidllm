@@ -524,7 +524,7 @@ settings:
     buffer_size: 100
 models:
   - name: gpt-4o
-    provider: bedrock
+    provider: invalidprovider
     base_url: https://api.openai.com
 `,
 			wantErr:     true,
@@ -994,7 +994,7 @@ settings:
   soft_limit_threshold: 2.0
 models:
   - name: ""
-    provider: bedrock
+    provider: invalidprovider
     base_url: ""
 `
 	path := writeTemp(t, "voidllm.yaml", yaml)

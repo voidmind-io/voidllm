@@ -37,6 +37,8 @@ const providerLabels: Record<ProviderKey, string> = {
   openai: 'OpenAI',
   anthropic: 'Anthropic',
   azure: 'Azure',
+  bedrock: 'AWS Bedrock',
+  'bedrock-converse': 'AWS Bedrock (Converse)',
   vllm: 'vLLM',
   ollama: 'Ollama',
   custom: 'Custom',
@@ -46,6 +48,8 @@ const PROVIDER_OPTIONS = [
   { value: 'openai', label: 'OpenAI' },
   { value: 'anthropic', label: 'Anthropic' },
   { value: 'azure', label: 'Azure' },
+  { value: 'bedrock', label: 'AWS Bedrock' },
+  { value: 'bedrock-converse', label: 'AWS Bedrock (Converse)' },
   { value: 'vllm', label: 'vLLM' },
   { value: 'ollama', label: 'Ollama' },
   { value: 'custom', label: 'Custom' },
@@ -92,6 +96,8 @@ const BASE_URL_PLACEHOLDERS: Record<string, string> = {
   openai: 'https://api.openai.com/v1',
   anthropic: 'https://api.anthropic.com',
   azure: 'https://<resource>.openai.azure.com',
+  bedrock: 'https://bedrock-runtime.<region>.amazonaws.com',
+  'bedrock-converse': 'https://bedrock-runtime.<region>.amazonaws.com',
   vllm: 'http://localhost:8000/v1',
   ollama: 'http://localhost:11434/v1',
   custom: 'https://your-endpoint/v1',
@@ -218,6 +224,11 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
   const [apiKey, setApiKey] = useState('')
   const [azureDeployment, setAzureDeployment] = useState(deployment?.azure_deployment ?? '')
   const [azureApiVersion, setAzureApiVersion] = useState(deployment?.azure_api_version ?? '')
+  const [awsRegion, setAwsRegion] = useState(deployment?.aws_region ?? '')
+  const [awsAccessKey, setAwsAccessKey] = useState('')
+  const [awsSecretKey, setAwsSecretKey] = useState('')
+  const [awsSessionToken, setAwsSessionToken] = useState('')
+  const [bedrockModelId, setBedrockModelId] = useState(deployment?.bedrock_model_id ?? '')
   const [weight, setWeight] = useState(String(deployment?.weight ?? 1))
   const [priority, setPriority] = useState(String(deployment?.priority ?? 0))
   const [errors, setErrors] = useState<DeploymentFormErrors>({})
@@ -228,6 +239,8 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
 
   const isPending = createDeployment.isPending || updateDeployment.isPending
   const isAzure = provider === 'azure'
+  const isBedrockConverse = provider === 'bedrock-converse'
+  const isBedrock = provider === 'bedrock' || isBedrockConverse
 
   function handleClose() {
     setName('')
@@ -236,6 +249,11 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
     setApiKey('')
     setAzureDeployment('')
     setAzureApiVersion('')
+    setAwsRegion('')
+    setAwsAccessKey('')
+    setAwsSecretKey('')
+    setAwsSessionToken('')
+    setBedrockModelId('')
     setWeight('1')
     setPriority('0')
     setErrors({})
@@ -270,6 +288,15 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
       if (isAzure && azureApiVersion.trim() !== (deployment.azure_api_version ?? '')) {
         params.azure_api_version = azureApiVersion.trim() || undefined
       }
+      if (isBedrock && awsRegion.trim() !== (deployment.aws_region ?? '')) {
+        params.aws_region = awsRegion.trim() || undefined
+      }
+      if (isBedrock && bedrockModelId.trim() !== (deployment.bedrock_model_id ?? '')) {
+        params.bedrock_model_id = bedrockModelId.trim() || undefined
+      }
+      if (isBedrockConverse && awsAccessKey.trim()) params.aws_access_key = awsAccessKey.trim()
+      if (isBedrockConverse && awsSecretKey.trim()) params.aws_secret_key = awsSecretKey.trim()
+      if (isBedrockConverse && awsSessionToken.trim()) params.aws_session_token = awsSessionToken.trim()
       if (!isNaN(parsedWeight) && parsedWeight !== deployment.weight) params.weight = parsedWeight
       if (!isNaN(parsedPriority) && parsedPriority !== deployment.priority) params.priority = parsedPriority
 
@@ -296,6 +323,11 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
             api_key: apiKey.trim() || undefined,
             azure_deployment: isAzure && azureDeployment.trim() ? azureDeployment.trim() : undefined,
             azure_api_version: isAzure && azureApiVersion.trim() ? azureApiVersion.trim() : undefined,
+            aws_region: isBedrock && awsRegion.trim() ? awsRegion.trim() : undefined,
+            bedrock_model_id: isBedrock && bedrockModelId.trim() ? bedrockModelId.trim() : undefined,
+            aws_access_key: isBedrockConverse && awsAccessKey.trim() ? awsAccessKey.trim() : undefined,
+            aws_secret_key: isBedrockConverse && awsSecretKey.trim() ? awsSecretKey.trim() : undefined,
+            aws_session_token: isBedrockConverse && awsSessionToken.trim() ? awsSessionToken.trim() : undefined,
             weight: !isNaN(parsedWeight) ? parsedWeight : 1,
             priority: !isNaN(parsedPriority) ? parsedPriority : 0,
           },
@@ -367,6 +399,54 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
             />
           </>
         )}
+        {isBedrock && (
+          <>
+            <Input
+              label="AWS Region"
+              value={awsRegion}
+              onChange={(e) => setAwsRegion(e.target.value)}
+              placeholder="us-east-1"
+              disabled={isPending}
+            />
+            <Input
+              label="Bedrock Model ID"
+              value={bedrockModelId}
+              onChange={(e) => setBedrockModelId(e.target.value)}
+              placeholder="anthropic.claude-sonnet-4-5-20250929-v1:0"
+              disabled={isPending}
+            />
+          </>
+        )}
+        {isBedrockConverse && (
+          <>
+            <Input
+              label="AWS Access Key"
+              value={awsAccessKey}
+              onChange={(e) => setAwsAccessKey(e.target.value)}
+              placeholder={isEdit ? 'Leave empty to keep current' : 'AKIA...'}
+              description={isEdit ? 'Leave empty to keep current key' : 'Encrypted at rest, never shown again'}
+              disabled={isPending}
+            />
+            <Input
+              label="AWS Secret Key"
+              type="password"
+              value={awsSecretKey}
+              onChange={(e) => setAwsSecretKey(e.target.value)}
+              placeholder={isEdit ? 'Leave empty to keep current' : ''}
+              description={isEdit ? 'Leave empty to keep current key' : 'Encrypted at rest, never shown again'}
+              disabled={isPending}
+            />
+            <Input
+              label="AWS Session Token"
+              type="password"
+              value={awsSessionToken}
+              onChange={(e) => setAwsSessionToken(e.target.value)}
+              placeholder={isEdit ? 'Leave empty to keep current' : 'Optional - for temporary credentials'}
+              description="Optional - only required for temporary credentials"
+              disabled={isPending}
+            />
+          </>
+        )}
         <div className="grid grid-cols-2 gap-4">
           <Input
             label="Weight"
@@ -421,6 +501,11 @@ interface DeploymentFormEntry {
   apiKey: string
   azureDeployment: string
   azureApiVersion: string
+  awsRegion: string
+  awsAccessKey: string
+  awsSecretKey: string
+  awsSessionToken: string
+  bedrockModelId: string
   weight: number
   priority: number
 }
@@ -432,6 +517,11 @@ const emptyDeploymentEntry = (): DeploymentFormEntry => ({
   apiKey: '',
   azureDeployment: '',
   azureApiVersion: '',
+  awsRegion: '',
+  awsAccessKey: '',
+  awsSecretKey: '',
+  awsSessionToken: '',
+  bedrockModelId: '',
   weight: 1,
   priority: 0,
 })
@@ -457,6 +547,11 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const [outputPricePer1m, setOutputPricePer1m] = useState('')
   const [azureDeployment, setAzureDeployment] = useState('')
   const [azureApiVersion, setAzureApiVersion] = useState('')
+  const [awsRegion, setAwsRegion] = useState('')
+  const [awsAccessKey, setAwsAccessKey] = useState('')
+  const [awsSecretKey, setAwsSecretKey] = useState('')
+  const [awsSessionToken, setAwsSessionToken] = useState('')
+  const [bedrockModelId, setBedrockModelId] = useState('')
   const [timeout, setTimeout] = useState('')
 
   // Load-balanced fields
@@ -489,6 +584,11 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     setOutputPricePer1m('')
     setAzureDeployment('')
     setAzureApiVersion('')
+    setAwsRegion('')
+    setAwsAccessKey('')
+    setAwsSecretKey('')
+    setAwsSessionToken('')
+    setBedrockModelId('')
     setTimeout('')
     setStrategy('round-robin')
     setMaxRetries('')
@@ -631,6 +731,15 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
         if (azureDeployment.trim()) params.azure_deployment = azureDeployment.trim()
         if (azureApiVersion.trim()) params.azure_api_version = azureApiVersion.trim()
       }
+      if (isBedrock) {
+        if (awsRegion.trim()) params.aws_region = awsRegion.trim()
+        if (bedrockModelId.trim()) params.bedrock_model_id = bedrockModelId.trim()
+      }
+      if (isBedrockConverse) {
+        if (awsAccessKey.trim()) params.aws_access_key = awsAccessKey.trim()
+        if (awsSecretKey.trim()) params.aws_secret_key = awsSecretKey.trim()
+        if (awsSessionToken.trim()) params.aws_session_token = awsSessionToken.trim()
+      }
       if (timeout.trim()) params.timeout = timeout.trim()
       if (parsedAliases.length > 0) params.aliases = parsedAliases
 
@@ -675,6 +784,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       try {
         const model = await createModel.mutateAsync(params)
         for (const dep of deployments) {
+          const depIsBedrockConverse = dep.provider === 'bedrock-converse'
+          const depIsBedrock = dep.provider === 'bedrock' || depIsBedrockConverse
           await createDeployment.mutateAsync({
             modelId: model.id,
             params: {
@@ -684,6 +795,11 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
               api_key: dep.apiKey || undefined,
               azure_deployment: dep.azureDeployment || undefined,
               azure_api_version: dep.azureApiVersion || undefined,
+              aws_region: depIsBedrock && dep.awsRegion ? dep.awsRegion : undefined,
+              bedrock_model_id: depIsBedrock && dep.bedrockModelId ? dep.bedrockModelId : undefined,
+              aws_access_key: depIsBedrockConverse && dep.awsAccessKey ? dep.awsAccessKey : undefined,
+              aws_secret_key: depIsBedrockConverse && dep.awsSecretKey ? dep.awsSecretKey : undefined,
+              aws_session_token: depIsBedrockConverse && dep.awsSessionToken ? dep.awsSessionToken : undefined,
               weight: dep.weight,
               priority: dep.priority,
             },
@@ -701,8 +817,12 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   }
 
   const isAzure = provider === 'azure'
+  const isBedrockConverse = provider === 'bedrock-converse'
+  const isBedrock = provider === 'bedrock' || isBedrockConverse
   const isPending = createModel.isPending || createDeployment.isPending
   const depFormIsAzure = depFormEntry.provider === 'azure'
+  const depFormIsBedrockConverse = depFormEntry.provider === 'bedrock-converse'
+  const depFormIsBedrock = depFormEntry.provider === 'bedrock' || depFormIsBedrockConverse
   const depFormIsOpen = showDeploymentForm || editingDeployment !== null
 
   return (
@@ -794,6 +914,53 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                 />
               </>
             )}
+            {isBedrock && (
+              <>
+                <Input
+                  label="AWS Region"
+                  value={awsRegion}
+                  onChange={(e) => setAwsRegion(e.target.value)}
+                  placeholder="us-east-1"
+                  disabled={isPending}
+                />
+                <Input
+                  label="Bedrock Model ID"
+                  value={bedrockModelId}
+                  onChange={(e) => setBedrockModelId(e.target.value)}
+                  placeholder="anthropic.claude-sonnet-4-5-20250929-v1:0"
+                  disabled={isPending}
+                />
+              </>
+            )}
+            {isBedrockConverse && (
+              <>
+                <Input
+                  label="AWS Access Key"
+                  value={awsAccessKey}
+                  onChange={(e) => setAwsAccessKey(e.target.value)}
+                  placeholder="AKIA..."
+                  description="Encrypted at rest, never shown again"
+                  disabled={isPending}
+                />
+                <Input
+                  label="AWS Secret Key"
+                  type="password"
+                  value={awsSecretKey}
+                  onChange={(e) => setAwsSecretKey(e.target.value)}
+                  description="Encrypted at rest, never shown again"
+                  disabled={isPending}
+                />
+                <Input
+                  label="AWS Session Token"
+                  type="password"
+                  value={awsSessionToken}
+                  onChange={(e) => setAwsSessionToken(e.target.value)}
+                  placeholder="Optional - for temporary credentials"
+                  description="Optional - only required for temporary credentials"
+                  disabled={isPending}
+                />
+              </>
+            )}
           </>
         ) : (
           <>
@@ -875,6 +1042,53 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                                 value={depFormEntry.azureApiVersion}
                                 onChange={(e) => setDepFormEntry((prev) => ({ ...prev, azureApiVersion: e.target.value }))}
                                 placeholder="e.g. 2024-02-01"
+                                disabled={isPending}
+                              />
+                            </>
+                          )}
+                          {depFormIsBedrock && (
+                            <>
+                              <Input
+                                label="AWS Region"
+                                value={depFormEntry.awsRegion}
+                                onChange={(e) => setDepFormEntry((prev) => ({ ...prev, awsRegion: e.target.value }))}
+                                placeholder="us-east-1"
+                                disabled={isPending}
+                              />
+                              <Input
+                                label="Bedrock Model ID"
+                                value={depFormEntry.bedrockModelId}
+                                onChange={(e) => setDepFormEntry((prev) => ({ ...prev, bedrockModelId: e.target.value }))}
+                                placeholder="anthropic.claude-sonnet-4-5-20250929-v1:0"
+                                disabled={isPending}
+                              />
+                            </>
+                          )}
+                          {depFormIsBedrockConverse && (
+                            <>
+                              <Input
+                                label="AWS Access Key"
+                                value={depFormEntry.awsAccessKey}
+                                onChange={(e) => setDepFormEntry((prev) => ({ ...prev, awsAccessKey: e.target.value }))}
+                                placeholder="AKIA..."
+                                description="Encrypted at rest, never shown again"
+                                disabled={isPending}
+                              />
+                              <Input
+                                label="AWS Secret Key"
+                                type="password"
+                                value={depFormEntry.awsSecretKey}
+                                onChange={(e) => setDepFormEntry((prev) => ({ ...prev, awsSecretKey: e.target.value }))}
+                                description="Encrypted at rest, never shown again"
+                                disabled={isPending}
+                              />
+                              <Input
+                                label="AWS Session Token"
+                                type="password"
+                                value={depFormEntry.awsSessionToken}
+                                onChange={(e) => setDepFormEntry((prev) => ({ ...prev, awsSessionToken: e.target.value }))}
+                                placeholder="Optional - for temporary credentials"
+                                description="Optional - only required for temporary credentials"
                                 disabled={isPending}
                               />
                             </>
@@ -994,6 +1208,53 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                         value={depFormEntry.azureApiVersion}
                         onChange={(e) => setDepFormEntry((prev) => ({ ...prev, azureApiVersion: e.target.value }))}
                         placeholder="e.g. 2024-02-01"
+                        disabled={isPending}
+                      />
+                    </>
+                  )}
+                  {depFormIsBedrock && (
+                    <>
+                      <Input
+                        label="AWS Region"
+                        value={depFormEntry.awsRegion}
+                        onChange={(e) => setDepFormEntry((prev) => ({ ...prev, awsRegion: e.target.value }))}
+                        placeholder="us-east-1"
+                        disabled={isPending}
+                      />
+                      <Input
+                        label="Bedrock Model ID"
+                        value={depFormEntry.bedrockModelId}
+                        onChange={(e) => setDepFormEntry((prev) => ({ ...prev, bedrockModelId: e.target.value }))}
+                        placeholder="anthropic.claude-sonnet-4-5-20250929-v1:0"
+                        disabled={isPending}
+                      />
+                    </>
+                  )}
+                  {depFormIsBedrockConverse && (
+                    <>
+                      <Input
+                        label="AWS Access Key"
+                        value={depFormEntry.awsAccessKey}
+                        onChange={(e) => setDepFormEntry((prev) => ({ ...prev, awsAccessKey: e.target.value }))}
+                        placeholder="AKIA..."
+                        description="Encrypted at rest, never shown again"
+                        disabled={isPending}
+                      />
+                      <Input
+                        label="AWS Secret Key"
+                        type="password"
+                        value={depFormEntry.awsSecretKey}
+                        onChange={(e) => setDepFormEntry((prev) => ({ ...prev, awsSecretKey: e.target.value }))}
+                        description="Encrypted at rest, never shown again"
+                        disabled={isPending}
+                      />
+                      <Input
+                        label="AWS Session Token"
+                        type="password"
+                        value={depFormEntry.awsSessionToken}
+                        onChange={(e) => setDepFormEntry((prev) => ({ ...prev, awsSessionToken: e.target.value }))}
+                        placeholder="Optional - for temporary credentials"
+                        description="Optional - only required for temporary credentials"
                         disabled={isPending}
                       />
                     </>
@@ -1147,12 +1408,19 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
   )
   const [azureDeployment, setAzureDeployment] = useState(model.azure_deployment ?? '')
   const [azureApiVersion, setAzureApiVersion] = useState(model.azure_api_version ?? '')
+  const [awsRegion, setAwsRegion] = useState(model.aws_region ?? '')
+  const [awsAccessKey, setAwsAccessKey] = useState('')
+  const [awsSecretKey, setAwsSecretKey] = useState('')
+  const [awsSessionToken, setAwsSessionToken] = useState('')
+  const [bedrockModelId, setBedrockModelId] = useState(model.bedrock_model_id ?? '')
   const [timeout, setTimeout] = useState(model.timeout ?? '')
 
   const updateModel = useUpdateModel()
   const { toast } = useToast()
 
   const isAzure = provider === 'azure'
+  const isBedrockConverse = provider === 'bedrock-converse'
+  const isBedrock = provider === 'bedrock' || isBedrockConverse
 
   function handleSubmit(e: React.FormEvent | React.MouseEvent) {
     e.preventDefault()
@@ -1199,6 +1467,20 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
       if (azureApiVersion.trim() !== (model.azure_api_version ?? '')) {
         params.azure_api_version = azureApiVersion.trim()
       }
+    }
+
+    if (isBedrock) {
+      if (awsRegion.trim() !== (model.aws_region ?? '')) {
+        params.aws_region = awsRegion.trim() || undefined
+      }
+      if (bedrockModelId.trim() !== (model.bedrock_model_id ?? '')) {
+        params.bedrock_model_id = bedrockModelId.trim() || undefined
+      }
+    }
+    if (isBedrockConverse) {
+      if (awsAccessKey.trim()) params.aws_access_key = awsAccessKey.trim()
+      if (awsSecretKey.trim()) params.aws_secret_key = awsSecretKey.trim()
+      if (awsSessionToken.trim()) params.aws_session_token = awsSessionToken.trim()
     }
 
     const trimmedTimeout = timeout.trim()
@@ -1315,6 +1597,54 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
               value={azureApiVersion}
               onChange={(e) => setAzureApiVersion(e.target.value)}
               placeholder="e.g. 2024-02-01"
+              disabled={updateModel.isPending}
+            />
+          </>
+        )}
+        {isBedrock && (
+          <>
+            <Input
+              label="AWS Region"
+              value={awsRegion}
+              onChange={(e) => setAwsRegion(e.target.value)}
+              placeholder="us-east-1"
+              disabled={updateModel.isPending}
+            />
+            <Input
+              label="Bedrock Model ID"
+              value={bedrockModelId}
+              onChange={(e) => setBedrockModelId(e.target.value)}
+              placeholder="anthropic.claude-sonnet-4-5-20250929-v1:0"
+              disabled={updateModel.isPending}
+            />
+          </>
+        )}
+        {isBedrockConverse && (
+          <>
+            <Input
+              label="AWS Access Key"
+              value={awsAccessKey}
+              onChange={(e) => setAwsAccessKey(e.target.value)}
+              placeholder="Leave empty to keep current"
+              description="Leave empty to keep current key. Enter a new value to replace."
+              disabled={updateModel.isPending}
+            />
+            <Input
+              label="AWS Secret Key"
+              type="password"
+              value={awsSecretKey}
+              onChange={(e) => setAwsSecretKey(e.target.value)}
+              placeholder="Leave empty to keep current"
+              description="Leave empty to keep current key. Enter a new value to replace."
+              disabled={updateModel.isPending}
+            />
+            <Input
+              label="AWS Session Token"
+              type="password"
+              value={awsSessionToken}
+              onChange={(e) => setAwsSessionToken(e.target.value)}
+              placeholder="Leave empty to keep current"
+              description="Optional - only required for temporary credentials"
               disabled={updateModel.isPending}
             />
           </>

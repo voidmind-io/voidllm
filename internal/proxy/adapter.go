@@ -1,6 +1,9 @@
 package proxy
 
-import "net/http"
+import (
+	"io"
+	"net/http"
+)
 
 // UsageInfo holds token counts extracted from a completed upstream response.
 // For non-streaming responses the counts come from the response JSON; for
@@ -49,6 +52,17 @@ type Adapter interface {
 	StreamUsage() UsageInfo
 }
 
+// StreamWrapper is an optional extension of Adapter for providers that use a
+// binary or non-SSE wire format for streaming. When an Adapter also implements
+// StreamWrapper, the proxy handler wraps the upstream response body with
+// WrapStream before passing it to the SSE scanner.
+type StreamWrapper interface {
+	// WrapStream wraps the raw upstream response body and returns a new reader
+	// that produces OpenAI-compatible SSE lines. The caller is responsible for
+	// closing the returned reader.
+	WrapStream(body io.ReadCloser) io.ReadCloser
+}
+
 // GetAdapter returns the Adapter for the named provider, or nil for providers
 // that speak the OpenAI wire format natively (passthrough). A fresh instance
 // is returned on every call so that stateful streaming adapters (e.g.
@@ -61,6 +75,10 @@ func GetAdapter(provider string) Adapter {
 		return &AzureAdapter{}
 	case "gemini", "vertex":
 		return &GeminiAdapter{}
+	case "bedrock":
+		return &BedrockAdapter{}
+	case "bedrock-converse":
+		return &BedrockConverseAdapter{}
 	default:
 		return nil
 	}

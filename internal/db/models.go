@@ -17,6 +17,7 @@ import (
 const modelSelectColumns = "id, name, provider, model_type, base_url, api_key_encrypted, " +
 	"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 	"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
+	"aws_region, aws_access_key_enc, aws_secret_key_enc, aws_session_token_enc, " +
 	"is_active, source, created_by, created_at, updated_at, deleted_at, aliases, timeout, " +
 	"strategy, max_retries"
 
@@ -39,12 +40,23 @@ type Model struct {
 	GCPProject string
 	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
 	GCPLocation string
-	IsActive    bool
-	Source      string
-	CreatedBy   *string
-	CreatedAt   string
-	UpdatedAt   string
-	DeletedAt   *string
+	// AWSRegion is the AWS region. Non-empty only for provider "bedrock-converse".
+	AWSRegion string
+	// AWSAccessKeyEnc is the AES-256-GCM encrypted AWS IAM access key ID.
+	// Non-nil only for provider "bedrock-converse".
+	AWSAccessKeyEnc *string
+	// AWSSecretKeyEnc is the AES-256-GCM encrypted AWS IAM secret access key.
+	// Non-nil only for provider "bedrock-converse".
+	AWSSecretKeyEnc *string
+	// AWSSessionTokenEnc is the AES-256-GCM encrypted AWS STS session token.
+	// Non-nil when temporary credentials are configured.
+	AWSSessionTokenEnc *string
+	IsActive           bool
+	Source             string
+	CreatedBy          *string
+	CreatedAt          string
+	UpdatedAt          string
+	DeletedAt          *string
 	// Aliases is a comma-separated list of alias names, e.g. "default,gpt4".
 	// An empty string means no aliases are configured.
 	Aliases string
@@ -76,6 +88,14 @@ type CreateModelParams struct {
 	GCPProject string
 	// GCPLocation is the Google Cloud region. Required when Provider is "vertex".
 	GCPLocation string
+	// AWSRegion is the AWS region. Required when Provider is "bedrock-converse".
+	AWSRegion string
+	// AWSAccessKeyEnc is the AES-256-GCM encrypted AWS IAM access key ID.
+	AWSAccessKeyEnc *string
+	// AWSSecretKeyEnc is the AES-256-GCM encrypted AWS IAM secret access key.
+	AWSSecretKeyEnc *string
+	// AWSSessionTokenEnc is the AES-256-GCM encrypted AWS STS session token.
+	AWSSessionTokenEnc *string
 	// Source is "yaml" for config-file-sourced models or "api" for Admin API-created models.
 	Source    string
 	CreatedBy *string
@@ -109,6 +129,15 @@ type UpdateModelParams struct {
 	GCPProject *string
 	// GCPLocation, when non-nil, replaces the stored Google Cloud region.
 	GCPLocation *string
+	// AWSRegion, when non-nil, replaces the stored AWS region.
+	AWSRegion *string
+	// AWSAccessKeyEnc, when non-nil, replaces the stored encrypted AWS access key.
+	AWSAccessKeyEnc *string
+	// AWSSecretKeyEnc, when non-nil, replaces the stored encrypted AWS secret key.
+	AWSSecretKeyEnc *string
+	// AWSSessionTokenEnc, when non-nil, replaces the stored encrypted session token.
+	// Set to a pointer to an empty string to clear the session token.
+	AWSSessionTokenEnc *string
 	// Aliases, when non-nil, replaces the stored comma-separated alias list.
 	// Set to a pointer to an empty string to clear all aliases.
 	Aliases *string
@@ -149,13 +178,15 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 		"(id, name, provider, model_type, base_url, api_key_encrypted, " +
 		"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 		"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
+		"aws_region, aws_access_key_enc, aws_secret_key_enc, aws_session_token_enc, " +
 		"is_active, source, created_by, aliases, timeout, strategy, max_retries, " +
 		"created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
 		p(7) + ", " + p(8) + ", " + p(9) + ", " +
 		p(10) + ", " + p(11) + ", " + p(12) + ", " + p(13) + ", " +
-		"1, " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " + p(18) + ", " + p(19) + ", " +
+		p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " +
+		"1, " + p(18) + ", " + p(19) + ", " + p(20) + ", " + p(21) + ", " + p(22) + ", " + p(23) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + modelSelectColumns +
@@ -177,6 +208,10 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 			params.AzureAPIVersion,
 			params.GCPProject,
 			params.GCPLocation,
+			params.AWSRegion,
+			params.AWSAccessKeyEnc,
+			params.AWSSecretKeyEnc,
+			params.AWSSessionTokenEnc,
 			params.Source,
 			params.CreatedBy,
 			params.Aliases,
@@ -346,6 +381,26 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 		args = append(args, *params.GCPLocation)
 		argN++
 	}
+	if params.AWSRegion != nil {
+		setClauses = append(setClauses, "aws_region = "+p(argN))
+		args = append(args, *params.AWSRegion)
+		argN++
+	}
+	if params.AWSAccessKeyEnc != nil {
+		setClauses = append(setClauses, "aws_access_key_enc = "+p(argN))
+		args = append(args, *params.AWSAccessKeyEnc)
+		argN++
+	}
+	if params.AWSSecretKeyEnc != nil {
+		setClauses = append(setClauses, "aws_secret_key_enc = "+p(argN))
+		args = append(args, *params.AWSSecretKeyEnc)
+		argN++
+	}
+	if params.AWSSessionTokenEnc != nil {
+		setClauses = append(setClauses, "aws_session_token_enc = "+p(argN))
+		args = append(args, *params.AWSSessionTokenEnc)
+		argN++
+	}
 	if params.Aliases != nil {
 		setClauses = append(setClauses, "aliases = "+p(argN))
 		args = append(args, *params.Aliases)
@@ -512,6 +567,7 @@ func scanModel(scanner interface{ Scan(...any) error }) (*Model, error) {
 		&m.ID, &m.Name, &m.Provider, &m.ModelType, &m.BaseURL, &m.APIKeyEncrypted,
 		&m.MaxContextTokens, &m.InputPricePer1M, &m.OutputPricePer1M,
 		&m.AzureDeployment, &m.AzureAPIVersion, &m.GCPProject, &m.GCPLocation,
+		&m.AWSRegion, &m.AWSAccessKeyEnc, &m.AWSSecretKeyEnc, &m.AWSSessionTokenEnc,
 		&isActiveInt, &m.Source, &m.CreatedBy,
 		&m.CreatedAt, &m.UpdatedAt, &m.DeletedAt, &m.Aliases, &m.Timeout,
 		&m.Strategy, &m.MaxRetries,
@@ -577,6 +633,7 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 				AzureAPIVersion:  m.AzureAPIVersion,
 				GCPProject:       m.GCPProject,
 				GCPLocation:      m.GCPLocation,
+				AWSRegion:        m.AWSRegion,
 				Source:           "yaml",
 				Aliases:          aliases,
 				Timeout:          m.Timeout,
@@ -587,17 +644,45 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 				return fmt.Errorf("sync yaml models: create %s: %w", m.Name, createErr)
 			}
 
-			// Encrypt the API key now that we have the model ID to use as AAD,
-			// then store it in a follow-up UPDATE.
+			// Encrypt secrets now that we have the model ID to use as AAD,
+			// then store them in a follow-up UPDATE.
+			updateAfterCreate := UpdateModelParams{}
+			needsUpdate := false
 			if m.APIKey != "" {
 				enc, encErr := crypto.EncryptString(m.APIKey, encKey, []byte("model:"+created.ID))
 				if encErr != nil {
 					return fmt.Errorf("sync yaml models: encrypt key for %s: %w", m.Name, encErr)
 				}
-				if _, updateErr := d.UpdateModel(ctx, created.ID, UpdateModelParams{
-					APIKeyEncrypted: &enc,
-				}); updateErr != nil {
-					return fmt.Errorf("sync yaml models: set key for %s: %w", m.Name, updateErr)
+				updateAfterCreate.APIKeyEncrypted = &enc
+				needsUpdate = true
+			}
+			if m.AWSAccessKey != "" {
+				enc, encErr := crypto.EncryptString(m.AWSAccessKey, encKey, []byte("model-aws-access:"+created.ID))
+				if encErr != nil {
+					return fmt.Errorf("sync yaml models: encrypt aws access key for %s: %w", m.Name, encErr)
+				}
+				updateAfterCreate.AWSAccessKeyEnc = &enc
+				needsUpdate = true
+			}
+			if m.AWSSecretKey != "" {
+				enc, encErr := crypto.EncryptString(m.AWSSecretKey, encKey, []byte("model-aws-secret:"+created.ID))
+				if encErr != nil {
+					return fmt.Errorf("sync yaml models: encrypt aws secret key for %s: %w", m.Name, encErr)
+				}
+				updateAfterCreate.AWSSecretKeyEnc = &enc
+				needsUpdate = true
+			}
+			if m.AWSSessionToken != "" {
+				enc, encErr := crypto.EncryptString(m.AWSSessionToken, encKey, []byte("model-aws-session:"+created.ID))
+				if encErr != nil {
+					return fmt.Errorf("sync yaml models: encrypt aws session token for %s: %w", m.Name, encErr)
+				}
+				updateAfterCreate.AWSSessionTokenEnc = &enc
+				needsUpdate = true
+			}
+			if needsUpdate {
+				if _, updateErr := d.UpdateModel(ctx, created.ID, updateAfterCreate); updateErr != nil {
+					return fmt.Errorf("sync yaml models: set secrets for %s: %w", m.Name, updateErr)
 				}
 			}
 
@@ -629,6 +714,7 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 		azureVersion := m.AzureAPIVersion
 		gcpProject := m.GCPProject
 		gcpLocation := m.GCPLocation
+		awsRegion := m.AWSRegion
 		timeout := m.Timeout
 		strategy := m.Strategy
 		maxRetries := m.MaxRetries
@@ -645,6 +731,7 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 			AzureAPIVersion:  &azureVersion,
 			GCPProject:       &gcpProject,
 			GCPLocation:      &gcpLocation,
+			AWSRegion:        &awsRegion,
 			Aliases:          &aliases,
 			Timeout:          &timeout,
 			Strategy:         &strategy,
@@ -657,6 +744,27 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 				return fmt.Errorf("sync yaml models: encrypt key for %s: %w", m.Name, encErr)
 			}
 			params.APIKeyEncrypted = &enc
+		}
+		if m.AWSAccessKey != "" {
+			enc, encErr := crypto.EncryptString(m.AWSAccessKey, encKey, []byte("model-aws-access:"+existing.ID))
+			if encErr != nil {
+				return fmt.Errorf("sync yaml models: encrypt aws access key for %s: %w", m.Name, encErr)
+			}
+			params.AWSAccessKeyEnc = &enc
+		}
+		if m.AWSSecretKey != "" {
+			enc, encErr := crypto.EncryptString(m.AWSSecretKey, encKey, []byte("model-aws-secret:"+existing.ID))
+			if encErr != nil {
+				return fmt.Errorf("sync yaml models: encrypt aws secret key for %s: %w", m.Name, encErr)
+			}
+			params.AWSSecretKeyEnc = &enc
+		}
+		if m.AWSSessionToken != "" {
+			enc, encErr := crypto.EncryptString(m.AWSSessionToken, encKey, []byte("model-aws-session:"+existing.ID))
+			if encErr != nil {
+				return fmt.Errorf("sync yaml models: encrypt aws session token for %s: %w", m.Name, encErr)
+			}
+			params.AWSSessionTokenEnc = &enc
 		}
 
 		if _, updateErr := d.UpdateModel(ctx, existing.ID, params); updateErr != nil {
@@ -713,21 +821,50 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 				AzureAPIVersion: cd.AzureAPIVersion,
 				GCPProject:      cd.GCPProject,
 				GCPLocation:     cd.GCPLocation,
+				AWSRegion:       cd.AWSRegion,
 				Weight:          weight,
 				Priority:        cd.Priority,
 			})
 			if createErr != nil {
 				return fmt.Errorf("create deployment %s: %w", cd.Name, createErr)
 			}
+			depUpdateAfterCreate := UpdateDeploymentParams{}
+			depNeedsUpdate := false
 			if cd.APIKey != "" {
 				enc, encErr := crypto.EncryptString(cd.APIKey, encKey, deploymentAAD(created.ID))
 				if encErr != nil {
 					return fmt.Errorf("encrypt api key for deployment %s: %w", cd.Name, encErr)
 				}
-				if _, updateErr := d.UpdateDeployment(ctx, created.ID, UpdateDeploymentParams{
-					APIKeyEncrypted: &enc,
-				}); updateErr != nil {
-					return fmt.Errorf("set api key for deployment %s: %w", cd.Name, updateErr)
+				depUpdateAfterCreate.APIKeyEncrypted = &enc
+				depNeedsUpdate = true
+			}
+			if cd.AWSAccessKey != "" {
+				enc, encErr := crypto.EncryptString(cd.AWSAccessKey, encKey, []byte("dep-aws-access:"+created.ID))
+				if encErr != nil {
+					return fmt.Errorf("encrypt aws access key for deployment %s: %w", cd.Name, encErr)
+				}
+				depUpdateAfterCreate.AWSAccessKeyEnc = &enc
+				depNeedsUpdate = true
+			}
+			if cd.AWSSecretKey != "" {
+				enc, encErr := crypto.EncryptString(cd.AWSSecretKey, encKey, []byte("dep-aws-secret:"+created.ID))
+				if encErr != nil {
+					return fmt.Errorf("encrypt aws secret key for deployment %s: %w", cd.Name, encErr)
+				}
+				depUpdateAfterCreate.AWSSecretKeyEnc = &enc
+				depNeedsUpdate = true
+			}
+			if cd.AWSSessionToken != "" {
+				enc, encErr := crypto.EncryptString(cd.AWSSessionToken, encKey, []byte("dep-aws-session:"+created.ID))
+				if encErr != nil {
+					return fmt.Errorf("encrypt aws session token for deployment %s: %w", cd.Name, encErr)
+				}
+				depUpdateAfterCreate.AWSSessionTokenEnc = &enc
+				depNeedsUpdate = true
+			}
+			if depNeedsUpdate {
+				if _, updateErr := d.UpdateDeployment(ctx, created.ID, depUpdateAfterCreate); updateErr != nil {
+					return fmt.Errorf("set secrets for deployment %s: %w", cd.Name, updateErr)
 				}
 			}
 			continue
@@ -740,6 +877,7 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 		azureVersion := cd.AzureAPIVersion
 		gcpProject := cd.GCPProject
 		gcpLocation := cd.GCPLocation
+		awsRegion := cd.AWSRegion
 		weight := cd.Weight
 		if weight < 1 {
 			weight = 1
@@ -753,6 +891,7 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 			AzureAPIVersion: &azureVersion,
 			GCPProject:      &gcpProject,
 			GCPLocation:     &gcpLocation,
+			AWSRegion:       &awsRegion,
 			Weight:          &weight,
 			Priority:        &priority,
 		}
@@ -763,6 +902,27 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 				return fmt.Errorf("encrypt api key for deployment %s: %w", cd.Name, encErr)
 			}
 			updateParams.APIKeyEncrypted = &enc
+		}
+		if cd.AWSAccessKey != "" {
+			enc, encErr := crypto.EncryptString(cd.AWSAccessKey, encKey, []byte("dep-aws-access:"+existing.ID))
+			if encErr != nil {
+				return fmt.Errorf("encrypt aws access key for deployment %s: %w", cd.Name, encErr)
+			}
+			updateParams.AWSAccessKeyEnc = &enc
+		}
+		if cd.AWSSecretKey != "" {
+			enc, encErr := crypto.EncryptString(cd.AWSSecretKey, encKey, []byte("dep-aws-secret:"+existing.ID))
+			if encErr != nil {
+				return fmt.Errorf("encrypt aws secret key for deployment %s: %w", cd.Name, encErr)
+			}
+			updateParams.AWSSecretKeyEnc = &enc
+		}
+		if cd.AWSSessionToken != "" {
+			enc, encErr := crypto.EncryptString(cd.AWSSessionToken, encKey, []byte("dep-aws-session:"+existing.ID))
+			if encErr != nil {
+				return fmt.Errorf("encrypt aws session token for deployment %s: %w", cd.Name, encErr)
+			}
+			updateParams.AWSSessionTokenEnc = &enc
 		}
 
 		if _, updateErr := d.UpdateDeployment(ctx, existing.ID, updateParams); updateErr != nil {

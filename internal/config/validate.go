@@ -156,6 +156,18 @@ func (c *Config) validate() error {
 				}
 			}
 
+			if m.Provider == "bedrock-converse" {
+				if m.AWSRegion == "" {
+					errs = append(errs, fmt.Errorf("%s.aws_region: must not be empty for bedrock-converse provider", prefix))
+				}
+				if m.AWSAccessKey == "" {
+					errs = append(errs, fmt.Errorf("%s.aws_access_key: must not be empty for bedrock-converse provider", prefix))
+				}
+				if m.AWSSecretKey == "" {
+					errs = append(errs, fmt.Errorf("%s.aws_secret_key: must not be empty for bedrock-converse provider", prefix))
+				}
+			}
+
 			if m.Strategy != "" {
 				errs = append(errs, fmt.Errorf("%s.strategy: must be empty when deployments is not set", prefix))
 			}
@@ -198,6 +210,18 @@ func (c *Config) validate() error {
 					}
 					if d.GCPLocation == "" {
 						errs = append(errs, fmt.Errorf("%s.gcp_location: must not be empty for vertex provider", dprefix))
+					}
+				}
+
+				if d.Provider == "bedrock-converse" {
+					if d.AWSRegion == "" {
+						errs = append(errs, fmt.Errorf("%s.aws_region: must not be empty for bedrock-converse provider", dprefix))
+					}
+					if d.AWSAccessKey == "" {
+						errs = append(errs, fmt.Errorf("%s.aws_access_key: must not be empty for bedrock-converse provider", dprefix))
+					}
+					if d.AWSSecretKey == "" {
+						errs = append(errs, fmt.Errorf("%s.aws_secret_key: must not be empty for bedrock-converse provider", dprefix))
 					}
 				}
 

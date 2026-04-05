@@ -29,25 +29,36 @@ type Deployment struct {
 	GCPProject string
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when Provider is "vertex".
 	GCPLocation string
-	Weight      int
-	Priority    int
+	// AWSRegion is the AWS region (e.g. "us-east-1"). Required when Provider is "bedrock-converse".
+	AWSRegion string
+	// AWSAccessKey is the AWS IAM access key ID. Required when Provider is "bedrock-converse".
+	AWSAccessKey string
+	// AWSSecretKey is the AWS IAM secret access key (plaintext, in-memory).
+	AWSSecretKey string
+	// AWSSessionToken is an optional AWS STS session token for temporary credentials.
+	AWSSessionToken string
+	Weight          int
+	Priority        int
 }
 
-// LogValue implements slog.LogValuer to prevent the upstream API key from
-// appearing in structured log output.
+// LogValue implements slog.LogValuer to prevent the upstream API key and AWS
+// credentials from appearing in structured log output.
 func (d Deployment) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("name", d.Name),
 		slog.String("provider", d.Provider),
 		slog.String("base_url", d.BaseURL),
 		slog.String("api_key", "[REDACTED]"),
+		slog.String("aws_access_key", "[REDACTED]"),
+		slog.String("aws_secret_key", "[REDACTED]"),
+		slog.String("aws_session_token", "[REDACTED]"),
 	)
 }
 
 // Model holds a fully resolved model configuration ready for proxying.
 type Model struct {
 	Name     string
-	Provider string // "vllm" | "openai" | "anthropic" | "azure" | "ollama" | "custom"
+	Provider string // "vllm" | "openai" | "anthropic" | "azure" | "ollama" | "custom" | "bedrock" | "bedrock-converse"
 	// "completion", "image", "audio_transcription", or "tts". Defaults to "chat".
 	Type             string
 	BaseURL          string
@@ -61,6 +72,14 @@ type Model struct {
 	GCPProject string
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when Provider is "vertex".
 	GCPLocation string
+	// AWSRegion is the AWS region (e.g. "us-east-1"). Required when Provider is "bedrock-converse".
+	AWSRegion string
+	// AWSAccessKey is the AWS IAM access key ID. Required when Provider is "bedrock-converse".
+	AWSAccessKey string
+	// AWSSecretKey is the AWS IAM secret access key (plaintext, in-memory).
+	AWSSecretKey string
+	// AWSSessionToken is an optional AWS STS session token for temporary credentials.
+	AWSSessionToken string
 	// Timeout is the per-model upstream timeout. When non-zero it overrides the
 	// global MaxStreamDuration and the context deadline used for non-streaming
 	// requests. Zero means use the global default.
@@ -77,14 +96,17 @@ type Model struct {
 	Deployments []Deployment
 }
 
-// LogValue implements slog.LogValuer to prevent the upstream API key from
-// appearing in structured log output.
+// LogValue implements slog.LogValuer to prevent the upstream API key and AWS
+// credentials from appearing in structured log output.
 func (m Model) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("name", m.Name),
 		slog.String("provider", m.Provider),
 		slog.String("base_url", m.BaseURL),
 		slog.String("api_key", "[REDACTED]"),
+		slog.String("aws_access_key", "[REDACTED]"),
+		slog.String("aws_secret_key", "[REDACTED]"),
+		slog.String("aws_session_token", "[REDACTED]"),
 	)
 }
 
@@ -146,6 +168,10 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 				AzureAPIVersion: d.AzureAPIVersion,
 				GCPProject:      d.GCPProject,
 				GCPLocation:     d.GCPLocation,
+				AWSRegion:       d.AWSRegion,
+				AWSAccessKey:    d.AWSAccessKey,
+				AWSSecretKey:    d.AWSSecretKey,
+				AWSSessionToken: d.AWSSessionToken,
 				Weight:          d.Weight,
 				Priority:        d.Priority,
 			}
@@ -164,6 +190,10 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 			AzureAPIVersion:  mc.AzureAPIVersion,
 			GCPProject:       mc.GCPProject,
 			GCPLocation:      mc.GCPLocation,
+			AWSRegion:        mc.AWSRegion,
+			AWSAccessKey:     mc.AWSAccessKey,
+			AWSSecretKey:     mc.AWSSecretKey,
+			AWSSessionToken:  mc.AWSSessionToken,
 			Timeout:          timeout,
 			Strategy:         mc.Strategy,
 			MaxRetries:       mc.MaxRetries,
@@ -295,6 +325,10 @@ func (r *Registry) AddModel(m Model) {
 		AzureAPIVersion:  m.AzureAPIVersion,
 		GCPProject:       m.GCPProject,
 		GCPLocation:      m.GCPLocation,
+		AWSRegion:        m.AWSRegion,
+		AWSAccessKey:     m.AWSAccessKey,
+		AWSSecretKey:     m.AWSSecretKey,
+		AWSSessionToken:  m.AWSSessionToken,
 		Timeout:          m.Timeout,
 		Strategy:         m.Strategy,
 		MaxRetries:       m.MaxRetries,
