@@ -9,6 +9,46 @@ entries:
         - name: Blog
           url: https://voidllm.ai/blog
     apiVersion: v2
+    appVersion: 0.0.15
+    created: "2026-04-07T22:37:01.04104028Z"
+    description: Privacy-first LLM proxy and AI gateway with load balancing, RBAC,
+      MCP gateway, and built-in admin UI. Self-hosted, single binary, sub-500us overhead.
+    digest: 8672307fc17ae7435f67abe9677cf42e6ac2eb7d480a32b005340993ac5d729c
+    home: https://voidllm.ai
+    icon: https://voidllm.ai/logo.svg
+    keywords:
+    - llm
+    - proxy
+    - ai
+    - openai
+    - anthropic
+    - azure
+    - vllm
+    - ollama
+    - ai-gateway
+    - llm-proxy
+    - mcp
+    - privacy
+    - rbac
+    maintainers:
+    - email: hello@voidmind.io
+      name: VoidMind
+      url: https://voidmind.io
+    name: voidllm
+    sources:
+    - https://github.com/voidmind-io/voidllm
+    type: application
+    urls:
+    - https://github.com/voidmind-io/voidllm/releases/download/voidllm-0.0.15/voidllm-0.0.15.tgz
+    version: 0.0.15
+  - annotations:
+      artifacthub.io/license: BUSL-1.1
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/voidmind-io/voidllm/tree/main/docs
+        - name: Blog
+          url: https://voidllm.ai/blog
+    apiVersion: v2
     appVersion: 0.0.14
     created: "2026-04-04T23:23:39.774238238Z"
     description: Privacy-first LLM proxy and AI gateway with load balancing, RBAC,
@@ -226,4 +266,4 @@ entries:
     urls:
     - https://voidmind-io.github.io/voidllm/voidllm-0.0.9.tgz
     version: 0.0.9
-generated: "2026-04-04T23:23:39.774262003Z"
+generated: "2026-04-07T22:37:01.041066466Z"
