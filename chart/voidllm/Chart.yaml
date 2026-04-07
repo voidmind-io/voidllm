@@ -2,8 +2,8 @@ apiVersion: v2
 name: voidllm
 description: Privacy-first LLM proxy and AI gateway with load balancing, RBAC, MCP gateway, and built-in admin UI. Self-hosted, single binary, sub-500us overhead.
 type: application
-version: 0.0.14
-appVersion: "0.0.14"
+version: 0.0.15
+appVersion: "0.0.15"
 home: https://voidllm.ai
 icon: https://voidllm.ai/logo.svg
 sources:

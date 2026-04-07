@@ -2,6 +2,25 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.15] - 2026-04-07
+
+### Features
+- Configurable data retention for usage events and audit logs (#46)
+  - Opt-in background cleanup job with per-table retention durations
+  - Dialect-aware SQL predicate for correct SQLite and PostgreSQL behavior
+  - Batched deletes with single-column timestamp indexes for efficient cleanup on large tables
+- Admin UI update notification via GitHub release check
+- PostgreSQL migration locking via advisory lock prevents concurrent-migration races (#48)
+
+### Improvements
+- Batch dependency updates: grpc 1.80.0, OpenTelemetry 1.43.0, go-jose 4.1.4, vitest 4.1.2 (#63)
+- GitHub Actions workflow bumps: cosign-installer 4.1.1, docker/login-action 4.1.0, setup-node 6.3.0
+
+### Fixes
+- ESLint setState-in-useEffect violation in update notification component
+
+---
+
 ## [0.0.14] - 2026-04-05
 
 ### Features

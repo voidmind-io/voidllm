@@ -89,5 +89,5 @@ The Docker image sets `VOIDLLM_DATABASE_DSN=/data/voidllm.db` by default. Overri
 
 ```bash
 curl http://localhost:8080/healthz
-# {"status":"ok","uptime_seconds":42,"version":"0.0.14"}
+# {"status":"ok","uptime_seconds":42,"version":"0.0.15"}
 ```
