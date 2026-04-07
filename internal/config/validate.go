@@ -308,6 +308,25 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Errorf("settings.soft_limit_threshold: must be between 0.0 and 1.0, got %g", t))
 	}
 
+	// --- settings.retention ---
+	const maxRetention = 10 * 365 * 24 * time.Hour // 10 years
+	if c.Settings.Retention.UsageEvents < 0 {
+		errs = append(errs, errors.New("settings.retention.usage_events must be >= 0"))
+	}
+	if c.Settings.Retention.AuditLogs < 0 {
+		errs = append(errs, errors.New("settings.retention.audit_logs must be >= 0"))
+	}
+	if c.Settings.Retention.UsageEvents > maxRetention {
+		errs = append(errs, errors.New("settings.retention.usage_events exceeds maximum (10 years)"))
+	}
+	if c.Settings.Retention.AuditLogs > maxRetention {
+		errs = append(errs, errors.New("settings.retention.audit_logs exceeds maximum (10 years)"))
+	}
+	const minRetentionInterval = 1 * time.Minute
+	if c.Settings.Retention.Enabled() && c.Settings.Retention.Interval < minRetentionInterval {
+		errs = append(errs, fmt.Errorf("settings.retention.interval must be >= %s when retention is enabled", minRetentionInterval))
+	}
+
 	// --- settings.sso.default_role ---
 	if c.Settings.SSO.Enabled {
 		switch c.Settings.SSO.DefaultRole {
