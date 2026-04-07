@@ -263,6 +263,13 @@ settings:
   #   insecure: false
   #   sample_rate: 1.0
 
+  # Data retention - periodic deletion of old usage and audit records.
+  # Disabled by default (zero duration = keep forever).
+  # retention:
+  #   usage_events: 90d   # delete usage_events rows older than 90 days
+  #   audit_logs: 365d    # delete audit_logs rows older than 1 year
+  #   interval: 24h       # how often the cleanup job runs (default: 24h)
+
   # SSO/OIDC authentication
   # sso:
   #   enabled: true

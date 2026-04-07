@@ -415,6 +415,25 @@ type HealthProbeConfig struct {
 	Interval time.Duration `yaml:"interval"`
 }
 
+// RetentionConfig controls periodic deletion of old usage and audit records.
+// Retention is opt-in: a zero duration means "keep forever".
+type RetentionConfig struct {
+	// UsageEvents is the maximum age of rows in the usage_events table.
+	// A zero value means rows are kept forever.
+	UsageEvents time.Duration `yaml:"usage_events" json:"usage_events"`
+	// AuditLogs is the maximum age of rows in the audit_logs table.
+	// A zero value means rows are kept forever.
+	AuditLogs time.Duration `yaml:"audit_logs" json:"audit_logs"`
+	// Interval controls how often the cleanup job runs.
+	// Defaults to 24h when retention is enabled.
+	Interval time.Duration `yaml:"interval" json:"interval"`
+}
+
+// Enabled reports whether any retention job is active.
+func (r RetentionConfig) Enabled() bool {
+	return r.UsageEvents > 0 || r.AuditLogs > 0
+}
+
 // SettingsConfig holds application-level settings.
 type SettingsConfig struct {
 	AdminKey      string `yaml:"admin_key" json:"-"`
@@ -434,6 +453,7 @@ type SettingsConfig struct {
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
 	HealthCheck    HealthCheckConfig    `yaml:"health_check"`
 	MCP            MCPConfig            `yaml:"mcp"`
+	Retention      RetentionConfig      `yaml:"retention"`
 	// SoftLimitThreshold uses *float64 so that an explicit 0.0 can be
 	// distinguished from the zero value after unmarshalling. Use
 	// GetSoftLimitThreshold to read the value.
@@ -655,6 +675,11 @@ func (c *Config) setDefaults() {
 	}
 	if c.Settings.Audit.FlushInterval == 0 {
 		c.Settings.Audit.FlushInterval = 5 * time.Second
+	}
+
+	// Settings retention
+	if c.Settings.Retention.Interval <= 0 {
+		c.Settings.Retention.Interval = 24 * time.Hour
 	}
 
 	// Bootstrap

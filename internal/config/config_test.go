@@ -706,6 +706,161 @@ models:
 ` + validModel,
 			wantErr: false,
 		},
+		{
+			name: "retention usage_events negative error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    usage_events: -1h
+`,
+			wantErr:     true,
+			errContains: "settings.retention.usage_events must be >= 0",
+		},
+		{
+			name: "retention audit_logs negative error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    audit_logs: -1h
+`,
+			wantErr:     true,
+			errContains: "settings.retention.audit_logs must be >= 0",
+		},
+		{
+			name: "retention usage_events exceeds 10 years error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    usage_events: 87660h
+`,
+			wantErr:     true,
+			errContains: "settings.retention.usage_events exceeds maximum",
+		},
+		{
+			name: "retention audit_logs exceeds 10 years error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    audit_logs: 87660h
+`,
+			wantErr:     true,
+			errContains: "settings.retention.audit_logs exceeds maximum",
+		},
+		{
+			name: "retention interval below minimum when enabled error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    usage_events: 24h
+    interval: 30s
+`,
+			wantErr:     true,
+			errContains: "settings.retention.interval must be >=",
+		},
+		{
+			name: "retention interval irrelevant when disabled no error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    usage_events: 0s
+    audit_logs: 0s
+    interval: 1ms
+`,
+			wantErr: false,
+		},
+		{
+			name: "retention all zeros no error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    usage_events: 0s
+    audit_logs: 0s
+`,
+			wantErr: false,
+		},
+		{
+			name: "retention valid configuration no error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    usage_events: 720h
+    audit_logs: 2160h
+    interval: 24h
+`,
+			wantErr: false,
+		},
 	}
 
 	for _, tc := range tests {

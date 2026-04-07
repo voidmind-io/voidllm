@@ -41,6 +41,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/proxy"
 	"github.com/voidmind-io/voidllm/internal/ratelimit"
 	voidredis "github.com/voidmind-io/voidllm/internal/redis"
+	"github.com/voidmind-io/voidllm/internal/retention"
 	"github.com/voidmind-io/voidllm/internal/router"
 	"github.com/voidmind-io/voidllm/internal/shutdown"
 	"github.com/voidmind-io/voidllm/internal/sso"
@@ -79,6 +80,7 @@ type Application struct {
 	usageLogger      *usage.Logger
 	mcpLogger        *usage.MCPLogger
 	auditLogger      *audit.Logger
+	retentionCleaner *retention.Cleaner
 	healthChecker    *health.Checker
 	mcpHealthChecker *health.MCPHealthChecker
 
@@ -183,10 +185,11 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// Declare variables that the deferred cleanup needs to reference before
 	// they are assigned by the steps below.
 	var (
-		encKey      []byte
-		hmacSecret  []byte
-		usageLogger *usage.Logger
-		auditLogger *audit.Logger
+		encKey           []byte
+		hmacSecret       []byte
+		usageLogger      *usage.Logger
+		auditLogger      *audit.Logger
+		retentionCleaner *retention.Cleaner
 	)
 
 	// From this point on, any early return must clean up in reverse order.
@@ -196,6 +199,9 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	defer func() {
 		if success {
 			return
+		}
+		if retentionCleaner != nil {
+			retentionCleaner.Stop()
 		}
 		if usageLogger != nil {
 			usageLogger.Stop()
@@ -404,6 +410,9 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		auditLogger.Start()
 		log.LogAttrs(ctx, slog.LevelInfo, "audit logging enabled")
 	}
+
+	retentionCleaner = retention.New(database, cfg.Settings.Retention, log)
+	retentionCleaner.Start()
 
 	// Step 9: load model access cache and alias cache from DB.
 	accessCache := proxy.NewModelAccessCache()
@@ -984,6 +993,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		usageLogger:       usageLogger,
 		mcpLogger:         mcpLogger,
 		auditLogger:       auditLogger,
+		retentionCleaner:  retentionCleaner,
 		healthChecker:     healthChecker,
 		mcpHealthChecker:  mcpHealthChecker,
 		shutdownState:     shutdownState,
@@ -1064,6 +1074,10 @@ func (a *Application) Start() error {
 			}
 		}),
 	)
+
+	// Register retention cleaner stop so it is halted during graceful shutdown.
+	// LIFO ordering ensures retention stops before the usage and audit loggers.
+	a.stopFuncs = append(a.stopFuncs, a.retentionCleaner.Stop)
 
 	// The in-memory rate limiter accumulates counter entries that must be
 	// periodically evicted to reclaim memory. The Redis-backed checker uses
