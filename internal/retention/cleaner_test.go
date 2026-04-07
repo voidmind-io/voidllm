@@ -147,6 +147,19 @@ func newTestCleaner(database *db.DB, cfg config.RetentionConfig) *Cleaner {
 	return c
 }
 
+// TestNew_NilLoggerDefaults verifies that passing nil as the logger argument to
+// New causes it to fall back to slog.Default() instead of leaving c.log nil.
+func TestNew_NilLoggerDefaults(t *testing.T) {
+	t.Parallel()
+
+	database := newTestDB(t)
+	cfg := config.RetentionConfig{UsageEvents: time.Hour, Interval: time.Hour}
+	c := New(database, cfg, nil)
+	if c.log == nil {
+		t.Fatal("New(nil) must assign a default logger, got nil")
+	}
+}
+
 // TestRunOnce_RetentionDisabled verifies that when both retention durations are
 // zero, runOnce is a no-op: no rows in either table are deleted.
 func TestRunOnce_RetentionDisabled(t *testing.T) {

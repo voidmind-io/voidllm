@@ -55,3 +55,55 @@ func TestPostgresDialect_Placeholder(t *testing.T) {
 		})
 	}
 }
+
+func TestTimestampLessThan(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		dialect     Dialect
+		column      string
+		placeholder string
+		want        string
+	}{
+		{
+			name:        "sqlite basic",
+			dialect:     SQLiteDialect{},
+			column:      "created_at",
+			placeholder: "?",
+			want:        "datetime(created_at) < datetime(?)",
+		},
+		{
+			name:        "sqlite audit timestamp",
+			dialect:     SQLiteDialect{},
+			column:      "timestamp",
+			placeholder: "?",
+			want:        "datetime(timestamp) < datetime(?)",
+		},
+		{
+			name:        "postgres basic",
+			dialect:     PostgresDialect{},
+			column:      "created_at",
+			placeholder: "$1",
+			want:        "created_at::timestamptz < ($1)::timestamptz",
+		},
+		{
+			name:        "postgres audit timestamp",
+			dialect:     PostgresDialect{},
+			column:      "timestamp",
+			placeholder: "$2",
+			want:        "timestamp::timestamptz < ($2)::timestamptz",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := tc.dialect.TimestampLessThan(tc.column, tc.placeholder)
+			if got != tc.want {
+				t.Errorf("TimestampLessThan(%q, %q) = %q, want %q", tc.column, tc.placeholder, got, tc.want)
+			}
+		})
+	}
+}
