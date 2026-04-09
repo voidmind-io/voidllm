@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -57,6 +58,10 @@ type ProxyHandler struct {
 	MaxRequestBody    int           // maximum allowed request body size in bytes
 	MaxResponseBody   int           // maximum allowed non-streaming response body size in bytes
 	MaxStreamDuration time.Duration // maximum duration for a streaming response
+	// FallbackMaxDepth is the maximum number of fallback hops allowed per
+	// request. Zero or negative disables fallback chaining entirely.
+	// Set from config.SettingsConfig.FallbackMaxDepth at startup.
+	FallbackMaxDepth int
 }
 
 // NewProxyHandler constructs a ProxyHandler with a pre-configured HTTP client.
@@ -207,6 +212,189 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		)
 	}
 
+	// requestedModelName is the canonical name of the model originally requested
+	// by the client. It is preserved across fallback hops so usage events can
+	// record both the originally-requested model and the one that actually served
+	// the request.
+	requestedModelName := model.Name
+
+	// visited tracks the canonical names of all models attempted in this
+	// request's fallback chain so that runtime cycles are detected and broken.
+	visited := make(map[string]bool)
+
+	// currentModel and currentBody may be replaced on each fallback iteration.
+	currentModel := model
+	currentBody := body
+
+	// Per-model timeout overrides the global stream duration limit when set.
+	// Recomputed on each iteration in case the fallback model has a different timeout.
+	effectiveStreamDur := maxStreamDur
+	if currentModel.Timeout > 0 {
+		effectiveStreamDur = currentModel.Timeout
+	}
+
+	maxDepth := p.FallbackMaxDepth
+	if maxDepth <= 0 {
+		maxDepth = 0 // no fallback
+	}
+
+	var (
+		resp           *http.Response
+		cancelUpstream context.CancelFunc
+		adapter        Adapter
+		usedDep        Deployment
+		lastErr        error
+		lastStatus     int
+	)
+
+	// Chain wall time is bounded by the sum of per-model Timeout values
+	// across the hops actually attempted. Each tryModel call enforces its
+	// own timeout via the upstream HTTP client. No chain-level deadline
+	// is imposed here: any in-process work between hops completes in
+	// microseconds and cannot pathologically extend the request.
+	for depth := 0; depth <= maxDepth; depth++ {
+		visited[currentModel.Name] = true
+
+		var tryErr error
+		resp, cancelUpstream, adapter, usedDep, lastErr, lastStatus, tryErr = p.tryModel(c, currentModel, currentBody, envelope)
+		if tryErr != nil {
+			// tryModel wrote an error response to c (errResponseSent) or
+			// returned a framework error. Either way, stop immediately.
+			if errors.Is(tryErr, errResponseSent) {
+				return nil
+			}
+			return tryErr
+		}
+
+		if resp != nil && !isFallbackEligible(lastStatus, nil) {
+			// We have a usable response (success or non-retriable 4xx). Done.
+			break
+		}
+
+		// resp is nil (all deployments exhausted) or resp carries a 5xx that
+		// should trigger a fallback. Decide whether to try the next model in
+		// the chain.
+		if !isFallbackEligible(lastStatus, lastErr) {
+			break
+		}
+
+		next, hasFallback := p.Registry.FallbackFor(currentModel.Name, visited)
+		if !hasFallback {
+			// No fallback model configured — keep resp as-is so it can be
+			// forwarded to the client (even if it is a 5xx).
+			break
+		}
+		if depth >= maxDepth {
+			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "fallback chain depth limit reached",
+				slog.String("model", requestedModelName),
+				slog.Int("max_depth", maxDepth),
+			)
+			break
+		}
+
+		// Access control check for the fallback target. This must happen before
+		// committing to the hop so that a key without access to the fallback model
+		// cannot exploit the chain to bypass access policy. The check mirrors the
+		// one in resolveModel. We never surface a "forbidden" error to the client
+		// here — instead we silently stop the chain and preserve the primary's
+		// error, so the existence of the fallback target is not disclosed.
+		if p.AccessCache != nil && keyInfo != nil {
+			if !p.AccessCache.Check(keyInfo.OrgID, keyInfo.TeamID, keyInfo.ID, next.Name) {
+				p.Log.LogAttrs(c.Context(), slog.LevelInfo, "fallback target not permitted by access policy",
+					slog.String("requested", requestedModelName),
+					slog.String("target", next.Name),
+				)
+				// Preserve lastErr from the failed primary; do not leak
+				// "forbidden" to the client.
+				break
+			}
+		}
+
+		newBody, berr := rewriteModelInBody(currentBody, next.Name)
+		if berr != nil {
+			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "fallback: cannot rewrite request body; stopping chain",
+				slog.String("from", currentModel.Name),
+				slog.String("to", next.Name),
+				slog.String("error", berr.Error()),
+			)
+			// Preserve the primary's error; do not leak the body-rewrite error.
+			break
+		}
+
+		// We have a fallback target, access is permitted, and the body has been
+		// rewritten. Log the hop and commit to using the fallback model.
+		// This log fires only after all checks pass, so it never fires unless the
+		// hop is actually going to happen.
+		p.Log.LogAttrs(c.Context(), slog.LevelInfo, "falling back to next model",
+			slog.String("from", requestedModelName),
+			slog.String("to", next.Name),
+			slog.Int("depth", depth+1),
+		)
+
+		// Drain and discard the current 5xx response before moving on so
+		// the upstream connection is returned to the pool cleanly.
+		if resp != nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			cancelUpstream()
+			resp = nil
+			cancelUpstream = nil
+		}
+
+		currentBody = newBody
+		currentModel = next
+		effectiveStreamDur = maxStreamDur
+		if currentModel.Timeout > 0 {
+			effectiveStreamDur = currentModel.Timeout
+		}
+	}
+
+	// All candidates (and fallback chain) exhausted without a usable response.
+	if resp == nil {
+		if lastErr != nil {
+			return apierror.Send(c, fiber.StatusBadGateway, "upstream_unavailable", "upstream provider is unavailable")
+		}
+		// Every candidate was blocked by its circuit breaker.
+		metrics.CircuitBreakerRejectionsTotal.WithLabelValues(currentModel.Name).Inc()
+		return apierror.Send(c, fiber.StatusServiceUnavailable,
+			"circuit_open", "upstream temporarily unavailable")
+	}
+
+	if isStreamingResponse(resp) {
+		var breaker *circuitbreaker.Breaker
+		if p.CircuitBreakers != nil {
+			breaker = p.CircuitBreakers.Get(deploymentKey(currentModel.Name, usedDep.Name))
+		}
+		return p.handleStreamingResponse(c, resp, cancelUpstream, currentModel,
+			keyInfo, adapter, startTime, requestID, requestedModelName, effectiveStreamDur, trackDone, breaker)
+	}
+
+	defer cancelUpstream()
+	return p.handleBufferedResponse(c, resp, currentModel, keyInfo, adapter,
+		startTime, requestID, requestedModelName, maxRespBody)
+}
+
+// tryModel attempts to forward the request to the given model using its
+// configured deployment candidates. It selects candidates via the Router (or
+// synthesises a single candidate), iterates them in order, and returns as soon
+// as one succeeds or returns a non-retryable status.
+//
+// Return values:
+//   - resp: the upstream response, or nil if all candidates failed.
+//   - cancel: the cancel func for the upstream request context. Non-nil only
+//     when resp is non-nil. Must be called by the caller when done.
+//   - adapter: the provider adapter selected for this model. May be nil.
+//   - usedDep: the deployment that produced the response. Valid only when resp != nil.
+//   - lastErr: the last transport-level error seen, or nil.
+//   - lastStatus: the HTTP status of the last response seen (0 for transport errors).
+//   - err: a framework-level error (including errResponseSent). When non-nil the
+//     caller must propagate it immediately without inspecting the other values.
+func (p *ProxyHandler) tryModel(
+	c fiber.Ctx,
+	model Model,
+	body []byte,
+	envelope requestEnvelope,
+) (*http.Response, context.CancelFunc, Adapter, Deployment, error, int, error) {
 	// Build the ordered list of deployment candidates. When Router is nil or
 	// the model has no multi-deployment configuration, synthesize a single
 	// candidate from the model's own fields so the retry loop is uniform.
@@ -227,27 +415,17 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		}}
 	}
 
-	// Per-model timeout overrides the global stream duration limit when set.
-	effectiveStreamDur := maxStreamDur
-	if model.Timeout > 0 {
-		effectiveStreamDur = model.Timeout
-	}
-
-	// req and cancelUpstream are set on the last successful buildUpstreamRequest
-	// call. They are used below after the loop exits to route into the response
-	// handlers. Both are nil if every candidate was skipped or failed during
-	// request construction.
 	var (
 		req            *http.Request
 		cancelUpstream context.CancelFunc
-		adapter        Adapter
-		resp           *http.Response
+		currentAdapter Adapter
+		currentResp    *http.Response
+		dep            Deployment
 		lastErr        error
-		usedDep        Deployment
 	)
 
-	for i, dep := range candidates {
-		depKey := deploymentKey(model.Name, dep.Name)
+	for i, d := range candidates {
+		depKey := deploymentKey(model.Name, d.Name)
 
 		// Per-deployment circuit breaker check. The router's filterAvailable
 		// already excludes open breakers when Router is non-nil, so we only
@@ -266,15 +444,12 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		// Overlay the deployment's endpoint fields onto a copy of the resolved
 		// model so buildUpstreamRequest uses the correct provider/URL/key.
 		m := model
-		applyDeployment(&m, dep)
+		applyDeployment(&m, d)
 
 		var buildErr error
-		req, cancelUpstream, adapter, buildErr = p.buildUpstreamRequest(c, m, body, envelope)
+		req, cancelUpstream, currentAdapter, buildErr = p.buildUpstreamRequest(c, m, body, envelope)
 		if buildErr != nil {
-			if errors.Is(buildErr, errResponseSent) {
-				return nil
-			}
-			return buildErr
+			return nil, nil, nil, Deployment{}, nil, 0, buildErr
 		}
 
 		// Send the request to the upstream. The upstream span measures
@@ -288,16 +463,16 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 				),
 			)
 			otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
-			resp, doErr = p.HTTPClient.Do(req)
+			currentResp, doErr = p.HTTPClient.Do(req)
 			if doErr != nil {
 				upstreamSpan.RecordError(doErr)
 				upstreamSpan.SetStatus(codes.Error, doErr.Error())
 			} else {
-				upstreamSpan.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
+				upstreamSpan.SetAttributes(attribute.Int("http.response.status_code", currentResp.StatusCode))
 			}
 			upstreamSpan.End()
 		} else {
-			resp, doErr = p.HTTPClient.Do(req)
+			currentResp, doErr = p.HTTPClient.Do(req)
 		}
 
 		if doErr != nil {
@@ -309,7 +484,7 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			metrics.UpstreamErrorsTotal.WithLabelValues(m.Name, m.Provider).Inc()
 			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream request failed, retrying next deployment",
 				slog.String("model", m.Name),
-				slog.String("deployment", dep.Name),
+				slog.String("deployment", d.Name),
 				slog.String("provider", m.Provider),
 				slog.Int("candidate", i),
 				slog.String("error", doErr.Error()),
@@ -317,19 +492,19 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			lastErr = doErr
 			req = nil
 			cancelUpstream = nil
-			resp = nil
+			currentResp = nil
 			metrics.RoutingRetriesTotal.WithLabelValues(model.Name, model.Strategy).Inc()
 			continue
 		}
 
-		metrics.UpstreamRequestsTotal.WithLabelValues(m.Name, m.Provider, strconv.Itoa(resp.StatusCode)).Inc()
+		metrics.UpstreamRequestsTotal.WithLabelValues(m.Name, m.Provider, strconv.Itoa(currentResp.StatusCode)).Inc()
 
-		if isRetryable(resp.StatusCode) && i < len(candidates)-1 {
+		if isRetryable(currentResp.StatusCode) && i < len(candidates)-1 {
 			// 5xx response from upstream — try the next deployment. Drain
 			// and close the body before moving on so the connection is
 			// returned to the pool.
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
+			_, _ = io.Copy(io.Discard, currentResp.Body)
+			_ = currentResp.Body.Close()
 			cancelUpstream()
 			if p.CircuitBreakers != nil {
 				p.CircuitBreakers.Get(depKey).RecordFailure()
@@ -337,15 +512,15 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			metrics.UpstreamErrorsTotal.WithLabelValues(m.Name, m.Provider).Inc()
 			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream returned retryable error, retrying next deployment",
 				slog.String("model", m.Name),
-				slog.String("deployment", dep.Name),
+				slog.String("deployment", d.Name),
 				slog.String("provider", m.Provider),
 				slog.Int("candidate", i),
-				slog.Int("status", resp.StatusCode),
+				slog.Int("status", currentResp.StatusCode),
 			)
-			lastErr = errors.New("upstream returned " + strconv.Itoa(resp.StatusCode))
+			lastErr = errors.New("upstream returned " + strconv.Itoa(currentResp.StatusCode))
 			req = nil
 			cancelUpstream = nil
-			resp = nil
+			currentResp = nil
 			metrics.RoutingRetriesTotal.WithLabelValues(model.Name, model.Strategy).Inc()
 			continue
 		}
@@ -354,45 +529,24 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		// more candidates). Record circuit breaker outcome for non-streaming
 		// responses immediately; streaming outcome is recorded inside the
 		// goroutine once the stream completes.
-		if p.CircuitBreakers != nil && !isStreamingResponse(resp) {
+		if p.CircuitBreakers != nil && !isStreamingResponse(currentResp) {
 			breaker := p.CircuitBreakers.Get(depKey)
-			if resp.StatusCode >= 500 {
+			if currentResp.StatusCode >= 500 {
 				breaker.RecordFailure()
 			} else {
 				breaker.RecordSuccess()
 			}
 		}
 
-		usedDep = dep
+		dep = d
 		model = m // use the deployment-overlaid model for response handling
 		break
 	}
 
-	// All candidates were exhausted without a usable response.
-	if resp == nil {
-		if lastErr != nil {
-			return apierror.Send(c, fiber.StatusBadGateway, "upstream_unavailable", "upstream provider is unavailable")
-		}
-		// Every candidate was blocked by its circuit breaker.
-		metrics.CircuitBreakerRejectionsTotal.WithLabelValues(model.Name).Inc()
-		return apierror.Send(c, fiber.StatusServiceUnavailable,
-			"circuit_open", "upstream temporarily unavailable")
+	if currentResp != nil {
+		return currentResp, cancelUpstream, currentAdapter, dep, lastErr, currentResp.StatusCode, nil
 	}
-
-	_ = usedDep // deployment name available for future usage event enrichment
-
-	if isStreamingResponse(resp) {
-		var breaker *circuitbreaker.Breaker
-		if p.CircuitBreakers != nil {
-			breaker = p.CircuitBreakers.Get(deploymentKey(model.Name, usedDep.Name))
-		}
-		return p.handleStreamingResponse(c, resp, cancelUpstream, model,
-			keyInfo, adapter, startTime, requestID, effectiveStreamDur, trackDone, breaker)
-	}
-
-	defer cancelUpstream()
-	return p.handleBufferedResponse(c, resp, model, keyInfo, adapter,
-		startTime, requestID, maxRespBody)
+	return nil, nil, nil, Deployment{}, lastErr, 0, nil
 }
 
 // resolveEffectiveLimits returns the effective request body, response body, and
@@ -684,7 +838,9 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 // none of these must be deferred at Handle scope on the streaming path.
 // breaker may be nil when circuit breaking is disabled; when non-nil, the
 // goroutine records success or failure after the stream completes.
-func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response, cancelUpstream context.CancelFunc, model Model, keyInfo *auth.KeyInfo, adapter Adapter, startTime time.Time, requestID string, maxStreamDuration time.Duration, trackDone func(), breaker *circuitbreaker.Breaker) error {
+// requestedModelName is the canonical name the client originally asked for;
+// it may differ from model.Name when a fallback was activated.
+func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response, cancelUpstream context.CancelFunc, model Model, keyInfo *auth.KeyInfo, adapter Adapter, startTime time.Time, requestID string, requestedModelName string, maxStreamDuration time.Duration, trackDone func(), breaker *circuitbreaker.Breaker) error {
 	copyResponseHeaders(c, resp)
 	c.Set("Content-Type", "text/event-stream")
 	c.Set("Cache-Control", "no-cache")
@@ -787,7 +943,7 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				streamUI = extractor.lastUsage
 			}
 			durationMS := int(time.Since(startTime).Milliseconds())
-			p.logUsageEvent(keyInfo, model, streamUI, durationMS, ttftMS, respStatusCode, requestID)
+			p.logUsageEvent(keyInfo, model, streamUI, durationMS, ttftMS, respStatusCode, requestID, requestedModelName)
 		}
 
 		metrics.ProxyDurationSeconds.WithLabelValues(model.Name, "true").Observe(time.Since(startTime).Seconds())
@@ -797,7 +953,9 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 // handleBufferedResponse reads the full upstream response body, validates its
 // size, applies any adapter transformation, then sends the status, headers, and
 // body to the client. Usage is logged asynchronously on success.
-func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, model Model, keyInfo *auth.KeyInfo, adapter Adapter, startTime time.Time, requestID string, maxResponseBody int) error {
+// requestedModelName is the canonical name the client originally asked for;
+// it may differ from model.Name when a fallback was activated.
+func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, model Model, keyInfo *auth.KeyInfo, adapter Adapter, startTime time.Time, requestID string, requestedModelName string, maxResponseBody int) error {
 	// Content-Length pre-check: fast-reject optimization to avoid allocating
 	// memory for obviously oversized responses. Not the security boundary —
 	// io.LimitReader on the next line handles chunked/unknown-length responses.
@@ -868,7 +1026,7 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 		// For non-streaming responses TTFT equals total duration: the entire
 		// response body is the first (and only) "token delivery".
 		ttftMS := durationMS
-		p.logUsageEvent(keyInfo, model, ui, durationMS, &ttftMS, resp.StatusCode, requestID)
+		p.logUsageEvent(keyInfo, model, ui, durationMS, &ttftMS, resp.StatusCode, requestID, requestedModelName)
 	}
 
 	metrics.ProxyDurationSeconds.WithLabelValues(model.Name, "false").Observe(time.Since(startTime).Seconds())
@@ -883,7 +1041,9 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 // requestID is the per-request trace ID from the request ID middleware; it must
 // be captured from the Fiber context before Handle returns because the context
 // is recycled by fasthttp after the handler exits.
-func (p *ProxyHandler) logUsageEvent(keyInfo *auth.KeyInfo, model Model, ui UsageInfo, durationMS int, ttftMS *int, statusCode int, requestID string) {
+// requestedModelName is the canonical name the client originally asked for; equal
+// to model.Name when no fallback occurred.
+func (p *ProxyHandler) logUsageEvent(keyInfo *auth.KeyInfo, model Model, ui UsageInfo, durationMS int, ttftMS *int, statusCode int, requestID string, requestedModelName string) {
 	if keyInfo == nil {
 		return
 	}
@@ -902,22 +1062,23 @@ func (p *ProxyHandler) logUsageEvent(keyInfo *auth.KeyInfo, model Model, ui Usag
 	}
 
 	p.UsageLogger.Log(usage.Event{
-		KeyID:            keyInfo.ID,
-		KeyType:          keyInfo.KeyType,
-		OrgID:            keyInfo.OrgID,
-		TeamID:           keyInfo.TeamID,
-		UserID:           keyInfo.UserID,
-		ServiceAccountID: keyInfo.ServiceAccountID,
-		ModelName:        model.Name,
-		PromptTokens:     ui.PromptTokens,
-		CompletionTokens: ui.CompletionTokens,
-		TotalTokens:      ui.TotalTokens,
-		CostEstimate:     cost,
-		DurationMS:       durationMS,
-		TTFT_MS:          ttftMS,
-		TokensPerSecond:  tps,
-		StatusCode:       statusCode,
-		RequestID:        requestID,
+		KeyID:              keyInfo.ID,
+		KeyType:            keyInfo.KeyType,
+		OrgID:              keyInfo.OrgID,
+		TeamID:             keyInfo.TeamID,
+		UserID:             keyInfo.UserID,
+		ServiceAccountID:   keyInfo.ServiceAccountID,
+		ModelName:          model.Name,
+		RequestedModelName: requestedModelName,
+		PromptTokens:       ui.PromptTokens,
+		CompletionTokens:   ui.CompletionTokens,
+		TotalTokens:        ui.TotalTokens,
+		CostEstimate:       cost,
+		DurationMS:         durationMS,
+		TTFT_MS:            ttftMS,
+		TokensPerSecond:    tps,
+		StatusCode:         statusCode,
+		RequestID:          requestID,
 	})
 
 	metrics.TokensTotal.WithLabelValues(model.Name, "prompt").Add(float64(ui.PromptTokens))
@@ -999,6 +1160,44 @@ func mutateRequestBody(body []byte, canonicalModel string, injectUsage bool) []b
 		return out
 	}
 	return body
+}
+
+// isFallbackEligible reports whether a failure on one model should trigger a
+// fallback to the next model in the chain.
+//
+// Network / DNS / dial / timeout errors are eligible. Context cancellation is
+// NOT eligible — the client went away and there is no point retrying. 5xx
+// responses are eligible; 4xx are not (bad request or auth failure will recur
+// on any backend).
+func isFallbackEligible(statusCode int, err error) bool {
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return false
+		}
+		return true
+	}
+	return statusCode >= 500 && statusCode < 600
+}
+
+// rewriteModelInBody replaces the "model" field inside a JSON request body
+// with newModel. It unmarshals into a map, updates the field, and re-marshals.
+// If the body is not valid JSON an error is returned — a non-JSON body cannot
+// be safely forwarded to a fallback model and the chain should stop.
+func rewriteModelInBody(body []byte, newModel string) ([]byte, error) {
+	var doc map[string]jsonx.RawMessage
+	if err := jsonx.Unmarshal(body, &doc); err != nil {
+		return nil, fmt.Errorf("fallback body rewrite: body is not JSON: %w", err)
+	}
+	nameJSON, err := jsonx.Marshal(newModel)
+	if err != nil {
+		return nil, fmt.Errorf("fallback body rewrite: marshal model name: %w", err)
+	}
+	doc["model"] = jsonx.RawMessage(nameJSON)
+	out, err := jsonx.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("fallback body rewrite: marshal document: %w", err)
+	}
+	return out, nil
 }
 
 // isAzureAdapter reports whether the given adapter is an Azure OpenAI adapter.

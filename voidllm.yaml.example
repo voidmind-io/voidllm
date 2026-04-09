@@ -123,6 +123,7 @@ models:
     aliases:
       - small
       - fast
+    # fallback: gpt-oss-120b  # Enterprise: retry on this model when gpt-oss-20b is unavailable
     max_context_tokens: 32000
     pricing:
       input_per_1m:  0.10
@@ -242,6 +243,14 @@ settings:
       interval: 5m
 
   # --- Enterprise Features (require license) ---
+
+  # Model fallback chains: retry a different model when the primary is unavailable.
+  # Requires a license with the fallback_chains feature; ignored otherwise.
+  # fallback_max_depth: 3
+  #   Maximum depth of the model fallback chain.
+  #   - 0 (default, if unset): fallback chains disabled globally
+  #   - 1-10: enables fallback chains, capped at this depth
+  #   Requires Enterprise license.
 
   # Audit logging
   # audit:

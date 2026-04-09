@@ -47,6 +47,38 @@ func TestCommunityLicense(t *testing.T) {
 	}
 }
 
+// TestFeatureFallbackChainsConstant is a sanity test that the constant has
+// the exact value the JWT claim and feature-gate checks expect.
+func TestFeatureFallbackChainsConstant(t *testing.T) {
+	t.Parallel()
+
+	if license.FeatureFallbackChains != "fallback_chains" {
+		t.Errorf("FeatureFallbackChains = %q, want %q", license.FeatureFallbackChains, "fallback_chains")
+	}
+}
+
+// TestCommunityLicense_NoFallbackChains verifies that the community (unlicensed)
+// edition does not have the fallback_chains feature.
+func TestCommunityLicense_NoFallbackChains(t *testing.T) {
+	t.Parallel()
+
+	lic := license.Verify("", false)
+	if lic.HasFeature(license.FeatureFallbackChains) {
+		t.Errorf("HasFeature(%q) = true on community license, want false", license.FeatureFallbackChains)
+	}
+}
+
+// TestDevLicense_HasFallbackChains verifies that the dev license grants the
+// fallback_chains feature so that local development works without a paid key.
+func TestDevLicense_HasFallbackChains(t *testing.T) {
+	t.Parallel()
+
+	lic := license.Verify("", true)
+	if !lic.HasFeature(license.FeatureFallbackChains) {
+		t.Errorf("HasFeature(%q) = false on dev license, want true", license.FeatureFallbackChains)
+	}
+}
+
 func TestDevLicense(t *testing.T) {
 	t.Parallel()
 

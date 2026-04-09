@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useMemo } from 'react'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Table } from '../components/ui/Table'
 import type { Column } from '../components/ui/Table'
@@ -7,6 +7,7 @@ import { Badge } from '../components/ui/Badge'
 import { Button } from '../components/ui/Button'
 import { Input } from '../components/ui/Input'
 import { Select } from '../components/ui/Select'
+import type { SelectOption } from '../components/ui/Select'
 import { Toggle } from '../components/ui/Toggle'
 import { StatCard } from '../components/ui/StatCard'
 import TabSwitcher from '../components/ui/TabSwitcher'
@@ -24,6 +25,7 @@ import type { ModelResponse, DeploymentResponse, CreateModelParams, UpdateModelP
 import { useModelHealth } from '../hooks/useModelHealth'
 import type { ModelHealthInfo } from '../hooks/useModelHealth'
 import { useToast } from '../hooks/useToast'
+import { useLicense } from '../hooks/useLicense'
 import { providerBadgeVariant, isKnownProvider } from '../lib/providers'
 import type { ProviderKey } from '../lib/providers'
 import apiClient from '../api/client'
@@ -462,6 +464,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   // Load-balanced fields
   const [strategy, setStrategy] = useState('round-robin')
   const [maxRetries, setMaxRetries] = useState('')
+  const [fallbackModelName, setFallbackModelName] = useState('')
   const [deployments, setDeployments] = useState<DeploymentFormEntry[]>([])
   const [showDeploymentForm, setShowDeploymentForm] = useState(false)
   const [editingDeployment, setEditingDeployment] = useState<number | null>(null)
@@ -475,6 +478,9 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const createModel = useCreateModel()
   const createDeployment = useCreateDeployment()
   const { toast } = useToast()
+  const { data: license } = useLicense()
+  const { data: modelsData } = useModels()
+  const hasFallbackFeature = license?.features.includes('fallback_chains') ?? false
 
   function handleClose() {
     setMode('single')
@@ -492,6 +498,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     setTimeout('')
     setStrategy('round-robin')
     setMaxRetries('')
+    setFallbackModelName('')
     setDeployments([])
     setShowDeploymentForm(false)
     setEditingDeployment(null)
@@ -657,6 +664,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
         const parsed = parseInt(maxRetries, 10)
         if (!isNaN(parsed)) params.max_retries = parsed
       }
+      if (fallbackModelName) params.fallback_model_name = fallbackModelName
       if (maxContextTokens.trim()) {
         const parsed = parseInt(maxContextTokens, 10)
         if (!isNaN(parsed)) params.max_context_tokens = parsed
@@ -704,6 +712,16 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const isPending = createModel.isPending || createDeployment.isPending
   const depFormIsAzure = depFormEntry.provider === 'azure'
   const depFormIsOpen = showDeploymentForm || editingDeployment !== null
+
+  const fallbackOptions: SelectOption[] = useMemo(() => {
+    const allModels = modelsData?.data ?? []
+    return [
+      { value: '', label: 'None' },
+      ...allModels
+        .filter((m) => m.name !== name && m.type === type)
+        .map((m) => ({ value: m.name, label: m.name })),
+    ]
+  }, [modelsData, name, type])
 
   return (
     <Dialog open={open} onClose={handleClose} title="Add Model">
@@ -812,6 +830,25 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
               placeholder="0"
               disabled={isPending}
             />
+            <div>
+              <Select
+                label="Fallback Model"
+                options={fallbackOptions}
+                value={fallbackModelName}
+                onChange={setFallbackModelName}
+                disabled={isPending || !hasFallbackFeature}
+              />
+              {!hasFallbackFeature && (
+                <p className="text-xs text-text-tertiary mt-1">
+                  Available with an Enterprise license.
+                </p>
+              )}
+              {hasFallbackFeature && (
+                <p className="text-xs text-text-tertiary mt-1">
+                  When this model fails, requests automatically retry on the fallback model.
+                </p>
+              )}
+            </div>
 
             {/* Deployments list */}
             <div>
@@ -1148,11 +1185,25 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
   const [azureDeployment, setAzureDeployment] = useState(model.azure_deployment ?? '')
   const [azureApiVersion, setAzureApiVersion] = useState(model.azure_api_version ?? '')
   const [timeout, setTimeout] = useState(model.timeout ?? '')
+  const [fallbackModelName, setFallbackModelName] = useState(model.fallback_model_name ?? '')
 
   const updateModel = useUpdateModel()
   const { toast } = useToast()
+  const { data: license } = useLicense()
+  const { data: modelsData } = useModels()
+  const hasFallbackFeature = license?.features.includes('fallback_chains') ?? false
 
   const isAzure = provider === 'azure'
+
+  const fallbackOptions: SelectOption[] = useMemo(() => {
+    const allModels = modelsData?.data ?? []
+    return [
+      { value: '', label: 'None' },
+      ...allModels
+        .filter((m) => m.name !== name && m.type === type)
+        .map((m) => ({ value: m.name, label: m.name })),
+    ]
+  }, [modelsData, name, type])
 
   function handleSubmit(e: React.FormEvent | React.MouseEvent) {
     e.preventDefault()
@@ -1211,6 +1262,12 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
     const sortedOld = [...(model.aliases ?? [])].sort()
     if (JSON.stringify(sortedNew) !== JSON.stringify(sortedOld)) {
       params.aliases = newAliases
+    }
+
+    if (fallbackModelName !== (model.fallback_model_name ?? '')) {
+      // Empty string sent as empty string — backend treats it as "clear"
+      // Non-empty string sent as the chosen name
+      params.fallback_model_name = fallbackModelName || ''
     }
 
     if (Object.keys(params).length === 0) {
@@ -1327,6 +1384,25 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
           description="Per-model upstream timeout. Empty = use global default."
           disabled={updateModel.isPending}
         />
+        <div>
+          <Select
+            label="Fallback Model"
+            options={fallbackOptions}
+            value={fallbackModelName}
+            onChange={setFallbackModelName}
+            disabled={updateModel.isPending || !hasFallbackFeature}
+          />
+          {!hasFallbackFeature && (
+            <p className="text-xs text-text-tertiary mt-1">
+              Available with an Enterprise license.
+            </p>
+          )}
+          {hasFallbackFeature && (
+            <p className="text-xs text-text-tertiary mt-1">
+              When this model fails, requests automatically retry on the fallback model.
+            </p>
+          )}
+        </div>
         <Input
           label="Aliases"
           value={aliases}

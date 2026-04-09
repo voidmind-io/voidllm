@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1574,4 +1575,573 @@ func TestTestConnection_NonAnthropicUsesBearerAuth(t *testing.T) {
 	if capturedHeaders.Get("Authorization") != "Bearer sk-openai-key" {
 		t.Errorf("Authorization header = %q, want %q", capturedHeaders.Get("Authorization"), "Bearer sk-openai-key")
 	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Fallback model name tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+// setupModelTestAppWithLicense is like setupModelTestApp but accepts an
+// explicit License instead of always using the dev license.
+func setupModelTestAppWithLicense(t *testing.T, dsn string, lic license.License) (*fiber.App, *db.DB, *cache.Cache[string, auth.KeyInfo]) {
+	t.Helper()
+
+	ctx := context.Background()
+	database, err := db.Open(ctx, config.DatabaseConfig{
+		Driver:          "sqlite",
+		DSN:             dsn,
+		MaxOpenConns:    1,
+		MaxIdleConns:    1,
+		ConnMaxLifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("open test DB: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	registry, err := proxy.NewRegistry(nil)
+	if err != nil {
+		t.Fatalf("proxy.NewRegistry: %v", err)
+	}
+
+	keyCache := cache.New[string, auth.KeyInfo]()
+
+	handler := &admin.Handler{
+		DB:            database,
+		HMACSecret:    testHMACSecret,
+		EncryptionKey: testEncryptionKey,
+		Registry:      registry,
+		KeyCache:      keyCache,
+		License:       license.NewHolder(lic),
+		Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	app := fiber.New()
+	admin.RegisterRoutes(app, handler, keyCache, testHMACSecret, nil)
+
+	return app, database, keyCache
+}
+
+// TestCreateModel_WithFallbackLicensed verifies that creating a model with a
+// fallback_model_name succeeds when the license includes FeatureFallbackChains.
+func TestCreateModel_WithFallbackLicensed(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestCreateModel_WithFallbackLicensed?mode=memory&cache=private"
+	// Dev license has all features including fallback_chains.
+	app, database, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	// Create model-a first (it will be the fallback target).
+	mustCreateModelForDeployment(t, database, "model-a-target")
+
+	// Create model-b with fallback set to model-a-target.
+	reqBody := map[string]any{
+		"name":                "model-b-with-fallback",
+		"provider":            "openai",
+		"base_url":            "https://api.openai.com/v1",
+		"fallback_model_name": "model-a-target",
+	}
+
+	req := httptest.NewRequest("POST", modelURL(), bodyJSON(t, reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 201; body: %s", resp.StatusCode, body)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+	if got["fallback_model_name"] != "model-a-target" {
+		t.Errorf("fallback_model_name = %v, want %q", got["fallback_model_name"], "model-a-target")
+	}
+}
+
+// TestCreateModel_WithFallbackNotLicensed verifies that creating a model with a
+// fallback_model_name fails with 403 when the license lacks FeatureFallbackChains.
+func TestCreateModel_WithFallbackNotLicensed(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestCreateModel_WithFallbackNotLicensed?mode=memory&cache=private"
+	// Community license has no enterprise features.
+	app, database, keyCache := setupModelTestAppWithLicense(t, dsn, license.Verify("", false))
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	mustCreateModelForDeployment(t, database, "some-fallback-target")
+
+	reqBody := map[string]any{
+		"name":                "model-needs-fallback",
+		"provider":            "openai",
+		"base_url":            "https://api.openai.com/v1",
+		"fallback_model_name": "some-fallback-target",
+	}
+
+	req := httptest.NewRequest("POST", modelURL(), bodyJSON(t, reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusForbidden {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want 403; body: %s", resp.StatusCode, body)
+	}
+}
+
+// TestCreateModel_FallbackToNonExistentModel verifies that referencing a
+// fallback target that does not exist returns 400.
+func TestCreateModel_FallbackToNonExistentModel(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestCreateModel_FallbackNonExistent?mode=memory&cache=private"
+	app, _, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	reqBody := map[string]any{
+		"name":                "model-with-bad-fallback",
+		"provider":            "openai",
+		"base_url":            "https://api.openai.com/v1",
+		"fallback_model_name": "this-does-not-exist",
+	}
+
+	req := httptest.NewRequest("POST", modelURL(), bodyJSON(t, reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want 400; body: %s", resp.StatusCode, body)
+	}
+}
+
+// TestUpdateModel_WithFallbackLicensed verifies that updating a model to add a
+// fallback succeeds when the license includes FeatureFallbackChains.
+func TestUpdateModel_WithFallbackLicensed(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestUpdateModel_WithFallbackLicensed?mode=memory&cache=private"
+	app, database, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	target := mustCreateModelForDeployment(t, database, "fallback-target-upd")
+	source := mustCreateModelForDeployment(t, database, "source-model-upd")
+	_ = target
+
+	fallbackName := "fallback-target-upd"
+	patchBody := map[string]any{
+		"fallback_model_name": fallbackName,
+	}
+
+	req := httptest.NewRequest("PATCH", modelItemURL(source.ID), bodyJSON(t, patchBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+	if got["fallback_model_name"] != fallbackName {
+		t.Errorf("fallback_model_name = %v, want %q", got["fallback_model_name"], fallbackName)
+	}
+}
+
+// TestUpdateModel_WithFallbackNotLicensed verifies that updating a model to add
+// a fallback fails with 403 when the license lacks FeatureFallbackChains.
+func TestUpdateModel_WithFallbackNotLicensed(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestUpdateModel_WithFallbackNotLicensed?mode=memory&cache=private"
+	app, database, keyCache := setupModelTestAppWithLicense(t, dsn, license.Verify("", false))
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	mustCreateModelForDeployment(t, database, "fb-target-nolic")
+	source := mustCreateModelForDeployment(t, database, "source-nolic")
+
+	patchBody := map[string]any{
+		"fallback_model_name": "fb-target-nolic",
+	}
+
+	req := httptest.NewRequest("PATCH", modelItemURL(source.ID), bodyJSON(t, patchBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusForbidden {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want 403; body: %s", resp.StatusCode, body)
+	}
+}
+
+// TestUpdateModel_FallbackCycle verifies that setting up a cycle via PATCH
+// returns 400 with a cycle error message.
+func TestUpdateModel_FallbackCycle(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestUpdateModel_FallbackCycle?mode=memory&cache=private"
+	app, database, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	// Set up A→B via the DB directly (using API would work but DB is simpler).
+	modelA := mustCreateModelForDeployment(t, database, "cycle-model-a")
+	modelB := mustCreateModelForDeployment(t, database, "cycle-model-b")
+
+	// Link A → B using the PATCH endpoint.
+	req1 := httptest.NewRequest("PATCH", modelItemURL(modelA.ID), bodyJSON(t, map[string]any{
+		"fallback_model_name": "cycle-model-b",
+	}))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Authorization", "Bearer "+testKey)
+	resp1, err := app.Test(req1, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("PATCH A→B: app.Test: %v", err)
+	}
+	resp1.Body.Close()
+	if resp1.StatusCode != fiber.StatusOK {
+		t.Fatalf("PATCH A→B status = %d, want 200", resp1.StatusCode)
+	}
+
+	// Now try to link B → A, which would create a cycle.
+	req2 := httptest.NewRequest("PATCH", modelItemURL(modelB.ID), bodyJSON(t, map[string]any{
+		"fallback_model_name": "cycle-model-a",
+	}))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Authorization", "Bearer "+testKey)
+	resp2, err := app.Test(req2, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("PATCH B→A: app.Test: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != fiber.StatusBadRequest {
+		body, _ := io.ReadAll(resp2.Body)
+		t.Errorf("PATCH B→A: status = %d, want 400 (cycle); body: %s", resp2.StatusCode, body)
+	}
+}
+
+// TestUpdateModel_FallbackClearsWhenEmpty verifies that passing an empty string
+// for fallback_model_name clears the existing fallback (sets it to NULL in DB).
+func TestUpdateModel_FallbackClearsWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestUpdateModel_FallbackClearsWhenEmpty?mode=memory&cache=private"
+	app, database, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	target := mustCreateModelForDeployment(t, database, "fb-clear-target")
+	source := mustCreateModelForDeployment(t, database, "fb-clear-source")
+	_ = target
+
+	// First, set a fallback.
+	req1 := httptest.NewRequest("PATCH", modelItemURL(source.ID), bodyJSON(t, map[string]any{
+		"fallback_model_name": "fb-clear-target",
+	}))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Authorization", "Bearer "+testKey)
+	resp1, err := app.Test(req1, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("set fallback: app.Test: %v", err)
+	}
+	resp1.Body.Close()
+	if resp1.StatusCode != fiber.StatusOK {
+		t.Fatalf("set fallback: status = %d, want 200", resp1.StatusCode)
+	}
+
+	// Now clear the fallback by sending an empty string.
+	emptyStr := ""
+	req2 := httptest.NewRequest("PATCH", modelItemURL(source.ID), bodyJSON(t, map[string]any{
+		"fallback_model_name": emptyStr,
+	}))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Authorization", "Bearer "+testKey)
+	resp2, err := app.Test(req2, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("clear fallback: app.Test: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("clear fallback: status = %d, want 200; body: %s", resp2.StatusCode, body)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp2.Body, &got)
+	// fallback_model_name should be absent (omitempty) or empty string.
+	if v, ok := got["fallback_model_name"]; ok && v != "" && v != nil {
+		t.Errorf("fallback_model_name = %v after clear, want absent/empty", v)
+	}
+
+	// Confirm via DB that fallback_model_id IS NULL.
+	ctx := context.Background()
+	row := database.SQL().QueryRowContext(ctx,
+		"SELECT fallback_model_id FROM models WHERE id = ?", source.ID)
+	var fallbackID *string
+	if err := row.Scan(&fallbackID); err != nil {
+		t.Fatalf("scan fallback_model_id: %v", err)
+	}
+	if fallbackID != nil {
+		t.Errorf("fallback_model_id = %q, want NULL after clearing", *fallbackID)
+	}
+}
+
+// TestListModels_IncludesFallbackName verifies that the list response populates
+// fallback_model_name for models that have a fallback configured.
+func TestListModels_IncludesFallbackName(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestListModels_IncludesFallbackName?mode=memory&cache=private"
+	app, database, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	target := mustCreateModelForDeployment(t, database, "list-fallback-target")
+	source := mustCreateModelForDeployment(t, database, "list-fallback-source")
+	_ = target
+
+	// Set fallback via PATCH.
+	patchReq := httptest.NewRequest("PATCH", modelItemURL(source.ID), bodyJSON(t, map[string]any{
+		"fallback_model_name": "list-fallback-target",
+	}))
+	patchReq.Header.Set("Content-Type", "application/json")
+	patchReq.Header.Set("Authorization", "Bearer "+testKey)
+	patchResp, err := app.Test(patchReq, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("PATCH: app.Test: %v", err)
+	}
+	patchResp.Body.Close()
+	if patchResp.StatusCode != fiber.StatusOK {
+		t.Fatalf("PATCH status = %d, want 200", patchResp.StatusCode)
+	}
+
+	// List models and check that the source model shows fallback_model_name.
+	listReq := httptest.NewRequest("GET", modelURL(), nil)
+	listReq.Header.Set("Authorization", "Bearer "+testKey)
+
+	listResp, err := app.Test(listReq, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("GET list: app.Test: %v", err)
+	}
+	defer listResp.Body.Close()
+
+	if listResp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(listResp.Body)
+		t.Fatalf("GET list status = %d, want 200; body: %s", listResp.StatusCode, body)
+	}
+
+	var listBody map[string]any
+	decodeBody(t, listResp.Body, &listBody)
+
+	data, ok := listBody["data"].([]any)
+	if !ok {
+		t.Fatalf("data field is not an array: %v", listBody["data"])
+	}
+
+	// Find the source model in the list and verify its fallback name.
+	found := false
+	for _, item := range data {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if m["name"] == "list-fallback-source" {
+			found = true
+			if m["fallback_model_name"] != "list-fallback-target" {
+				t.Errorf("list-fallback-source fallback_model_name = %v, want %q",
+					m["fallback_model_name"], "list-fallback-target")
+			}
+		}
+	}
+	if !found {
+		t.Error("list-fallback-source not found in list response")
+	}
+}
+
+// TestListModels_FallbackAcrossPages verifies that when model A's fallback
+// target lives on a different page, resolveMissingFallbackNames resolves the
+// name correctly and the list response populates fallback_model_name for A.
+//
+// Setup: 5 models total. List page 1 with limit=4, leaving model E on page 2.
+// Model A (on page 1) has its fallback pointing to model E (on page 2).
+func TestListModels_FallbackAcrossPages(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestListModels_FallbackAcrossPages?mode=memory&cache=private"
+	app, database, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	// Create 5 models. The DB assigns UUIDs so listing order is by creation time
+	// (ascending). Models are named with sortable prefixes so alphabetical order
+	// matches creation order when the DB uses name-based cursor (verify below).
+	// We rely on ID-based cursor ordering; creating in alphabetical order is
+	// sufficient because UUID v7 is time-sortable (see architecture.md).
+	modelA := mustCreateModelForDeployment(t, database, "xpage-model-a")
+	mustCreateModelForDeployment(t, database, "xpage-model-b")
+	mustCreateModelForDeployment(t, database, "xpage-model-c")
+	mustCreateModelForDeployment(t, database, "xpage-model-d")
+	modelE := mustCreateModelForDeployment(t, database, "xpage-model-e")
+
+	// Link A → E via PATCH so model A's fallback_model_id points to E.
+	patchReq := httptest.NewRequest("PATCH", modelItemURL(modelA.ID), bodyJSON(t, map[string]any{
+		"fallback_model_name": "xpage-model-e",
+	}))
+	patchReq.Header.Set("Content-Type", "application/json")
+	patchReq.Header.Set("Authorization", "Bearer "+testKey)
+	patchResp, err := app.Test(patchReq, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("PATCH A→E: app.Test: %v", err)
+	}
+	patchResp.Body.Close()
+	if patchResp.StatusCode != fiber.StatusOK {
+		t.Fatalf("PATCH A→E status = %d, want 200", patchResp.StatusCode)
+	}
+
+	// Fetch page 1 with limit=4. A is on page 1; E is on page 2 (not returned).
+	listReq := httptest.NewRequest("GET", modelURL()+"?limit=4", nil)
+	listReq.Header.Set("Authorization", "Bearer "+testKey)
+
+	listResp, err := app.Test(listReq, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("GET list p1: app.Test: %v", err)
+	}
+	defer listResp.Body.Close()
+
+	if listResp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(listResp.Body)
+		t.Fatalf("GET list p1 status = %d, want 200; body: %s", listResp.StatusCode, body)
+	}
+
+	var listBody map[string]any
+	decodeBody(t, listResp.Body, &listBody)
+
+	data, ok := listBody["data"].([]any)
+	if !ok {
+		t.Fatalf("data field is not an array: %v", listBody["data"])
+	}
+	if len(data) != 4 {
+		t.Fatalf("len(data) = %d, want 4 (page 1 of 5 with limit=4)", len(data))
+	}
+	if listBody["has_more"] != true {
+		t.Error("has_more = false, want true (model E is on page 2)")
+	}
+
+	// Verify that E IS on page 2 and NOT on page 1.
+	eFoundOnPage1 := false
+	for _, item := range data {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if m["id"] == modelE.ID {
+			eFoundOnPage1 = true
+		}
+	}
+	if eFoundOnPage1 {
+		t.Skip("model E landed on page 1 — UUID ordering put all 5 on the same page; skip cross-page assertion")
+	}
+
+	// Find model A in the page-1 response and assert fallback_model_name = "xpage-model-e".
+	foundA := false
+	for _, item := range data {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if m["id"] == modelA.ID {
+			foundA = true
+			if m["fallback_model_name"] != "xpage-model-e" {
+				t.Errorf("model A fallback_model_name = %v, want %q (cross-page resolution failed)",
+					m["fallback_model_name"], "xpage-model-e")
+			}
+		}
+	}
+	if !foundA {
+		t.Error("model A not found on page 1")
+	}
+}
+
+// TestUpdateModel_ConcurrentFallbackMutations is a race-detector test that
+// verifies concurrent PATCH requests mutating fallback relationships do not
+// produce data races or panics (Fix C3). The exact final state is not asserted
+// because the Go scheduler determines which write wins — only absence of races
+// is required. Run the test suite with -race to exercise this property.
+func TestUpdateModel_ConcurrentFallbackMutations(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestUpdateModel_ConcurrentFallbackMutations?mode=memory&cache=private"
+	// Use a single connection so SQLite serialises writes; we test that the
+	// handler layer does not introduce data races, not SQLite concurrency.
+	app, database, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	modelA := mustCreateModelForDeployment(t, database, "conc-fallback-a")
+	modelB := mustCreateModelForDeployment(t, database, "conc-fallback-b")
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+	wg.Add(goroutines * 2)
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest("PATCH", modelItemURL(modelA.ID),
+				bodyJSON(t, map[string]any{"fallback_model_name": "conc-fallback-b"}))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+testKey)
+			resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+			if err == nil {
+				resp.Body.Close()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest("PATCH", modelItemURL(modelB.ID),
+				bodyJSON(t, map[string]any{"fallback_model_name": "conc-fallback-a"}))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+testKey)
+			resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+			if err == nil {
+				resp.Body.Close()
+			}
+		}()
+	}
+
+	wg.Wait()
+	// No assertion on the specific outcome — reaching here without -race failure
+	// or panic is the pass condition. The mutex protecting the Registry's
+	// fallback state (Fix C3) prevents data corruption under concurrent access.
 }

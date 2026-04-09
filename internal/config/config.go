@@ -155,6 +155,10 @@ type ModelConfig struct {
 	// MaxRetries is the number of times the proxy will retry a failed upstream
 	// request across the available deployments. Must be >= 0.
 	MaxRetries int `yaml:"max_retries"`
+	// Fallback is the canonical name (or alias) of another model to retry
+	// when all deployments of this model are unavailable. Resolved at
+	// registry build time. Empty disables fallback for this model.
+	Fallback string `yaml:"fallback" json:"fallback,omitempty"`
 	// Deployments is the list of backend endpoints for this model. When set,
 	// the model-level Provider and BaseURL fields are ignored in favour of the
 	// per-deployment values, and Strategy must be set.
@@ -454,6 +458,10 @@ type SettingsConfig struct {
 	HealthCheck    HealthCheckConfig    `yaml:"health_check"`
 	MCP            MCPConfig            `yaml:"mcp"`
 	Retention      RetentionConfig      `yaml:"retention"`
+	// FallbackMaxDepth limits how deep the model fallback chain can recurse
+	// per request. Default 3, valid range [1, 10]. Ignored when no model has
+	// fallback configured or when the license lacks FeatureFallbackChains.
+	FallbackMaxDepth int `yaml:"fallback_max_depth" json:"fallback_max_depth"`
 	// SoftLimitThreshold uses *float64 so that an explicit 0.0 can be
 	// distinguished from the zero value after unmarshalling. Use
 	// GetSoftLimitThreshold to read the value.
@@ -680,6 +688,12 @@ func (c *Config) setDefaults() {
 	// Settings retention
 	if c.Settings.Retention.Interval <= 0 {
 		c.Settings.Retention.Interval = 24 * time.Hour
+	}
+
+	// Settings fallback: promote strictly negative to 3; 0 is a valid explicit
+	// "disabled" value and must not be overwritten to the default.
+	if c.Settings.FallbackMaxDepth < 0 {
+		c.Settings.FallbackMaxDepth = 3
 	}
 
 	// Bootstrap

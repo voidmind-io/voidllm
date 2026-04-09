@@ -9,6 +9,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/license"
+	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 )
 
 // setLicenseRequest is the JSON body accepted by SetLicense.
@@ -94,6 +95,34 @@ func (h *Handler) SetLicense(c fiber.Ctx) error {
 	}
 
 	h.License.Store(lic)
+
+	// Apply the license change locally by re-gating the registry.
+	// This path is the ONLY re-gate trigger on deployments without Redis;
+	// on multi-instance deployments it also covers the local instance
+	// before the Redis broadcast reaches peers.
+	if h.ReloadModels != nil {
+		if err := h.ReloadModels(c.Context()); err != nil {
+			h.Log.LogAttrs(c.Context(), slog.LevelError,
+				"set license: in-process registry reload failed",
+				slog.String("error", err.Error()))
+			// Do not return an error to the client - the license is already
+			// stored, only the registry is stale. Operators can trigger a
+			// manual reload or restart.
+		}
+	}
+
+	// On multi-instance deployments, broadcast a model invalidation so
+	// all peers rebuild their registry with the updated license state.
+	if h.Redis != nil {
+		if pubErr := h.Redis.PublishInvalidation(c.Context(), voidredis.ChannelModels, "reload"); pubErr != nil {
+			h.Log.LogAttrs(c.Context(), slog.LevelWarn, "set license: publish model reload failed",
+				slog.String("error", pubErr.Error()),
+			)
+			// Non-fatal: the in-memory license is already updated above and the
+			// local registry has been reloaded. Peers will reconcile on the next
+			// admin-triggered model change or process restart.
+		}
+	}
 
 	// Persist to DB so the license survives restarts.
 	if err := h.DB.SetSetting(c.Context(), "license_jwt", req.Key); err != nil {

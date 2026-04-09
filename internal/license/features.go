@@ -26,6 +26,11 @@ const (
 
 	// FeatureCostReports enables cost analysis, budget alerts, and usage export.
 	FeatureCostReports = "cost_reports"
+
+	// FeatureFallbackChains enables cross-model fallback. When the primary
+	// model is unavailable, the proxy automatically retries on the configured
+	// fallback model.
+	FeatureFallbackChains = "fallback_chains"
 )
 
 // CommunityMaxOrgs is the maximum number of organizations permitted on the

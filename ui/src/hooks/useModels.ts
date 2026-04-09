@@ -35,6 +35,7 @@ export interface ModelResponse {
   updated_at: string
   strategy?: string
   max_retries?: number
+  fallback_model_name?: string
   deployments?: DeploymentResponse[]
 }
 
@@ -59,6 +60,7 @@ export interface CreateModelParams {
   aliases?: string[]
   strategy?: string
   max_retries?: number
+  fallback_model_name?: string
 }
 
 export interface CreateDeploymentParams {
@@ -96,6 +98,7 @@ export interface UpdateModelParams {
   azure_api_version?: string
   timeout?: string
   aliases?: string[]
+  fallback_model_name?: string | null
 }
 
 export function useModels(cursor?: string) {
