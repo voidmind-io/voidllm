@@ -13,12 +13,13 @@ import { formatDate } from '../lib/utils'
 
 // Human-readable labels for feature flag keys returned by the API.
 const FEATURE_LABELS: Record<string, string> = {
-  multi_org:     'Multi-org management',
-  cost_reports:  'Cost reports + budget alerts',
-  audit_logs:    'Audit logs',
-  sso_oidc:      'SSO / OIDC integration',
-  custom_roles:  'Custom roles',
-  otel_tracing:  'OpenTelemetry tracing',
+  multi_org:        'Multi-org management',
+  cost_reports:     'Cost reports + budget alerts',
+  audit_logs:       'Audit logs',
+  sso_oidc:         'SSO / OIDC integration',
+  custom_roles:     'Custom roles',
+  otel_tracing:     'OpenTelemetry tracing',
+  fallback_chains:  'Model fallback chains',
 }
 
 const proFeatures = [
@@ -35,6 +36,7 @@ const enterpriseFeatures = [
   'Audit logs',
   'Custom roles',
   'OpenTelemetry tracing',
+  'Model fallback chains',
   'Distributed rate limiting (Redis)',
   'Unlimited data retention',
   'Dedicated Slack support (24h)',

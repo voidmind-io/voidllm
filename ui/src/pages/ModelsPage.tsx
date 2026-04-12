@@ -843,7 +843,12 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                   Available with an Enterprise license.
                 </p>
               )}
-              {hasFallbackFeature && (
+              {hasFallbackFeature && license?.fallback_max_depth === 0 && (
+                <p className="text-xs text-amber-400 mt-1">
+                  Fallback is configured but disabled. Set fallback_max_depth in your server config to enable.
+                </p>
+              )}
+              {hasFallbackFeature && (license?.fallback_max_depth ?? 0) > 0 && (
                 <p className="text-xs text-text-tertiary mt-1">
                   When this model fails, requests automatically retry on the fallback model.
                 </p>
@@ -1397,7 +1402,12 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
               Available with an Enterprise license.
             </p>
           )}
-          {hasFallbackFeature && (
+          {hasFallbackFeature && license?.fallback_max_depth === 0 && (
+            <p className="text-xs text-amber-400 mt-1">
+              Fallback is configured but disabled. Set fallback_max_depth in your server config to enable.
+            </p>
+          )}
+          {hasFallbackFeature && (license?.fallback_max_depth ?? 0) > 0 && (
             <p className="text-xs text-text-tertiary mt-1">
               When this model fails, requests automatically retry on the fallback model.
             </p>

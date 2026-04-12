@@ -56,6 +56,7 @@ type Handler struct {
 	Redis             *voidredis.Client        // nil when Redis is not configured
 	AuditLogger       *audit.Logger            // nil when audit logging is disabled
 	License           *license.Holder          // thread-safe license holder; Load() never returns nil
+	FallbackMaxDepth  int                      // from config; 0 = fallback disabled; exposed via GET /license
 	Log               *slog.Logger
 	// SSOProvider is the OIDC provider used for SSO login. Nil when SSO is
 	// disabled or unlicensed.

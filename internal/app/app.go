@@ -977,6 +977,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 
 	adminHandler.MCPCallTimeout = cfg.Settings.MCP.CallTimeout
 	adminHandler.MCPAllowPrivateURLs = cfg.Settings.MCP.AllowPrivateURLs
+	adminHandler.FallbackMaxDepth = cfg.Settings.FallbackMaxDepth
 
 	mcpLogger := usage.NewMCPLogger(database, 1000, log)
 	adminHandler.MCPLogger = mcpLogger

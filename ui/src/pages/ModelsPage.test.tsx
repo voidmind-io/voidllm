@@ -73,6 +73,7 @@ const MOCK_LICENSE_WITH_FALLBACK = {
   features: ['fallback_chains', 'audit_logs'],
   max_orgs: -1,
   max_teams: -1,
+  fallback_max_depth: 3,
 }
 
 // ---------------------------------------------------------------------------

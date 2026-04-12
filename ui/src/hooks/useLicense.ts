@@ -9,6 +9,7 @@ export interface LicenseInfo {
   max_orgs: number       // -1 = unlimited
   max_teams: number      // -1 = unlimited
   customer_id?: string   // only visible to admins
+  fallback_max_depth: number // 0 = fallback disabled
 }
 
 export function useLicense() {

@@ -57,6 +57,9 @@ type licenseResponse struct {
 	// CustomerID is the opaque customer identifier embedded in an enterprise
 	// license. Empty for community and dev licenses.
 	CustomerID string `json:"customer_id"`
+	// FallbackMaxDepth is the configured maximum fallback chain depth.
+	// 0 means fallback chains are disabled even if models have fallback configured.
+	FallbackMaxDepth int `json:"fallback_max_depth"`
 }
 
 // SetLicense handles PUT /api/v1/settings/license.
@@ -172,11 +175,12 @@ func (h *Handler) GetLicense(c fiber.Ctx) error {
 	lic := h.License.Load()
 
 	resp := licenseResponse{
-		Edition:  string(lic.Edition()),
-		Valid:    lic.Valid(),
-		Features: lic.Features(),
-		MaxOrgs:  lic.MaxOrgs(),
-		MaxTeams: lic.MaxTeams(),
+		Edition:          string(lic.Edition()),
+		Valid:            lic.Valid(),
+		Features:         lic.Features(),
+		MaxOrgs:          lic.MaxOrgs(),
+		MaxTeams:         lic.MaxTeams(),
+		FallbackMaxDepth: h.FallbackMaxDepth,
 	}
 
 	// CustomerID is sensitive — only org_admin and above may see it.
