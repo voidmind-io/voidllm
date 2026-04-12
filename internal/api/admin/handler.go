@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -33,6 +34,15 @@ type ModelHealthProvider interface {
 
 // Handler holds shared dependencies for all admin API handlers.
 type Handler struct {
+	// fallbackMu serializes fallback mutations (cycle-check + DB write) to make
+	// them atomic at the process level. Acquired only when a CreateModel or
+	// UpdateModel request includes a fallback_model_name change.
+	//
+	// Multi-instance cluster-wide serialization would require DB-level locking
+	// (SELECT FOR UPDATE / advisory lock). For single-instance and typical
+	// enterprise deployments the process-level mutex is sufficient.
+	fallbackMu sync.Mutex
+
 	DB                *db.DB
 	HMACSecret        []byte
 	EncryptionKey     []byte // AES-256-GCM key for upstream API key encryption
@@ -46,6 +56,7 @@ type Handler struct {
 	Redis             *voidredis.Client        // nil when Redis is not configured
 	AuditLogger       *audit.Logger            // nil when audit logging is disabled
 	License           *license.Holder          // thread-safe license holder; Load() never returns nil
+	FallbackMaxDepth  int                      // from config; 0 = fallback disabled; exposed via GET /license
 	Log               *slog.Logger
 	// SSOProvider is the OIDC provider used for SSO login. Nil when SSO is
 	// disabled or unlicensed.
@@ -88,6 +99,11 @@ type Handler struct {
 	// Nil in dev builds (Version == "dev") — GetUpdateStatus returns a static
 	// response in that case.
 	UpdateChecker *update.Checker
+	// ReloadModels triggers an in-process rebuild of the model registry,
+	// including the license-aware fallback gating. Called from SetLicense
+	// to apply license changes immediately, independent of Redis pub/sub.
+	// Must be safe to call concurrently. May be nil — callers must nil-check.
+	ReloadModels func(context.Context) error
 }
 
 // swaggerErrorResponse is the standard API error envelope used in OpenAPI docs.

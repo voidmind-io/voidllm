@@ -308,6 +308,56 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Errorf("settings.soft_limit_threshold: must be between 0.0 and 1.0, got %g", t))
 	}
 
+	// --- settings.fallback_max_depth ---
+	// 0 means "disabled" (no fallback hops); positive values in [1, 10] set the
+	// maximum chain depth. Negative values are promoted to 3 in setDefaults, so
+	// validation only needs to reject values that slipped through unchanged.
+	if c.Settings.FallbackMaxDepth < 0 || c.Settings.FallbackMaxDepth > 10 {
+		errs = append(errs, errors.New("settings.fallback_max_depth must be in [0, 10] (0 = disabled)"))
+	}
+
+	// Per-model fallback validation: target exists, no self-loop, no cycles
+	modelByName := make(map[string]*ModelConfig, len(c.Models))
+	for i := range c.Models {
+		modelByName[c.Models[i].Name] = &c.Models[i]
+		for _, alias := range c.Models[i].Aliases {
+			modelByName[alias] = &c.Models[i]
+		}
+	}
+	for i := range c.Models {
+		m := &c.Models[i]
+		if m.Fallback == "" {
+			continue
+		}
+		if m.Fallback == m.Name {
+			errs = append(errs, fmt.Errorf("model %q: fallback cannot reference itself", m.Name))
+			continue
+		}
+		target, ok := modelByName[m.Fallback]
+		if !ok {
+			errs = append(errs, fmt.Errorf("model %q: fallback target %q not found", m.Name, m.Fallback))
+			continue
+		}
+		// Walk the chain looking for a cycle back to m
+		visited := map[string]bool{m.Name: true}
+		curr := target
+		for curr != nil {
+			if visited[curr.Name] {
+				errs = append(errs, fmt.Errorf("model %q: fallback chain forms a cycle through %q", m.Name, curr.Name))
+				break
+			}
+			visited[curr.Name] = true
+			if curr.Fallback == "" {
+				break
+			}
+			next, ok := modelByName[curr.Fallback]
+			if !ok {
+				break // unreachable target gets caught on its own iteration
+			}
+			curr = next
+		}
+	}
+
 	// --- settings.retention ---
 	const maxRetention = 10 * 365 * 24 * time.Hour // 10 years
 	if c.Settings.Retention.UsageEvents < 0 {

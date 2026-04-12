@@ -90,6 +90,11 @@ func (l *Logger) BufferLen() int {
 // silently dropped rather than blocking the caller. This ensures the proxy hot
 // path is never delayed by a slow DB.
 func (l *Logger) Log(event Event) {
+	// Cap attacker-controlled fields at a sane size before they enter
+	// the buffer or the in-memory rollups map.
+	event.ModelName = truncateForStorage(event.ModelName)
+	event.RequestedModelName = truncateForStorage(event.RequestedModelName)
+
 	// Increment the in-memory token counter immediately so that subsequent
 	// CheckTokens calls reflect this request even before it reaches the DB.
 	if l.tokenCounter != nil && event.TotalTokens > 0 {
@@ -162,6 +167,22 @@ func (l *Logger) run() {
 	}
 }
 
+// maxModelNameLen is the maximum number of bytes stored for model name fields
+// in usage_events rows. Values longer than this are truncated before persistence
+// to prevent a hostile client from bloating the database via oversized model names.
+const maxModelNameLen = 256
+
+// truncateForStorage caps s to maxModelNameLen bytes. It does not split
+// multi-byte UTF-8 sequences — the byte-level cap is intentional since the
+// DB column is defined as TEXT and the limit is a storage budget, not a display
+// limit.
+func truncateForStorage(s string) string {
+	if len(s) > maxModelNameLen {
+		return s[:maxModelNameLen]
+	}
+	return s
+}
+
 // flush writes a batch of events to the database inside a single transaction.
 // Each event receives a new UUIDv7 ID. Nullable fields (TeamID, UserID,
 // ServiceAccountID, CostEstimate, TTFT_MS, TokensPerSecond) are stored as SQL
@@ -172,12 +193,14 @@ func (l *Logger) flush(events []Event) error {
 	query := "INSERT INTO usage_events " +
 		"(id, key_id, key_type, org_id, team_id, user_id, service_account_id, " +
 		"model_name, prompt_tokens, completion_tokens, total_tokens, " +
-		"cost_estimate, request_duration_ms, ttft_ms, tokens_per_second, status_code, request_id) " +
+		"cost_estimate, request_duration_ms, ttft_ms, tokens_per_second, status_code, request_id, " +
+		"requested_model_name) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " +
 		p(5) + ", " + p(6) + ", " + p(7) + ", " + p(8) + ", " +
 		p(9) + ", " + p(10) + ", " + p(11) + ", " +
-		p(12) + ", " + p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ")"
+		p(12) + ", " + p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " +
+		p(18) + ")"
 
 	ctx := context.Background()
 
@@ -210,6 +233,7 @@ func (l *Logger) flush(events []Event) error {
 				ev.TokensPerSecond,
 				ev.StatusCode,
 				ev.RequestID,
+				ev.RequestedModelName,
 			)
 			if err != nil {
 				return fmt.Errorf("usage flush: insert event: %w", err)

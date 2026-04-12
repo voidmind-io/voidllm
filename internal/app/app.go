@@ -265,6 +265,27 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		return nil, fmt.Errorf("build model registry: %w", err)
 	}
 
+	// gateFallback strips FallbackModelName from every model in reg when the
+	// current license (read live from h) does not include FeatureFallbackChains.
+	// It reads the license from the Holder on each invocation so that a license
+	// change via the admin API takes effect on the next registry reload without
+	// requiring a process restart. Safe to call with any reg/h combination.
+	//
+	// The strip is performed atomically via StripAllFallbacks (single write-lock
+	// acquisition) to eliminate the race window between snapshot and re-insert
+	// that existed in the previous snapshot+loop pattern.
+	gateFallback := func(reg *proxy.Registry, h *license.Holder) {
+		l := h.Load()
+		if l.HasFeature(license.FeatureFallbackChains) {
+			return
+		}
+		stripped := reg.StripAllFallbacks()
+		if stripped > 0 {
+			log.Warn("model fallback chains require an Enterprise license; stripped fallback configuration",
+				slog.Int("models_affected", stripped))
+		}
+	}
+
 	// loadModelsIntoRegistry fetches all active models from the DB, decrypts
 	// their API keys, and upserts each one into the registry. It is called once
 	// at startup and again whenever a ChannelModels invalidation is received via
@@ -274,6 +295,14 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		if loadErr != nil {
 			return fmt.Errorf("list active models: %w", loadErr)
 		}
+
+		// Build an id→name map from the loaded models so we can resolve
+		// FallbackModelID to a name without extra DB round-trips.
+		idToName := make(map[string]string, len(dbModels))
+		for _, m := range dbModels {
+			idToName[m.ID] = m.Name
+		}
+
 		for _, m := range dbModels {
 			var apiKey string
 			if m.APIKeyEncrypted != nil {
@@ -343,31 +372,56 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 				})
 			}
 
+			var fallbackName string
+			if m.FallbackModelID != nil {
+				fallbackName = idToName[*m.FallbackModelID]
+			}
+
 			registry.AddModel(proxy.Model{
-				Name:             m.Name,
-				Provider:         m.Provider,
-				Type:             modelType,
-				BaseURL:          m.BaseURL,
-				APIKey:           apiKey,
-				Aliases:          aliases,
-				MaxContextTokens: m.MaxContextTokens,
-				Pricing:          config.PricingConfig{InputPer1M: m.InputPricePer1M, OutputPer1M: m.OutputPricePer1M},
-				AzureDeployment:  m.AzureDeployment,
-				AzureAPIVersion:  m.AzureAPIVersion,
-				GCPProject:       m.GCPProject,
-				GCPLocation:      m.GCPLocation,
-				Timeout:          timeout,
-				Strategy:         m.Strategy,
-				MaxRetries:       m.MaxRetries,
-				Deployments:      deployments,
+				Name:              m.Name,
+				Provider:          m.Provider,
+				Type:              modelType,
+				BaseURL:           m.BaseURL,
+				APIKey:            apiKey,
+				Aliases:           aliases,
+				MaxContextTokens:  m.MaxContextTokens,
+				Pricing:           config.PricingConfig{InputPer1M: m.InputPricePer1M, OutputPer1M: m.OutputPricePer1M},
+				AzureDeployment:   m.AzureDeployment,
+				AzureAPIVersion:   m.AzureAPIVersion,
+				GCPProject:        m.GCPProject,
+				GCPLocation:       m.GCPLocation,
+				Timeout:           timeout,
+				Strategy:          m.Strategy,
+				MaxRetries:        m.MaxRetries,
+				Deployments:       deployments,
+				FallbackModelName: fallbackName,
 			})
 		}
+		gateFallback(registry, licHolder)
 		return nil
 	}
 
 	// Step 4b: overlay DB models on top of YAML registry.
 	if err := loadModelsIntoRegistry(ctx); err != nil {
 		return nil, fmt.Errorf("load models from database: %w", err)
+	}
+
+	// Warn operators who have configured fallback targets in their models but
+	// have not set fallback_max_depth (which defaults to 0 = disabled). Without
+	// a non-zero depth the fallback configuration is silently inactive, which is
+	// a common misconfiguration after upgrading from a version that didn't have
+	// this feature.
+	if cfg.Settings.FallbackMaxDepth == 0 {
+		modelsWithFallback := 0
+		for _, m := range registry.AllModels() {
+			if m.FallbackModelName != "" {
+				modelsWithFallback++
+			}
+		}
+		if modelsWithFallback > 0 {
+			log.Warn("fallback chains are configured on some models but settings.fallback_max_depth is 0 (disabled). Set fallback_max_depth to enable.",
+				slog.Int("models_with_fallback", modelsWithFallback))
+		}
 	}
 
 	// Step 5: derive HMAC secret from the encryption key using HKDF (RFC 5869).
@@ -613,6 +667,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	proxyHandler.MaxRequestBody = cfg.Server.Proxy.MaxRequestBody
 	proxyHandler.MaxResponseBody = cfg.Server.Proxy.MaxResponseBody
 	proxyHandler.MaxStreamDuration = cfg.Server.Proxy.MaxStreamDuration
+	proxyHandler.FallbackMaxDepth = cfg.Settings.FallbackMaxDepth
 
 	adminHandler := &admin.Handler{
 		DB:                database,
@@ -631,6 +686,12 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		Log:               log,
 		SSOProvider:       ssoProvider,
 		SSOConfig:         cfg.Settings.SSO,
+	}
+	// Wire the in-process reload callback so SetLicense can re-gate the
+	// model registry immediately after storing a new license, even on
+	// deployments that have no Redis (the default single-instance setup).
+	adminHandler.ReloadModels = func(reloadCtx context.Context) error {
+		return loadModelsIntoRegistry(reloadCtx)
 	}
 	// Only assign the health checker when it was actually created — a typed nil
 	// (*health.Checker)(nil) satisfies the interface but is NOT == nil when
@@ -916,6 +977,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 
 	adminHandler.MCPCallTimeout = cfg.Settings.MCP.CallTimeout
 	adminHandler.MCPAllowPrivateURLs = cfg.Settings.MCP.AllowPrivateURLs
+	adminHandler.FallbackMaxDepth = cfg.Settings.FallbackMaxDepth
 
 	mcpLogger := usage.NewMCPLogger(database, 1000, log)
 	adminHandler.MCPLogger = mcpLogger

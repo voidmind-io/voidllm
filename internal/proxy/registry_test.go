@@ -3,6 +3,7 @@ package proxy
 import (
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/voidmind-io/voidllm/internal/config"
@@ -391,4 +392,135 @@ func TestModelLogValue(t *testing.T) {
 	if !found {
 		t.Error("LogValue() missing api_key attribute")
 	}
+}
+
+// mcWithFallback returns a ModelConfig with a fallback model set.
+func mcWithFallback(name, provider, fallback string) config.ModelConfig {
+	return config.ModelConfig{
+		Name:     name,
+		Provider: provider,
+		BaseURL:  "http://" + name,
+		APIKey:   "k",
+		Fallback: fallback,
+	}
+}
+
+// TestRegistry_StripAllFallbacks verifies the direct unit contract of
+// StripAllFallbacks: count returned equals models that had a fallback,
+// all FallbackModelName fields are cleared, and a second call returns 0.
+func TestRegistry_StripAllFallbacks(t *testing.T) {
+	t.Parallel()
+
+	reg, err := NewRegistry([]config.ModelConfig{
+		mcWithFallback("a", "openai", "b"),
+		mcWithFallback("b", "openai", "c"),
+		{Name: "c", Provider: "openai", BaseURL: "http://c", APIKey: "k"},
+	})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+
+	// Sanity: all three models are registered.
+	if got := len(reg.AllModels()); got != 3 {
+		t.Fatalf("AllModels() len = %d, want 3", got)
+	}
+
+	// First strip: two models have a fallback.
+	stripped := reg.StripAllFallbacks()
+	if stripped != 2 {
+		t.Errorf("StripAllFallbacks() = %d, want 2", stripped)
+	}
+
+	// All fallbacks must now be empty.
+	for _, m := range reg.AllModels() {
+		if m.FallbackModelName != "" {
+			t.Errorf("model %q still has FallbackModelName=%q after strip", m.Name, m.FallbackModelName)
+		}
+	}
+
+	// Idempotent: second call should clear nothing.
+	stripped2 := reg.StripAllFallbacks()
+	if stripped2 != 0 {
+		t.Errorf("StripAllFallbacks() second call = %d, want 0", stripped2)
+	}
+}
+
+// TestRegistry_StripAllFallbacks_EmptyRegistry verifies that StripAllFallbacks
+// on an empty registry returns 0 without panicking.
+func TestRegistry_StripAllFallbacks_EmptyRegistry(t *testing.T) {
+	t.Parallel()
+
+	reg, err := NewRegistry(nil)
+	if err != nil {
+		t.Fatalf("NewRegistry(nil): %v", err)
+	}
+
+	if got := reg.StripAllFallbacks(); got != 0 {
+		t.Errorf("StripAllFallbacks() on empty registry = %d, want 0", got)
+	}
+}
+
+// TestRegistry_StripAllFallbacks_NoFallbacks verifies that StripAllFallbacks
+// returns 0 when no model has a fallback configured.
+func TestRegistry_StripAllFallbacks_NoFallbacks(t *testing.T) {
+	t.Parallel()
+
+	reg, err := NewRegistry([]config.ModelConfig{
+		mc("x", "openai", "http://x", "k"),
+		mc("y", "openai", "http://y", "k"),
+	})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+
+	if got := reg.StripAllFallbacks(); got != 0 {
+		t.Errorf("StripAllFallbacks() with no fallbacks = %d, want 0", got)
+	}
+}
+
+// TestRegistry_StripAllFallbacks_Concurrent verifies that concurrent reads
+// (AllModels, FallbackFor) and writes (StripAllFallbacks) do not produce data
+// races. Correctness of specific counts is not asserted — the criterion is
+// that the race detector reports no violations.
+func TestRegistry_StripAllFallbacks_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	reg, err := NewRegistry([]config.ModelConfig{
+		mcWithFallback("m1", "openai", "m2"),
+		mcWithFallback("m2", "openai", "m3"),
+		{Name: "m3", Provider: "openai", BaseURL: "http://m3", APIKey: "k"},
+		{Name: "m4", Provider: "openai", BaseURL: "http://m4", APIKey: "k"},
+	})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+
+	const goroutines = 20
+	const iterations = 50
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := range goroutines {
+		go func(id int) {
+			defer wg.Done()
+			for range iterations {
+				switch id % 3 {
+				case 0:
+					// Writer: strip fallbacks.
+					_ = reg.StripAllFallbacks()
+				case 1:
+					// Reader: iterate all models.
+					_ = reg.AllModels()
+				case 2:
+					// Reader: resolve fallback for a named model.
+					visited := map[string]bool{}
+					_, _ = reg.FallbackFor("m1", visited)
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	// Reaching here without the race detector firing is the success criterion.
 }

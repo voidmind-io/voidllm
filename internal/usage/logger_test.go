@@ -576,6 +576,75 @@ func TestNullableString(t *testing.T) {
 	}
 }
 
+// TestLog_RequestedModelNameStored verifies that when an event has a
+// RequestedModelName different from ModelName (i.e. fallback occurred), both
+// columns are persisted to the database correctly.
+func TestLog_RequestedModelNameStored(t *testing.T) {
+	t.Parallel()
+
+	d := openTestDB(t, "file:TestLog_RequestedModelNameStored?mode=memory&cache=private")
+	l := newTestLogger(d, defaultCfg())
+	l.Start()
+
+	ev := makeEvent()
+	ev.ModelName = "fallback-model"
+	ev.RequestedModelName = "original-model"
+
+	l.Log(ev)
+	stopAndWait(t, l, d, 1)
+
+	ctx := context.Background()
+	row := d.SQL().QueryRowContext(ctx,
+		"SELECT model_name, requested_model_name FROM usage_events LIMIT 1")
+
+	var modelName, requestedModelName string
+	if err := row.Scan(&modelName, &requestedModelName); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	if modelName != "fallback-model" {
+		t.Errorf("model_name = %q, want %q", modelName, "fallback-model")
+	}
+	if requestedModelName != "original-model" {
+		t.Errorf("requested_model_name = %q, want %q", requestedModelName, "original-model")
+	}
+}
+
+// TestLog_RequestedModelNameEqualsModelNameWhenNoFallback verifies that when no
+// fallback occurs (RequestedModelName is empty), the column stores an empty
+// string and model_name reflects the served model.
+func TestLog_RequestedModelNameEqualsModelNameWhenNoFallback(t *testing.T) {
+	t.Parallel()
+
+	d := openTestDB(t, "file:TestLog_RequestedModelNameNoFallback?mode=memory&cache=private")
+	l := newTestLogger(d, defaultCfg())
+	l.Start()
+
+	ev := makeEvent()
+	ev.ModelName = "primary-model"
+	ev.RequestedModelName = "" // no fallback
+
+	l.Log(ev)
+	stopAndWait(t, l, d, 1)
+
+	ctx := context.Background()
+	row := d.SQL().QueryRowContext(ctx,
+		"SELECT model_name, requested_model_name FROM usage_events LIMIT 1")
+
+	var modelName, requestedModelName string
+	if err := row.Scan(&modelName, &requestedModelName); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	if modelName != "primary-model" {
+		t.Errorf("model_name = %q, want %q", modelName, "primary-model")
+	}
+	// Empty RequestedModelName — the column should be empty string (or NULL converted to "").
+	if requestedModelName != "" {
+		t.Errorf("requested_model_name = %q, want empty string when no fallback", requestedModelName)
+	}
+}
+
 // TestLog_TokenCounterUpdatedBeforeFlush verifies that when a Logger is wired
 // with a TokenCounter, Log() increments the counter synchronously — before the
 // event reaches the database — so that a subsequent CheckTokens call sees the

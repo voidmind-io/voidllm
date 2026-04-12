@@ -71,6 +71,10 @@ type Model struct {
 	// MaxRetries is the number of times the proxy will retry a failed upstream
 	// request across the available deployments. Must be >= 0.
 	MaxRetries int
+	// FallbackModelName is the canonical name of the fallback target.
+	// Empty when no fallback is configured. Set to empty by the registry
+	// builder if the license does not include FeatureFallbackChains.
+	FallbackModelName string
 	// Deployments is the list of backend endpoints for this model. When
 	// non-empty, the model-level Provider, BaseURL, and APIKey are ignored
 	// in favour of the per-deployment values.
@@ -152,22 +156,23 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 		}
 
 		m := &Model{
-			Name:             mc.Name,
-			Provider:         mc.Provider,
-			Type:             modelType,
-			BaseURL:          mc.BaseURL,
-			APIKey:           mc.APIKey,
-			Aliases:          aliases,
-			MaxContextTokens: mc.MaxContextTokens,
-			Pricing:          mc.Pricing,
-			AzureDeployment:  mc.AzureDeployment,
-			AzureAPIVersion:  mc.AzureAPIVersion,
-			GCPProject:       mc.GCPProject,
-			GCPLocation:      mc.GCPLocation,
-			Timeout:          timeout,
-			Strategy:         mc.Strategy,
-			MaxRetries:       mc.MaxRetries,
-			Deployments:      deployments,
+			Name:              mc.Name,
+			Provider:          mc.Provider,
+			Type:              modelType,
+			BaseURL:           mc.BaseURL,
+			APIKey:            mc.APIKey,
+			Aliases:           aliases,
+			MaxContextTokens:  mc.MaxContextTokens,
+			Pricing:           mc.Pricing,
+			AzureDeployment:   mc.AzureDeployment,
+			AzureAPIVersion:   mc.AzureAPIVersion,
+			GCPProject:        mc.GCPProject,
+			GCPLocation:       mc.GCPLocation,
+			Timeout:           timeout,
+			Strategy:          mc.Strategy,
+			MaxRetries:        mc.MaxRetries,
+			Deployments:       deployments,
+			FallbackModelName: mc.Fallback,
 		}
 		r.models[mc.Name] = m
 	}
@@ -283,22 +288,23 @@ func (r *Registry) AddModel(m Model) {
 	copy(deployments, m.Deployments)
 
 	entry := &Model{
-		Name:             m.Name,
-		Provider:         m.Provider,
-		Type:             m.Type,
-		BaseURL:          m.BaseURL,
-		APIKey:           m.APIKey,
-		Aliases:          aliases,
-		MaxContextTokens: m.MaxContextTokens,
-		Pricing:          m.Pricing,
-		AzureDeployment:  m.AzureDeployment,
-		AzureAPIVersion:  m.AzureAPIVersion,
-		GCPProject:       m.GCPProject,
-		GCPLocation:      m.GCPLocation,
-		Timeout:          m.Timeout,
-		Strategy:         m.Strategy,
-		MaxRetries:       m.MaxRetries,
-		Deployments:      deployments,
+		Name:              m.Name,
+		Provider:          m.Provider,
+		Type:              m.Type,
+		BaseURL:           m.BaseURL,
+		APIKey:            m.APIKey,
+		Aliases:           aliases,
+		MaxContextTokens:  m.MaxContextTokens,
+		Pricing:           m.Pricing,
+		AzureDeployment:   m.AzureDeployment,
+		AzureAPIVersion:   m.AzureAPIVersion,
+		GCPProject:        m.GCPProject,
+		GCPLocation:       m.GCPLocation,
+		Timeout:           m.Timeout,
+		Strategy:          m.Strategy,
+		MaxRetries:        m.MaxRetries,
+		Deployments:       deployments,
+		FallbackModelName: m.FallbackModelName,
 	}
 	r.models[m.Name] = entry
 
@@ -326,6 +332,71 @@ func (r *Registry) RemoveModel(name string) {
 	delete(r.models, name)
 
 	r.rebuildSorted()
+}
+
+// StripAllFallbacks clears the FallbackModelName on every model in a
+// single critical section. Used by the license gate to atomically
+// remove fallback configuration when the license is downgraded.
+// Returns the number of models whose fallback was cleared.
+func (r *Registry) StripAllFallbacks() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	stripped := 0
+	for _, m := range r.models {
+		if m.FallbackModelName != "" {
+			m.FallbackModelName = ""
+			stripped++
+		}
+	}
+	return stripped
+}
+
+// AllModels returns copies of every model currently in the registry. The order
+// is unspecified. Use this for batch operations such as license-gating rather
+// than for serving hot-path requests.
+func (r *Registry) AllModels() []Model {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	result := make([]Model, 0, len(r.models))
+	for _, m := range r.models {
+		result = append(result, copyModel(m))
+	}
+	return result
+}
+
+// FallbackFor returns the resolved fallback Model for the given current
+// model name (or alias). Returns false if no fallback is configured, the
+// target does not exist, or the target has been visited already in this
+// chain (cycle protection at runtime).
+func (r *Registry) FallbackFor(currentName string, visited map[string]bool) (Model, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Resolve current to its canonical entry (handles aliases).
+	canonical := currentName
+	if alias, ok := r.aliases[currentName]; ok {
+		canonical = alias
+	}
+	m, ok := r.models[canonical]
+	if !ok || m.FallbackModelName == "" {
+		return Model{}, false
+	}
+
+	// Resolve the fallback target.
+	targetCanonical := m.FallbackModelName
+	if alias, ok := r.aliases[targetCanonical]; ok {
+		targetCanonical = alias
+	}
+	target, ok := r.models[targetCanonical]
+	if !ok {
+		return Model{}, false
+	}
+	if visited[target.Name] {
+		return Model{}, false // cycle
+	}
+	return copyModel(target), true
 }
 
 // copyModel returns a deep copy of m so callers cannot mutate the registry's

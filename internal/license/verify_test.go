@@ -266,3 +266,69 @@ func TestVerify_WrongSigningKey(t *testing.T) {
 		t.Errorf("Edition() = %q, want %q (wrong key must fall back to community)", got, EditionCommunity)
 	}
 }
+
+// TestEnterpriseLicense_FallbackChainsGranted verifies that an enterprise
+// license that includes FeatureFallbackChains in its claims reports the feature
+// as available.
+func TestEnterpriseLicense_FallbackChainsGranted(t *testing.T) {
+	// Cannot run in parallel — uses withTestPublicKey which mutates package state.
+
+	pub, priv := newTestKeypair(t)
+	withTestPublicKey(t, pub)
+
+	claims := LicenseClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(24 * time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
+			Issuer:    "voidllm.ai",
+		},
+		Plan:       "enterprise",
+		Features:   []string{FeatureFallbackChains},
+		MaxOrgs:    -1,
+		MaxTeams:   -1,
+		CustomerID: "cust_fallback_test",
+	}
+	key := signTestJWT(t, priv, claims)
+
+	lic := Verify(key, false)
+
+	if got := lic.Edition(); got != EditionEnterprise {
+		t.Errorf("Edition() = %q, want %q", got, EditionEnterprise)
+	}
+	if !lic.HasFeature(FeatureFallbackChains) {
+		t.Errorf("HasFeature(%q) = false on enterprise license with feature granted, want true", FeatureFallbackChains)
+	}
+}
+
+// TestEnterpriseLicense_FallbackChainsNotGranted verifies that an enterprise
+// license that does NOT include FeatureFallbackChains in its claims reports the
+// feature as unavailable.
+func TestEnterpriseLicense_FallbackChainsNotGranted(t *testing.T) {
+	// Cannot run in parallel — uses withTestPublicKey which mutates package state.
+
+	pub, priv := newTestKeypair(t)
+	withTestPublicKey(t, pub)
+
+	claims := LicenseClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(24 * time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
+			Issuer:    "voidllm.ai",
+		},
+		Plan:       "enterprise",
+		Features:   []string{FeatureAuditLogs}, // different feature, not fallback_chains
+		MaxOrgs:    -1,
+		MaxTeams:   -1,
+		CustomerID: "cust_no_fallback_test",
+	}
+	key := signTestJWT(t, priv, claims)
+
+	lic := Verify(key, false)
+
+	if got := lic.Edition(); got != EditionEnterprise {
+		t.Errorf("Edition() = %q, want %q", got, EditionEnterprise)
+	}
+	if lic.HasFeature(FeatureFallbackChains) {
+		t.Errorf("HasFeature(%q) = true on enterprise license without this feature, want false", FeatureFallbackChains)
+	}
+}
