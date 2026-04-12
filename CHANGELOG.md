@@ -2,6 +2,22 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.16] - 2026-04-12
+
+### Features
+- Model fallback chains - cross-model failover when all deployments of the primary are unavailable (Enterprise) (#45)
+  - Configurable chain depth via `settings.fallback_max_depth`
+  - Per-hop access control enforcement
+  - Cycle detection at config, API, and runtime
+  - Usage events track both requested and served model name
+  - UI: Fallback Model dropdown in model create and edit dialogs
+  - UI: depth-0 warning when fallback is configured but disabled
+
+### Fixes
+- Flaky MCP usage day-grouping test near midnight UTC
+
+---
+
 ## [0.0.15] - 2026-04-07
 
 ### Features
