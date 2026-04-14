@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/voidmind-io/voidllm/internal/auth"
+	"github.com/voidmind-io/voidllm/internal/config"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/mcp"
 )
 
@@ -37,6 +39,9 @@ type mockCodeModeDB struct {
 	blockedTools map[string][]string
 	// listErr is returned by all List* methods when non-nil.
 	listErr error
+	// outputSchemasByServerID maps serverID → (toolName → schema JSON) for
+	// GetAllOutputSchemas. When nil the method returns nil, nil (no schemas).
+	outputSchemasByServerID map[string]map[string]jsonx.RawMessage
 }
 
 func (m *mockCodeModeDB) ListMCPServers(_ context.Context) ([]db.MCPServer, error) {
@@ -72,6 +77,21 @@ func (m *mockCodeModeDB) ListBlockedToolNames(_ context.Context, serverID string
 		return nil, nil
 	}
 	return append([]string(nil), m.blockedTools[serverID]...), nil
+}
+
+func (m *mockCodeModeDB) SaveOutputSchema(_ context.Context, _, _ string, _ jsonx.RawMessage) error {
+	return nil
+}
+
+func (m *mockCodeModeDB) GetAllOutputSchemas(_ context.Context, serverID string, _ time.Duration) (map[string]jsonx.RawMessage, error) {
+	if m.outputSchemasByServerID == nil {
+		return nil, nil
+	}
+	return m.outputSchemasByServerID[serverID], nil
+}
+
+func (m *mockCodeModeDB) IsOutputSchemaStale(_ context.Context, _, _ string, _ time.Duration) (bool, error) {
+	return true, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -604,6 +624,24 @@ func TestListAccessibleMCPServers_NilCache(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// SearchMCPTools helpers
+// ---------------------------------------------------------------------------
+
+func assertContainsSearch(t *testing.T, got, substr string) {
+	t.Helper()
+	if !strings.Contains(got, substr) {
+		t.Errorf("search result missing %q\ngot: %s", substr, got)
+	}
+}
+
+func assertNotContainsSearch(t *testing.T, got, substr string) {
+	t.Helper()
+	if strings.Contains(got, substr) {
+		t.Errorf("search result should not contain %q\ngot: %s", substr, got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // SearchMCPTools tests
 // ---------------------------------------------------------------------------
 
@@ -633,12 +671,10 @@ func TestSearchMCPTools_KeywordMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchMCPTools() error = %v", err)
 	}
-	if len(result) != 1 {
-		t.Fatalf("got %d results, want 1", len(result))
-	}
-	if result[0]["name"] != "find_documents" {
-		t.Errorf("got tool %q, want %q", result[0]["name"], "find_documents")
-	}
+	assertContainsSearch(t, result, `Found `)
+	assertContainsSearch(t, result, `"find"`)
+	assertContainsSearch(t, result, `function find_documents(`)
+	assertContainsSearch(t, result, `declare namespace tools_search_srv`)
 }
 
 func TestSearchMCPTools_DescriptionMatch(t *testing.T) {
@@ -667,12 +703,9 @@ func TestSearchMCPTools_DescriptionMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchMCPTools() error = %v", err)
 	}
-	if len(result) != 1 {
-		t.Fatalf("got %d results, want 1", len(result))
-	}
-	if result[0]["name"] != "beta" {
-		t.Errorf("got tool %q, want %q", result[0]["name"], "beta")
-	}
+	// "beta" matched via description; "alpha" must not appear.
+	assertContainsSearch(t, result, `function beta(`)
+	assertNotContainsSearch(t, result, `function alpha(`)
 }
 
 func TestSearchMCPTools_CaseInsensitive(t *testing.T) {
@@ -714,9 +747,8 @@ func TestSearchMCPTools_CaseInsensitive(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SearchMCPTools(%q) error = %v", tc2.query, err)
 			}
-			if len(result) != 1 {
-				t.Errorf("query %q: got %d results, want 1", tc2.query, len(result))
-			}
+			// Original casing of the tool name must be preserved in output.
+			assertContainsSearch(t, result, `function ReadFile(`)
 		})
 	}
 }
@@ -750,12 +782,8 @@ func TestSearchMCPTools_FiltersBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchMCPTools() error = %v", err)
 	}
-	if len(result) != 1 {
-		t.Fatalf("got %d results, want 1 (blocked tool must be excluded)", len(result))
-	}
-	if result[0]["name"] != "safe_tool" {
-		t.Errorf("expected safe_tool, got %q", result[0]["name"])
-	}
+	assertContainsSearch(t, result, `function safe_tool(`)
+	assertNotContainsSearch(t, result, `function danger_tool(`)
 }
 
 func TestSearchMCPTools_ServerFilter(t *testing.T) {
@@ -787,17 +815,91 @@ func TestSearchMCPTools_ServerFilter(t *testing.T) {
 
 	ctx := ctxWithIdentity(mcp.KeyIdentity{OrgID: orgID, KeyID: "key-sf", Role: "member"})
 
-	// Restrict to "first" only — should get exactly 1 result even though
-	// "second" also has a tool named "lookup".
+	// Restrict to "first" only — should include server_a namespace and exclude server_b.
 	result, err := svc.SearchMCPTools(ctx, "lookup", []string{"first"})
 	if err != nil {
 		t.Fatalf("SearchMCPTools() error = %v", err)
 	}
-	if len(result) != 1 {
-		t.Fatalf("got %d results, want 1", len(result))
+	assertContainsSearch(t, result, `declare namespace tools.first`)
+	assertNotContainsSearch(t, result, `declare namespace tools.second`)
+}
+
+func TestSearchMCPTools_SurfacesInferredTypes(t *testing.T) {
+	t.Parallel()
+
+	orgID := "org-infer-search"
+	sv := db.MCPServer{
+		ID:              "sv-infer-search",
+		Alias:           "infer-srv",
+		Name:            "Infer Server",
+		OrgID:           ptrStr(orgID),
+		CodeModeEnabled: true,
 	}
-	if result[0]["server"] != "first" {
-		t.Errorf("got server %q, want %q", result[0]["server"], "first")
+
+	// Output schema for "my_infer_tool" — simple object with id (number) and name (string).
+	schemaJSON := jsonx.RawMessage(`{"type":"object","properties":{"id":{"type":"number"},"name":{"type":"string"}}}`)
+
+	mock := &mockCodeModeDB{
+		orgServers: map[string][]db.MCPServer{orgID: {sv}},
+		outputSchemasByServerID: map[string]map[string]jsonx.RawMessage{
+			sv.ID: {"my_infer_tool": schemaJSON},
+		},
+	}
+	tools := []mcp.Tool{
+		{Name: "my_infer_tool", Description: "A tool with inferred output schema"},
+	}
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{sv.ID: tools})
+
+	serverCache := &staticServerCache{
+		byID: map[string]*db.MCPServer{sv.ID: &sv},
+	}
+
+	svc := &codeModeService{
+		db:          mock,
+		toolCache:   tc,
+		serverCache: serverCache,
+		log:         newDiscardLogger(),
+	}
+
+	ctx := ctxWithIdentity(mcp.KeyIdentity{OrgID: orgID, KeyID: "key-infer-s", Role: "member"})
+	result, err := svc.SearchMCPTools(ctx, "my_infer_tool", nil)
+	if err != nil {
+		t.Fatalf("SearchMCPTools() error = %v", err)
+	}
+
+	assertContainsSearch(t, result, `Promise<{ id: number; name: string }>`)
+	assertContainsSearch(t, result, `// inferred - could depend on previous query`)
+	// Ensure the inferred type replaced Promise<any> for this tool.
+	assertNotContainsSearch(t, result, `Promise<any>`)
+}
+
+func TestSearchMCPTools_NoResults(t *testing.T) {
+	t.Parallel()
+
+	orgID := "org-noresults"
+	sv := db.MCPServer{
+		ID:              "sv-noresults",
+		Alias:           "noresults-srv",
+		Name:            "No Results Server",
+		OrgID:           ptrStr(orgID),
+		CodeModeEnabled: true,
+	}
+	mock := &mockCodeModeDB{
+		orgServers: map[string][]db.MCPServer{orgID: {sv}},
+	}
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{
+		sv.ID: {{Name: "some_tool", Description: "Does something"}},
+	})
+	svc := &codeModeService{db: mock, toolCache: tc, log: newDiscardLogger()}
+
+	ctx := ctxWithIdentity(mcp.KeyIdentity{OrgID: orgID, KeyID: "key-nr", Role: "member"})
+	result, err := svc.SearchMCPTools(ctx, "xyzzyfooBarNonExistent", nil)
+	if err != nil {
+		t.Fatalf("SearchMCPTools() error = %v", err)
+	}
+	const want = `No tools found matching "xyzzyfooBarNonExistent".`
+	if result != want {
+		t.Errorf("SearchMCPTools() = %q, want %q", result, want)
 	}
 }
 
@@ -1214,5 +1316,365 @@ func TestToolsListHook_NoExecuteCodeTool(t *testing.T) {
 	// execute_code is not in the list — other tools must be unchanged.
 	if got[0].Description != "lists models" {
 		t.Errorf("description changed to %q", got[0].Description)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Schema inference integration tests — real SQLite DB, real Executor
+// ---------------------------------------------------------------------------
+
+// staticServerCache is a minimal mcpServerByIDer that serves a fixed map of
+// server ID → MCPServer for use in schema-inference tests.
+type staticServerCache struct {
+	byID map[string]*db.MCPServer
+}
+
+func (s *staticServerCache) GetByID(serverID string) (*db.MCPServer, bool) {
+	sv, ok := s.byID[serverID]
+	return sv, ok
+}
+
+// openTestDBForSchemaTests opens an isolated in-memory SQLite DB, runs all
+// migrations, and registers cleanup. The dsn suffix must be unique per test.
+func openTestDBForSchemaTests(t *testing.T) *db.DB {
+	t.Helper()
+	// Use test name sanitised to a safe URI filename component.
+	safeName := strings.NewReplacer("/", "_", " ", "_", "#", "_", "=", "_").Replace(t.Name())
+	cfg := config.DatabaseConfig{
+		Driver:          "sqlite",
+		DSN:             "file:" + safeName + "?mode=memory&cache=private",
+		MaxOpenConns:    1,
+		MaxIdleConns:    1,
+		ConnMaxLifetime: time.Minute,
+	}
+	ctx := context.Background()
+	d, err := db.Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	if err := db.RunMigrations(ctx, d.SQL(), d.Dialect(), slog.New(slog.DiscardHandler)); err != nil {
+		t.Fatalf("RunMigrations: %v", err)
+	}
+	return d
+}
+
+// createTestMCPServer inserts a global builtin MCP server and returns it.
+// Using source="builtin" avoids the need for an org row (no FK) and bypasses
+// the MCP access check so any identity can access the server.
+func createTestMCPServer(t *testing.T, database *db.DB, alias string) *db.MCPServer {
+	t.Helper()
+	enabled := true
+	sv, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:            "Test " + alias,
+		Alias:           alias,
+		URL:             "https://mcp.test/" + alias,
+		AuthType:        "none",
+		Source:          "builtin",
+		CodeModeEnabled: &enabled,
+	})
+	if err != nil {
+		t.Fatalf("CreateMCPServer(%q): %v", alias, err)
+	}
+	return sv
+}
+
+// pollUntilSchemaInferred polls the DB until a schema row exists for
+// (serverID, toolName) or the deadline passes. It fails the test if no row
+// appears within the timeout.
+func pollUntilSchemaInferred(t *testing.T, database *db.DB, serverID, toolName string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		stale, err := database.IsOutputSchemaStale(context.Background(), serverID, toolName, time.Hour)
+		if err != nil {
+			t.Fatalf("IsOutputSchemaStale: %v", err)
+		}
+		if !stale {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("schema for (%s, %s) was not inferred within %s", serverID, toolName, timeout)
+}
+
+// readInferredAt returns the raw inferred_at string for a (serverID, toolName)
+// row directly from the underlying sql.DB. It fails the test if the row is missing.
+func readInferredAt(t *testing.T, database *db.DB, serverID, toolName string) string {
+	t.Helper()
+	var inferredAt string
+	err := database.SQL().QueryRowContext(
+		context.Background(),
+		"SELECT inferred_at FROM output_schemas WHERE server_id = ? AND tool_name = ?",
+		serverID, toolName,
+	).Scan(&inferredAt)
+	if err != nil {
+		t.Fatalf("readInferredAt(%s, %s): %v", serverID, toolName, err)
+	}
+	return inferredAt
+}
+
+// setupSchemaInferenceTest builds a codeModeService wired to a real SQLite DB
+// and a mock callMCPTool that returns the given JSON payload.
+// The MCP server is created as a global builtin so no org FK is required.
+// Returns the service, the database, and the MCPServer that was created.
+func setupSchemaInferenceTest(t *testing.T, alias string, schemaTTL time.Duration, toolPayload json.RawMessage) (*codeModeService, *db.DB, *db.MCPServer) {
+	t.Helper()
+
+	database := openTestDBForSchemaTests(t)
+	sv := createTestMCPServer(t, database, alias)
+
+	// Tool cache keyed by server ID — must match what ExecuteCode uses.
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{
+		sv.ID: {{Name: "my_tool", Description: "A tool"}},
+	})
+
+	executor := newTestExecutor(t)
+
+	caller := func(_ context.Context, _ *auth.KeyInfo, _, _ string, _ json.RawMessage, _ bool, _ string) (json.RawMessage, error) {
+		return toolPayload, nil
+	}
+
+	serverCache := &staticServerCache{
+		byID: map[string]*db.MCPServer{sv.ID: sv},
+	}
+
+	svc := &codeModeService{
+		executor:     executor,
+		toolCache:    tc,
+		callMCPTool:  caller,
+		db:           database,
+		log:          newDiscardLogger(),
+		maxToolCalls: 10,
+		schemaTTL:    schemaTTL,
+		serverCache:  serverCache,
+	}
+	return svc, database, sv
+}
+
+// TestCodeMode_InfersSchemaOnFirstCall verifies that calling a tool whose
+// response is {"users":[{"id":1,"name":"a"}]} causes the schema to be
+// persisted and then surfaced as a typed Promise in toolsListHook output.
+func TestCodeMode_InfersSchemaOnFirstCall(t *testing.T) {
+	t.Parallel()
+
+	const alias = "testsrv"
+
+	toolPayload := json.RawMessage(`{"users":[{"id":1,"name":"a"}]}`)
+
+	svc, database, sv := setupSchemaInferenceTest(t, alias, time.Hour, toolPayload)
+
+	// system_admin with no OrgID/TeamID triggers ListMCPServers; builtin servers
+	// bypass the MCP access check so no access record is needed.
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-infer", Role: "system_admin"})
+
+	// Execute code that calls the tool.
+	result, err := svc.ExecuteCode(ctx, `
+		async function run() {
+			const r = await tools["`+alias+`"].my_tool({});
+			return JSON.stringify(r);
+		}
+		await run();
+	`, nil)
+	if err != nil {
+		t.Fatalf("ExecuteCode: %v", err)
+	}
+	if result.Error != "" {
+		t.Fatalf("ExecuteCode result.Error = %q", result.Error)
+	}
+
+	// Wait for the async OnToolResult goroutine to write the schema.
+	pollUntilSchemaInferred(t, database, sv.ID, "my_tool", 500*time.Millisecond)
+
+	// Now call toolsListHook and verify the execute_code description contains
+	// the inferred TypeScript return type.
+	hook := svc.toolsListHook()
+	inputTools := []mcp.Tool{
+		{Name: "execute_code", Description: "original"},
+	}
+	got := hook(inputTools)
+
+	if len(got) != 1 {
+		t.Fatalf("hook returned %d tools, want 1", len(got))
+	}
+	desc := got[0].Description
+
+	// {"users":[{"id":1,"name":"a"}]} infers:
+	//   object with property "users" of type Array<{ id: number; name: string }>
+	// schemaToTypeScript produces: { users: Array<{ id: number; name: string }> }
+	const wantType = "Promise<{ users: Array<{ id: number; name: string }> }>"
+	if !strings.Contains(desc, wantType) {
+		t.Errorf("description does not contain %q\ngot: %s", wantType, desc)
+	}
+
+	const wantComment = "// inferred - could depend on previous query"
+	if !strings.Contains(desc, wantComment) {
+		t.Errorf("description does not contain %q\ngot: %s", wantComment, desc)
+	}
+}
+
+// TestCodeMode_TTLPreventsReinference verifies that a second tool call within
+// the schema TTL does not update the inferred_at timestamp.
+func TestCodeMode_TTLPreventsReinference(t *testing.T) {
+	t.Parallel()
+
+	const alias = "ttlsrv"
+
+	toolPayload := json.RawMessage(`{"value":1}`)
+
+	svc, database, sv := setupSchemaInferenceTest(t, alias, time.Hour, toolPayload)
+
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-ttl", Role: "system_admin"})
+
+	callScript := `
+		async function run() {
+			const r = await tools["` + alias + `"].my_tool({});
+			return JSON.stringify(r);
+		}
+		await run();
+	`
+
+	// First call — schema should be inferred and persisted.
+	if _, err := svc.ExecuteCode(ctx, callScript, nil); err != nil {
+		t.Fatalf("first ExecuteCode: %v", err)
+	}
+	pollUntilSchemaInferred(t, database, sv.ID, "my_tool", 500*time.Millisecond)
+	firstInferredAt := readInferredAt(t, database, sv.ID, "my_tool")
+
+	// Second call — within the 1h TTL so schema is not stale; inferred_at must be unchanged.
+	if _, err := svc.ExecuteCode(ctx, callScript, nil); err != nil {
+		t.Fatalf("second ExecuteCode: %v", err)
+	}
+	// Brief pause to let the goroutine run if it was (incorrectly) triggered.
+	time.Sleep(100 * time.Millisecond)
+
+	secondInferredAt := readInferredAt(t, database, sv.ID, "my_tool")
+	if firstInferredAt != secondInferredAt {
+		t.Errorf("inferred_at changed on second call within TTL:\n  first  = %s\n  second = %s", firstInferredAt, secondInferredAt)
+	}
+}
+
+// TestCodeMode_ZeroTTLAllowsIndefiniteCache verifies that schemaTTL=0 means
+// "never stale" — a row that already exists is never overwritten on re-calls.
+func TestCodeMode_ZeroTTLAllowsIndefiniteCache(t *testing.T) {
+	t.Parallel()
+
+	const alias = "zerosrv"
+
+	toolPayload := json.RawMessage(`{"ok":true}`)
+
+	svc, database, sv := setupSchemaInferenceTest(t, alias, 0, toolPayload)
+
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-zero", Role: "system_admin"})
+
+	callScript := `
+		async function run() {
+			const r = await tools["` + alias + `"].my_tool({});
+			return JSON.stringify(r);
+		}
+		await run();
+	`
+
+	// First call — schema is written because no row exists yet (missing = stale).
+	if _, err := svc.ExecuteCode(ctx, callScript, nil); err != nil {
+		t.Fatalf("first ExecuteCode: %v", err)
+	}
+	pollUntilSchemaInferred(t, database, sv.ID, "my_tool", 500*time.Millisecond)
+	firstInferredAt := readInferredAt(t, database, sv.ID, "my_tool")
+
+	// Second call — schemaTTL=0 means the existing row is never stale; no update.
+	if _, err := svc.ExecuteCode(ctx, callScript, nil); err != nil {
+		t.Fatalf("second ExecuteCode: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	secondInferredAt := readInferredAt(t, database, sv.ID, "my_tool")
+	if firstInferredAt != secondInferredAt {
+		t.Errorf("inferred_at changed with schemaTTL=0 (should never re-infer):\n  first  = %s\n  second = %s", firstInferredAt, secondInferredAt)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// toolsListHook description-content regression test (L-013)
+// ---------------------------------------------------------------------------
+
+// TestToolsListHook_InjectsCodeModePreference verifies that the dynamic hook
+// appends the full "## Available Tools" section to the execute_code description
+// and that the result retains all STRONG PREFERENCE / PATTERNS / NOTE guidance
+// from the static CodeModeDescription(). It also asserts that the old trailing
+// "Call tools via `await tools.serverAlias.toolName(args)`" sentence, which
+// was removed during L-013, is no longer present.
+func TestToolsListHook_InjectsCodeModePreference(t *testing.T) {
+	t.Parallel()
+
+	// Seed the tool cache with one server that has one tool with a required
+	// string parameter — GenerateToolTypeDefs will emit a Promise<any> signature.
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{
+		"myserver": {
+			{
+				Name:        "fetch_data",
+				Description: "Fetches data by ID",
+				InputSchema: mcp.InputSchema{
+					Type: "object",
+					Properties: map[string]mcp.Property{
+						"id": {Type: "string", Description: "Record ID"},
+					},
+					Required: []string{"id"},
+				},
+			},
+		},
+	})
+
+	svc := &codeModeService{
+		db:        &mockCodeModeDB{},
+		toolCache: tc,
+		log:       newDiscardLogger(),
+	}
+
+	hook := svc.toolsListHook()
+
+	// The hook receives the static description that RegisterCodeModeTools wires.
+	inputTools := []mcp.Tool{
+		{
+			Name:        "execute_code",
+			Description: mcp.CodeModeDescription(),
+		},
+	}
+
+	got := hook(inputTools)
+	if len(got) != 1 {
+		t.Fatalf("hook changed tool count: got %d, want 1", len(got))
+	}
+
+	desc := got[0].Description
+
+	// Static guidance must survive the hook — if STRONG PREFERENCE disappears the
+	// LLM loses critical workflow instructions.
+	if !strings.Contains(desc, "STRONG PREFERENCE") {
+		t.Errorf("execute_code description after hook missing STRONG PREFERENCE;\ngot: %s", desc)
+	}
+
+	// Dynamic section must be appended with blank-line padding so the markdown
+	// heading renders correctly for the LLM.
+	if !strings.Contains(desc, "\n\n## Available Tools\n\n") {
+		t.Errorf("execute_code description after hook missing '\\n\\n## Available Tools\\n\\n' (with surrounding blank lines);\ngot: %s", desc)
+	}
+
+	// TypeScript type definitions must appear (Promise<any> is the default for a
+	// tool whose output schema has not yet been inferred).
+	if !strings.Contains(desc, "Promise<") {
+		t.Errorf("execute_code description after hook missing TypeScript Promise type;\ngot: %s", desc)
+	}
+
+	// The specific tool name injected by the cache must appear.
+	if !strings.Contains(desc, "fetch_data") {
+		t.Errorf("execute_code description after hook missing tool name 'fetch_data';\ngot: %s", desc)
+	}
+
+	// The old trailing call-syntax sentence was dropped in L-013.  If it comes
+	// back a refactor has reintroduced it — that would be a regression.
+	const droppedSentence = "Call tools via `await tools.serverAlias.toolName(args)`"
+	if strings.Contains(desc, droppedSentence) {
+		t.Errorf("execute_code description contains dropped sentence %q — was it re-added by mistake?", droppedSentence)
 	}
 }

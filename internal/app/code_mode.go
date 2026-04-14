@@ -24,6 +24,9 @@ type codeModeDB interface {
 	ListMCPServersByTeam(ctx context.Context, teamID, orgID string) ([]db.MCPServer, error)
 	CheckMCPAccess(ctx context.Context, orgID, teamID, keyID, serverID string) (bool, error)
 	ListBlockedToolNames(ctx context.Context, serverID string) ([]string, error)
+	SaveOutputSchema(ctx context.Context, serverID, toolName string, schema jsonx.RawMessage) error
+	GetAllOutputSchemas(ctx context.Context, serverID string, maxAge time.Duration) (map[string]jsonx.RawMessage, error)
+	IsOutputSchemaStale(ctx context.Context, serverID, toolName string, maxAge time.Duration) (bool, error)
 }
 
 // mcpServerByIDer is the subset of proxy.MCPServerCache used by codeModeService
@@ -31,6 +34,10 @@ type codeModeDB interface {
 type mcpServerByIDer interface {
 	GetByID(serverID string) (*db.MCPServer, bool)
 }
+
+// searchToolsLimit is the maximum number of matched tools returned by
+// SearchMCPTools. Matches VoidMCP's hard limit to keep responses tractable.
+const searchToolsLimit = 50
 
 // codeModeService holds the dependencies for the three Code Mode VoidLLMDeps
 // closures (ExecuteCode, ListAccessibleMCPServers, SearchMCPTools) and the
@@ -43,6 +50,8 @@ type codeModeService struct {
 	db           codeModeDB
 	log          *slog.Logger
 	maxToolCalls int
+	// schemaTTL is the TTL for inferred output schemas (from config).
+	schemaTTL time.Duration
 	// serverCache resolves server IDs to aliases for TypeScript type generation.
 	serverCache mcpServerByIDer
 	// codePool is optional; when non-nil the pool's Available count is recorded
@@ -208,6 +217,14 @@ func (s *codeModeService) ExecuteCode(ctx context.Context, code string, serverAl
 		return s.callMCPTool(callCtx, kiAuth, serverAlias, toolName, args, true, executionID)
 	})
 
+	aliasToServerID := make(map[string]string, len(servers))
+	for _, sv := range servers {
+		if len(wantSet) > 0 && !wantSet[sv.Alias] {
+			continue
+		}
+		aliasToServerID[sv.Alias] = sv.ID
+	}
+
 	start := time.Now()
 	result, execErr := s.executor.Execute(ctx, mcp.ExecuteParams{
 		Code:         code,
@@ -215,6 +232,26 @@ func (s *codeModeService) ExecuteCode(ctx context.Context, code string, serverAl
 		CallTool:     callTool,
 		MaxToolCalls: s.maxToolCalls,
 		ExecutionID:  executionID,
+		OnToolResult: func(alias, toolName string, result jsonx.RawMessage) {
+			serverID, ok := aliasToServerID[alias]
+			if !ok {
+				return
+			}
+			// Use a 5-second timeout: the hook runs in a goroutine that
+			// outlives the request, but must not pin the goroutine
+			// indefinitely on a slow or contended DB write.
+			hctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			stale, err := s.db.IsOutputSchemaStale(hctx, serverID, toolName, s.schemaTTL)
+			if err != nil || !stale {
+				return
+			}
+			schema := mcp.InferSchema(result)
+			if schema == nil {
+				return
+			}
+			_ = s.db.SaveOutputSchema(hctx, serverID, toolName, schema)
+		},
 	})
 	duration := time.Since(start)
 
@@ -281,17 +318,20 @@ func (s *codeModeService) ListAccessibleMCPServers(ctx context.Context, codeMode
 }
 
 // SearchMCPTools searches tool schemas across accessible MCP servers by
-// keyword. query is matched case-insensitively against tool name and
-// description. serverAliases restricts the search scope when non-empty.
-// Returns nil when the tool cache is nil (Code Mode disabled).
-func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serverAliases []string) ([]map[string]any, error) {
+// keyword and returns a TypeScript text block ready for LLM consumption.
+// query is matched case-insensitively against tool name and description.
+// serverAliases restricts the search scope when non-empty (nil = all).
+// Returns an empty string when the tool cache is nil (Code Mode disabled).
+// At most searchToolsLimit tools are returned; when query == "*" and results
+// were truncated a notice is appended.
+func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serverAliases []string) (string, error) {
 	if s.toolCache == nil {
-		return nil, nil
+		return "", nil
 	}
 
 	servers, listErr := s.accessibleServers(ctx, true)
 	if listErr != nil {
-		return nil, fmt.Errorf("search mcp tools: list servers: %w", listErr)
+		return "", fmt.Errorf("search mcp tools: list servers: %w", listErr)
 	}
 
 	wantSet := make(map[string]bool, len(serverAliases))
@@ -300,8 +340,16 @@ func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serv
 	}
 
 	queryLower := strings.ToLower(query)
-	var matches []map[string]any
+	matched := make(map[string][]mcp.Tool)
+	matchedServerIDs := make(map[string]struct{})
+	matchCount := 0
+	totalAvailable := 0
+	capped := false
+
 	for _, sv := range servers {
+		if capped {
+			break
+		}
 		if len(wantSet) > 0 && !wantSet[sv.Alias] {
 			continue
 		}
@@ -327,19 +375,55 @@ func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serv
 			if blockedSet[t.Name] {
 				continue
 			}
-			if strings.Contains(strings.ToLower(t.Name), queryLower) ||
-				strings.Contains(strings.ToLower(t.Description), queryLower) {
-				matches = append(matches, map[string]any{
-					"server":       sv.Alias,
-					"server_name":  sv.Name,
-					"name":         t.Name,
-					"description":  t.Description,
-					"input_schema": t.InputSchema,
-				})
+			if !strings.Contains(strings.ToLower(t.Name), queryLower) &&
+				!strings.Contains(strings.ToLower(t.Description), queryLower) {
+				continue
 			}
+			totalAvailable++
+			if matchCount >= searchToolsLimit {
+				capped = true
+				break
+			}
+			matched[sv.Alias] = append(matched[sv.Alias], t)
+			matchedServerIDs[sv.ID] = struct{}{}
+			matchCount++
 		}
 	}
-	return matches, nil
+
+	if matchCount == 0 {
+		return fmt.Sprintf("No tools found matching %q.", query), nil
+	}
+
+	outputSchemas := make(map[string]map[string]jsonx.RawMessage, len(matchedServerIDs))
+	for serverID := range matchedServerIDs {
+		if s.serverCache == nil {
+			continue
+		}
+		sv, ok := s.serverCache.GetByID(serverID)
+		if !ok {
+			continue
+		}
+		schemas, schemaErr := s.db.GetAllOutputSchemas(ctx, serverID, s.schemaTTL)
+		if schemaErr != nil {
+			s.log.LogAttrs(ctx, slog.LevelWarn, "search mcp tools: get output schemas",
+				slog.String("server", sv.Alias),
+				slog.String("error", schemaErr.Error()))
+			continue
+		}
+		if len(schemas) > 0 {
+			outputSchemas[sv.Alias] = schemas
+		}
+	}
+
+	types := mcp.GenerateToolTypeDefs(matched, outputSchemas)
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Found %d tool(s) matching %q:\n\n", matchCount, query)
+	sb.WriteString(types)
+	if query == "*" && matchCount < totalAvailable {
+		fmt.Fprintf(&sb, "\n(showing %d of %d tools)\n", matchCount, totalAvailable)
+	}
+	return sb.String(), nil
 }
 
 // toolsListHook returns an mcp.OnToolsListHook that injects TypeScript type
@@ -370,13 +454,26 @@ func (s *codeModeService) toolsListHook() mcp.OnToolsListHook {
 			byAlias[serverID] = serverToolList
 		}
 
-		types := mcp.GenerateToolTypeDefs(byAlias)
+		// The hook runs on every tools/list request. Bound the per-server schema
+		// reads so a slow or stuck DB cannot pin the handler.
+		outputSchemas := make(map[string]map[string]jsonx.RawMessage, len(allCached))
+		hctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		for serverID := range allCached {
+			if s.serverCache != nil {
+				if server, ok := s.serverCache.GetByID(serverID); ok {
+					schemas, err := s.db.GetAllOutputSchemas(hctx, serverID, s.schemaTTL)
+					if err == nil && len(schemas) > 0 {
+						outputSchemas[server.Alias] = schemas
+					}
+				}
+			}
+		}
+		types := mcp.GenerateToolTypeDefs(byAlias, outputSchemas)
 		if types == "" {
 			return tools
 		}
-		desc := "Execute JavaScript code in a sandboxed WASM runtime.\n\n" +
-			"## Available Tools\n\n" + types + "\n\n" +
-			"Call tools via `await tools.serverAlias.toolName(args)`. Return a value as the result."
+		desc := mcp.CodeModeDescription() + "\n\n## Available Tools\n\n" + types
 		for i := range tools {
 			if tools[i].Name == "execute_code" {
 				tools[i].Description = desc

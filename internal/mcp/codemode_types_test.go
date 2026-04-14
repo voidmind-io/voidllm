@@ -15,7 +15,7 @@ import (
 func TestGenerateToolTypeDefs_Empty(t *testing.T) {
 	t.Parallel()
 
-	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{})
+	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{}, nil)
 	if got != "" {
 		t.Errorf("GenerateToolTypeDefs(empty) = %q, want empty string", got)
 	}
@@ -24,7 +24,7 @@ func TestGenerateToolTypeDefs_Empty(t *testing.T) {
 func TestGenerateToolTypeDefs_NilMap(t *testing.T) {
 	t.Parallel()
 
-	got := mcp.GenerateToolTypeDefs(nil)
+	got := mcp.GenerateToolTypeDefs(nil, nil)
 	if got != "" {
 		t.Errorf("GenerateToolTypeDefs(nil) = %q, want empty string", got)
 	}
@@ -118,7 +118,7 @@ func TestGenerateToolTypeDefs_SingleServerSingleTool(t *testing.T) {
 
 			got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
 				"aws": {tc.tool},
-			})
+			}, nil)
 			for _, want := range tc.wantContain {
 				if !strings.Contains(got, want) {
 					t.Errorf("output does not contain %q\nfull output:\n%s", want, got)
@@ -145,7 +145,7 @@ func TestGenerateToolTypeDefs_RequiredVsOptional(t *testing.T) {
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
 		"srv": {tool},
-	})
+	}, nil)
 
 	// required_field has no ?; optional_field has ?
 	if !strings.Contains(got, "required_field: string") {
@@ -175,7 +175,7 @@ func TestGenerateToolTypeDefs_ArrayAndObjectParams(t *testing.T) {
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
 		"srv": {tool},
-	})
+	}, nil)
 
 	if !strings.Contains(got, "tags?: any[]") {
 		t.Errorf("array param should map to 'any[]', got:\n%s", got)
@@ -200,7 +200,7 @@ func TestGenerateToolTypeDefs_UnknownTypeMapToAny(t *testing.T) {
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
 		"srv": {tool},
-	})
+	}, nil)
 
 	if !strings.Contains(got, "val?: any") {
 		t.Errorf("property with no type should map to 'any', got:\n%s", got)
@@ -218,7 +218,7 @@ func TestGenerateToolTypeDefs_EmptyDescription(t *testing.T) {
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
 		"srv": {tool},
-	})
+	}, nil)
 
 	// No JSDoc comment should be emitted.
 	if strings.Contains(got, "/**") {
@@ -241,7 +241,7 @@ func TestGenerateToolTypeDefs_LongDescriptionTruncated(t *testing.T) {
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
 		"srv": {tool},
-	})
+	}, nil)
 
 	if !strings.Contains(got, "First sentence.") {
 		t.Errorf("first sentence should appear in output, got:\n%s", got)
@@ -262,7 +262,7 @@ func TestGenerateToolTypeDefs_LongDescriptionNewlineTruncated(t *testing.T) {
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
 		"srv": {tool},
-	})
+	}, nil)
 
 	if !strings.Contains(got, "First line") {
 		t.Errorf("first line should appear in output, got:\n%s", got)
@@ -281,7 +281,7 @@ func TestGenerateToolTypeDefs_MultipleServersSortedAlphabetically(t *testing.T) 
 		"mango": {{Name: "tool_m", InputSchema: mcp.InputSchema{Type: "object"}}},
 	}
 
-	got := mcp.GenerateToolTypeDefs(tools)
+	got := mcp.GenerateToolTypeDefs(tools, nil)
 
 	posAlpha := strings.Index(got, "tools.alpha")
 	posMango := strings.Index(got, "tools.mango")
@@ -307,7 +307,7 @@ func TestGenerateToolTypeDefs_ToolNamesWithHyphensAndDots(t *testing.T) {
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
 		"my-api.v1": {tool},
-	})
+	}, nil)
 
 	// Aliases with special chars use bracket notation comment + sanitized namespace.
 	if !strings.Contains(got, `tools["my-api.v1"]`) {
@@ -337,7 +337,7 @@ func TestGenerateToolTypeDefs_NoPropertiesProducesEmptyArgs(t *testing.T) {
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
 		"srv": {tool},
-	})
+	}, nil)
 
 	// args block should be inline with no newlines between braces.
 	if !strings.Contains(got, "function no_args(args: {})") {
@@ -354,7 +354,7 @@ func TestGenerateToolTypeDefs_ServerWithNoToolsOmitted(t *testing.T) {
 		"empty_server": {},
 	}
 
-	got := mcp.GenerateToolTypeDefs(tools)
+	got := mcp.GenerateToolTypeDefs(tools, nil)
 
 	if strings.Contains(got, "tools.empty_server") {
 		t.Errorf("server with no tools should be omitted, got:\n%s", got)
@@ -375,7 +375,7 @@ func TestGenerateToolTypeDefs_ToolsSortedWithinNamespace(t *testing.T) {
 		},
 	}
 
-	got := mcp.GenerateToolTypeDefs(tools)
+	got := mcp.GenerateToolTypeDefs(tools, nil)
 
 	posFirst := strings.Index(got, "aaa_first")
 	posMiddle := strings.Index(got, "mmm_middle")
@@ -400,8 +400,8 @@ func TestGenerateToolTypeDefs_DeterministicOutput(t *testing.T) {
 		"alpha": {{Name: "tool_a", InputSchema: mcp.InputSchema{Type: "object"}}},
 	}
 
-	first := mcp.GenerateToolTypeDefs(tools)
-	second := mcp.GenerateToolTypeDefs(tools)
+	first := mcp.GenerateToolTypeDefs(tools, nil)
+	second := mcp.GenerateToolTypeDefs(tools, nil)
 
 	if first != second {
 		t.Errorf("non-deterministic output:\nfirst:\n%s\nsecond:\n%s", first, second)
@@ -427,7 +427,7 @@ func TestGenerateToolTypeDefs_OutputStructure(t *testing.T) {
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
 		"users": {tool},
-	})
+	}, nil)
 
 	wantParts := []string{
 		"declare namespace tools.users {",
