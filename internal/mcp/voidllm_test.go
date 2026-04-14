@@ -1111,15 +1111,15 @@ func TestVoidLLM_SearchTools_Success(t *testing.T) {
 	var capturedQuery string
 	var capturedAliases []string
 
-	tools := []map[string]any{
-		{"name": "get_weather", "description": "Get current weather", "server": "weather"},
-	}
-
 	deps := defaultDeps()
-	deps.SearchMCPTools = func(_ context.Context, query string, serverAliases []string) ([]map[string]any, error) {
+	deps.SearchMCPTools = func(_ context.Context, query string, serverAliases []string) (string, error) {
 		capturedQuery = query
 		capturedAliases = serverAliases
-		return tools, nil
+		return `Found 1 tool(s) matching "weather":
+
+declare namespace tools.weather {
+  function get_weather(args: { city: string; }): Promise<any>;
+}`, nil
 	}
 	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
 		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
@@ -1150,9 +1150,9 @@ func TestVoidLLM_SearchTools_WithServerFilter(t *testing.T) {
 	var capturedAliases []string
 
 	deps := defaultDeps()
-	deps.SearchMCPTools = func(_ context.Context, _ string, serverAliases []string) ([]map[string]any, error) {
+	deps.SearchMCPTools = func(_ context.Context, _ string, serverAliases []string) (string, error) {
 		capturedAliases = serverAliases
-		return []map[string]any{}, nil
+		return "", nil
 	}
 	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
 		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
@@ -1173,8 +1173,8 @@ func TestVoidLLM_SearchTools_MissingQuery(t *testing.T) {
 	t.Parallel()
 
 	deps := defaultDeps()
-	deps.SearchMCPTools = func(_ context.Context, _ string, _ []string) ([]map[string]any, error) {
-		return nil, nil
+	deps.SearchMCPTools = func(_ context.Context, _ string, _ []string) (string, error) {
+		return "", nil
 	}
 	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
 		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
@@ -1195,8 +1195,8 @@ func TestVoidLLM_SearchTools_DepError(t *testing.T) {
 	t.Parallel()
 
 	deps := defaultDeps()
-	deps.SearchMCPTools = func(_ context.Context, _ string, _ []string) ([]map[string]any, error) {
-		return nil, errors.New("search index unavailable")
+	deps.SearchMCPTools = func(_ context.Context, _ string, _ []string) (string, error) {
+		return "", errors.New("search index unavailable")
 	}
 	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
 		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
@@ -1230,6 +1230,53 @@ func TestVoidLLM_SearchTools_DepError(t *testing.T) {
 	}
 	if strings.Contains(tr.Content[0].Text, "search index") {
 		t.Errorf("raw dep error must not be leaked: %q", tr.Content[0].Text)
+	}
+}
+
+func TestVoidLLM_SearchTools_SurfacesTypeScript(t *testing.T) {
+	t.Parallel()
+
+	const tsBlock = `Found 1 tool(s) matching "infer":
+
+declare namespace tools.my_server {
+  function get_result(args: { id: number; }): Promise<{ id: number; name: string }>; // inferred - could depend on previous query
+}`
+
+	deps := defaultDeps()
+	deps.SearchMCPTools = func(_ context.Context, _ string, _ []string) (string, error) {
+		return tsBlock, nil
+	}
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
+	}
+
+	s := buildCodeModeServer(deps)
+	tr := callTool(t, s, context.Background(), "search_tools", map[string]any{
+		"query": "infer",
+	})
+
+	if tr.IsError {
+		t.Fatalf("unexpected error: %s", tr.Content[0].Text)
+	}
+	if len(tr.Content) == 0 {
+		t.Fatal("empty content")
+	}
+
+	text := tr.Content[0].Text
+
+	// The handler must pass the TypeScript string through verbatim.
+	if text != tsBlock {
+		t.Errorf("handler output differs from stub return:\ngot:  %q\nwant: %q", text, tsBlock)
+	}
+
+	// Output must not be JSON-encoded (no leading '[' or '{').
+	if strings.HasPrefix(text, "[") || strings.HasPrefix(text, "{") {
+		t.Errorf("output must not be JSON-encoded, got: %s", text)
+	}
+
+	// Inferred-types marker must be preserved.
+	if !strings.Contains(text, "// inferred - could depend on previous query") {
+		t.Errorf("inferred-types marker missing from handler output\ngot: %s", text)
 	}
 }
 
@@ -1390,8 +1437,8 @@ func TestRegisterVoidLLMTools_CodeModeToolsListed(t *testing.T) {
 	deps.ListAccessibleMCPServers = func(_ context.Context, _ bool) ([]map[string]any, error) {
 		return nil, nil
 	}
-	deps.SearchMCPTools = func(_ context.Context, _ string, _ []string) ([]map[string]any, error) {
-		return nil, nil
+	deps.SearchMCPTools = func(_ context.Context, _ string, _ []string) (string, error) {
+		return "", nil
 	}
 
 	s := buildCodeModeServer(deps)
@@ -1414,4 +1461,133 @@ func TestRegisterVoidLLMTools_CodeModeToolsListed(t *testing.T) {
 			t.Errorf("Code Mode tool %q not found in tools/list", want)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Code Mode description regression tests (L-013)
+// ---------------------------------------------------------------------------
+
+// assertContains fails the test if desc does not contain needle.
+func assertContains(t *testing.T, desc, needle string) {
+	t.Helper()
+	if !strings.Contains(desc, needle) {
+		t.Errorf("description missing %q, got:\n%s", needle, desc)
+	}
+}
+
+// assertNotContains fails the test if desc contains needle.
+func assertNotContains(t *testing.T, desc, needle string) {
+	t.Helper()
+	if strings.Contains(desc, needle) {
+		t.Errorf("description should not contain %q, got:\n%s", needle, desc)
+	}
+}
+
+// findTool returns the Tool with the given name from tools, or the zero value
+// if not found.
+func findTool(tools []mcp.Tool, name string) (mcp.Tool, bool) {
+	for _, t := range tools {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return mcp.Tool{}, false
+}
+
+// TestCodeModeToolDescriptions_Static locks in the STRONG PREFERENCE, WORKFLOW,
+// PATTERNS, NOTE, and cross-reference language in each Code Mode tool description.
+// Any future refactor that strips this guidance must fail this test.
+func TestCodeModeToolDescriptions_Static(t *testing.T) {
+	t.Parallel()
+
+	// Use CodeModeDescription() directly for the execute_code body — it is the
+	// authoritative source and what RegisterCodeModeTools wires in.
+	execDesc := mcp.CodeModeDescription()
+
+	// Also verify the descriptions come through the registered tool objects so
+	// the wiring is covered.
+	deps := defaultDeps()
+	deps.ExecuteCode = func(_ context.Context, _ string, _ []string) (*mcp.ExecuteResult, error) {
+		return &mcp.ExecuteResult{Result: json.RawMessage(`"ok"`)}, nil
+	}
+	deps.ListAccessibleMCPServers = func(_ context.Context, _ bool) ([]map[string]any, error) {
+		return nil, nil
+	}
+	deps.SearchMCPTools = func(_ context.Context, _ string, _ []string) (string, error) {
+		return "", nil
+	}
+	s := buildCodeModeServer(deps)
+	registeredTools := s.Tools()
+
+	t.Run("execute_code_static_description", func(t *testing.T) {
+		t.Parallel()
+
+		// --- required substrings ---
+		assertContains(t, execDesc, "STRONG PREFERENCE")
+		assertContains(t, execDesc, "Promise.allSettled")
+		assertContains(t, execDesc, "search_tools()")
+		assertContains(t, execDesc, "try {")
+		assertContains(t, execDesc, "Promise<any>")
+
+		// --- forbidden substrings (VoidMCP artefacts must be scrubbed) ---
+		assertNotContains(t, execDesc, "add_mcp")
+		assertNotContains(t, execDesc, "remove_mcp")
+		assertNotContains(t, execDesc, "list_mcps")
+		assertNotContains(t, execDesc, "via CLI")
+	})
+
+	t.Run("execute_code_registered_description_matches", func(t *testing.T) {
+		t.Parallel()
+
+		tool, ok := findTool(registeredTools, "execute_code")
+		if !ok {
+			t.Fatal("execute_code not found in registered tools")
+		}
+		// The registered description is the static constant — it must start with
+		// the same text that CodeModeDescription() returns (the hook may later
+		// append more, but at registration time they must be identical).
+		if tool.Description != execDesc {
+			t.Errorf("registered execute_code description does not match CodeModeDescription();\ngot:  %q\nwant: %q",
+				tool.Description, execDesc)
+		}
+	})
+
+	t.Run("search_tools_description", func(t *testing.T) {
+		t.Parallel()
+
+		tool, ok := findTool(registeredTools, "search_tools")
+		if !ok {
+			t.Fatal("search_tools not found in registered tools")
+		}
+		desc := tool.Description
+
+		// --- required substrings ---
+		assertContains(t, desc, "execute_code")
+		assertContains(t, desc, "chain them")
+		assertContains(t, desc, "ask an admin")
+
+		// --- forbidden substrings ---
+		assertNotContains(t, desc, "add_mcp")
+		assertNotContains(t, desc, "via CLI")
+	})
+
+	t.Run("list_servers_description", func(t *testing.T) {
+		t.Parallel()
+
+		tool, ok := findTool(registeredTools, "list_servers")
+		if !ok {
+			t.Fatal("list_servers not found in registered tools")
+		}
+		desc := tool.Description
+
+		// list_servers must cross-reference search_tools.
+		assertContains(t, desc, "search_tools")
+
+		// Lock in that it stays minimal — a bloated description is a regression.
+		const maxLen = 300
+		if len(desc) >= maxLen {
+			t.Errorf("list_servers description is %d chars (>= %d); it should stay minimal:\n%s",
+				len(desc), maxLen, desc)
+		}
+	})
 }

@@ -3,6 +3,8 @@ package mcp
 import (
 	"sort"
 	"strings"
+
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
 // GenerateToolTypeDefs produces TypeScript-style namespace declarations for all
@@ -17,8 +19,14 @@ import (
 //	  function search_documentation(args: { query: string; limit?: number }): Promise<any>;
 //	}
 //
+// outputSchemas maps server alias → tool name → inferred output schema
+// (as returned by InferSchema). When a schema is present for a tool, the
+// return type is emitted as a concrete TypeScript type instead of Promise<any>.
+// A nil outputSchemas map is valid and produces the same output as before —
+// all tool signatures emit Promise<any>.
+//
 // If serverTools is empty, GenerateToolTypeDefs returns an empty string.
-func GenerateToolTypeDefs(serverTools map[string][]Tool) string {
+func GenerateToolTypeDefs(serverTools map[string][]Tool, outputSchemas map[string]map[string]jsonx.RawMessage) string {
 	if len(serverTools) == 0 {
 		return ""
 	}
@@ -69,8 +77,13 @@ func GenerateToolTypeDefs(serverTools map[string][]Tool) string {
 			return sorted[a].Name < sorted[b].Name
 		})
 
+		aliasSchemas := outputSchemas[alias] // nil when outputSchemas is nil or alias absent
 		for _, tool := range sorted {
-			writeToolDecl(&sb, tool)
+			var outSchema jsonx.RawMessage
+			if aliasSchemas != nil {
+				outSchema = aliasSchemas[tool.Name]
+			}
+			writeToolDecl(&sb, tool, outSchema)
 		}
 
 		sb.WriteString("}")
@@ -79,7 +92,10 @@ func GenerateToolTypeDefs(serverTools map[string][]Tool) string {
 }
 
 // writeToolDecl writes a single TypeScript function declaration into sb.
-func writeToolDecl(sb *strings.Builder, tool Tool) {
+// outSchema is the inferred output schema for the tool; when non-nil the
+// return type is a concrete TypeScript type with a comment noting it is
+// inferred. When nil, Promise<any> is emitted.
+func writeToolDecl(sb *strings.Builder, tool Tool, outSchema jsonx.RawMessage) {
 	// Skip tools whose names are not valid identifiers — they could inject
 	// arbitrary content into the TypeScript declaration block.
 	if !isValidJSIdentifier(tool.Name) {
@@ -133,7 +149,13 @@ func writeToolDecl(sb *strings.Builder, tool Tool) {
 		sb.WriteString("  ")
 	}
 
-	sb.WriteString("}): Promise<any>;\n")
+	if outSchema != nil {
+		sb.WriteString("}): Promise<")
+		sb.WriteString(schemaToTypeScript(outSchema))
+		sb.WriteString(">; // inferred - could depend on previous query\n")
+	} else {
+		sb.WriteString("}): Promise<any>;\n")
+	}
 }
 
 // isValidJSIdentifier reports whether s is a valid bare JavaScript identifier
