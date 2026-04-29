@@ -1515,6 +1515,75 @@ func TestLoad_FallbackToDefaultsPicksUpAdminKey(t *testing.T) {
 	}
 }
 
+// ---- setDefaults — SchemaTTL pointer semantics -----------------------------
+
+// ptrDuration returns a pointer to a time.Duration value. Used to set
+// CodeModeConfig.SchemaTTL explicitly in tests.
+func ptrDuration(d time.Duration) *time.Duration { return &d }
+
+// minimalValidYAMLWithCodeMode returns a valid config YAML with code_mode
+// enabled. Individual tests set or omit schema_ttl as needed.
+func minimalValidYAMLWithCodeMode(codeModeBlock string) string {
+	return `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+  mcp:
+    code_mode:
+      enabled: true
+` + codeModeBlock
+}
+
+// TestSetDefaults_SchemaTTL_NilDefaultsTo168h verifies that when CodeMode is
+// enabled but schema_ttl is absent from YAML (nil pointer), setDefaults fills
+// it in as 168h (7 days).
+func TestSetDefaults_SchemaTTL_NilDefaultsTo168h(t *testing.T) {
+	t.Parallel()
+
+	// No schema_ttl key at all — SchemaTTL pointer stays nil after unmarshal.
+	path := writeTemp(t, "voidllm.yaml", minimalValidYAMLWithCodeMode(""))
+	cfg, _, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+
+	if cfg.Settings.MCP.CodeMode.SchemaTTL == nil {
+		t.Fatal("SchemaTTL is nil after setDefaults, want 168h")
+	}
+	if got := *cfg.Settings.MCP.CodeMode.SchemaTTL; got != 168*time.Hour {
+		t.Errorf("*SchemaTTL = %v, want %v", got, 168*time.Hour)
+	}
+}
+
+// TestSetDefaults_SchemaTTL_ExplicitZeroIsPreserved verifies that when
+// schema_ttl is explicitly set to 0s in YAML the value is preserved as 0 after
+// setDefaults — it must NOT be overwritten to the 168h default. This locks in
+// the fix that distinguishes "absent" (nil → default) from "explicitly zero"
+// (non-nil zero → keep as-is).
+func TestSetDefaults_SchemaTTL_ExplicitZeroIsPreserved(t *testing.T) {
+	t.Parallel()
+
+	path := writeTemp(t, "voidllm.yaml", minimalValidYAMLWithCodeMode("      schema_ttl: 0s\n"))
+	cfg, _, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+
+	if cfg.Settings.MCP.CodeMode.SchemaTTL == nil {
+		t.Fatal("SchemaTTL is nil after setDefaults, want explicit 0")
+	}
+	if got := *cfg.Settings.MCP.CodeMode.SchemaTTL; got != 0 {
+		t.Errorf("*SchemaTTL = %v, want 0 (explicit zero must not be overwritten to 168h)", got)
+	}
+}
+
 // ---- Load — full integration -----------------------------------------------
 
 func TestLoad_FullConfig(t *testing.T) {
