@@ -58,6 +58,11 @@ type ExecuteParams struct {
 	// this execute_code invocation. It is threaded through to every tool call
 	// log so that all tool calls from one execution can be grouped together.
 	ExecutionID string
+	// OnToolResult is an optional hook called after each successful tool call
+	// with the unwrapped result. It is invoked in a separate goroutine and must
+	// not block. serverAlias and toolName identify the tool; result is the
+	// unwrapped JSON payload.
+	OnToolResult func(serverAlias, toolName string, result jsonx.RawMessage)
 }
 
 // ExecuteResult holds the output of a Code Mode script execution.
@@ -224,7 +229,14 @@ func (e *Executor) Execute(ctx context.Context, params ExecuteParams) (res *Exec
 			this.Promise().Reject(qctx.ThrowError(callErr))
 			return
 		}
-		this.Promise().Resolve(qctx.ParseJSON(string(callResult)))
+		unwrapped := unwrapToolResult(callResult)
+		const maxCaptureSize = 1 << 20 // 1 MB — skip inference for huge responses to bound memory.
+		if params.OnToolResult != nil && len(unwrapped) <= maxCaptureSize {
+			captured := make(jsonx.RawMessage, len(unwrapped))
+			copy(captured, unwrapped)
+			go params.OnToolResult(entry.alias, entry.tool, captured)
+		}
+		this.Promise().Resolve(qctx.ParseJSON(string(unwrapped)))
 	})
 
 	preamble := buildProxyPreamble(params.ServerTools)

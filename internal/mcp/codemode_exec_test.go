@@ -992,6 +992,44 @@ func TestExecute_ToolCallsNonNil(t *testing.T) {
 	}
 }
 
+// ---- ToolResult unwrapping ---------------------------------------------------
+
+// TestExecute_ToolResultUnwrapped verifies that a ToolResult wrapper returned
+// by a mock tool caller is transparently unwrapped before the script sees it.
+// The script accesses r.key directly rather than r.content[0].text.
+func TestExecute_ToolResultUnwrapped(t *testing.T) {
+	t.Parallel()
+
+	exec := newTestExecutor(t)
+
+	caller := mockToolCaller(map[string]json.RawMessage{
+		"srv/tool": json.RawMessage(`{"content":[{"type":"text","text":"{\"key\":\"value\"}"}]}`),
+	})
+
+	res, err := exec.Execute(context.Background(), mcp.ExecuteParams{
+		Code: `
+			async function main() {
+				const r = await tools.srv.tool({});
+				return JSON.stringify(r.key);
+			}
+			await main();
+		`,
+		ServerTools: map[string][]mcp.Tool{
+			"srv": {{Name: "tool"}},
+		},
+		CallTool: caller,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if res.Error != "" {
+		t.Fatalf("Execute() result.Error = %q", res.Error)
+	}
+	if string(res.Result) != `"value"` {
+		t.Errorf("Result = %s, want %q (unwrapped inner field)", res.Result, `"value"`)
+	}
+}
+
 // ---- Benchmark ---------------------------------------------------------------
 
 func BenchmarkExecute_NoTools(b *testing.B) {
