@@ -6,11 +6,14 @@ package app
 // an in-process mcp.Executor / mcp.ToolCache — no real database, no real HTTP.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,6 +42,8 @@ type mockCodeModeDB struct {
 	blockedTools map[string][]string
 	// listErr is returned by all List* methods when non-nil.
 	listErr error
+	// saveErr is returned by SaveOutputSchema when non-nil.
+	saveErr error
 	// outputSchemasByServerID maps serverID → (toolName → schema JSON) for
 	// GetAllOutputSchemas. When nil the method returns nil, nil (no schemas).
 	outputSchemasByServerID map[string]map[string]jsonx.RawMessage
@@ -80,7 +85,7 @@ func (m *mockCodeModeDB) ListBlockedToolNames(_ context.Context, serverID string
 }
 
 func (m *mockCodeModeDB) SaveOutputSchema(_ context.Context, _, _ string, _ jsonx.RawMessage) error {
-	return nil
+	return m.saveErr
 }
 
 func (m *mockCodeModeDB) GetAllOutputSchemas(_ context.Context, serverID string, _ time.Duration) (map[string]jsonx.RawMessage, error) {
@@ -1677,4 +1682,186 @@ func TestToolsListHook_InjectsCodeModePreference(t *testing.T) {
 	if strings.Contains(desc, droppedSentence) {
 		t.Errorf("execute_code description contains dropped sentence %q — was it re-added by mistake?", droppedSentence)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// SaveOutputSchema error logging test
+// ---------------------------------------------------------------------------
+
+// TestExecuteCode_SaveOutputSchemaError_Logged verifies that when SaveOutputSchema
+// returns an error the codeModeService logs a WARN-level message containing the
+// expected message text and the underlying error string. The OnToolResult hook
+// runs in a goroutine after ExecuteCode returns, so the test polls for the log
+// entry with a short deadline.
+func TestExecuteCode_SaveOutputSchemaError_Logged(t *testing.T) {
+	t.Parallel()
+
+	const orgID = "org-save-err"
+	sv := db.MCPServer{
+		ID:              "sv-save-err",
+		Alias:           "save-err-srv",
+		Name:            "Save Err Server",
+		OrgID:           ptrStr(orgID),
+		CodeModeEnabled: true,
+	}
+
+	// SaveOutputSchema will return this error.
+	saveError := errors.New("disk full")
+
+	mock := &mockCodeModeDB{
+		orgServers: map[string][]db.MCPServer{orgID: {sv}},
+		saveErr:    saveError,
+		// IsOutputSchemaStale returns true (default in the mock), so the
+		// OnToolResult hook will proceed past the stale check and attempt to save.
+	}
+
+	tools := []mcp.Tool{
+		{
+			Name:        "my_tool",
+			Description: "A tool with valid JSON output",
+			InputSchema: mcp.InputSchema{Type: "object"},
+		},
+	}
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{sv.ID: tools})
+	executor := newTestExecutor(t)
+
+	// Caller returns valid JSON so InferSchema produces a non-nil schema, which
+	// triggers the SaveOutputSchema path inside OnToolResult.
+	caller := func(_ context.Context, _ *auth.KeyInfo, _, _ string, _ json.RawMessage, _ bool, _ string) (json.RawMessage, error) {
+		return json.RawMessage(`{"result":"ok","count":1}`), nil
+	}
+
+	serverCache := &staticServerCache{
+		byID: map[string]*db.MCPServer{sv.ID: &sv},
+	}
+
+	// Wire a real JSON handler that captures log output to a buffer.
+	var buf syncBuffer
+	testLogger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+
+	svc := &codeModeService{
+		executor:     executor,
+		toolCache:    tc,
+		callMCPTool:  caller,
+		db:           mock,
+		log:          testLogger,
+		maxToolCalls: 10,
+		schemaTTL:    time.Hour,
+		serverCache:  serverCache,
+	}
+
+	ctx := ctxWithIdentity(mcp.KeyIdentity{OrgID: orgID, KeyID: "key-save-err", Role: "member"})
+	result, err := svc.ExecuteCode(ctx, `
+		async function run() {
+			const r = await tools["save-err-srv"].my_tool({});
+			return JSON.stringify(r);
+		}
+		await run();
+	`, nil)
+	if err != nil {
+		t.Fatalf("ExecuteCode() unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Fatalf("ExecuteCode() result.Error = %q, want empty", result.Error)
+	}
+
+	// The OnToolResult goroutine is fire-and-forget. Poll for the log line with
+	// a short deadline — 500 ms is generous for an in-process write.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		logged := buf.String()
+		if strings.Contains(logged, "schema inference: save failed") &&
+			strings.Contains(logged, "disk full") {
+			return // success
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Errorf("log did not contain expected WARN message within deadline\ngot: %s", buf.String())
+}
+
+// ---------------------------------------------------------------------------
+// SearchMCPTools: totalAvailable exceeds limit
+// ---------------------------------------------------------------------------
+
+// TestSearchMCPTools_TotalAvailableExceedsLimit verifies that when more than
+// searchToolsLimit tools match a query the result contains both the cap notice
+// "(showing N of M tools)" and that the cap reflects the actual counts. The
+// test seeds 60 matching tools so both the 50-tool cap and the truncation
+// notice are exercised.
+func TestSearchMCPTools_TotalAvailableExceedsLimit(t *testing.T) {
+	t.Parallel()
+
+	const orgID = "org-overlimit"
+	sv := db.MCPServer{
+		ID:              "sv-overlimit",
+		Alias:           "overlimit-srv",
+		Name:            "Over Limit Server",
+		OrgID:           ptrStr(orgID),
+		CodeModeEnabled: true,
+	}
+	mock := &mockCodeModeDB{
+		orgServers: map[string][]db.MCPServer{orgID: {sv}},
+	}
+
+	// Seed 60 tools whose names all contain the substring "match".
+	const totalTools = 60
+	toolList := make([]mcp.Tool, totalTools)
+	for i := range totalTools {
+		toolList[i] = mcp.Tool{
+			Name:        fmt.Sprintf("match_%02d", i),
+			Description: "matches the query",
+		}
+	}
+	tc := newPreloadedCache(t, map[string][]mcp.Tool{sv.ID: toolList})
+
+	svc := &codeModeService{
+		db:        mock,
+		toolCache: tc,
+		log:       newDiscardLogger(),
+	}
+
+	ctx := ctxWithIdentity(mcp.KeyIdentity{OrgID: orgID, KeyID: "key-ol", Role: "member"})
+	result, err := svc.SearchMCPTools(ctx, "match", nil)
+	if err != nil {
+		t.Fatalf("SearchMCPTools() error = %v", err)
+	}
+
+	// The cap notice must appear because totalAvailable (60) > matchCount (50).
+	wantNotice := fmt.Sprintf("(showing %d of %d tools)", searchToolsLimit, totalTools)
+	if !strings.Contains(result, wantNotice) {
+		t.Errorf("result missing truncation notice %q\ngot: %s", wantNotice, result)
+	}
+
+	// The header line must reflect the capped count (50), not the total (60).
+	wantHeader := fmt.Sprintf("Found %d tool(s) matching", searchToolsLimit)
+	if !strings.Contains(result, wantHeader) {
+		t.Errorf("result missing header %q\ngot: %s", wantHeader, result)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+// syncBuffer is a bytes.Buffer wrapper that is safe for concurrent use.
+// It is used in tests where a goroutine writes log output via slog while
+// the test goroutine reads back the accumulated content.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (sb *syncBuffer) Write(p []byte) (int, error) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return sb.buf.Write(p)
+}
+
+func (sb *syncBuffer) String() string {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return sb.buf.String()
 }

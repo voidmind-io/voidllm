@@ -19,6 +19,12 @@ const (
 	// for a single object property. Values that exceed this are replaced with
 	// "any" to prevent description bloat from crafted deeply-nested schemas.
 	maxPropTypeLen = 500
+	// maxTSRenderDepth caps recursion in schemaTypeToTS as defense-in-depth against
+	// malformed schemas read from the output_schemas table. InferSchema already
+	// caps inputs at maxSchemaDepth=3, but rendering reads from DB rows which could
+	// in principle be malformed. 10 is conservative — a 10-deep nested type
+	// already exceeds maxPropTypeLen and gets collapsed to "any" upstream.
+	maxTSRenderDepth = 10
 )
 
 // InferSchema walks a JSON value and produces a JSON-Schema-like map.
@@ -116,6 +122,13 @@ func schemaToTypeScript(schema jsonx.RawMessage) string {
 // Property type strings longer than maxPropTypeLen characters are rendered as
 // "any" to prevent description bloat from pathologically wide schemas.
 func schemaTypeToTS(s map[string]any) string {
+	return schemaTypeToTSInner(s, 0)
+}
+
+func schemaTypeToTSInner(s map[string]any, depth int) string {
+	if depth > maxTSRenderDepth {
+		return "any"
+	}
 	typ, _ := s["type"].(string)
 	switch typ {
 	case "string":
@@ -129,7 +142,7 @@ func schemaTypeToTS(s map[string]any) string {
 		if !ok {
 			return "any[]"
 		}
-		return "Array<" + schemaTypeToTS(items) + ">"
+		return "Array<" + schemaTypeToTSInner(items, depth+1) + ">"
 	case "object":
 		props, ok := s["properties"].(map[string]any)
 		if !ok || len(props) == 0 {
@@ -159,7 +172,7 @@ func schemaTypeToTS(s map[string]any) string {
 				sb.WriteString(k + ": any")
 				continue
 			}
-			propType := schemaTypeToTS(propSchema)
+			propType := schemaTypeToTSInner(propSchema, depth+1)
 			if len(propType) > maxPropTypeLen {
 				propType = "any"
 			}

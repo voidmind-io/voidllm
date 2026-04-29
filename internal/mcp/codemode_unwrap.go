@@ -5,6 +5,9 @@ import "github.com/voidmind-io/voidllm/internal/jsonx"
 // unwrapToolResult strips the MCP ToolResult wrapper when the response matches
 // the expected shape. Returns raw unchanged when the response does not match
 // the ToolResult wrapper shape, providing a defensive fallback for arbitrary payloads.
+// Note: isError=true responses are also unwrapped — Code Mode scripts handle
+// errors via JS try/catch on the call's promise rejection rather than via the
+// wrapper's error flag.
 func unwrapToolResult(raw jsonx.RawMessage) jsonx.RawMessage {
 	// Phase 1: inspect top-level keys to confirm the MCP ToolResult shape.
 	var topLevel map[string]jsonx.RawMessage

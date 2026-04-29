@@ -1,6 +1,7 @@
 package mcp_test
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -191,16 +192,23 @@ func TestInferSchema(t *testing.T) {
 	}
 }
 
-// buildDeepArraySchema returns a JSON schema for an array nested n levels deep,
-// with "string" at the innermost items. At n=71 the rendered TypeScript type
-// "Array<Array<...<string>...>>" is 503 characters, exceeding maxPropTypeLen=500.
-func buildDeepArraySchema(n int) jsonx.RawMessage {
-	// Build from the inside out: start with {"type":"string"}, then wrap n times.
-	inner := `{"type":"string"}`
-	for range n {
-		inner = `{"type":"array","items":` + inner + `}`
+// buildWideObjectSchema returns a JSON schema for an object with n string
+// properties named "p01", "p02", ..., "pNN". The rendered TypeScript type is
+// approximately 13*n characters (each "pNN: string; " is 13 chars). At n=40
+// the result is ~522 chars, exceeding maxPropTypeLen=500.
+// Unlike deeply-nested schemas this stays at a single level of nesting, so
+// it exercises maxPropTypeLen independently of maxTSRenderDepth.
+func buildWideObjectSchema(n int) jsonx.RawMessage {
+	var sb strings.Builder
+	sb.WriteString(`{"type":"object","properties":{`)
+	for i := range n {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(fmt.Sprintf(`"p%02d":{"type":"string"}`, i+1))
 	}
-	return jsonx.RawMessage(inner)
+	sb.WriteString("}}")
+	return jsonx.RawMessage(sb.String())
 }
 
 // TestSchemaToTypeScript verifies the TypeScript type-string generation for a
@@ -210,10 +218,13 @@ func TestSchemaToTypeScript(t *testing.T) {
 
 	// oversizedPropSchema builds an object schema whose single valid property
 	// renders to a TypeScript type longer than maxPropTypeLen (500) characters.
-	// At 71 nesting levels: len("Array<")*71 + len("string") + 71 = 6*71+6+71 = 503 > 500.
+	// The inner schema is a wide object with 40 string properties. Each property
+	// renders as "pNN: string; " (~13 chars), so 40 properties ≈ 522 chars > 500.
+	// This stays within 2 nesting levels so it fires maxPropTypeLen before
+	// maxTSRenderDepth, exercising the length cap independently of the depth guard.
 	oversizedPropSchema := func() jsonx.RawMessage {
-		itemsSchema := buildDeepArraySchema(71)
-		return jsonx.RawMessage(`{"type":"object","properties":{"bigprop":` + string(itemsSchema) + `}}`)
+		innerSchema := buildWideObjectSchema(40)
+		return jsonx.RawMessage(`{"type":"object","properties":{"bigprop":` + string(innerSchema) + `}}`)
 	}()
 
 	tests := []struct {
@@ -372,6 +383,54 @@ func TestInferSchema_RejectsPathologicalDepth(t *testing.T) {
 			t.Error("InferSchema(depth=60): expected non-nil result (guard should not fire), got nil")
 		}
 	})
+}
+
+// TestSchemaTypeToTS_DeepNestingCappedAtAny verifies that the maxTSRenderDepth
+// guard in schemaTypeToTSInner fires on a 12-deep nested object schema and
+// returns "any" somewhere in the rendered string, rather than recursing
+// unboundedly.
+//
+// The schema is constructed directly as a map (not via InferSchema, which caps
+// at maxSchemaDepth=3) so we can reach the TS rendering guard at depth 10+.
+func TestSchemaTypeToTS_DeepNestingCappedAtAny(t *testing.T) {
+	t.Parallel()
+
+	// deeplyNestedSchema builds a JSON schema for a nested object chain of the
+	// given depth. At depth 0 the leaf is {"type":"string"}. At depth n the
+	// result is {"type":"object","properties":{"x": deeplyNestedSchema(n-1)}}.
+	var deeplyNestedSchema func(depth int) map[string]any
+	deeplyNestedSchema = func(depth int) map[string]any {
+		if depth == 0 {
+			return map[string]any{"type": "string"}
+		}
+		return map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"x": deeplyNestedSchema(depth - 1),
+			},
+		}
+	}
+
+	// Build a 12-deep schema and marshal it to JSON for SchemaToTypeScript.
+	schema := deeplyNestedSchema(12)
+	raw, err := jsonx.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshal deep schema: %v", err)
+	}
+
+	result := mcp.SchemaToTypeScript(jsonx.RawMessage(raw))
+
+	// The depth guard must have fired — "any" must appear in the output.
+	if !strings.Contains(result, "any") {
+		t.Errorf("depth guard did not fire: result contains no \"any\"\ngot: %s", result)
+	}
+
+	// The recursion must have been capped — a 12-deep chain of "x:" keys is not
+	// present in the output.
+	xCount := strings.Count(result, "x:")
+	if xCount >= 12 {
+		t.Errorf("recursion was not capped: result contains %d occurrences of \"x:\", want < 12\ngot: %s", xCount, result)
+	}
 }
 
 // TestInferSchema_DepthScanIgnoresStringContents documents a known, deliberate

@@ -756,7 +756,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		db:           database,
 		log:          log,
 		maxToolCalls: cfg.Settings.MCP.CodeMode.MaxToolCalls,
-		schemaTTL:    cfg.Settings.MCP.CodeMode.SchemaTTL,
+		schemaTTL:    *cfg.Settings.MCP.CodeMode.SchemaTTL,
 		serverCache:  mcpServerCache,
 		codePool:     adminHandler.CodePool,
 	}

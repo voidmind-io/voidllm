@@ -250,7 +250,12 @@ func (s *codeModeService) ExecuteCode(ctx context.Context, code string, serverAl
 			if schema == nil {
 				return
 			}
-			_ = s.db.SaveOutputSchema(hctx, serverID, toolName, schema)
+			if saveErr := s.db.SaveOutputSchema(hctx, serverID, toolName, schema); saveErr != nil {
+				s.log.LogAttrs(hctx, slog.LevelWarn, "schema inference: save failed",
+					slog.String("server_id", serverID),
+					slog.String("tool", toolName),
+					slog.String("error", saveErr.Error()))
+			}
 		},
 	})
 	duration := time.Since(start)
@@ -344,12 +349,8 @@ func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serv
 	matchedServerIDs := make(map[string]struct{})
 	matchCount := 0
 	totalAvailable := 0
-	capped := false
 
 	for _, sv := range servers {
-		if capped {
-			break
-		}
 		if len(wantSet) > 0 && !wantSet[sv.Alias] {
 			continue
 		}
@@ -380,13 +381,11 @@ func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serv
 				continue
 			}
 			totalAvailable++
-			if matchCount >= searchToolsLimit {
-				capped = true
-				break
+			if matchCount < searchToolsLimit {
+				matched[sv.Alias] = append(matched[sv.Alias], t)
+				matchedServerIDs[sv.ID] = struct{}{}
+				matchCount++
 			}
-			matched[sv.Alias] = append(matched[sv.Alias], t)
-			matchedServerIDs[sv.ID] = struct{}{}
-			matchCount++
 		}
 	}
 
@@ -420,7 +419,7 @@ func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serv
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Found %d tool(s) matching %q:\n\n", matchCount, query)
 	sb.WriteString(types)
-	if query == "*" && matchCount < totalAvailable {
+	if totalAvailable > matchCount {
 		fmt.Fprintf(&sb, "\n(showing %d of %d tools)\n", matchCount, totalAvailable)
 	}
 	return sb.String(), nil

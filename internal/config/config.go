@@ -361,9 +361,11 @@ type CodeModeConfig struct {
 	// unbounded upstream calls. Default: 50. Valid range: [1, 1000].
 	MaxToolCalls int `yaml:"max_tool_calls"`
 	// SchemaTTL is the maximum age of an inferred output schema before it is
-	// re-inferred on the next tool call. Zero means never re-infer after the
-	// first successful inference. Defaults to 168h (7 days) if unset.
-	SchemaTTL time.Duration `yaml:"schema_ttl"`
+	// re-inferred on the next tool call. Defaults to 168h (7 days) when unset.
+	// Set explicitly to 0 to disable re-inference after the first successful
+	// inference. Pointer type lets the YAML parser distinguish "absent"
+	// (apply default) from "explicitly zero" (never re-infer).
+	SchemaTTL *time.Duration `yaml:"schema_ttl"`
 }
 
 // IsEnabled returns true only when Code Mode has been explicitly enabled via
@@ -796,8 +798,9 @@ func (c *Config) setDefaults() {
 		if c.Settings.MCP.CodeMode.MaxToolCalls == 0 {
 			c.Settings.MCP.CodeMode.MaxToolCalls = 50
 		}
-		if c.Settings.MCP.CodeMode.SchemaTTL == 0 {
-			c.Settings.MCP.CodeMode.SchemaTTL = 168 * time.Hour
+		if c.Settings.MCP.CodeMode.SchemaTTL == nil {
+			d := 168 * time.Hour
+			c.Settings.MCP.CodeMode.SchemaTTL = &d
 		}
 	}
 
