@@ -2,6 +2,30 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.17] - 2026-04-30
+
+### Features
+- Code Mode response unwrapping — MCP ToolResult wrapper is stripped before results reach JS, so scripts work with plain values not protocol envelopes (#73)
+- Code Mode output schema inference — return types are learned from the first successful tool call and persisted, surfacing as TypeScript via `search_tools` (#73)
+- Code Mode tool descriptions rewritten with STRONG PREFERENCE / WORKFLOW / PATTERNS guidance to push LLMs toward chained calls and reduce sequential round-trips (#73)
+
+### Security
+- pgx 5.9.1 → 5.9.2 — SQL injection via dollar-quoted placeholder (low) (#75)
+- vite 7.3.1 → 7.3.2 — arbitrary file read via dev-server WebSocket (high), path traversal in optimized-deps `.map` (medium), `server.fs.deny` bypass with queries (high) (#53)
+- fiber 3.1.0 → 3.2.0 — cache middleware default key generator ignores query string (medium) (#77)
+- postcss 8.5.x → 8.5.12 — XSS via unescaped `</style>` (medium) (#78)
+
+### Dependencies
+- go-oidc 3.17.0 → 3.18.0 (#67)
+- fasthttp 1.69.0 → 1.70.0 (#70)
+- golang.org/x/crypto 0.49.0 → 0.50.0 (#71)
+- modernc.org/sqlite 1.48.0 → 1.50.0 (#76)
+- react-router-dom 7.13.2 → 7.14.2 (#68)
+- docker/build-push-action 7.0.0 → 7.1.0 (#66)
+- actions/setup-node 6.3.0 → 6.4.0 (#74)
+
+---
+
 ## [0.0.16] - 2026-04-12
 
 ### Features
