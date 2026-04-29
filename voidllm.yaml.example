@@ -123,6 +123,7 @@ models:
     aliases:
       - small
       - fast
+    # fallback: gpt-oss-120b  # Enterprise: retry on this model when gpt-oss-20b is unavailable
     max_context_tokens: 32000
     pricing:
       input_per_1m:  0.10
@@ -243,6 +244,14 @@ settings:
 
   # --- Enterprise Features (require license) ---
 
+  # Model fallback chains: retry a different model when the primary is unavailable.
+  # Requires a license with the fallback_chains feature; ignored otherwise.
+  # fallback_max_depth: 3
+  #   Maximum depth of the model fallback chain.
+  #   - 0 (default, if unset): fallback chains disabled globally
+  #   - 1-10: enables fallback chains, capped at this depth
+  #   Requires Enterprise license.
+
   # Audit logging
   # audit:
   #   enabled: true
@@ -262,6 +271,13 @@ settings:
   #   endpoint: "localhost:4317"
   #   insecure: false
   #   sample_rate: 1.0
+
+  # Data retention - periodic deletion of old usage and audit records.
+  # Disabled by default (zero duration = keep forever).
+  # retention:
+  #   usage_events: 90d   # delete usage_events rows older than 90 days
+  #   audit_logs: 365d    # delete audit_logs rows older than 1 year
+  #   interval: 24h       # how often the cleanup job runs (default: 24h)
 
   # SSO/OIDC authentication
   # sso:

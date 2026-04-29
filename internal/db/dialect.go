@@ -13,6 +13,15 @@ type Dialect interface {
 	// SupportsMigrationLock reports whether the dialect supports advisory locking
 	// during schema migrations. PostgreSQL supports pg_advisory_lock; SQLite does not.
 	SupportsMigrationLock() bool
+	// TimestampLessThan returns a SQL expression (without parameter binding) that
+	// compares the named TEXT-typed timestamp column to a parameter, handling
+	// format differences across drivers. The caller supplies the column name and
+	// placeholder string; the dialect wraps both sides in a driver-appropriate
+	// cast so string-level comparison is never used.
+	//
+	// Example (SQLite):   datetime(created_at) < datetime(?)
+	// Example (Postgres): created_at::timestamptz < ($1)::timestamptz
+	TimestampLessThan(column, placeholder string) string
 }
 
 // SQLiteDialect implements Dialect for SQLite.
@@ -30,6 +39,13 @@ func (SQLiteDialect) HourTrunc() string {
 // SupportsMigrationLock returns false because SQLite does not support advisory
 // locks. SQLite's single-writer model makes migration locking unnecessary.
 func (SQLiteDialect) SupportsMigrationLock() bool { return false }
+
+// TimestampLessThan wraps both sides in datetime() which parses TEXT into a
+// comparable form. datetime() accepts ISO-8601 with or without subseconds and
+// both the "2006-01-02 15:04:05" and "2006-01-02T15:04:05Z" variants.
+func (SQLiteDialect) TimestampLessThan(column, placeholder string) string {
+	return "datetime(" + column + ") < datetime(" + placeholder + ")"
+}
 
 // PostgresDialect implements Dialect for PostgreSQL.
 type PostgresDialect struct{}
@@ -49,3 +65,9 @@ func (PostgresDialect) HourTrunc() string {
 // via pg_advisory_lock, which prevents concurrent migration runs in multi-replica
 // deployments.
 func (PostgresDialect) SupportsMigrationLock() bool { return true }
+
+// TimestampLessThan casts both sides to timestamptz which parses any reasonable
+// ISO-8601 variant and compares as absolute instants.
+func (PostgresDialect) TimestampLessThan(column, placeholder string) string {
+	return column + "::timestamptz < (" + placeholder + ")::timestamptz"
+}

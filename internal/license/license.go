@@ -119,6 +119,7 @@ func (devLicense) Features() []string {
 		FeatureCustomRoles,
 		FeatureMultiOrg,
 		FeatureCostReports,
+		FeatureFallbackChains,
 	}
 }
 

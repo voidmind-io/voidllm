@@ -18,6 +18,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/config"
 	"github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
+	"github.com/voidmind-io/voidllm/internal/license"
 	"github.com/voidmind-io/voidllm/internal/provider"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 	voidredis "github.com/voidmind-io/voidllm/internal/redis"
@@ -53,6 +54,10 @@ type createModelRequest struct {
 	// MaxRetries is the maximum number of deployments to attempt before returning
 	// an error. 0 means try all available deployments.
 	MaxRetries int `json:"max_retries,omitempty"`
+	// FallbackModelName is the name of the model to try if all deployments of
+	// this model are unavailable. Requires an Enterprise license with the
+	// fallback_chains feature. Leave empty to disable fallback.
+	FallbackModelName string `json:"fallback_model_name,omitempty"`
 }
 
 // updateModelRequest is the JSON body accepted by UpdateModel.
@@ -83,6 +88,10 @@ type updateModelRequest struct {
 	Strategy *string `json:"strategy"`
 	// MaxRetries, when non-nil, replaces the maximum deployment retry count.
 	MaxRetries *int `json:"max_retries"`
+	// FallbackModelName, when non-nil, replaces the fallback model. Pass a
+	// pointer to an empty string to clear the fallback. Requires Enterprise
+	// license with the fallback_chains feature when setting a non-empty value.
+	FallbackModelName *string `json:"fallback_model_name"`
 }
 
 // modelResponse is the JSON representation of a model returned by the API.
@@ -115,6 +124,9 @@ type modelResponse struct {
 	// MaxRetries is the maximum number of deployments to attempt before
 	// returning an error. 0 means try all available deployments.
 	MaxRetries int `json:"max_retries,omitempty"`
+	// FallbackModelName is the name of the fallback model, or empty when none
+	// is configured.
+	FallbackModelName string `json:"fallback_model_name,omitempty"`
 	// Deployments contains the model's deployment entries when present.
 	Deployments []deploymentResponse `json:"deployments,omitempty"`
 	CreatedAt   string               `json:"created_at"`
@@ -150,7 +162,9 @@ var testClient = &http.Client{
 }
 
 // modelToResponse converts a db.Model to its API wire representation.
-func modelToResponse(m *db.Model) modelResponse {
+// fallbackName is the resolved canonical name of the fallback model; pass an
+// empty string when the model has no fallback or the caller has not resolved it.
+func modelToResponse(m *db.Model, fallbackName string) modelResponse {
 	aliases := []string{}
 	if m.Aliases != "" {
 		aliases = strings.Split(m.Aliases, ",")
@@ -160,32 +174,35 @@ func modelToResponse(m *db.Model) modelResponse {
 		modelType = "chat"
 	}
 	return modelResponse{
-		ID:               m.ID,
-		Name:             m.Name,
-		Provider:         m.Provider,
-		Type:             modelType,
-		BaseURL:          m.BaseURL,
-		MaxContextTokens: m.MaxContextTokens,
-		InputPricePer1M:  m.InputPricePer1M,
-		OutputPricePer1M: m.OutputPricePer1M,
-		AzureDeployment:  m.AzureDeployment,
-		AzureAPIVersion:  m.AzureAPIVersion,
-		GCPProject:       m.GCPProject,
-		GCPLocation:      m.GCPLocation,
-		IsActive:         m.IsActive,
-		Source:           m.Source,
-		Aliases:          aliases,
-		Timeout:          m.Timeout,
-		Strategy:         m.Strategy,
-		MaxRetries:       m.MaxRetries,
-		CreatedAt:        m.CreatedAt,
-		UpdatedAt:        m.UpdatedAt,
+		ID:                m.ID,
+		Name:              m.Name,
+		Provider:          m.Provider,
+		Type:              modelType,
+		BaseURL:           m.BaseURL,
+		MaxContextTokens:  m.MaxContextTokens,
+		InputPricePer1M:   m.InputPricePer1M,
+		OutputPricePer1M:  m.OutputPricePer1M,
+		AzureDeployment:   m.AzureDeployment,
+		AzureAPIVersion:   m.AzureAPIVersion,
+		GCPProject:        m.GCPProject,
+		GCPLocation:       m.GCPLocation,
+		IsActive:          m.IsActive,
+		Source:            m.Source,
+		Aliases:           aliases,
+		Timeout:           m.Timeout,
+		Strategy:          m.Strategy,
+		MaxRetries:        m.MaxRetries,
+		FallbackModelName: fallbackName,
+		CreatedAt:         m.CreatedAt,
+		UpdatedAt:         m.UpdatedAt,
 	}
 }
 
 // dbModelToProxy converts a db.Model to a proxy.Model for registry insertion.
 // apiKeyPlaintext is the decrypted API key; pass an empty string when no key is set.
-func dbModelToProxy(m *db.Model, apiKeyPlaintext string) proxy.Model {
+// fallbackName is the resolved canonical name of the fallback model; pass an empty
+// string when the model has no fallback or the license does not include the feature.
+func dbModelToProxy(m *db.Model, apiKeyPlaintext string, fallbackName string) proxy.Model {
 	var aliases []string
 	if m.Aliases != "" {
 		aliases = strings.Split(m.Aliases, ",")
@@ -201,22 +218,20 @@ func dbModelToProxy(m *db.Model, apiKeyPlaintext string) proxy.Model {
 		modelType = "chat"
 	}
 	return proxy.Model{
-		Name:             m.Name,
-		Provider:         m.Provider,
-		Type:             modelType,
-		BaseURL:          m.BaseURL,
-		APIKey:           apiKeyPlaintext,
-		Aliases:          aliases,
-		MaxContextTokens: m.MaxContextTokens,
-		Pricing: config.PricingConfig{
-			InputPer1M:  m.InputPricePer1M,
-			OutputPer1M: m.OutputPricePer1M,
-		},
-		AzureDeployment: m.AzureDeployment,
-		AzureAPIVersion: m.AzureAPIVersion,
-		GCPProject:      m.GCPProject,
-		GCPLocation:     m.GCPLocation,
-		Timeout:         timeout,
+		Name:              m.Name,
+		Provider:          m.Provider,
+		Type:              modelType,
+		BaseURL:           m.BaseURL,
+		APIKey:            apiKeyPlaintext,
+		Aliases:           aliases,
+		MaxContextTokens:  m.MaxContextTokens,
+		Pricing:           config.PricingConfig{InputPer1M: m.InputPricePer1M, OutputPer1M: m.OutputPricePer1M},
+		AzureDeployment:   m.AzureDeployment,
+		AzureAPIVersion:   m.AzureAPIVersion,
+		GCPProject:        m.GCPProject,
+		GCPLocation:       m.GCPLocation,
+		Timeout:           timeout,
+		FallbackModelName: fallbackName,
 	}
 }
 
@@ -280,6 +295,99 @@ func (h *Handler) decryptModelAPIKey(m *db.Model) (string, error) {
 		return "", err
 	}
 	return plaintext, nil
+}
+
+// fallbackCycleMaxSteps is the upper bound on chain length checked by
+// checkFallbackCycle. It is intentionally larger than FallbackMaxDepth (3)
+// to catch impossibly-deep chains that should not exist in the database.
+const fallbackCycleMaxSteps = 20
+
+// checkFallbackCycle walks the fallback chain starting from targetID and
+// returns an error if sourceID appears anywhere in the chain, which would
+// form a cycle. It also detects self-references (targetID == sourceID).
+// maxSteps bounds the walk to avoid infinite loops on corrupt chain data.
+// Transient DB errors are bubbled up so callers can return 500 instead of
+// incorrectly reporting "no cycle" or "cycle" on a failed lookup.
+func (h *Handler) checkFallbackCycle(ctx context.Context, sourceID, targetID string) error {
+	if sourceID == targetID {
+		return fmt.Errorf("self-reference")
+	}
+	current := targetID
+	for step := 0; step < fallbackCycleMaxSteps; step++ {
+		m, err := h.DB.GetModel(ctx, current)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return nil // chain ends safely, no cycle
+			}
+			return fmt.Errorf("walk fallback chain: %w", err) // bubble up transient errors
+		}
+		if m.FallbackModelID == nil || *m.FallbackModelID == "" {
+			return nil
+		}
+		next := *m.FallbackModelID
+		if next == sourceID {
+			return fmt.Errorf("cycle")
+		}
+		current = next
+	}
+	return nil
+}
+
+// resolveFallbackName looks up the canonical name for the model with the given
+// ID. It returns an empty string when id is nil or empty, and an empty string
+// (without error) when the model has been soft-deleted — the caller gets a
+// graceful degradation rather than a hard failure.
+func (h *Handler) resolveFallbackName(ctx context.Context, fallbackModelID *string) string {
+	if fallbackModelID == nil || *fallbackModelID == "" {
+		return ""
+	}
+	m, err := h.DB.GetModel(ctx, *fallbackModelID)
+	if err != nil {
+		return ""
+	}
+	return m.Name
+}
+
+// buildFallbackIDNameMap builds an id→name lookup table from a slice of models.
+// It is used on list endpoints to resolve FallbackModelID without an N+1 query.
+func buildFallbackIDNameMap(models []db.Model) map[string]string {
+	m := make(map[string]string, len(models))
+	for i := range models {
+		m[models[i].ID] = models[i].Name
+	}
+	return m
+}
+
+// resolveMissingFallbackNames ensures every FallbackModelID referenced by the
+// current page of models is present in idToName. IDs that point to models on a
+// different page (or soft-deleted models) are resolved via individual GetModel
+// calls. Typically 0–5 extra queries per page.
+func (h *Handler) resolveMissingFallbackNames(ctx context.Context, models []db.Model, idToName map[string]string) error {
+	missing := []string{}
+	for _, m := range models {
+		if m.FallbackModelID != nil && *m.FallbackModelID != "" {
+			if _, ok := idToName[*m.FallbackModelID]; !ok {
+				missing = append(missing, *m.FallbackModelID)
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	// Look up each missing ID individually via GetModel (existing method).
+	// N extra queries where N = unique cross-page fallback references.
+	// Typically 0-5 per page.
+	for _, id := range missing {
+		m, err := h.DB.GetModel(ctx, id)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				continue // fallback pointing to deleted model — show empty name
+			}
+			return fmt.Errorf("resolve cross-page fallback: %w", err)
+		}
+		idToName[id] = m.Name
+	}
+	return nil
 }
 
 // CreateModel handles POST /api/v1/models.
@@ -354,10 +462,49 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		return apierror.BadRequest(c, aliasMsg)
 	}
 
+	// Validate and resolve the fallback model when provided.
+	var fallbackModelID *string
+	if req.FallbackModelName != "" {
+		lic := h.License.Load()
+		if !lic.HasFeature(license.FeatureFallbackChains) {
+			return apierror.Send(c, fiber.StatusForbidden, "feature_unavailable",
+				"model fallback chains require an Enterprise license")
+		}
+		fbID, fbErr := h.DB.GetModelIDByName(ctx, req.FallbackModelName)
+		if fbErr != nil {
+			if errors.Is(fbErr, db.ErrNotFound) {
+				return apierror.BadRequest(c, "fallback target model not found")
+			}
+			h.Log.ErrorContext(ctx, "create model: resolve fallback model", slog.String("error", fbErr.Error()))
+			return apierror.InternalError(c, "failed to resolve fallback model")
+		}
+		// Self-reference check: the new model's ID is not known yet so we can
+		// only check by name (the model is being created, so no ID exists yet).
+		if req.FallbackModelName == req.Name {
+			return apierror.BadRequest(c, "model cannot reference itself as fallback")
+		}
+		// A brand-new model has no ID yet, so nothing in the DB can point back
+		// to it — no cycle is possible on create. Cycle checks are only
+		// meaningful on update (when the model already exists in the chain).
+		fallbackModelID = &fbID
+	}
+
 	keyInfo := auth.KeyInfoFromCtx(c)
 	var createdBy *string
 	if keyInfo != nil && keyInfo.UserID != "" {
 		createdBy = &keyInfo.UserID
+	}
+
+	// Serialize fallback mutations to prevent concurrent creates from racing
+	// past each other's implicit cycle check. Acquired only when a fallback is
+	// being set; plain creates do not contend on the mutex.
+	//
+	// Multi-instance cluster-wide serialization would require DB-level locking
+	// (SELECT FOR UPDATE / advisory lock). For single-instance and typical
+	// enterprise deployments the process-level mutex is sufficient.
+	if fallbackModelID != nil {
+		h.fallbackMu.Lock()
+		defer h.fallbackMu.Unlock()
 	}
 
 	reqType := req.Type
@@ -381,6 +528,7 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		Timeout:          req.Timeout,
 		Strategy:         &req.Strategy,
 		MaxRetries:       &req.MaxRetries,
+		FallbackModelID:  fallbackModelID,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
@@ -405,7 +553,7 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 	}
 
 	if m.IsActive {
-		h.Registry.AddModel(dbModelToProxy(m, req.APIKey))
+		h.Registry.AddModel(dbModelToProxy(m, req.APIKey, req.FallbackModelName))
 	}
 
 	if h.Redis != nil {
@@ -414,7 +562,7 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		}
 	}
 
-	return c.Status(fiber.StatusCreated).JSON(modelToResponse(m))
+	return c.Status(fiber.StatusCreated).JSON(modelToResponse(m, req.FallbackModelName))
 }
 
 // ListModels handles GET /api/v1/models.
@@ -463,12 +611,28 @@ func (h *Handler) ListModels(c fiber.Ctx) error {
 			slog.String("error", depsErr.Error()))
 	}
 
+	// Build an id→name map from the current page to resolve FallbackModelID
+	// without extra DB round-trips. Cross-page fallback targets (models on a
+	// different page) are resolved by resolveMissingFallbackNames via individual
+	// GetModel calls — typically 0 extra queries per page.
+	idToName := buildFallbackIDNameMap(models)
+	if resolveErr := h.resolveMissingFallbackNames(c.Context(), models, idToName); resolveErr != nil {
+		h.Log.ErrorContext(c.Context(), "list models: resolve cross-page fallback names",
+			slog.String("error", resolveErr.Error()))
+		// Non-fatal: the affected models will show an empty fallback name in the
+		// response rather than failing the entire list request.
+	}
+
 	resp := paginatedModelsResponse{
 		Data:    make([]modelResponse, len(models)),
 		HasMore: hasMore,
 	}
 	for i := range models {
-		resp.Data[i] = modelToResponse(&models[i])
+		var fallbackName string
+		if models[i].FallbackModelID != nil && *models[i].FallbackModelID != "" {
+			fallbackName = idToName[*models[i].FallbackModelID]
+		}
+		resp.Data[i] = modelToResponse(&models[i], fallbackName)
 		if deps := depsByModel[models[i].ID]; len(deps) > 0 {
 			resp.Data[i].Deployments = make([]deploymentResponse, len(deps))
 			for j := range deps {
@@ -510,7 +674,8 @@ func (h *Handler) GetModel(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to get model")
 	}
 
-	resp := modelToResponse(m)
+	fallbackName := h.resolveFallbackName(ctx, m.FallbackModelID)
+	resp := modelToResponse(m, fallbackName)
 
 	deps, err := h.DB.ListDeployments(ctx, modelID)
 	if err != nil {
@@ -631,6 +796,41 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		params.Aliases = &aliasStr
 	}
 
+	// newFallbackName tracks what name to use when refreshing the registry and
+	// building the response. It is set when req.FallbackModelName is non-nil.
+	var newFallbackName string
+	if req.FallbackModelName != nil {
+		if *req.FallbackModelName == "" {
+			// Clearing the fallback — store an empty-string pointer so UpdateModel
+			// sets the column to NULL.
+			empty := ""
+			params.FallbackModelID = &empty
+		} else {
+			lic := h.License.Load()
+			if !lic.HasFeature(license.FeatureFallbackChains) {
+				return apierror.Send(c, fiber.StatusForbidden, "feature_unavailable",
+					"model fallback chains require an Enterprise license")
+			}
+			fbID, fbErr := h.DB.GetModelIDByName(ctx, *req.FallbackModelName)
+			if fbErr != nil {
+				if errors.Is(fbErr, db.ErrNotFound) {
+					return apierror.BadRequest(c, "fallback target model not found")
+				}
+				h.Log.ErrorContext(ctx, "update model: resolve fallback model", slog.String("error", fbErr.Error()))
+				return apierror.InternalError(c, "failed to resolve fallback model")
+			}
+			if fbID == modelID {
+				return apierror.BadRequest(c, "model cannot reference itself as fallback")
+			}
+			params.FallbackModelID = &fbID
+			newFallbackName = *req.FallbackModelName
+		}
+	} else {
+		// FallbackModelName not provided — resolve existing fallback name for
+		// registry and response population.
+		newFallbackName = h.resolveFallbackName(ctx, existing.FallbackModelID)
+	}
+
 	if req.APIKey != nil {
 		// The model ID is the AAD — immutable, so no re-encryption is needed on rename.
 		enc, encErr := crypto.EncryptString(*req.APIKey, h.EncryptionKey, modelAAD(modelID))
@@ -641,7 +841,36 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		params.APIKeyEncrypted = &enc
 	}
 
-	updated, err := h.DB.UpdateModel(ctx, modelID, params)
+	// Serialize fallback mutations to make the cycle-check + DB write atomic at
+	// the process level, preventing a TOCTOU race where two concurrent requests
+	// could each pass the cycle check before either commits, resulting in a cycle
+	// in the stored chain.
+	//
+	// Multi-instance cluster-wide serialization would require DB-level locking
+	// (SELECT FOR UPDATE / advisory lock). For single-instance and typical
+	// enterprise deployments the process-level mutex is sufficient.
+	var updated *db.Model
+	if req.FallbackModelName != nil && *req.FallbackModelName != "" {
+		h.fallbackMu.Lock()
+		defer h.fallbackMu.Unlock()
+
+		// Re-check for cycles under the lock. params.FallbackModelID was set
+		// above before acquiring the lock; we use its value directly.
+		// Transient DB errors are wrapped by checkFallbackCycle; unwrappable
+		// errors are "cycle" or "self-reference" sentinel strings.
+		if cycErr := h.checkFallbackCycle(ctx, modelID, *params.FallbackModelID); cycErr != nil {
+			if errors.Unwrap(cycErr) != nil {
+				// Wrapped error means a transient DB failure during chain walk.
+				h.Log.ErrorContext(ctx, "update model: check fallback cycle", slog.String("error", cycErr.Error()))
+				return apierror.InternalError(c, "failed to check fallback cycle")
+			}
+			return apierror.BadRequest(c, "fallback chain forms a cycle")
+		}
+
+		updated, err = h.DB.UpdateModel(ctx, modelID, params)
+	} else {
+		updated, err = h.DB.UpdateModel(ctx, modelID, params)
+	}
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "model not found")
@@ -659,6 +888,10 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		if existing.Name != updated.Name {
 			h.Registry.RemoveModel(existing.Name)
 		}
+		// When the fallback was cleared, newFallbackName is already empty.
+		if req.FallbackModelName != nil && *req.FallbackModelName == "" {
+			newFallbackName = ""
+		}
 		plaintext, decErr := h.decryptModelAPIKey(updated)
 		if decErr != nil {
 			h.Log.ErrorContext(ctx, "update model: decrypt api key for registry", slog.String("error", decErr.Error()))
@@ -666,7 +899,7 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 			// updated record and log the inconsistency. A process restart will
 			// reconcile the registry from the database.
 		} else {
-			h.Registry.AddModel(dbModelToProxy(updated, plaintext))
+			h.Registry.AddModel(dbModelToProxy(updated, plaintext, newFallbackName))
 		}
 	} else {
 		h.Registry.RemoveModel(existing.Name)
@@ -678,7 +911,7 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		}
 	}
 
-	return c.JSON(modelToResponse(updated))
+	return c.JSON(modelToResponse(updated, newFallbackName))
 }
 
 // DeleteModel handles DELETE /api/v1/models/:model_id.
@@ -767,7 +1000,8 @@ func (h *Handler) ActivateModel(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to decrypt model api key")
 	}
 
-	h.Registry.AddModel(dbModelToProxy(m, plaintext))
+	fallbackName := h.resolveFallbackName(ctx, m.FallbackModelID)
+	h.Registry.AddModel(dbModelToProxy(m, plaintext, fallbackName))
 
 	if h.Redis != nil {
 		if pubErr := h.Redis.PublishInvalidation(ctx, voidredis.ChannelModels, "reload"); pubErr != nil {
@@ -775,7 +1009,7 @@ func (h *Handler) ActivateModel(c fiber.Ctx) error {
 		}
 	}
 
-	return c.JSON(modelToResponse(m))
+	return c.JSON(modelToResponse(m, fallbackName))
 }
 
 // DeactivateModel handles PATCH /api/v1/models/:model_id/deactivate.
@@ -823,7 +1057,8 @@ func (h *Handler) DeactivateModel(c fiber.Ctx) error {
 	}
 
 	m.IsActive = false
-	return c.JSON(modelToResponse(m))
+	fallbackName := h.resolveFallbackName(ctx, m.FallbackModelID)
+	return c.JSON(modelToResponse(m, fallbackName))
 }
 
 // GetModelHealth handles GET /api/v1/models/health.

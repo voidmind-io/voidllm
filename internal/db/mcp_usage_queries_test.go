@@ -199,10 +199,11 @@ func TestGetMCPUsageAggregates_GroupByDay_ChronologicalOrder(t *testing.T) {
 	now := time.Now().UTC()
 	orgID := "org-day-order"
 
-	// Insert calls on three distinct days.
-	day1 := now.Add(-48 * time.Hour).Truncate(24 * time.Hour).Add(12 * time.Hour)
-	day2 := now.Add(-24 * time.Hour).Truncate(24 * time.Hour).Add(12 * time.Hour)
-	day3 := now.Truncate(24 * time.Hour).Add(12 * time.Hour)
+	// Insert calls on three distinct days. Use fixed offsets from now
+	// instead of truncate+noon to avoid failures near midnight UTC.
+	day1 := now.Add(-50 * time.Hour)
+	day2 := now.Add(-26 * time.Hour)
+	day3 := now.Add(-2 * time.Hour)
 	from := now.Add(-72 * time.Hour)
 	to := now.Add(time.Hour)
 

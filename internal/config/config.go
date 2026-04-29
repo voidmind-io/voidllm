@@ -155,6 +155,10 @@ type ModelConfig struct {
 	// MaxRetries is the number of times the proxy will retry a failed upstream
 	// request across the available deployments. Must be >= 0.
 	MaxRetries int `yaml:"max_retries"`
+	// Fallback is the canonical name (or alias) of another model to retry
+	// when all deployments of this model are unavailable. Resolved at
+	// registry build time. Empty disables fallback for this model.
+	Fallback string `yaml:"fallback" json:"fallback,omitempty"`
 	// Deployments is the list of backend endpoints for this model. When set,
 	// the model-level Provider and BaseURL fields are ignored in favour of the
 	// per-deployment values, and Strategy must be set.
@@ -356,6 +360,12 @@ type CodeModeConfig struct {
 	// single Code Mode execution. Prevents runaway scripts from making
 	// unbounded upstream calls. Default: 50. Valid range: [1, 1000].
 	MaxToolCalls int `yaml:"max_tool_calls"`
+	// SchemaTTL is the maximum age of an inferred output schema before it is
+	// re-inferred on the next tool call. Defaults to 168h (7 days) when unset.
+	// Set explicitly to 0 to disable re-inference after the first successful
+	// inference. Pointer type lets the YAML parser distinguish "absent"
+	// (apply default) from "explicitly zero" (never re-infer).
+	SchemaTTL *time.Duration `yaml:"schema_ttl"`
 }
 
 // IsEnabled returns true only when Code Mode has been explicitly enabled via
@@ -415,6 +425,25 @@ type HealthProbeConfig struct {
 	Interval time.Duration `yaml:"interval"`
 }
 
+// RetentionConfig controls periodic deletion of old usage and audit records.
+// Retention is opt-in: a zero duration means "keep forever".
+type RetentionConfig struct {
+	// UsageEvents is the maximum age of rows in the usage_events table.
+	// A zero value means rows are kept forever.
+	UsageEvents time.Duration `yaml:"usage_events" json:"usage_events"`
+	// AuditLogs is the maximum age of rows in the audit_logs table.
+	// A zero value means rows are kept forever.
+	AuditLogs time.Duration `yaml:"audit_logs" json:"audit_logs"`
+	// Interval controls how often the cleanup job runs.
+	// Defaults to 24h when retention is enabled.
+	Interval time.Duration `yaml:"interval" json:"interval"`
+}
+
+// Enabled reports whether any retention job is active.
+func (r RetentionConfig) Enabled() bool {
+	return r.UsageEvents > 0 || r.AuditLogs > 0
+}
+
 // SettingsConfig holds application-level settings.
 type SettingsConfig struct {
 	AdminKey      string `yaml:"admin_key" json:"-"`
@@ -434,6 +463,11 @@ type SettingsConfig struct {
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
 	HealthCheck    HealthCheckConfig    `yaml:"health_check"`
 	MCP            MCPConfig            `yaml:"mcp"`
+	Retention      RetentionConfig      `yaml:"retention"`
+	// FallbackMaxDepth limits how deep the model fallback chain can recurse
+	// per request. Default 3, valid range [1, 10]. Ignored when no model has
+	// fallback configured or when the license lacks FeatureFallbackChains.
+	FallbackMaxDepth int `yaml:"fallback_max_depth" json:"fallback_max_depth"`
 	// SoftLimitThreshold uses *float64 so that an explicit 0.0 can be
 	// distinguished from the zero value after unmarshalling. Use
 	// GetSoftLimitThreshold to read the value.
@@ -657,6 +691,17 @@ func (c *Config) setDefaults() {
 		c.Settings.Audit.FlushInterval = 5 * time.Second
 	}
 
+	// Settings retention
+	if c.Settings.Retention.Interval <= 0 {
+		c.Settings.Retention.Interval = 24 * time.Hour
+	}
+
+	// Settings fallback: promote strictly negative to 3; 0 is a valid explicit
+	// "disabled" value and must not be overwritten to the default.
+	if c.Settings.FallbackMaxDepth < 0 {
+		c.Settings.FallbackMaxDepth = 3
+	}
+
 	// Bootstrap
 	if c.Settings.Bootstrap.OrgName == "" {
 		c.Settings.Bootstrap.OrgName = "Default"
@@ -752,6 +797,10 @@ func (c *Config) setDefaults() {
 		}
 		if c.Settings.MCP.CodeMode.MaxToolCalls == 0 {
 			c.Settings.MCP.CodeMode.MaxToolCalls = 50
+		}
+		if c.Settings.MCP.CodeMode.SchemaTTL == nil {
+			d := 168 * time.Hour
+			c.Settings.MCP.CodeMode.SchemaTTL = &d
 		}
 	}
 

@@ -18,7 +18,7 @@ const modelSelectColumns = "id, name, provider, model_type, base_url, api_key_en
 	"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 	"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
 	"is_active, source, created_by, created_at, updated_at, deleted_at, aliases, timeout, " +
-	"strategy, max_retries"
+	"strategy, max_retries, fallback_model_id"
 
 // Model represents a model record in the database.
 // This is the storage layer representation; see proxy.Model for the in-memory registry type.
@@ -58,6 +58,9 @@ type Model struct {
 	// MaxRetries is the maximum number of deployments to attempt before returning
 	// an error to the caller. 0 means try all available deployments.
 	MaxRetries int
+	// FallbackModelID is the ID of the model to try when all deployments of
+	// this model are unavailable. Nil when no fallback is configured.
+	FallbackModelID *string
 }
 
 // CreateModelParams holds the input for creating a model.
@@ -90,6 +93,8 @@ type CreateModelParams struct {
 	Strategy *string
 	// MaxRetries is the maximum number of deployments to attempt. 0 means try all.
 	MaxRetries *int
+	// FallbackModelID is the ID of the fallback model. Nil means no fallback.
+	FallbackModelID *string
 }
 
 // UpdateModelParams holds optional fields for updating a model.
@@ -120,6 +125,9 @@ type UpdateModelParams struct {
 	Strategy *string
 	// MaxRetries, when non-nil, replaces the stored retry count.
 	MaxRetries *int
+	// FallbackModelID, when non-nil, replaces the stored fallback model ID.
+	// Set to a pointer to an empty string to clear the fallback.
+	FallbackModelID *string
 }
 
 // CreateModel inserts a new model and returns the persisted record.
@@ -150,12 +158,13 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 		"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 		"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
 		"is_active, source, created_by, aliases, timeout, strategy, max_retries, " +
-		"created_at, updated_at) " +
+		"fallback_model_id, created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
 		p(7) + ", " + p(8) + ", " + p(9) + ", " +
 		p(10) + ", " + p(11) + ", " + p(12) + ", " + p(13) + ", " +
 		"1, " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " + p(18) + ", " + p(19) + ", " +
+		p(20) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + modelSelectColumns +
@@ -183,6 +192,7 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 			params.Timeout,
 			strategy,
 			maxRetries,
+			params.FallbackModelID,
 		)
 		if execErr != nil {
 			return translateError(execErr)
@@ -366,6 +376,15 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 		args = append(args, *params.MaxRetries)
 		argN++
 	}
+	if params.FallbackModelID != nil {
+		if *params.FallbackModelID == "" {
+			setClauses = append(setClauses, "fallback_model_id = NULL")
+		} else {
+			setClauses = append(setClauses, "fallback_model_id = "+p(argN))
+			args = append(args, *params.FallbackModelID)
+			argN++
+		}
+	}
 
 	if len(setClauses) == 0 {
 		return d.GetModel(ctx, id)
@@ -514,13 +533,25 @@ func scanModel(scanner interface{ Scan(...any) error }) (*Model, error) {
 		&m.AzureDeployment, &m.AzureAPIVersion, &m.GCPProject, &m.GCPLocation,
 		&isActiveInt, &m.Source, &m.CreatedBy,
 		&m.CreatedAt, &m.UpdatedAt, &m.DeletedAt, &m.Aliases, &m.Timeout,
-		&m.Strategy, &m.MaxRetries,
+		&m.Strategy, &m.MaxRetries, &m.FallbackModelID,
 	)
 	if err != nil {
 		return nil, err
 	}
 	m.IsActive = isActiveInt == 1
 	return &m, nil
+}
+
+// GetModelIDByName returns the UUID for a given active model name (case-sensitive).
+// It returns ErrNotFound if the model does not exist or has been soft-deleted.
+func (d *DB) GetModelIDByName(ctx context.Context, name string) (string, error) {
+	query := "SELECT id FROM models WHERE name = " + d.dialect.Placeholder(1) + " AND deleted_at IS NULL"
+	var id string
+	err := d.sql.QueryRowContext(ctx, query, name).Scan(&id)
+	if err != nil {
+		return "", fmt.Errorf("get model id by name %q: %w", name, translateError(err))
+	}
+	return id, nil
 }
 
 // SyncYAMLModels upserts YAML-configured models into the database.

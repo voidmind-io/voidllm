@@ -19,8 +19,12 @@ type Event struct {
 	UserID string
 	// ServiceAccountID is the service account the key belongs to. Empty if not a SA key.
 	ServiceAccountID string
-	// ModelName is the canonical upstream model name.
+	// ModelName is the canonical upstream model name that actually served the request.
+	// When fallback is active, this is the fallback model's name.
 	ModelName string
+	// RequestedModelName is the model name the client originally requested.
+	// Equal to ModelName when no fallback occurred. Empty for legacy events.
+	RequestedModelName string
 	// PromptTokens is the number of input tokens consumed.
 	PromptTokens int
 	// CompletionTokens is the number of output tokens produced.

@@ -706,6 +706,161 @@ models:
 ` + validModel,
 			wantErr: false,
 		},
+		{
+			name: "retention usage_events negative error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    usage_events: -1h
+`,
+			wantErr:     true,
+			errContains: "settings.retention.usage_events must be >= 0",
+		},
+		{
+			name: "retention audit_logs negative error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    audit_logs: -1h
+`,
+			wantErr:     true,
+			errContains: "settings.retention.audit_logs must be >= 0",
+		},
+		{
+			name: "retention usage_events exceeds 10 years error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    usage_events: 87660h
+`,
+			wantErr:     true,
+			errContains: "settings.retention.usage_events exceeds maximum",
+		},
+		{
+			name: "retention audit_logs exceeds 10 years error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    audit_logs: 87660h
+`,
+			wantErr:     true,
+			errContains: "settings.retention.audit_logs exceeds maximum",
+		},
+		{
+			name: "retention interval below minimum when enabled error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    usage_events: 24h
+    interval: 30s
+`,
+			wantErr:     true,
+			errContains: "settings.retention.interval must be >=",
+		},
+		{
+			name: "retention interval irrelevant when disabled no error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    usage_events: 0s
+    audit_logs: 0s
+    interval: 1ms
+`,
+			wantErr: false,
+		},
+		{
+			name: "retention all zeros no error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    usage_events: 0s
+    audit_logs: 0s
+`,
+			wantErr: false,
+		},
+		{
+			name: "retention valid configuration no error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+  retention:
+    usage_events: 720h
+    audit_logs: 2160h
+    interval: 24h
+`,
+			wantErr: false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -947,6 +1102,219 @@ func TestValidate_MCPServer(t *testing.T) {
 `),
 			wantErr: false,
 		},
+
+		// ── Fallback max depth validation ────────────────────────────────────
+		// Note: setDefaults converts 0 and negative values to 3 before
+		// validation runs, so those cannot be tested as errors via Load().
+		// Only the out-of-range upper bound (> 10) triggers a validation error.
+		{
+			name: "fallback_max_depth above 10 returns error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+  fallback_max_depth: 11
+`,
+			wantErr:     true,
+			errContains: "fallback_max_depth",
+		},
+		{
+			name: "fallback_max_depth 1 is valid",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+  fallback_max_depth: 1
+`,
+			wantErr: false,
+		},
+		{
+			name: "fallback_max_depth 10 is valid",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+  fallback_max_depth: 10
+`,
+			wantErr: false,
+		},
+
+		// ── Per-model fallback validation ────────────────────────────────────
+		{
+			name: "fallback to nonexistent model returns error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+models:
+  - name: model-a
+    provider: openai
+    base_url: https://api.openai.com
+    fallback: does-not-exist
+`,
+			wantErr:     true,
+			errContains: "not found",
+		},
+		{
+			name: "fallback to self returns error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+models:
+  - name: model-a
+    provider: openai
+    base_url: https://api.openai.com
+    fallback: model-a
+`,
+			wantErr:     true,
+			errContains: "itself",
+		},
+		{
+			name: "fallback cycle length 2 returns error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+models:
+  - name: model-a
+    provider: openai
+    base_url: https://api.openai.com
+    fallback: model-b
+  - name: model-b
+    provider: openai
+    base_url: https://api.openai.com
+    fallback: model-a
+`,
+			wantErr:     true,
+			errContains: "cycle",
+		},
+		{
+			name: "fallback cycle length 3 returns error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+models:
+  - name: model-a
+    provider: openai
+    base_url: https://api.openai.com
+    fallback: model-b
+  - name: model-b
+    provider: openai
+    base_url: https://api.openai.com
+    fallback: model-c
+  - name: model-c
+    provider: openai
+    base_url: https://api.openai.com
+    fallback: model-a
+`,
+			wantErr:     true,
+			errContains: "cycle",
+		},
+		{
+			name: "fallback chain no cycle is valid",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+models:
+  - name: model-a
+    provider: openai
+    base_url: https://api.openai.com
+    fallback: model-b
+  - name: model-b
+    provider: openai
+    base_url: https://api.openai.com
+    fallback: model-c
+  - name: model-c
+    provider: openai
+    base_url: https://api.openai.com
+`,
+			wantErr: false,
+		},
+		{
+			name: "fallback targets an alias resolves without error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+models:
+  - name: model-a
+    provider: openai
+    base_url: https://api.openai.com
+    fallback: m-alias
+  - name: model-b
+    provider: openai
+    base_url: https://api.openai.com
+    aliases:
+      - m-alias
+`,
+			wantErr: false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -1144,6 +1512,75 @@ func TestLoad_FallbackToDefaultsPicksUpAdminKey(t *testing.T) {
 	}
 	if cfg.Settings.AdminKey != "vl_sa_testsecretadminkey" {
 		t.Errorf("Settings.AdminKey = %q, want %q", cfg.Settings.AdminKey, "vl_sa_testsecretadminkey")
+	}
+}
+
+// ---- setDefaults — SchemaTTL pointer semantics -----------------------------
+
+// ptrDuration returns a pointer to a time.Duration value. Used to set
+// CodeModeConfig.SchemaTTL explicitly in tests.
+func ptrDuration(d time.Duration) *time.Duration { return &d }
+
+// minimalValidYAMLWithCodeMode returns a valid config YAML with code_mode
+// enabled. Individual tests set or omit schema_ttl as needed.
+func minimalValidYAMLWithCodeMode(codeModeBlock string) string {
+	return `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+  mcp:
+    code_mode:
+      enabled: true
+` + codeModeBlock
+}
+
+// TestSetDefaults_SchemaTTL_NilDefaultsTo168h verifies that when CodeMode is
+// enabled but schema_ttl is absent from YAML (nil pointer), setDefaults fills
+// it in as 168h (7 days).
+func TestSetDefaults_SchemaTTL_NilDefaultsTo168h(t *testing.T) {
+	t.Parallel()
+
+	// No schema_ttl key at all — SchemaTTL pointer stays nil after unmarshal.
+	path := writeTemp(t, "voidllm.yaml", minimalValidYAMLWithCodeMode(""))
+	cfg, _, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+
+	if cfg.Settings.MCP.CodeMode.SchemaTTL == nil {
+		t.Fatal("SchemaTTL is nil after setDefaults, want 168h")
+	}
+	if got := *cfg.Settings.MCP.CodeMode.SchemaTTL; got != 168*time.Hour {
+		t.Errorf("*SchemaTTL = %v, want %v", got, 168*time.Hour)
+	}
+}
+
+// TestSetDefaults_SchemaTTL_ExplicitZeroIsPreserved verifies that when
+// schema_ttl is explicitly set to 0s in YAML the value is preserved as 0 after
+// setDefaults — it must NOT be overwritten to the 168h default. This locks in
+// the fix that distinguishes "absent" (nil → default) from "explicitly zero"
+// (non-nil zero → keep as-is).
+func TestSetDefaults_SchemaTTL_ExplicitZeroIsPreserved(t *testing.T) {
+	t.Parallel()
+
+	path := writeTemp(t, "voidllm.yaml", minimalValidYAMLWithCodeMode("      schema_ttl: 0s\n"))
+	cfg, _, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+
+	if cfg.Settings.MCP.CodeMode.SchemaTTL == nil {
+		t.Fatal("SchemaTTL is nil after setDefaults, want explicit 0")
+	}
+	if got := *cfg.Settings.MCP.CodeMode.SchemaTTL; got != 0 {
+		t.Errorf("*SchemaTTL = %v, want 0 (explicit zero must not be overwritten to 168h)", got)
 	}
 }
 
