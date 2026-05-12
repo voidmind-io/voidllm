@@ -749,6 +749,15 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// Create Code Mode service — wires the three Code Mode VoidLLMDeps functions
 	// and the OnToolsListHook as methods on a single struct so they share state
 	// without ad-hoc closure captures.
+	//
+	// SchemaTTL is only assigned a default when Code Mode is explicitly enabled,
+	// so it can still be nil here when Code Mode is disabled. Dereferencing it
+	// unconditionally would panic at startup; fall back to a zero TTL in that
+	// case (the service's Code Mode entrypoints are not reachable anyway).
+	var schemaTTL time.Duration
+	if cfg.Settings.MCP.CodeMode.SchemaTTL != nil {
+		schemaTTL = *cfg.Settings.MCP.CodeMode.SchemaTTL
+	}
 	cmService := &codeModeService{
 		executor:     adminHandler.CodeExecutor,
 		toolCache:    adminHandler.ToolCache,
@@ -756,7 +765,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		db:           database,
 		log:          log,
 		maxToolCalls: cfg.Settings.MCP.CodeMode.MaxToolCalls,
-		schemaTTL:    *cfg.Settings.MCP.CodeMode.SchemaTTL,
+		schemaTTL:    schemaTTL,
 		serverCache:  mcpServerCache,
 		codePool:     adminHandler.CodePool,
 	}
