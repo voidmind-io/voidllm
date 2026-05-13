@@ -1584,6 +1584,36 @@ func TestSetDefaults_SchemaTTL_ExplicitZeroIsPreserved(t *testing.T) {
 	}
 }
 
+// TestSetDefaults_SchemaTTL_NilWhenCodeModeDisabled verifies that setDefaults
+// does NOT fill in a SchemaTTL default when Code Mode is not enabled. The
+// pointer stays nil, so any consumer that dereferences it (e.g. app.New) must
+// guard against nil; see the regression for the startup panic in
+// internal/app/app.go.
+func TestSetDefaults_SchemaTTL_NilWhenCodeModeDisabled(t *testing.T) {
+	t.Parallel()
+
+	yaml := `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: aaaaaaaaaaaaaaaa
+  usage:
+    buffer_size: 100
+`
+	path := writeTemp(t, "voidllm.yaml", yaml)
+	cfg, _, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.Settings.MCP.CodeMode.SchemaTTL != nil {
+		t.Errorf("SchemaTTL = %v, want nil when Code Mode is disabled", *cfg.Settings.MCP.CodeMode.SchemaTTL)
+	}
+}
+
 // ---- Load — full integration -----------------------------------------------
 
 func TestLoad_FullConfig(t *testing.T) {
