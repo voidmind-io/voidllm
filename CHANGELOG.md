@@ -2,6 +2,13 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.18] - 2026-05-13
+
+### Fixes
+- Startup panic when Code Mode is disabled - default config caused a nil pointer dereference of `SchemaTTL` in `app.go`. Thanks to @kernelb00t for the report (#87) and @SAY-5 for the fix (#90)
+
+---
+
 ## [0.0.17] - 2026-04-30
 
 ### Features
