@@ -15,6 +15,18 @@ import (
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
+// warnIfSinglePortTLS emits one WARN when admin TLS is configured but the
+// admin port is sharing the proxy port (TLS termination unsupported there).
+func (a *Application) warnIfSinglePortTLS(adminPort int) {
+	if a.cfg.Server.Admin.TLS.Enabled {
+		a.log.LogAttrs(context.Background(), slog.LevelWarn,
+			"admin TLS configured but ignored in single-port mode",
+			slog.Int("admin_port", adminPort),
+			slog.Int("proxy_port", a.cfg.Server.Proxy.Port),
+		)
+	}
+}
+
 // devCORSMiddleware returns a Fiber handler that sets permissive CORS headers
 // for every response. It is only installed when dev mode is active so that the
 // Vite development server can reach both the proxy and admin apps without
@@ -72,6 +84,7 @@ func (a *Application) setupRoutes() {
 
 	if adminPort == 0 || adminPort == a.cfg.Server.Proxy.Port {
 		// Single-port mode: admin routes share the proxy app.
+		a.warnIfSinglePortTLS(adminPort)
 		admin.RegisterRoutes(a.proxyApp, a.adminHandler, a.keyCache, a.hmacSecret, a.auditLogger)
 
 		// Swagger UI is served after API routes but before the SPA catch-all.
@@ -138,10 +151,12 @@ func (a *Application) startListening() {
 
 	// Dual-port mode.
 	adminAddr := fmt.Sprintf(":%d", a.cfg.Server.Admin.Port)
+	adminTLS := a.cfg.Server.Admin.TLS.Enabled
 	a.log.LogAttrs(context.Background(), slog.LevelInfo, "starting servers",
 		slog.String("proxy_addr", proxyAddr),
 		slog.String("admin_addr", adminAddr),
 		slog.String("mode", "split"),
+		slog.Bool("admin_tls", adminTLS),
 	)
 	go func() {
 		if err := a.proxyApp.Listen(proxyAddr); err != nil {
@@ -151,6 +166,22 @@ func (a *Application) startListening() {
 		}
 	}()
 	go func() {
+		if adminTLS {
+			certFile := a.cfg.Server.Admin.TLS.Cert
+			keyFile := a.cfg.Server.Admin.TLS.Key
+			if err := a.adminApp.Listen(adminAddr, fiber.ListenConfig{
+				CertFile:    certFile,
+				CertKeyFile: keyFile,
+			}); err != nil {
+				a.log.LogAttrs(context.Background(), slog.LevelError, "admin server stopped",
+					slog.String("error", err.Error()),
+					slog.Bool("tls", true),
+					slog.String("cert", certFile),
+					slog.String("key", keyFile),
+				)
+			}
+			return
+		}
 		if err := a.adminApp.Listen(adminAddr); err != nil {
 			a.log.LogAttrs(context.Background(), slog.LevelError, "admin server stopped",
 				slog.String("error", err.Error()),
