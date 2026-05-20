@@ -2,6 +2,13 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.19] - 2026-05-14
+
+### Fixes
+- Admin TLS configuration (`server.admin.tls`) is now actually applied in dual-port mode. Previously `tls.enabled: true` was a silent no-op - the schema and validation existed but no listener consumed the cert/key. In single-port mode (admin sharing the proxy port) configuring TLS now emits a WARN since external termination is expected there. Thanks to @martinsotirov for the fix (#92)
+
+---
+
 ## [0.0.18] - 2026-05-13
 
 ### Fixes
