@@ -18,8 +18,13 @@ var ErrConflict = errors.New("conflict")
 // ErrNoPassword is returned when a user has no password hash (SSO-only account).
 var ErrNoPassword = errors.New("no password")
 
+// ErrForeignKey is returned when an insert or update violates a foreign key constraint.
+// It indicates that a referenced record (e.g. organization) does not exist.
+var ErrForeignKey = errors.New("foreign key violation")
+
 // translateError maps low-level driver errors to domain sentinels.
 // sql.ErrNoRows becomes ErrNotFound, UNIQUE constraint violations become ErrConflict,
+// FOREIGN KEY constraint violations become ErrForeignKey,
 // and all other errors are returned unchanged. Both sentinel and original error
 // are preserved in the chain so callers can use errors.Is on either.
 func translateError(err error) error {
@@ -33,6 +38,10 @@ func translateError(err error) error {
 	if strings.Contains(msg, "UNIQUE constraint failed") ||
 		strings.Contains(msg, "duplicate key value violates unique constraint") {
 		return fmt.Errorf("%w: %w", ErrConflict, err)
+	}
+	if strings.Contains(msg, "FOREIGN KEY constraint failed") ||
+		strings.Contains(msg, "violates foreign key constraint") {
+		return fmt.Errorf("%w: %w", ErrForeignKey, err)
 	}
 	return err
 }

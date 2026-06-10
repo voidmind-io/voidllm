@@ -128,6 +128,20 @@ func (h *Handler) Login(c fiber.Ctx) error {
 		return apierror.InternalError(c, "authentication failed")
 	}
 
+	// Defense-in-depth guard for legacy/inconsistent data: under the current
+	// invariant every user belongs to an org, so orgID is never empty here.
+	// Deployments affected by the old bug may have org-less users in their DB.
+	// Return the same generic 401 as a wrong password to prevent enumeration —
+	// an attacker who already supplied the correct password must not learn that
+	// the account exists but has no org. The specific reason is written to the
+	// server log for operators.
+	if orgID == "" {
+		h.Log.WarnContext(ctx, "login: user has no organization membership",
+			slog.String("email", req.Email))
+		h.auditLoginFailed(c, req.Email, fiber.StatusUnauthorized)
+		return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "invalid email or password")
+	}
+
 	// Revoke previous session keys for this user so only one session exists.
 	if err := h.DB.RevokeUserSessions(ctx, userID); err != nil {
 		h.Log.ErrorContext(ctx, "login: revoke old sessions", slog.String("error", err.Error()))

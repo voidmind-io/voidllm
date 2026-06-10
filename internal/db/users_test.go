@@ -9,6 +9,30 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// countUsers returns the number of active (non-deleted) users in the DB.
+func countUsers(t *testing.T, d *DB) int {
+	t.Helper()
+	var n int
+	if err := d.sql.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM users WHERE deleted_at IS NULL",
+	).Scan(&n); err != nil {
+		t.Fatalf("countUsers: %v", err)
+	}
+	return n
+}
+
+// countMemberships returns the number of org_memberships rows for a given user.
+func countMemberships(t *testing.T, d *DB, userID string) int {
+	t.Helper()
+	var n int
+	if err := d.sql.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM org_memberships WHERE user_id = ?", userID,
+	).Scan(&n); err != nil {
+		t.Fatalf("countMemberships: %v", err)
+	}
+	return n
+}
+
 // mustCreateUser creates a user and fatals the test on error.
 func mustCreateUser(t *testing.T, d *DB, params CreateUserParams) *User {
 	t.Helper()
@@ -665,6 +689,172 @@ func TestGetUserPasswordHash(t *testing.T) {
 			}
 			if tc.wantErr == nil && tc.checkHash != nil {
 				tc.checkHash(t, userID, hash, d)
+			}
+		})
+	}
+}
+
+// ---- CreateUserWithMembership ------------------------------------------------
+
+func TestCreateUserWithMembership(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		setup      func(t *testing.T, d *DB) (orgID string)
+		userParams CreateUserParams
+		role       string
+		wantErr    error
+		checkFunc  func(t *testing.T, d *DB, got *User, orgID string)
+	}{
+		{
+			name: "happy path: user and membership created atomically",
+			setup: func(t *testing.T, d *DB) string {
+				t.Helper()
+				org := mustCreateOrg(t, d, CreateOrgParams{Name: "Test Org", Slug: "cwm-happy"})
+				return org.ID
+			},
+			userParams: CreateUserParams{
+				Email:       "cwm-happy@example.com",
+				DisplayName: "Happy Path User",
+			},
+			role:    "member",
+			wantErr: nil,
+			checkFunc: func(t *testing.T, d *DB, got *User, orgID string) {
+				t.Helper()
+				// Returned user has the expected fields.
+				if got.ID == "" {
+					t.Error("ID is empty, want non-empty UUID")
+				}
+				if got.Email != "cwm-happy@example.com" {
+					t.Errorf("Email = %q, want %q", got.Email, "cwm-happy@example.com")
+				}
+				// ResolveUserRole returns the correct role and orgID.
+				role, resolvedOrgID, err := d.ResolveUserRole(context.Background(), got.ID)
+				if err != nil {
+					t.Fatalf("ResolveUserRole() error = %v", err)
+				}
+				if role != "member" {
+					t.Errorf("ResolveUserRole() role = %q, want %q", role, "member")
+				}
+				if resolvedOrgID != orgID {
+					t.Errorf("ResolveUserRole() orgID = %q, want %q", resolvedOrgID, orgID)
+				}
+				// Membership row exists in the DB.
+				if n := countMemberships(t, d, got.ID); n != 1 {
+					t.Errorf("org_memberships count = %d, want 1", n)
+				}
+			},
+		},
+		{
+			name: "non-existent orgID returns ErrForeignKey",
+			setup: func(t *testing.T, d *DB) string {
+				return "00000000-0000-0000-0000-000000000000" // does not exist
+			},
+			userParams: CreateUserParams{
+				Email:       "cwm-fk@example.com",
+				DisplayName: "FK User",
+			},
+			role:      "member",
+			wantErr:   ErrForeignKey,
+			checkFunc: nil,
+		},
+		{
+			name: "FK failure rolls back: no orphan user record left behind",
+			setup: func(t *testing.T, d *DB) string {
+				return "00000000-0000-0000-0000-000000000000"
+			},
+			userParams: CreateUserParams{
+				Email:       "cwm-rollback@example.com",
+				DisplayName: "Rollback User",
+			},
+			role:    "member",
+			wantErr: ErrForeignKey,
+			checkFunc: func(t *testing.T, d *DB, _ *User, _ string) {
+				t.Helper()
+				// After FK failure no user row should exist.
+				_, err := d.GetUserByEmail(context.Background(), "cwm-rollback@example.com")
+				if !errors.Is(err, ErrNotFound) {
+					t.Errorf("GetUserByEmail() after FK rollback = %v, want ErrNotFound (no orphan user)", err)
+				}
+			},
+		},
+		{
+			name: "role org_admin is stored correctly in membership",
+			setup: func(t *testing.T, d *DB) string {
+				t.Helper()
+				org := mustCreateOrg(t, d, CreateOrgParams{Name: "Admin Role Org", Slug: "cwm-admin-role"})
+				return org.ID
+			},
+			userParams: CreateUserParams{
+				Email:       "cwm-admin@example.com",
+				DisplayName: "Org Admin User",
+			},
+			role:    "org_admin",
+			wantErr: nil,
+			checkFunc: func(t *testing.T, d *DB, got *User, orgID string) {
+				t.Helper()
+				role, resolvedOrgID, err := d.ResolveUserRole(context.Background(), got.ID)
+				if err != nil {
+					t.Fatalf("ResolveUserRole() error = %v", err)
+				}
+				if role != "org_admin" {
+					t.Errorf("ResolveUserRole() role = %q, want %q", role, "org_admin")
+				}
+				if resolvedOrgID != orgID {
+					t.Errorf("ResolveUserRole() orgID = %q, want %q", resolvedOrgID, orgID)
+				}
+			},
+		},
+		{
+			name: "duplicate email returns ErrConflict",
+			setup: func(t *testing.T, d *DB) string {
+				t.Helper()
+				org := mustCreateOrg(t, d, CreateOrgParams{Name: "Dup Email Org", Slug: "cwm-dup-email"})
+				// Pre-create a user with the same email.
+				mustCreateUser(t, d, CreateUserParams{
+					Email:        "cwm-dup@example.com",
+					DisplayName:  "Original",
+					PasswordHash: testPasswordHash(t),
+				})
+				return org.ID
+			},
+			userParams: CreateUserParams{
+				Email:       "cwm-dup@example.com",
+				DisplayName: "Duplicate",
+			},
+			role:    "member",
+			wantErr: ErrConflict,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := openMigratedDB(t)
+
+			if tc.userParams.PasswordHash == nil {
+				tc.userParams.PasswordHash = testPasswordHash(t)
+			}
+
+			orgID := tc.setup(t, d)
+			usersBefore := countUsers(t, d)
+
+			got, err := d.CreateUserWithMembership(context.Background(), tc.userParams, orgID, tc.role)
+
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("CreateUserWithMembership() error = %v, wantErr %v", err, tc.wantErr)
+			}
+
+			if tc.wantErr != nil {
+				// On any error, no new user row must have been committed.
+				if after := countUsers(t, d); after != usersBefore {
+					t.Errorf("user count = %d, want %d (no orphan rows after failure)", after, usersBefore)
+				}
+			}
+
+			if tc.wantErr == nil && tc.checkFunc != nil {
+				tc.checkFunc(t, d, got, orgID)
 			}
 		})
 	}

@@ -3,21 +3,29 @@ package admin
 import (
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/voidmind-io/voidllm/internal/apierror"
+	"github.com/voidmind-io/voidllm/internal/audit"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
 	"golang.org/x/crypto/bcrypt"
 )
 
 // createUserRequest is the JSON body accepted by CreateUser.
+// OrgID is required for all users, including system admins. Every user belongs
+// to exactly one organization; there are no org-less users. Role is the
+// organization membership role (defaults to "member" when omitted).
 type createUserRequest struct {
 	Email         string `json:"email"`
 	DisplayName   string `json:"display_name"`
 	Password      string `json:"password"`
 	IsSystemAdmin bool   `json:"is_system_admin"`
+	OrgID         string `json:"org_id"`
+	Role          string `json:"role"`
 }
 
 // updateUserRequest is the JSON body accepted by UpdateUser.
@@ -113,6 +121,35 @@ func (h *Handler) CreateUser(c fiber.Ctx) error {
 		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "only system admins may create system admin users")
 	}
 
+	// Every user must belong to an org — there are no org-less users.
+	if req.OrgID == "" {
+		return apierror.BadRequest(c, "org_id is required")
+	}
+
+	// Non-system-admin callers may only assign users to their own org.
+	if !auth.HasRole(keyInfo.Role, auth.RoleSystemAdmin) {
+		if req.OrgID != keyInfo.OrgID {
+			return apierror.Send(c, fiber.StatusForbidden, "forbidden", "org_id must match your organization")
+		}
+	}
+
+	// Validate and default the membership role.
+	membershipRole := req.Role
+	if membershipRole == "" {
+		membershipRole = auth.RoleMember
+	}
+	switch membershipRole {
+	case auth.RoleMember, auth.RoleTeamAdmin:
+		// valid membership roles for all callers
+	case auth.RoleOrgAdmin:
+		// only system admins may grant the org_admin membership role
+		if !auth.HasRole(keyInfo.Role, auth.RoleSystemAdmin) {
+			return apierror.Send(c, fiber.StatusForbidden, "forbidden", "only system admins may assign the org_admin role")
+		}
+	default:
+		return apierror.BadRequest(c, "role must be one of: member, team_admin, org_admin")
+	}
+
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
 		h.Log.ErrorContext(c.Context(), "create user: bcrypt", slog.String("error", err.Error()))
@@ -120,19 +157,44 @@ func (h *Handler) CreateUser(c fiber.Ctx) error {
 	}
 	hashStr := string(hash)
 
-	user, err := h.DB.CreateUser(c.Context(), db.CreateUserParams{
+	user, err := h.DB.CreateUserWithMembership(c.Context(), db.CreateUserParams{
 		Email:         req.Email,
 		DisplayName:   req.DisplayName,
 		PasswordHash:  &hashStr,
 		AuthProvider:  "local",
 		IsSystemAdmin: req.IsSystemAdmin,
-	})
+	}, req.OrgID, membershipRole)
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "email already in use")
 		}
+		if errors.Is(err, db.ErrForeignKey) {
+			return apierror.BadRequest(c, "organization not found")
+		}
 		h.Log.ErrorContext(c.Context(), "create user", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to create user")
+	}
+
+	if h.AuditLogger != nil {
+		h.AuditLogger.Log(audit.Event{
+			Timestamp:    time.Now().UTC(),
+			OrgID:        req.OrgID,
+			ActorID:      keyInfo.UserID,
+			ActorType:    "user",
+			ActorKeyID:   keyInfo.ID,
+			Action:       "user_created",
+			ResourceType: "user",
+			ResourceID:   user.ID,
+			Description: marshalDescription(map[string]string{
+				"email":           req.Email,
+				"org_id":          req.OrgID,
+				"role":            membershipRole,
+				"is_system_admin": strconv.FormatBool(req.IsSystemAdmin),
+			}),
+			IPAddress:  c.IP(),
+			StatusCode: fiber.StatusCreated,
+			RequestID:  apierror.RequestIDFromCtx(c),
+		})
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(userToResponse(user))

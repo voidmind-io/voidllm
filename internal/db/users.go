@@ -109,6 +109,87 @@ func (d *DB) CreateUser(ctx context.Context, params CreateUserParams) (*User, er
 	return user, nil
 }
 
+// CreateUserWithMembership creates a user and an organization membership
+// atomically within a single transaction. orgID must be non-empty; every user
+// belongs to exactly one organization. role is the org membership role
+// (e.g. "member", "team_admin", "org_admin").
+//
+// Returns ErrConflict if the email is already taken.
+// Returns ErrForeignKey if orgID does not reference an existing organization,
+// allowing callers to map this to a 400 "organization not found" response
+// without an additional pre-flight SELECT.
+func (d *DB) CreateUserWithMembership(ctx context.Context, userParams CreateUserParams, orgID, role string) (*User, error) {
+	userID, err := uuid.NewV7()
+	if err != nil {
+		return nil, fmt.Errorf("create user with membership: generate user id: %w", err)
+	}
+
+	authProvider := userParams.AuthProvider
+	if authProvider == "" {
+		authProvider = "local"
+	}
+
+	p := d.dialect.Placeholder
+
+	insertUserQuery := "INSERT INTO users " +
+		"(id, email, display_name, password_hash, auth_provider, external_id, is_system_admin, created_at, updated_at) " +
+		"VALUES (" +
+		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " +
+		p(5) + ", " + p(6) + ", " + p(7) + ", " +
+		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+
+	selectUserQuery := "SELECT " + userSelectColumns +
+		" FROM users WHERE id = " + p(1) + " AND deleted_at IS NULL"
+
+	isSystemAdminInt := 0
+	if userParams.IsSystemAdmin {
+		isSystemAdminInt = 1
+	}
+
+	var user *User
+	err = d.WithTx(ctx, func(q Querier) error {
+		_, execErr := q.ExecContext(ctx, insertUserQuery,
+			userID.String(),
+			userParams.Email,
+			userParams.DisplayName,
+			userParams.PasswordHash,
+			authProvider,
+			userParams.ExternalID,
+			isSystemAdminInt,
+		)
+		if execErr != nil {
+			return translateError(execErr)
+		}
+
+		membershipID, idErr := uuid.NewV7()
+		if idErr != nil {
+			return fmt.Errorf("generate membership id: %w", idErr)
+		}
+
+		insertMembershipQuery := "INSERT INTO org_memberships (id, org_id, user_id, role, created_at) " +
+			"VALUES (" + p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", CURRENT_TIMESTAMP)"
+
+		_, execErr = q.ExecContext(ctx, insertMembershipQuery,
+			membershipID.String(),
+			orgID,
+			userID.String(),
+			role,
+		)
+		if execErr != nil {
+			return translateError(execErr)
+		}
+
+		row := q.QueryRowContext(ctx, selectUserQuery, userID.String())
+		var scanErr error
+		user, scanErr = scanUser(row)
+		return scanErr
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create user with membership: %w", err)
+	}
+	return user, nil
+}
+
 // GetUser retrieves an active user by their ID.
 // It returns ErrNotFound if the user does not exist or has been soft-deleted.
 func (d *DB) GetUser(ctx context.Context, id string) (*User, error) {
