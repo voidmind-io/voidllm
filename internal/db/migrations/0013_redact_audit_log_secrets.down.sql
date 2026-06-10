@@ -1,0 +1,18 @@
+-- Migration: 0013_redact_audit_log_secrets.down.sql
+-- Description: This migration is intentionally a no-op.
+--
+-- The up migration overwrote plaintext secrets in audit_logs.description with
+-- an empty string. The original secret values are not stored anywhere and
+-- cannot be recovered. Rolling back this migration is therefore not possible
+-- without data loss — and restoring plaintext secrets into the database would
+-- be a security regression in any case.
+--
+-- If you need to roll back the schema version recorded in schema_migrations,
+-- you can delete the row manually:
+--
+--   DELETE FROM schema_migrations
+--   WHERE filename = '0013_redact_audit_log_secrets.up.sql';
+--
+-- This will cause the up migration to be re-applied on next startup, which is
+-- safe because the UPDATE is idempotent (rows already cleared to '' are
+-- excluded by the WHERE description != '' guard).
