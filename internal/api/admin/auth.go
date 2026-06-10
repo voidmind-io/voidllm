@@ -99,6 +99,24 @@ func (h *Handler) Login(c fiber.Ctx) error {
 		return apierror.BadRequest(c, "password is required")
 	}
 
+	// Brute-force protection: per-IP rate limit and per-account lockout.
+	// Called after field validation so that missing-field 400s are not throttled.
+	if h.LoginThrottle != nil {
+		if err := h.LoginThrottle.Allow(c.IP(), req.Email); err != nil {
+			h.Log.LogAttrs(c.Context(), slog.LevelWarn, "login throttled",
+				slog.String("ip", c.IP()),
+				slog.String("email", req.Email),
+			)
+			// Burn bcrypt time before returning 429 so that a throttled response
+			// takes ~the same wall time as a normal failed-password response.
+			// Without this, an attacker can distinguish "account locked" (fast)
+			// from "wrong password" (slow ~100ms) via timing. The error is
+			// intentionally discarded — the burn's only purpose is elapsed time.
+			_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(req.Password))
+			return apierror.Send(c, fiber.StatusTooManyRequests, "too_many_requests", "too many login attempts, try again later")
+		}
+	}
+
 	ctx := c.Context()
 
 	userID, hash, err := h.DB.GetUserPasswordHash(ctx, req.Email)
@@ -106,6 +124,9 @@ func (h *Handler) Login(c fiber.Ctx) error {
 		// Burn bcrypt time to prevent timing-based email enumeration.
 		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(req.Password))
 		if errors.Is(err, db.ErrNotFound) || errors.Is(err, db.ErrNoPassword) {
+			if h.LoginThrottle != nil {
+				h.LoginThrottle.RecordFailure(req.Email)
+			}
 			h.auditLoginFailed(c, req.Email, fiber.StatusUnauthorized)
 			return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "invalid email or password")
 		}
@@ -114,6 +135,9 @@ func (h *Handler) Login(c fiber.Ctx) error {
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+		if h.LoginThrottle != nil {
+			h.LoginThrottle.RecordFailure(req.Email)
+		}
 		h.auditLoginFailed(c, req.Email, fiber.StatusUnauthorized)
 		return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "invalid email or password")
 	}
@@ -174,6 +198,10 @@ func (h *Handler) Login(c fiber.Ctx) error {
 	if err != nil {
 		h.Log.ErrorContext(ctx, "login: get user", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "authentication failed")
+	}
+
+	if h.LoginThrottle != nil {
+		h.LoginThrottle.RecordSuccess(req.Email)
 	}
 
 	if h.AuditLogger != nil {
