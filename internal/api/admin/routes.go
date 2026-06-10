@@ -37,6 +37,7 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 
 	// Current user profile — no role restriction.
 	api.Get("/me", handler.Me)
+	api.Post("/me/password", handler.ChangeOwnPassword)
 	api.Get("/me/available-models", handler.AvailableModels)
 
 	// Own usage — no role restriction; any authenticated key sees its own data.

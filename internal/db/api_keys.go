@@ -294,9 +294,10 @@ func (d *DB) UpdateAPIKey(ctx context.Context, id string, params UpdateAPIKeyPar
 
 // DeleteAPIKey soft-deletes an active API key by setting deleted_at.
 // It returns ErrNotFound if the key does not exist or is already deleted.
+
 // RevokeUserSessions hard-deletes all session keys for a user.
-// Called during login to ensure only one session exists per user.
-// Session keys are ephemeral — no audit trail needed, hard delete
+// Called during login and OIDC callback to ensure only one session exists per
+// user. Session keys are ephemeral — no audit trail needed, hard delete
 // prevents the api_keys table from filling up with dead sessions.
 func (d *DB) RevokeUserSessions(ctx context.Context, userID string) error {
 	p := d.dialect.Placeholder
@@ -305,6 +306,23 @@ func (d *DB) RevokeUserSessions(ctx context.Context, userID string) error {
 	_, err := d.sql.ExecContext(ctx, query, userID, "session_key")
 	if err != nil {
 		return fmt.Errorf("revoke user sessions %s: %w", userID, translateError(err))
+	}
+	return nil
+}
+
+// RevokeUserSessionsExcept hard-deletes all session keys for a user except the
+// one identified by exceptKeyID. Used during a password change so that the
+// current session survives the revocation — preventing the user from being
+// silently logged out when the cache is next refreshed from the database.
+func (d *DB) RevokeUserSessionsExcept(ctx context.Context, userID, exceptKeyID string) error {
+	p := d.dialect.Placeholder
+	query := "DELETE FROM api_keys WHERE user_id = " + p(1) +
+		" AND key_type = " + p(2) +
+		" AND id != " + p(3)
+
+	_, err := d.sql.ExecContext(ctx, query, userID, "session_key", exceptKeyID)
+	if err != nil {
+		return fmt.Errorf("revoke user sessions except %s: %w", userID, translateError(err))
 	}
 	return nil
 }

@@ -663,6 +663,115 @@ func TestDeleteAPIKey(t *testing.T) {
 	}
 }
 
+// ---- RevokeUserSessionsExcept -----------------------------------------------
+
+// TestRevokeUserSessionsExcept verifies that the method deletes all session
+// keys for a user except the one specified by exceptKeyID.
+func TestRevokeUserSessionsExcept(t *testing.T) {
+	t.Parallel()
+	d := openMigratedDB(t)
+	ctx := context.Background()
+
+	org := mustCreateOrg(t, d, CreateOrgParams{Name: "O", Slug: "revoke-except-org"})
+	user := mustCreateUser(t, d, CreateUserParams{Email: "revoke-except@example.com", DisplayName: "RE"})
+
+	makeSessionKey := func(name string) *APIKey {
+		plain := "vl_sk_" + name + strings.Repeat("0", 48-len(name))
+		return mustCreateAPIKey(t, d, CreateAPIKeyParams{
+			KeyHash:   keygen.Hash(plain, testHMACSecret),
+			KeyHint:   keygen.Hint(plain),
+			KeyType:   "session_key",
+			Name:      name,
+			OrgID:     org.ID,
+			UserID:    ptr(user.ID),
+			CreatedBy: user.ID,
+		})
+	}
+
+	key1 := makeSessionKey("session1")
+	key2 := makeSessionKey("session2")
+
+	// Revoke all sessions except key1.
+	if err := d.RevokeUserSessionsExcept(ctx, user.ID, key1.ID); err != nil {
+		t.Fatalf("RevokeUserSessionsExcept() error = %v", err)
+	}
+
+	// key1 must still exist in the DB (raw SELECT — GetAPIKey filters deleted_at,
+	// but session keys are hard-deleted so check existence directly).
+	var count1 int
+	if err := d.SQL().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM api_keys WHERE id = ?", key1.ID).Scan(&count1); err != nil {
+		t.Fatalf("count key1: %v", err)
+	}
+	if count1 != 1 {
+		t.Errorf("key1 count = %d after RevokeUserSessionsExcept, want 1 (key must survive)", count1)
+	}
+
+	// key2 must be gone (hard-deleted by RevokeUserSessionsExcept).
+	var count2 int
+	if err := d.SQL().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM api_keys WHERE id = ?", key2.ID).Scan(&count2); err != nil {
+		t.Fatalf("count key2: %v", err)
+	}
+	if count2 != 0 {
+		t.Errorf("key2 count = %d after RevokeUserSessionsExcept, want 0 (key must be deleted)", count2)
+	}
+}
+
+// TestRevokeUserSessionsExcept_OnlyOwnSessions ensures the method does not
+// delete session keys belonging to a different user.
+func TestRevokeUserSessionsExcept_OnlyOwnSessions(t *testing.T) {
+	t.Parallel()
+	d := openMigratedDB(t)
+	ctx := context.Background()
+
+	org := mustCreateOrg(t, d, CreateOrgParams{Name: "O", Slug: "revoke-except-iso-org"})
+	userA := mustCreateUser(t, d, CreateUserParams{Email: "revokeA@example.com", DisplayName: "A"})
+	userB := mustCreateUser(t, d, CreateUserParams{Email: "revokeB@example.com", DisplayName: "B"})
+
+	makeSession := func(u *User, name string) *APIKey {
+		plain := "vl_sk_" + name + strings.Repeat("0", 48-len(name))
+		return mustCreateAPIKey(t, d, CreateAPIKeyParams{
+			KeyHash:   keygen.Hash(plain, testHMACSecret),
+			KeyHint:   keygen.Hint(plain),
+			KeyType:   "session_key",
+			Name:      name,
+			OrgID:     org.ID,
+			UserID:    ptr(u.ID),
+			CreatedBy: u.ID,
+		})
+	}
+
+	keyA1 := makeSession(userA, "sa1xxxxx")
+	keyA2 := makeSession(userA, "sa2xxxxx")
+	keyB := makeSession(userB, "sb1xxxxx")
+
+	// Revoke userA's sessions except keyA1.
+	if err := d.RevokeUserSessionsExcept(ctx, userA.ID, keyA1.ID); err != nil {
+		t.Fatalf("RevokeUserSessionsExcept() error = %v", err)
+	}
+
+	// keyA2 must be gone.
+	var countA2 int
+	if err := d.SQL().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM api_keys WHERE id = ?", keyA2.ID).Scan(&countA2); err != nil {
+		t.Fatalf("count keyA2: %v", err)
+	}
+	if countA2 != 0 {
+		t.Errorf("keyA2 count = %d, want 0 (must be deleted)", countA2)
+	}
+
+	// keyB (other user) must be untouched.
+	var countB int
+	if err := d.SQL().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM api_keys WHERE id = ?", keyB.ID).Scan(&countB); err != nil {
+		t.Fatalf("count keyB: %v", err)
+	}
+	if countB != 1 {
+		t.Errorf("keyB count = %d, want 1 (other user's session must not be deleted)", countB)
+	}
+}
+
 // ---- GetUserOrgRole ---------------------------------------------------------
 
 func TestGetUserOrgRole(t *testing.T) {
