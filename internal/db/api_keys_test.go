@@ -663,17 +663,99 @@ func TestDeleteAPIKey(t *testing.T) {
 	}
 }
 
-// ---- RevokeUserSessionsExcept -----------------------------------------------
+// ---- ChangePasswordAndRevokeOtherSessions -----------------------------------
 
-// TestRevokeUserSessionsExcept verifies that the method deletes all session
-// keys for a user except the one specified by exceptKeyID.
-func TestRevokeUserSessionsExcept(t *testing.T) {
+// TestChangePasswordAndRevokeOtherSessions verifies the atomic password-change
+// + session-revocation method: the new hash is persisted, other session keys are
+// deleted, the excepted session key survives, and an unrelated user is unaffected.
+func TestChangePasswordAndRevokeOtherSessions(t *testing.T) {
 	t.Parallel()
 	d := openMigratedDB(t)
 	ctx := context.Background()
 
-	org := mustCreateOrg(t, d, CreateOrgParams{Name: "O", Slug: "revoke-except-org"})
-	user := mustCreateUser(t, d, CreateUserParams{Email: "revoke-except@example.com", DisplayName: "RE"})
+	org := mustCreateOrg(t, d, CreateOrgParams{Name: "O", Slug: "chpwd-revoke-org"})
+	user := mustCreateUser(t, d, CreateUserParams{
+		Email:        "chpwd-revoke@example.com",
+		DisplayName:  "CPR",
+		PasswordHash: ptr("$2a$10$initialhashinitialhashinitialhashinitialhashinitialh"),
+	})
+
+	makeSessionKey := func(u *User, name string) *APIKey {
+		plain := "vl_sk_" + name + strings.Repeat("0", 48-len(name))
+		return mustCreateAPIKey(t, d, CreateAPIKeyParams{
+			KeyHash:   keygen.Hash(plain, testHMACSecret),
+			KeyHint:   keygen.Hint(plain),
+			KeyType:   "session_key",
+			Name:      name,
+			OrgID:     org.ID,
+			UserID:    ptr(u.ID),
+			CreatedBy: u.ID,
+		})
+	}
+
+	currentSession := makeSessionKey(user, "current0")
+	otherSession := makeSessionKey(user, "other000")
+
+	// Unrelated user — must be completely untouched.
+	otherUser := mustCreateUser(t, d, CreateUserParams{Email: "chpwd-other@example.com", DisplayName: "O"})
+	otherUserSession := makeSessionKey(otherUser, "otherU00")
+
+	newHash := "$2a$10$newhashnewhashnewhashnewhashnewhashnewhashnewhashne"
+	if err := d.ChangePasswordAndRevokeOtherSessions(ctx, user.ID, newHash, currentSession.ID); err != nil {
+		t.Fatalf("ChangePasswordAndRevokeOtherSessions() error = %v", err)
+	}
+
+	// Password hash must be updated in the DB.
+	var storedHash *string
+	if err := d.SQL().QueryRowContext(ctx,
+		"SELECT password_hash FROM users WHERE id = ?", user.ID).Scan(&storedHash); err != nil {
+		t.Fatalf("read stored hash: %v", err)
+	}
+	if storedHash == nil || *storedHash != newHash {
+		t.Errorf("stored password hash = %v, want %q", storedHash, newHash)
+	}
+
+	// Current session must still exist.
+	var countCurrent int
+	if err := d.SQL().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM api_keys WHERE id = ?", currentSession.ID).Scan(&countCurrent); err != nil {
+		t.Fatalf("count current session: %v", err)
+	}
+	if countCurrent != 1 {
+		t.Errorf("current session count = %d, want 1 (excepted session must survive)", countCurrent)
+	}
+
+	// Other session must be gone (hard-deleted).
+	var countOther int
+	if err := d.SQL().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM api_keys WHERE id = ?", otherSession.ID).Scan(&countOther); err != nil {
+		t.Fatalf("count other session: %v", err)
+	}
+	if countOther != 0 {
+		t.Errorf("other session count = %d, want 0 (must be hard-deleted)", countOther)
+	}
+
+	// Other user's session must be untouched.
+	var countOtherUser int
+	if err := d.SQL().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM api_keys WHERE id = ?", otherUserSession.ID).Scan(&countOtherUser); err != nil {
+		t.Fatalf("count other user session: %v", err)
+	}
+	if countOtherUser != 1 {
+		t.Errorf("other user session count = %d, want 1 (must not be affected)", countOtherUser)
+	}
+}
+
+// TestChangePasswordAndRevokeOtherSessions_NotFound verifies that calling the
+// method for a non-existent user returns ErrNotFound and does not delete any
+// session keys (full rollback).
+func TestChangePasswordAndRevokeOtherSessions_NotFound(t *testing.T) {
+	t.Parallel()
+	d := openMigratedDB(t)
+	ctx := context.Background()
+
+	org := mustCreateOrg(t, d, CreateOrgParams{Name: "O", Slug: "chpwd-notfound-org"})
+	user := mustCreateUser(t, d, CreateUserParams{Email: "chpwd-notfound@example.com", DisplayName: "NF"})
 
 	makeSessionKey := func(name string) *APIKey {
 		plain := "vl_sk_" + name + strings.Repeat("0", 48-len(name))
@@ -688,87 +770,25 @@ func TestRevokeUserSessionsExcept(t *testing.T) {
 		})
 	}
 
-	key1 := makeSessionKey("session1")
-	key2 := makeSessionKey("session2")
+	session1 := makeSessionKey("nf-sess1")
+	session2 := makeSessionKey("nf-sess2")
 
-	// Revoke all sessions except key1.
-	if err := d.RevokeUserSessionsExcept(ctx, user.ID, key1.ID); err != nil {
-		t.Fatalf("RevokeUserSessionsExcept() error = %v", err)
+	const nonExistentUserID = "00000000-0000-0000-0000-000000000000"
+	err := d.ChangePasswordAndRevokeOtherSessions(ctx, nonExistentUserID, "somehash", session1.ID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ChangePasswordAndRevokeOtherSessions() error = %v, want ErrNotFound", err)
 	}
 
-	// key1 must still exist in the DB (raw SELECT — GetAPIKey filters deleted_at,
-	// but session keys are hard-deleted so check existence directly).
-	var count1 int
-	if err := d.SQL().QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM api_keys WHERE id = ?", key1.ID).Scan(&count1); err != nil {
-		t.Fatalf("count key1: %v", err)
-	}
-	if count1 != 1 {
-		t.Errorf("key1 count = %d after RevokeUserSessionsExcept, want 1 (key must survive)", count1)
-	}
-
-	// key2 must be gone (hard-deleted by RevokeUserSessionsExcept).
-	var count2 int
-	if err := d.SQL().QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM api_keys WHERE id = ?", key2.ID).Scan(&count2); err != nil {
-		t.Fatalf("count key2: %v", err)
-	}
-	if count2 != 0 {
-		t.Errorf("key2 count = %d after RevokeUserSessionsExcept, want 0 (key must be deleted)", count2)
-	}
-}
-
-// TestRevokeUserSessionsExcept_OnlyOwnSessions ensures the method does not
-// delete session keys belonging to a different user.
-func TestRevokeUserSessionsExcept_OnlyOwnSessions(t *testing.T) {
-	t.Parallel()
-	d := openMigratedDB(t)
-	ctx := context.Background()
-
-	org := mustCreateOrg(t, d, CreateOrgParams{Name: "O", Slug: "revoke-except-iso-org"})
-	userA := mustCreateUser(t, d, CreateUserParams{Email: "revokeA@example.com", DisplayName: "A"})
-	userB := mustCreateUser(t, d, CreateUserParams{Email: "revokeB@example.com", DisplayName: "B"})
-
-	makeSession := func(u *User, name string) *APIKey {
-		plain := "vl_sk_" + name + strings.Repeat("0", 48-len(name))
-		return mustCreateAPIKey(t, d, CreateAPIKeyParams{
-			KeyHash:   keygen.Hash(plain, testHMACSecret),
-			KeyHint:   keygen.Hint(plain),
-			KeyType:   "session_key",
-			Name:      name,
-			OrgID:     org.ID,
-			UserID:    ptr(u.ID),
-			CreatedBy: u.ID,
-		})
-	}
-
-	keyA1 := makeSession(userA, "sa1xxxxx")
-	keyA2 := makeSession(userA, "sa2xxxxx")
-	keyB := makeSession(userB, "sb1xxxxx")
-
-	// Revoke userA's sessions except keyA1.
-	if err := d.RevokeUserSessionsExcept(ctx, userA.ID, keyA1.ID); err != nil {
-		t.Fatalf("RevokeUserSessionsExcept() error = %v", err)
-	}
-
-	// keyA2 must be gone.
-	var countA2 int
-	if err := d.SQL().QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM api_keys WHERE id = ?", keyA2.ID).Scan(&countA2); err != nil {
-		t.Fatalf("count keyA2: %v", err)
-	}
-	if countA2 != 0 {
-		t.Errorf("keyA2 count = %d, want 0 (must be deleted)", countA2)
-	}
-
-	// keyB (other user) must be untouched.
-	var countB int
-	if err := d.SQL().QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM api_keys WHERE id = ?", keyB.ID).Scan(&countB); err != nil {
-		t.Fatalf("count keyB: %v", err)
-	}
-	if countB != 1 {
-		t.Errorf("keyB count = %d, want 1 (other user's session must not be deleted)", countB)
+	// Both sessions must still exist — transaction was rolled back.
+	for _, key := range []*APIKey{session1, session2} {
+		var count int
+		if err := d.SQL().QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM api_keys WHERE id = ?", key.ID).Scan(&count); err != nil {
+			t.Fatalf("count session %s: %v", key.ID, err)
+		}
+		if count != 1 {
+			t.Errorf("session %s count = %d, want 1 (rollback must preserve all sessions)", key.ID, count)
+		}
 	}
 }
 

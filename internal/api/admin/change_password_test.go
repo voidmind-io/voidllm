@@ -303,8 +303,9 @@ func TestChangeOwnPassword_ValidationErrors(t *testing.T) {
 	}
 }
 
-// TestChangeOwnPassword_MaxLength verifies that a new_password longer than 128
-// characters is rejected with 400 before any bcrypt work is done.
+// TestChangeOwnPassword_MaxLength verifies that a new_password longer than 72
+// bytes is rejected with 400 before any bcrypt work is done. The 72-byte limit
+// matches bcrypt's internal processing boundary.
 func TestChangeOwnPassword_MaxLength(t *testing.T) {
 	t.Parallel()
 
@@ -318,19 +319,20 @@ func TestChangeOwnPassword_MaxLength(t *testing.T) {
 
 	token := doLogin(t, app, email, pwd)
 
-	tooLong := strings.Repeat("a", 129)
+	tooLong := strings.Repeat("a", 73)
 	status, msg := doChangePassword(t, app, token, pwd, tooLong)
 	if status != fiber.StatusBadRequest {
-		t.Errorf("status = %d, want 400 for password > 128 chars", status)
+		t.Errorf("status = %d, want 400 for password > 72 bytes", status)
 	}
-	if !strings.Contains(msg, "at most 128") {
-		t.Errorf("error.message = %q, want it to contain %q", msg, "at most 128")
+	if !strings.Contains(msg, "at most 72") {
+		t.Errorf("error.message = %q, want it to contain %q", msg, "at most 72")
 	}
 }
 
-// TestChangeOwnPassword_MaxLengthBoundary verifies that a new_password of
-// exactly 128 characters is rejected with 400 (one over the limit), and that a
-// password of 127 characters is accepted.
+// TestChangeOwnPassword_MaxLengthBoundary verifies that a new_password of exactly
+// 73 bytes is rejected with 400 (one over bcrypt's 72-byte limit), that a
+// password of exactly 72 bytes is accepted (at the limit), and that a password
+// of 71 bytes is also accepted (well within the limit).
 func TestChangeOwnPassword_MaxLengthBoundary(t *testing.T) {
 	t.Parallel()
 
@@ -342,20 +344,20 @@ func TestChangeOwnPassword_MaxLengthBoundary(t *testing.T) {
 	app, database, _ := setupTestApp(t, "file:TestChangePwd_MaxBound?mode=memory&cache=private")
 	setupLocalUser(t, database, "maxbound-org", email, "MaxBound User", pwd)
 
-	// 129 chars must be rejected.
+	// 73 bytes must be rejected (one over the limit).
 	token := doLogin(t, app, email, pwd)
-	tooLong := strings.Repeat("b", 129)
+	tooLong := strings.Repeat("b", 73)
 	status, msg := doChangePassword(t, app, token, pwd, tooLong)
 	if status != fiber.StatusBadRequest {
-		t.Errorf("129-char password: status = %d, msg: %s — want 400", status, msg)
+		t.Errorf("73-byte password: status = %d, msg: %s — want 400", status, msg)
 	}
 
-	// 64 chars (well within bcrypt's 72-byte limit and under 128) must be accepted.
+	// 72 bytes must be accepted (exactly at bcrypt's limit).
 	token2 := doLogin(t, app, email, pwd)
-	exactly64 := strings.Repeat("c", 64)
-	status2, msg2 := doChangePassword(t, app, token2, pwd, exactly64)
+	exactly72 := strings.Repeat("c", 72)
+	status2, msg2 := doChangePassword(t, app, token2, pwd, exactly72)
 	if status2 != fiber.StatusOK {
-		t.Errorf("64-char password: status = %d, msg: %s — want 200", status2, msg2)
+		t.Errorf("72-byte password: status = %d, msg: %s — want 200", status2, msg2)
 	}
 }
 
@@ -405,7 +407,7 @@ func TestChangeOwnPassword_CurrentSessionSurvivesInDB(t *testing.T) {
 		t.Fatalf("change password: status = %d, msg: %s", status, msg)
 	}
 
-	// token1's DB row must still exist (RevokeUserSessionsExcept preserves it).
+	// token1's DB row must still exist (ChangePasswordAndRevokeOtherSessions preserves it).
 	var count1 int
 	if err := database.SQL().QueryRowContext(context.Background(),
 		"SELECT COUNT(*) FROM api_keys WHERE id = ?", ki1.ID).Scan(&count1); err != nil {

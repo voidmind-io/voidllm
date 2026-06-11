@@ -295,8 +295,8 @@ func (h *Handler) ChangeOwnPassword(c fiber.Ctx) error {
 	if len(req.NewPassword) < 8 {
 		return apierror.BadRequest(c, "new_password must be at least 8 characters")
 	}
-	if len(req.NewPassword) > 128 {
-		return apierror.BadRequest(c, "new_password must be at most 128 characters")
+	if len(req.NewPassword) > 72 {
+		return apierror.BadRequest(c, "new_password must be at most 72 bytes")
 	}
 
 	ctx := c.Context()
@@ -333,28 +333,23 @@ func (h *Handler) ChangeOwnPassword(c fiber.Ctx) error {
 
 	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
 	if err != nil {
+		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+			return apierror.BadRequest(c, "new_password must be at most 72 bytes")
+		}
 		h.Log.ErrorContext(ctx, "change own password: bcrypt", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to hash new password")
 	}
 	newHashStr := string(newHash)
 
-	if _, err := h.DB.UpdateUser(ctx, keyInfo.UserID, db.UpdateUserParams{
-		PasswordHash: &newHashStr,
-	}); err != nil {
+	// Update the password hash and revoke all other sessions atomically.
+	// If either operation fails the transaction rolls back, leaving the DB
+	// consistent: neither the password nor the session list is partially updated.
+	if err := h.DB.ChangePasswordAndRevokeOtherSessions(ctx, keyInfo.UserID, newHashStr, keyInfo.ID); err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "user not found")
 		}
-		h.Log.ErrorContext(ctx, "change own password: update user", slog.String("error", err.Error()))
+		h.Log.ErrorContext(ctx, "change own password: update password and revoke sessions", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to update password")
-	}
-
-	// Revoke all other session keys for this user from the database, keeping the
-	// current session alive. Using RevokeUserSessionsExcept rather than
-	// RevokeUserSessions prevents the current session row from being deleted,
-	// which would cause a silent logout on the next periodic cache refresh.
-	if err := h.DB.RevokeUserSessionsExcept(ctx, keyInfo.UserID, keyInfo.ID); err != nil {
-		// Non-fatal: the password has already been changed; log and continue.
-		h.Log.ErrorContext(ctx, "change own password: revoke sessions", slog.String("error", err.Error()))
 	}
 
 	// Evict all other session entries for this user from the in-memory key cache

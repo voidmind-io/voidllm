@@ -310,21 +310,40 @@ func (d *DB) RevokeUserSessions(ctx context.Context, userID string) error {
 	return nil
 }
 
-// RevokeUserSessionsExcept hard-deletes all session keys for a user except the
-// one identified by exceptKeyID. Used during a password change so that the
-// current session survives the revocation — preventing the user from being
-// silently logged out when the cache is next refreshed from the database.
-func (d *DB) RevokeUserSessionsExcept(ctx context.Context, userID, exceptKeyID string) error {
+// ChangePasswordAndRevokeOtherSessions atomically updates a user's password hash
+// and hard-deletes all session keys for that user except the one identified by
+// exceptKeyID. Both operations run in a single transaction: if either fails the
+// whole operation is rolled back so the DB is never left in a partially-updated
+// state. Returns ErrNotFound if the user does not exist or has been soft-deleted.
+func (d *DB) ChangePasswordAndRevokeOtherSessions(ctx context.Context, userID, newPasswordHash, exceptKeyID string) error {
 	p := d.dialect.Placeholder
-	query := "DELETE FROM api_keys WHERE user_id = " + p(1) +
+
+	updateQuery := "UPDATE users SET password_hash = " + p(1) +
+		", updated_at = CURRENT_TIMESTAMP" +
+		" WHERE id = " + p(2) + " AND deleted_at IS NULL"
+
+	deleteQuery := "DELETE FROM api_keys WHERE user_id = " + p(1) +
 		" AND key_type = " + p(2) +
 		" AND id != " + p(3)
 
-	_, err := d.sql.ExecContext(ctx, query, userID, "session_key", exceptKeyID)
-	if err != nil {
-		return fmt.Errorf("revoke user sessions except %s: %w", userID, translateError(err))
-	}
-	return nil
+	return d.WithTx(ctx, func(q Querier) error {
+		result, err := q.ExecContext(ctx, updateQuery, newPasswordHash, userID)
+		if err != nil {
+			return fmt.Errorf("update password hash: %w", translateError(err))
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("update password hash rows affected: %w", err)
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+
+		if _, err := q.ExecContext(ctx, deleteQuery, userID, "session_key", exceptKeyID); err != nil {
+			return fmt.Errorf("revoke other sessions: %w", translateError(err))
+		}
+		return nil
+	})
 }
 
 func (d *DB) DeleteAPIKey(ctx context.Context, id string) error {
