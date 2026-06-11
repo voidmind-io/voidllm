@@ -388,6 +388,69 @@ func TestCreateUser_ResponseHasNoPassword(t *testing.T) {
 	}
 }
 
+// TestCreateUser_PasswordTooLong verifies that a password exceeding the bcrypt
+// 72-byte limit is rejected with 400 before reaching GenerateFromPassword,
+// and that a 72-byte password (at the exact limit) is accepted with 201.
+func TestCreateUser_PasswordTooLong(t *testing.T) {
+	t.Parallel()
+
+	t.Run("73-byte password returns 400", func(t *testing.T) {
+		t.Parallel()
+
+		app, database, keyCache := setupTestApp(t, "file:TestCreateUser_PwTooLong_73?mode=memory&cache=private")
+		org := mustCreateOrg(t, database, "PW Len Org", "pw-len-org-73")
+		testKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+		req := httptest.NewRequest("POST", "/api/v1/users", bodyJSON(t, map[string]any{
+			"email":        "toolong@example.com",
+			"display_name": "Too Long PW",
+			"password":     strings.Repeat("a", 73),
+			"org_id":       org.ID,
+		}))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+testKey)
+
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != fiber.StatusBadRequest {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("status = %d, want 400; body: %s", resp.StatusCode, body)
+		}
+	})
+
+	t.Run("72-byte password returns 201", func(t *testing.T) {
+		t.Parallel()
+
+		app, database, keyCache := setupTestApp(t, "file:TestCreateUser_PwTooLong_72?mode=memory&cache=private")
+		org := mustCreateOrg(t, database, "PW Len Org", "pw-len-org-72")
+		testKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+		req := httptest.NewRequest("POST", "/api/v1/users", bodyJSON(t, map[string]any{
+			"email":        "maxlen@example.com",
+			"display_name": "Max Len PW",
+			"password":     strings.Repeat("a", 72),
+			"org_id":       org.ID,
+		}))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+testKey)
+
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != fiber.StatusCreated {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("status = %d, want 201; body: %s", resp.StatusCode, body)
+		}
+	})
+}
+
 // ---- GET /api/v1/users/:user_id ----------------------------------------------
 
 func TestGetUser(t *testing.T) {

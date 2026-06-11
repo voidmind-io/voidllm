@@ -117,6 +117,9 @@ func (h *Handler) CreateUser(c fiber.Ctx) error {
 	if len(req.Password) < 8 {
 		return apierror.BadRequest(c, "password must be at least 8 characters")
 	}
+	if len(req.Password) > 72 {
+		return apierror.BadRequest(c, "password must be at most 72 bytes")
+	}
 	if req.IsSystemAdmin && !auth.HasRole(keyInfo.Role, auth.RoleSystemAdmin) {
 		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "only system admins may create system admin users")
 	}
@@ -152,6 +155,9 @@ func (h *Handler) CreateUser(c fiber.Ctx) error {
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
+		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+			return apierror.BadRequest(c, "password must be at most 72 bytes")
+		}
 		h.Log.ErrorContext(c.Context(), "create user: bcrypt", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to hash password")
 	}
@@ -385,8 +391,14 @@ func (h *Handler) UpdateUser(c fiber.Ctx) error {
 		if len(*req.Password) < 8 {
 			return apierror.BadRequest(c, "password must be at least 8 characters")
 		}
+		if len(*req.Password) > 72 {
+			return apierror.BadRequest(c, "password must be at most 72 bytes")
+		}
 		hash, err := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
 		if err != nil {
+			if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+				return apierror.BadRequest(c, "password must be at most 72 bytes")
+			}
 			h.Log.ErrorContext(c.Context(), "update user: bcrypt", slog.String("error", err.Error()))
 			return apierror.InternalError(c, "failed to hash password")
 		}
