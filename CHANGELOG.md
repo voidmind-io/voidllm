@@ -2,6 +2,35 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.20] - 2026-06-16
+
+### Features
+- Brute-force protection on the login endpoint: per-IP rate limiting plus per-account lockout after repeated failed attempts. In-memory, per-process (single-instance; distributed throttling will follow with Redis) (#104)
+
+### Fixes
+- Rate limiter now enforces each scope against its own limit. Previously the most-restrictive limit across key/team/org was applied to every counter, so an org or team was incorrectly capped at the smallest key limit and requests were rejected with 429 too early (#102)
+- Users created via the admin UI now receive an organization membership and can sign in. User creation now requires an organization and creates the user and membership atomically; a guard turns the previous login crash for org-less users into a clean error (#100, #105)
+- Profile password change now actually changes the password and verifies the current password first. The previous flow silently dropped the new password and reported success without changing anything (#99, #106)
+
+### Security
+- Audit log descriptions now redact sensitive fields (passwords, API keys, auth tokens, OAuth/client secrets) instead of persisting request bodies verbatim. A migration clears historical `audit_logs` rows that may contain such values. Operators upgrading from an earlier version should rotate any secrets that were entered through the admin API before this release (#103)
+- Closed upstream dependency advisories in `react-router` (#111) and `vite` (#112)
+
+### Dependencies
+- github.com/valyala/fasthttp 1.70.0 → 1.71.0 (#111)
+- react-router-dom 7.14.2 → 7.17.0 (#111)
+- vite 7.3.2 → 7.3.5 (#112)
+- github.com/redis/go-redis/v9 9.18.0 → 9.19.0 (#80)
+- google.golang.org/grpc 1.80.0 → 1.81.0 (#82)
+- github.com/bytedance/sonic 1.15.0 → 1.15.1 (#84)
+- modernc.org/sqlite 1.50.0 → 1.50.1 (#88)
+- js-yaml 4.1.1 → 4.2.0 (#109)
+- tailwindcss 4.2.2 → 4.2.4 (#81)
+- typescript-eslint 8.58.0 → 8.59.2 (#85)
+- CI actions: docker/setup-buildx-action 4.1.0 (#97), docker/login-action 4.2.0 (#96), docker/build-push-action 7.2.0 (#95), codecov/codecov-action 6.0.1 (#93), sigstore/cosign-installer 4.1.2 (#89)
+
+---
+
 ## [0.0.19] - 2026-05-14
 
 ### Fixes
