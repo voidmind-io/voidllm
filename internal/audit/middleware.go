@@ -10,6 +10,37 @@ import (
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
+// sensitiveFields lists JSON field names whose values must never be persisted
+// in audit log descriptions. All keys are lowercase; redactMap normalises
+// incoming field names with strings.ToLower before the lookup so that
+// mixed-case variants such as "Password" or "API_KEY" are caught correctly.
+// Matching is exact (not substring) to avoid false positives such as
+// "max_tokens". When a field in this set is present in the request body, its
+// value is replaced with the string "[REDACTED]" rather than being dropped
+// entirely — so the audit trail shows that the field was sent (e.g. "password
+// was changed") without exposing the value.
+//
+// Sources:
+//   - "password":            createUserRequest, updateUserRequest (users.go)
+//   - "api_key":             createModelRequest, updateModelRequest (models.go);
+//     createDeploymentRequest, updateDeploymentRequest (deployments.go);
+//     testConnectionRequest (models.go)
+//   - "auth_token":          createMCPServerRequest, updateMCPServerRequest (mcp_servers.go)
+//   - "oauth_client_secret": createMCPServerRequest, updateMCPServerRequest (mcp_servers.go)
+//   - "client_secret":       ssoConfigRequest (org_sso.go)
+//   - "key":                 setLicenseRequest (license.go)
+//   - "token":               defense-in-depth for invite tokens and similar
+//     single-field token payloads
+var sensitiveFields = map[string]struct{}{
+	"password":            {},
+	"api_key":             {},
+	"auth_token":          {},
+	"oauth_client_secret": {},
+	"client_secret":       {},
+	"key":                 {},
+	"token":               {},
+}
+
 // normalizeResourceType maps plural URL path segments to their canonical
 // resource type names used in audit events.
 var normalizeResourceType = map[string]string{
@@ -209,27 +240,30 @@ func parseRoute(c fiber.Ctx) (action, resourceType, resourceID string) {
 	return action, resourceType, resourceID
 }
 
+// redactedValue is the JSON literal substituted for any sensitive field value.
+const redactedValue = `"[REDACTED]"`
+
 // buildDescription creates a compact JSON representation of the request body
 // fields that were sent. This shows exactly what the caller changed without
 // requiring a pre-change DB read. Fields with zero values are omitted.
+// Sensitive field values (see sensitiveFields) are replaced with "[REDACTED]"
+// rather than being dropped — the audit trail records that the field was
+// present without exposing the secret. Redaction is applied recursively into
+// nested objects and into objects contained in arrays.
 // The result is stored as the audit event description.
 func buildDescription(body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
-	var raw map[string]jsonx.RawMessage
+	// any is intentional here: jsonx.Unmarshal of an arbitrary JSON document
+	// into interface{} is the standard approach for schema-agnostic traversal.
+	// The alternative — operating purely on RawMessage bytes — would require a
+	// custom JSON tokeniser and is not meaningfully safer.
+	var raw map[string]any
 	if jsonx.Unmarshal(body, &raw) != nil {
 		return ""
 	}
-	// Re-marshal only non-null, non-empty fields into compact JSON.
-	clean := make(map[string]jsonx.RawMessage, len(raw))
-	for k, v := range raw {
-		s := string(v)
-		if s == "null" || s == `""` || s == "0" || s == "false" {
-			continue
-		}
-		clean[k] = v
-	}
+	clean := redactMap(raw)
 	if len(clean) == 0 {
 		return ""
 	}
@@ -238,4 +272,75 @@ func buildDescription(body []byte) string {
 		return ""
 	}
 	return string(out)
+}
+
+// redactMap processes a JSON object map: it drops zero-value fields for
+// non-sensitive keys, replaces sensitive key values with redactedValue, and
+// recurses into nested objects and arrays of objects.
+//
+// The return type is map[string]any. any is required here because the values
+// may be strings, numbers, booleans, nested maps, or slices — all originating
+// from jsonx.Unmarshal into interface{}.
+func redactMap(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		if _, sensitive := sensitiveFields[strings.ToLower(k)]; sensitive {
+			// Always include sensitive fields, but replace their value so the
+			// audit trail shows the field was present (e.g. "password changed").
+			out[k] = jsonx.RawMessage(redactedValue)
+			continue
+		}
+		// Drop zero/empty values for non-sensitive fields (existing behaviour).
+		if isZeroValue(v) {
+			continue
+		}
+		// Recurse into nested objects.
+		if nested, ok := v.(map[string]any); ok {
+			if rec := redactMap(nested); len(rec) > 0 {
+				out[k] = rec
+			}
+			continue
+		}
+		// Recurse into arrays: process object elements, pass scalars through.
+		if arr, ok := v.([]any); ok {
+			out[k] = redactSlice(arr)
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// redactSlice processes a JSON array: object elements are passed through
+// redactMap; scalar elements are included as-is.
+//
+// []any is the natural type produced by jsonx.Unmarshal for JSON arrays.
+func redactSlice(arr []any) []any {
+	out := make([]any, 0, len(arr))
+	for _, elem := range arr {
+		if nested, ok := elem.(map[string]any); ok {
+			out = append(out, redactMap(nested))
+		} else {
+			out = append(out, elem)
+		}
+	}
+	return out
+}
+
+// isZeroValue reports whether v represents a JSON zero/empty value that should
+// be omitted from the audit description. It mirrors the original string-based
+// checks: null, empty string, numeric zero, and boolean false.
+func isZeroValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch val := v.(type) {
+	case string:
+		return val == ""
+	case float64:
+		return val == 0
+	case bool:
+		return !val
+	}
+	return false
 }
