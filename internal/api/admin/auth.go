@@ -281,6 +281,141 @@ func (h *Handler) AvailableModels(c fiber.Ctx) error {
 	return c.JSON(availableModelsResponse{Models: models})
 }
 
+// changeOwnPasswordRequest is the JSON body for POST /api/v1/me/password.
+type changeOwnPasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// ChangeOwnPassword handles POST /api/v1/me/password. It verifies the caller's
+// current password, then replaces it with the new one and invalidates all other
+// active sessions for the user. The current session remains valid.
+// Only local (non-SSO) accounts may use this endpoint.
+//
+// @Summary      Change own password
+// @Description  Verifies the current password and sets a new one. Revokes all other active sessions. Requires a user-scoped session key.
+// @Tags         auth
+// @Accept       json
+// @Produce      json
+// @Param        body  body      changeOwnPasswordRequest  true  "Password change request"
+// @Success      200   "OK"
+// @Failure      400   {object}  swaggerErrorResponse
+// @Failure      401   {object}  swaggerErrorResponse
+// @Failure      500   {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /me/password [post]
+func (h *Handler) ChangeOwnPassword(c fiber.Ctx) error {
+	keyInfo := auth.KeyInfoFromCtx(c)
+	if keyInfo == nil {
+		return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "missing authentication")
+	}
+	if keyInfo.UserID == "" {
+		return apierror.Send(c, fiber.StatusBadRequest, "bad_request", "this endpoint requires a user-scoped key")
+	}
+
+	var req changeOwnPasswordRequest
+	if err := c.Bind().JSON(&req); err != nil {
+		return apierror.BadRequest(c, "invalid request body")
+	}
+	if req.CurrentPassword == "" {
+		return apierror.BadRequest(c, "current_password is required")
+	}
+	if len(req.NewPassword) < 8 {
+		return apierror.BadRequest(c, "new_password must be at least 8 characters")
+	}
+	if len(req.NewPassword) > 72 {
+		return apierror.BadRequest(c, "new_password must be at most 72 bytes")
+	}
+
+	ctx := c.Context()
+
+	authProvider, currentHash, err := h.DB.GetUserPasswordHashByID(ctx, keyInfo.UserID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "user not found")
+		}
+		if errors.Is(err, db.ErrNoPassword) {
+			// Burn bcrypt time to prevent timing-based account-type enumeration.
+			// The error from CompareHashAndPassword is intentionally ignored here.
+			_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(req.CurrentPassword))
+			return apierror.BadRequest(c, "password change not available for this account")
+		}
+		h.Log.ErrorContext(ctx, "change own password: get password hash", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to verify current password")
+	}
+
+	// SSO accounts never have a local password even if auth_provider is set.
+	// The ErrNoPassword sentinel above covers the NULL hash case; this guard
+	// catches rows where auth_provider is set to a non-local value but the hash
+	// column is somehow populated — defensive, belt-and-suspenders.
+	if authProvider != "local" {
+		// Burn bcrypt time to prevent timing-based account-type enumeration.
+		// The error from CompareHashAndPassword is intentionally ignored here.
+		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(req.CurrentPassword))
+		return apierror.BadRequest(c, "password change not available for this account")
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(currentHash), []byte(req.CurrentPassword)); err != nil {
+		return apierror.Send(c, fiber.StatusBadRequest, "bad_request", "current password is incorrect")
+	}
+
+	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+			return apierror.BadRequest(c, "new_password must be at most 72 bytes")
+		}
+		h.Log.ErrorContext(ctx, "change own password: bcrypt", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to hash new password")
+	}
+	newHashStr := string(newHash)
+
+	// Update the password hash and revoke all other sessions atomically.
+	// If either operation fails the transaction rolls back, leaving the DB
+	// consistent: neither the password nor the session list is partially updated.
+	if err := h.DB.ChangePasswordAndRevokeOtherSessions(ctx, keyInfo.UserID, newHashStr, keyInfo.ID); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "user not found")
+		}
+		h.Log.ErrorContext(ctx, "change own password: update password and revoke sessions", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to update password")
+	}
+
+	// Evict all other session entries for this user from the in-memory key cache
+	// so that revoked sessions are rejected immediately without waiting for the
+	// next periodic cache refresh.
+	// Collect hashes first — Range holds a read lock, so Delete (write lock)
+	// must not be called inside the Range closure.
+	var toEvict []string
+	currentKeyID := keyInfo.ID
+	h.KeyCache.Range(func(keyHash string, ki auth.KeyInfo) bool {
+		if ki.UserID == keyInfo.UserID && ki.ID != currentKeyID {
+			toEvict = append(toEvict, keyHash)
+		}
+		return true
+	})
+	for _, keyHash := range toEvict {
+		h.KeyCache.Delete(keyHash)
+	}
+
+	if h.AuditLogger != nil {
+		h.AuditLogger.Log(audit.Event{
+			Timestamp:    time.Now().UTC(),
+			OrgID:        keyInfo.OrgID,
+			ActorID:      keyInfo.UserID,
+			ActorType:    "user",
+			ActorKeyID:   keyInfo.ID,
+			Action:       "password_change",
+			ResourceType: "user",
+			ResourceID:   keyInfo.UserID,
+			IPAddress:    c.IP(),
+			StatusCode:   fiber.StatusOK,
+			RequestID:    apierror.RequestIDFromCtx(c),
+		})
+	}
+
+	return c.SendStatus(fiber.StatusOK)
+}
+
 // Me returns the authenticated user's profile.
 //
 // @Summary      Get authenticated user profile

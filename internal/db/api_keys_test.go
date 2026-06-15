@@ -663,6 +663,135 @@ func TestDeleteAPIKey(t *testing.T) {
 	}
 }
 
+// ---- ChangePasswordAndRevokeOtherSessions -----------------------------------
+
+// TestChangePasswordAndRevokeOtherSessions verifies the atomic password-change
+// + session-revocation method: the new hash is persisted, other session keys are
+// deleted, the excepted session key survives, and an unrelated user is unaffected.
+func TestChangePasswordAndRevokeOtherSessions(t *testing.T) {
+	t.Parallel()
+	d := openMigratedDB(t)
+	ctx := context.Background()
+
+	org := mustCreateOrg(t, d, CreateOrgParams{Name: "O", Slug: "chpwd-revoke-org"})
+	user := mustCreateUser(t, d, CreateUserParams{
+		Email:        "chpwd-revoke@example.com",
+		DisplayName:  "CPR",
+		PasswordHash: ptr("$2a$10$initialhashinitialhashinitialhashinitialhashinitialh"),
+	})
+
+	makeSessionKey := func(u *User, name string) *APIKey {
+		plain := "vl_sk_" + name + strings.Repeat("0", 48-len(name))
+		return mustCreateAPIKey(t, d, CreateAPIKeyParams{
+			KeyHash:   keygen.Hash(plain, testHMACSecret),
+			KeyHint:   keygen.Hint(plain),
+			KeyType:   "session_key",
+			Name:      name,
+			OrgID:     org.ID,
+			UserID:    ptr(u.ID),
+			CreatedBy: u.ID,
+		})
+	}
+
+	currentSession := makeSessionKey(user, "current0")
+	otherSession := makeSessionKey(user, "other000")
+
+	// Unrelated user — must be completely untouched.
+	otherUser := mustCreateUser(t, d, CreateUserParams{Email: "chpwd-other@example.com", DisplayName: "O"})
+	otherUserSession := makeSessionKey(otherUser, "otherU00")
+
+	newHash := "$2a$10$newhashnewhashnewhashnewhashnewhashnewhashnewhashne"
+	if err := d.ChangePasswordAndRevokeOtherSessions(ctx, user.ID, newHash, currentSession.ID); err != nil {
+		t.Fatalf("ChangePasswordAndRevokeOtherSessions() error = %v", err)
+	}
+
+	// Password hash must be updated in the DB.
+	var storedHash *string
+	if err := d.SQL().QueryRowContext(ctx,
+		"SELECT password_hash FROM users WHERE id = ?", user.ID).Scan(&storedHash); err != nil {
+		t.Fatalf("read stored hash: %v", err)
+	}
+	if storedHash == nil || *storedHash != newHash {
+		t.Errorf("stored password hash = %v, want %q", storedHash, newHash)
+	}
+
+	// Current session must still exist.
+	var countCurrent int
+	if err := d.SQL().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM api_keys WHERE id = ?", currentSession.ID).Scan(&countCurrent); err != nil {
+		t.Fatalf("count current session: %v", err)
+	}
+	if countCurrent != 1 {
+		t.Errorf("current session count = %d, want 1 (excepted session must survive)", countCurrent)
+	}
+
+	// Other session must be gone (hard-deleted).
+	var countOther int
+	if err := d.SQL().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM api_keys WHERE id = ?", otherSession.ID).Scan(&countOther); err != nil {
+		t.Fatalf("count other session: %v", err)
+	}
+	if countOther != 0 {
+		t.Errorf("other session count = %d, want 0 (must be hard-deleted)", countOther)
+	}
+
+	// Other user's session must be untouched.
+	var countOtherUser int
+	if err := d.SQL().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM api_keys WHERE id = ?", otherUserSession.ID).Scan(&countOtherUser); err != nil {
+		t.Fatalf("count other user session: %v", err)
+	}
+	if countOtherUser != 1 {
+		t.Errorf("other user session count = %d, want 1 (must not be affected)", countOtherUser)
+	}
+}
+
+// TestChangePasswordAndRevokeOtherSessions_NotFound verifies that calling the
+// method for a non-existent user returns ErrNotFound and does not delete any
+// session keys (full rollback).
+func TestChangePasswordAndRevokeOtherSessions_NotFound(t *testing.T) {
+	t.Parallel()
+	d := openMigratedDB(t)
+	ctx := context.Background()
+
+	org := mustCreateOrg(t, d, CreateOrgParams{Name: "O", Slug: "chpwd-notfound-org"})
+	user := mustCreateUser(t, d, CreateUserParams{Email: "chpwd-notfound@example.com", DisplayName: "NF"})
+
+	makeSessionKey := func(name string) *APIKey {
+		plain := "vl_sk_" + name + strings.Repeat("0", 48-len(name))
+		return mustCreateAPIKey(t, d, CreateAPIKeyParams{
+			KeyHash:   keygen.Hash(plain, testHMACSecret),
+			KeyHint:   keygen.Hint(plain),
+			KeyType:   "session_key",
+			Name:      name,
+			OrgID:     org.ID,
+			UserID:    ptr(user.ID),
+			CreatedBy: user.ID,
+		})
+	}
+
+	session1 := makeSessionKey("nf-sess1")
+	session2 := makeSessionKey("nf-sess2")
+
+	const nonExistentUserID = "00000000-0000-0000-0000-000000000000"
+	err := d.ChangePasswordAndRevokeOtherSessions(ctx, nonExistentUserID, "somehash", session1.ID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ChangePasswordAndRevokeOtherSessions() error = %v, want ErrNotFound", err)
+	}
+
+	// Both sessions must still exist — transaction was rolled back.
+	for _, key := range []*APIKey{session1, session2} {
+		var count int
+		if err := d.SQL().QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM api_keys WHERE id = ?", key.ID).Scan(&count); err != nil {
+			t.Fatalf("count session %s: %v", key.ID, err)
+		}
+		if count != 1 {
+			t.Errorf("session %s count = %d, want 1 (rollback must preserve all sessions)", key.ID, count)
+		}
+	}
+}
+
 // ---- GetUserOrgRole ---------------------------------------------------------
 
 func TestGetUserOrgRole(t *testing.T) {

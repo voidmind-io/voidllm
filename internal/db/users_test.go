@@ -670,6 +670,109 @@ func TestGetUserPasswordHash(t *testing.T) {
 	}
 }
 
+// ---- GetUserPasswordHashByID -------------------------------------------------
+
+func TestGetUserPasswordHashByID(t *testing.T) {
+	t.Parallel()
+
+	const testPassword = "testpassword123"
+
+	tests := []struct {
+		name              string
+		setup             func(t *testing.T, d *DB) string // returns userID to look up
+		wantErr           error
+		checkAuthProvider string // non-empty: verify returned authProvider equals this
+		checkHashMatches  bool   // true: verify returned hash matches testPassword
+	}{
+		{
+			name: "local user returns auth_provider and bcrypt hash",
+			setup: func(t *testing.T, d *DB) string {
+				t.Helper()
+				u := mustCreateUser(t, d, CreateUserParams{
+					Email:        "byid-local@example.com",
+					DisplayName:  "By ID Local",
+					PasswordHash: testPasswordHash(t),
+					AuthProvider: "local",
+				})
+				return u.ID
+			},
+			wantErr:           nil,
+			checkAuthProvider: "local",
+			checkHashMatches:  true,
+		},
+		{
+			name: "non-existent ID returns ErrNotFound",
+			setup: func(t *testing.T, d *DB) string {
+				return "00000000-0000-0000-0000-000000000000"
+			},
+			wantErr: ErrNotFound,
+		},
+		{
+			name: "soft-deleted user returns ErrNotFound",
+			setup: func(t *testing.T, d *DB) string {
+				t.Helper()
+				u := mustCreateUser(t, d, CreateUserParams{
+					Email:        "byid-deleted@example.com",
+					DisplayName:  "By ID Deleted",
+					PasswordHash: testPasswordHash(t),
+				})
+				if err := d.DeleteUser(context.Background(), u.ID); err != nil {
+					t.Fatalf("DeleteUser(): %v", err)
+				}
+				return u.ID
+			},
+			wantErr: ErrNotFound,
+		},
+		{
+			name: "SSO user with NULL password_hash returns ErrNoPassword",
+			setup: func(t *testing.T, d *DB) string {
+				t.Helper()
+				extID := "oidc-sub-byid-sso"
+				u := mustCreateUser(t, d, CreateUserParams{
+					Email:        "byid-sso@example.com",
+					DisplayName:  "By ID SSO",
+					AuthProvider: "oidc",
+					ExternalID:   &extID,
+					// PasswordHash intentionally nil — SSO account.
+				})
+				return u.ID
+			},
+			wantErr: ErrNoPassword,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := openMigratedDB(t)
+
+			userID := tc.setup(t, d)
+			authProvider, hash, err := d.GetUserPasswordHashByID(context.Background(), userID)
+
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("GetUserPasswordHashByID() error = %v, wantErr %v", err, tc.wantErr)
+			}
+
+			if tc.wantErr != nil {
+				return
+			}
+
+			if tc.checkAuthProvider != "" && authProvider != tc.checkAuthProvider {
+				t.Errorf("authProvider = %q, want %q", authProvider, tc.checkAuthProvider)
+			}
+
+			if tc.checkHashMatches {
+				if hash == "" {
+					t.Error("hash is empty, want non-empty bcrypt hash")
+				}
+				if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(testPassword)); err != nil {
+					t.Errorf("returned hash does not match test password: %v", err)
+				}
+			}
+		})
+	}
+}
+
 // ---- DeleteUser --------------------------------------------------------------
 
 func TestDeleteUser(t *testing.T) {
