@@ -164,7 +164,7 @@ func TestCheckRate_MostRestrictiveWins_KeyRPM10_OrgRPM3(t *testing.T) {
 	noLimits := Limits{}
 	orgLimits := Limits{RequestsPerMinute: 3}
 
-	// Effective RPM = min(10, 3) = 3. 4th request must fail.
+	// Key RPM=10 (not the bottleneck); org RPM=3 (org counter hits its limit of 3). 4th request must fail.
 	for i := range 3 {
 		if err := rl.CheckRate("key-mrw", "", "org-mrw", keyLimits, noLimits, orgLimits); err != nil {
 			t.Fatalf("request %d: CheckRate() error = %v, want nil", i+1, err)
@@ -369,6 +369,173 @@ func TestEvictStale_RemovesExpiredEntries(t *testing.T) {
 		if _, ok := rl.minuteCounters.Load("key:" + key); !ok {
 			t.Errorf("current-window minute entry for %s was wrongly evicted", key)
 		}
+	}
+}
+
+// TestCheckRate_OrgNotCappedByKeyLimit is the regression test for the bug
+// where CheckRate applied the effective (most-restrictive) limit to ALL scope
+// counters. Ten distinct keys each with RPM=5 and a shared org with RPM=50:
+// all 50 requests must succeed because each scope is now checked against its
+// own limit. A 51st request (11th key) must fail at the org limit.
+func TestCheckRate_OrgNotCappedByKeyLimit(t *testing.T) {
+	t.Parallel()
+
+	rl := NewRateLimiter()
+	keyLimits := Limits{RequestsPerMinute: 5}
+	noLimits := Limits{}
+	orgLimits := Limits{RequestsPerMinute: 50}
+	orgID := "org-regression-rpm"
+
+	// 10 keys × 5 requests each = 50 total — all must be allowed.
+	for k := range 10 {
+		keyID := fmt.Sprintf("reg-key-%d", k)
+		for req := range 5 {
+			if err := rl.CheckRate(keyID, "", orgID, keyLimits, noLimits, orgLimits); err != nil {
+				t.Fatalf("key %s request %d: CheckRate() error = %v, want nil", keyID, req+1, err)
+			}
+		}
+	}
+
+	// 51st request — org counter is now at 50; next must fail.
+	err := rl.CheckRate("reg-key-10", "", orgID, keyLimits, noLimits, orgLimits)
+	if !errors.Is(err, ErrRateLimitExceeded) {
+		t.Errorf("51st CheckRate() error = %v, want ErrRateLimitExceeded (org limit)", err)
+	}
+}
+
+// TestCheckRate_KeyLimitDoesNotConsumeOtherKeys verifies that exhausting one
+// key's budget has no effect on a different key sharing the same org, when the
+// org has no limit of its own.
+func TestCheckRate_KeyLimitDoesNotConsumeOtherKeys(t *testing.T) {
+	t.Parallel()
+
+	rl := NewRateLimiter()
+	keyLimits := Limits{RequestsPerMinute: 3}
+	noLimits := Limits{}
+	orgID := "org-key-isolation"
+
+	// Exhaust key A.
+	for i := range 3 {
+		if err := rl.CheckRate("key-isolation-a", "", orgID, keyLimits, noLimits, noLimits); err != nil {
+			t.Fatalf("key A request %d: CheckRate() error = %v, want nil", i+1, err)
+		}
+	}
+	err := rl.CheckRate("key-isolation-a", "", orgID, keyLimits, noLimits, noLimits)
+	if !errors.Is(err, ErrRateLimitExceeded) {
+		t.Errorf("key A 4th CheckRate() error = %v, want ErrRateLimitExceeded", err)
+	}
+
+	// Key B in the same org must still have its full budget.
+	for i := range 3 {
+		if err := rl.CheckRate("key-isolation-b", "", orgID, keyLimits, noLimits, noLimits); err != nil {
+			t.Fatalf("key B request %d: CheckRate() error = %v, want nil (key A's usage must not affect key B)", i+1, err)
+		}
+	}
+}
+
+// TestCheckRate_TeamLimitSharedAcrossKeys verifies that a team's RPM budget is
+// shared by all keys in that team, while a key in a different team is
+// completely unaffected.
+func TestCheckRate_TeamLimitSharedAcrossKeys(t *testing.T) {
+	t.Parallel()
+
+	rl := NewRateLimiter()
+	noLimits := Limits{}
+	teamLimits := Limits{RequestsPerMinute: 5}
+	orgID := "org-team-shared"
+
+	// Key A sends 3, Key B sends 2 — total 5, all inside the team budget.
+	for i := range 3 {
+		if err := rl.CheckRate("team-shared-key-a", "team-shared-alpha", orgID, noLimits, teamLimits, noLimits); err != nil {
+			t.Fatalf("key A request %d: CheckRate() error = %v, want nil", i+1, err)
+		}
+	}
+	for i := range 2 {
+		if err := rl.CheckRate("team-shared-key-b", "team-shared-alpha", orgID, noLimits, teamLimits, noLimits); err != nil {
+			t.Fatalf("key B request %d: CheckRate() error = %v, want nil", i+1, err)
+		}
+	}
+
+	// 6th request from either key must hit the team limit.
+	err := rl.CheckRate("team-shared-key-a", "team-shared-alpha", orgID, noLimits, teamLimits, noLimits)
+	if !errors.Is(err, ErrRateLimitExceeded) {
+		t.Errorf("6th CheckRate() (team-alpha) error = %v, want ErrRateLimitExceeded", err)
+	}
+
+	// Key C in a different team with the same RPM=5 must be entirely unaffected.
+	for i := range 5 {
+		if err := rl.CheckRate("team-shared-key-c", "team-shared-beta", orgID, noLimits, teamLimits, noLimits); err != nil {
+			t.Fatalf("key C request %d: CheckRate() error = %v, want nil (different team must be unaffected)", i+1, err)
+		}
+	}
+}
+
+// TestCheckRate_OrgNotCappedByKeyLimit_RPD is the RPD analogue of
+// TestCheckRate_OrgNotCappedByKeyLimit: 10 keys × 5 RPD each against an org
+// limit of 50 RPD. All 50 must succeed; the 51st must fail.
+func TestCheckRate_OrgNotCappedByKeyLimit_RPD(t *testing.T) {
+	t.Parallel()
+
+	rl := NewRateLimiter()
+	keyLimits := Limits{RequestsPerDay: 5}
+	noLimits := Limits{}
+	orgLimits := Limits{RequestsPerDay: 50}
+	orgID := "org-regression-rpd"
+
+	for k := range 10 {
+		keyID := fmt.Sprintf("reg-rpd-key-%d", k)
+		for req := range 5 {
+			if err := rl.CheckRate(keyID, "", orgID, keyLimits, noLimits, orgLimits); err != nil {
+				t.Fatalf("key %s request %d: CheckRate() error = %v, want nil", keyID, req+1, err)
+			}
+		}
+	}
+
+	err := rl.CheckRate("reg-rpd-key-10", "", orgID, keyLimits, noLimits, orgLimits)
+	if !errors.Is(err, ErrRateLimitExceeded) {
+		t.Errorf("51st CheckRate() RPD error = %v, want ErrRateLimitExceeded (org RPD limit)", err)
+	}
+}
+
+// TestCheckRate_ScopesWithoutLimitCreateNoCounters verifies that scopes with
+// zero limits (Limits{}) do not allocate counter entries. Only the key scope,
+// which has an actual limit, must create an entry.
+func TestCheckRate_ScopesWithoutLimitCreateNoCounters(t *testing.T) {
+	t.Parallel()
+
+	rl := NewRateLimiter()
+	keyLimits := Limits{RequestsPerMinute: 3}
+	noLimits := Limits{}
+	teamID := "team-no-counter"
+	orgID := "org-no-counter"
+	keyID := "key-no-counter"
+
+	if err := rl.CheckRate(keyID, teamID, orgID, keyLimits, noLimits, noLimits); err != nil {
+		t.Fatalf("CheckRate() error = %v, want nil", err)
+	}
+
+	// The key scope must have a minute counter entry.
+	if _, ok := rl.minuteCounters.Load("key:" + keyID); !ok {
+		t.Error("minute counter for key scope not found, want entry")
+	}
+
+	// Team and org have zero limits — no counter should have been created.
+	if _, ok := rl.minuteCounters.Load("team:" + teamID); ok {
+		t.Error("minute counter for team scope found, want no entry (team limit is zero)")
+	}
+	if _, ok := rl.minuteCounters.Load("org:" + orgID); ok {
+		t.Error("minute counter for org scope found, want no entry (org limit is zero)")
+	}
+
+	// Day counters: only key has an RPM limit (no RPD set) — no day counter at all.
+	if _, ok := rl.dayCounters.Load("key:" + keyID); ok {
+		t.Error("day counter for key scope found, want no entry (key has RPM only, no RPD)")
+	}
+	if _, ok := rl.dayCounters.Load("team:" + teamID); ok {
+		t.Error("day counter for team scope found, want no entry")
+	}
+	if _, ok := rl.dayCounters.Load("org:" + orgID); ok {
+		t.Error("day counter for org scope found, want no entry")
 	}
 }
 

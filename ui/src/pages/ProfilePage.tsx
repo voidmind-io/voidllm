@@ -4,7 +4,7 @@ import { Input } from '../components/ui/Input'
 import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
 import { useMe } from '../hooks/useMe'
-import { useUpdateProfile } from '../hooks/useProfile'
+import { useUpdateProfile, useChangePassword } from '../hooks/useProfile'
 import { useToast } from '../hooks/useToast'
 
 function formatRole(role?: string): string {
@@ -119,11 +119,7 @@ function EditProfileSection({ userId, initialDisplayName }: EditProfileSectionPr
 // ChangePasswordSection
 // ---------------------------------------------------------------------------
 
-interface ChangePasswordSectionProps {
-  userId: string
-}
-
-function ChangePasswordSection({ userId }: ChangePasswordSectionProps) {
+function ChangePasswordSection() {
   const [currentPassword, setCurrentPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
@@ -131,7 +127,7 @@ function ChangePasswordSection({ userId }: ChangePasswordSectionProps) {
   const [newPasswordError, setNewPasswordError] = useState<string | undefined>()
   const [confirmPasswordError, setConfirmPasswordError] = useState<string | undefined>()
 
-  const updateProfile = useUpdateProfile()
+  const changePassword = useChangePassword()
   const { toast } = useToast()
 
   function handleSubmit(e: React.FormEvent) {
@@ -167,14 +163,8 @@ function ChangePasswordSection({ userId }: ChangePasswordSectionProps) {
 
     if (hasError) return
 
-    updateProfile.mutate(
-      {
-        userId,
-        params: {
-          current_password: currentPassword,
-          new_password: newPassword,
-        },
-      },
+    changePassword.mutate(
+      { current_password: currentPassword, new_password: newPassword },
       {
         onSuccess: () => {
           toast({ variant: 'success', message: 'Password changed' })
@@ -183,10 +173,14 @@ function ChangePasswordSection({ userId }: ChangePasswordSectionProps) {
           setConfirmPassword('')
         },
         onError: (err) => {
-          toast({
-            variant: 'error',
-            message: err instanceof Error ? err.message : 'Failed to change password',
-          })
+          const message = err instanceof Error ? err.message : 'Failed to change password'
+          // Surface "current password is incorrect" inline on the field rather than
+          // only as a toast, so the user knows exactly which field is wrong.
+          if (message.toLowerCase().includes('current password')) {
+            setCurrentPasswordError(message)
+          } else {
+            toast({ variant: 'error', message })
+          }
         },
       },
     )
@@ -205,7 +199,7 @@ function ChangePasswordSection({ userId }: ChangePasswordSectionProps) {
           }}
           placeholder=""
           error={currentPasswordError}
-          disabled={updateProfile.isPending}
+          disabled={changePassword.isPending}
           autoComplete="current-password"
         />
         <Input
@@ -218,7 +212,7 @@ function ChangePasswordSection({ userId }: ChangePasswordSectionProps) {
           }}
           placeholder=""
           error={newPasswordError}
-          disabled={updateProfile.isPending}
+          disabled={changePassword.isPending}
           autoComplete="new-password"
           description="At least 8 characters"
         />
@@ -232,11 +226,11 @@ function ChangePasswordSection({ userId }: ChangePasswordSectionProps) {
           }}
           placeholder=""
           error={confirmPasswordError}
-          disabled={updateProfile.isPending}
+          disabled={changePassword.isPending}
           autoComplete="new-password"
         />
         <div className="flex justify-end">
-          <Button type="submit" loading={updateProfile.isPending}>
+          <Button type="submit" loading={changePassword.isPending}>
             Change Password
           </Button>
         </div>
@@ -293,7 +287,7 @@ export default function ProfilePage() {
         </SectionCard>
 
         <EditProfileSection userId={me.id} initialDisplayName={me.display_name} />
-        <ChangePasswordSection userId={me.id} />
+        <ChangePasswordSection />
       </div>
     </>
   )

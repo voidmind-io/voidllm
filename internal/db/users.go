@@ -406,6 +406,26 @@ func (d *DB) GetUserPasswordHash(ctx context.Context, email string) (string, str
 	return id, *passwordHash, nil
 }
 
+// GetUserPasswordHashByID retrieves the auth_provider and bcrypt password hash
+// for a user identified by their ID. It is used by the self-service password
+// change endpoint to verify the current password before accepting a new one.
+// Returns ErrNotFound if the user does not exist or is deleted.
+// Returns ErrNoPassword if password_hash is NULL, indicating an SSO-only account.
+func (d *DB) GetUserPasswordHashByID(ctx context.Context, userID string) (authProvider string, hash string, err error) {
+	query := "SELECT auth_provider, password_hash FROM users WHERE id = " +
+		d.dialect.Placeholder(1) + " AND deleted_at IS NULL"
+
+	var passwordHash *string
+	scanErr := d.sql.QueryRowContext(ctx, query, userID).Scan(&authProvider, &passwordHash)
+	if scanErr != nil {
+		return "", "", fmt.Errorf("GetUserPasswordHashByID: %w", translateError(scanErr))
+	}
+	if passwordHash == nil {
+		return authProvider, "", ErrNoPassword
+	}
+	return authProvider, *passwordHash, nil
+}
+
 // ResolveUserRole determines the effective RBAC role and organization for a user.
 // If the user is a system admin, it returns RoleSystemAdmin with the first org (if any).
 // Otherwise, it returns the role from the user's first org membership.

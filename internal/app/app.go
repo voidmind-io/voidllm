@@ -77,6 +77,7 @@ type Application struct {
 
 	rateLimiter      ratelimit.Checker
 	tokenCounter     *ratelimit.TokenCounter
+	loginThrottle    *auth.LoginThrottle
 	usageLogger      *usage.Logger
 	mcpLogger        *usage.MCPLogger
 	auditLogger      *audit.Logger
@@ -669,6 +670,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	proxyHandler.MaxStreamDuration = cfg.Server.Proxy.MaxStreamDuration
 	proxyHandler.FallbackMaxDepth = cfg.Settings.FallbackMaxDepth
 
+	loginThrottle := auth.NewLoginThrottle()
+
 	adminHandler := &admin.Handler{
 		DB:                database,
 		HMACSecret:        hmacSecret,
@@ -686,6 +689,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		Log:               log,
 		SSOProvider:       ssoProvider,
 		SSOConfig:         cfg.Settings.SSO,
+		LoginThrottle:     loginThrottle,
 	}
 	// Wire the in-process reload callback so SetLicense can re-gate the
 	// model registry immediately after storing a new license, even on
@@ -1062,6 +1066,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		mcpTransportCache: mcpTransportCache,
 		rateLimiter:       rateLimiter,
 		tokenCounter:      tokenCounter,
+		loginThrottle:     loginThrottle,
 		usageLogger:       usageLogger,
 		mcpLogger:         mcpLogger,
 		auditLogger:       auditLogger,
@@ -1114,6 +1119,7 @@ func (a *Application) Start() error {
 		}),
 		startTicker(5*time.Minute, func() {
 			a.tokenCounter.EvictStale()
+			a.loginThrottle.EvictStale()
 		}),
 		startTicker(30*time.Second, func() {
 			metrics.CacheSize.WithLabelValues("keys").Set(float64(a.keyCache.Len()))

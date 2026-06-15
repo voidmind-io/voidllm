@@ -12,3 +12,18 @@ export function useUpdateProfile() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['me'] }),
   })
 }
+
+export interface ChangePasswordInput {
+  current_password: string
+  new_password: string
+}
+
+export function useChangePassword() {
+  return useMutation({
+    mutationFn: (data: ChangePasswordInput) =>
+      apiClient<void>('/me/password', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+  })
+}
