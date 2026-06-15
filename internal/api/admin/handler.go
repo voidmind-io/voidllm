@@ -95,6 +95,9 @@ type Handler struct {
 	// app.cleanup can drain and close the pool on graceful shutdown.
 	// Nil when Code Mode is disabled.
 	CodePool *mcp.RuntimePool
+	// LoginThrottle enforces per-IP and per-account brute-force protection on
+	// the login endpoint. Nil disables throttling (test environments only).
+	LoginThrottle *auth.LoginThrottle
 	// UpdateChecker provides cached update status read from the settings table.
 	// Nil in dev builds (Version == "dev") — GetUpdateStatus returns a static
 	// response in that case.
