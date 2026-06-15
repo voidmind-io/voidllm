@@ -34,45 +34,54 @@ func NewRateLimiter() *RateLimiter {
 	return &RateLimiter{}
 }
 
-// CheckRate verifies rate limits for the key, team (if non-empty), and org scopes.
-// Effective limits are computed as the most-restrictive across all three scopes.
-// Counters are incremented atomically on success via a CAS loop; if any scope
-// limit is exceeded the request is rejected. Scopes that were already incremented
-// when a later scope fails are not rolled back — the over-count by 1 is
-// self-correcting at the next window reset.
+// scopeLimits pairs a counter scope with the rate limits that apply to it.
+type scopeLimits struct {
+	scope string
+	rpm   int
+	rpd   int
+}
+
+// CheckRate verifies rate limits for the key, team (if non-empty), and org
+// scopes. Each scope is checked against its own limits independently; a request
+// must pass all scopes, so the most restrictive limit in the hierarchy
+// effectively wins. Counters are incremented atomically on success via a CAS
+// loop. Scopes already incremented when a later scope fails are not rolled back
+// — the over-count by 1 is self-correcting at the next window reset.
 // Returns ErrRateLimitExceeded if any limit is exceeded.
 func (r *RateLimiter) CheckRate(keyID, teamID, orgID string, keyLimits, teamLimits, orgLimits Limits) error {
-	effective := EffectiveLimits(keyLimits, teamLimits, orgLimits)
-
 	now := time.Now().UTC()
 	minuteWindow := now.Truncate(time.Minute).Unix()
 	dayWindow := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Unix()
 
-	// Collect scope identifiers. Team scope is only included when the key is
-	// actually team-scoped so that per-team counters do not accumulate for keys
-	// that have no team.
-	scopes := make([]string, 0, 3)
-	scopes = append(scopes, "key:"+keyID)
+	checks := make([]scopeLimits, 0, 3)
+	checks = append(checks, scopeLimits{
+		scope: "key:" + keyID,
+		rpm:   keyLimits.RequestsPerMinute,
+		rpd:   keyLimits.RequestsPerDay,
+	})
 	if teamID != "" {
-		scopes = append(scopes, "team:"+teamID)
+		checks = append(checks, scopeLimits{
+			scope: "team:" + teamID,
+			rpm:   teamLimits.RequestsPerMinute,
+			rpd:   teamLimits.RequestsPerDay,
+		})
 	}
-	scopes = append(scopes, "org:"+orgID)
+	checks = append(checks, scopeLimits{
+		scope: "org:" + orgID,
+		rpm:   orgLimits.RequestsPerMinute,
+		rpd:   orgLimits.RequestsPerDay,
+	})
 
-	if effective.RequestsPerMinute > 0 {
-		limit := int64(effective.RequestsPerMinute)
-		for _, scope := range scopes {
-			entry := r.loadOrCreate(&r.minuteCounters, scope)
-			if !r.tryIncrement(entry, minuteWindow, limit) {
+	for _, c := range checks {
+		if c.rpm > 0 {
+			entry := r.loadOrCreate(&r.minuteCounters, c.scope)
+			if !r.tryIncrement(entry, minuteWindow, int64(c.rpm)) {
 				return ErrRateLimitExceeded
 			}
 		}
-	}
-
-	if effective.RequestsPerDay > 0 {
-		limit := int64(effective.RequestsPerDay)
-		for _, scope := range scopes {
-			entry := r.loadOrCreate(&r.dayCounters, scope)
-			if !r.tryIncrement(entry, dayWindow, limit) {
+		if c.rpd > 0 {
+			entry := r.loadOrCreate(&r.dayCounters, c.scope)
+			if !r.tryIncrement(entry, dayWindow, int64(c.rpd)) {
 				return ErrRateLimitExceeded
 			}
 		}
