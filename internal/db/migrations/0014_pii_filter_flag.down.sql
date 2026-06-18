@@ -1,0 +1,12 @@
+-- Migration: 0014_pii_filter_flag.down.sql
+-- Description: Reverses 0014_pii_filter_flag.up.sql.
+--
+-- DROP COLUMN requires SQLite >= 3.35.0 and cannot be used portably across all
+-- supported SQLite versions. Following the established project convention
+-- (see 0009_gcp_fields.down.sql), this down migration is a no-op.
+-- The columns remain in place but carry no data and have no effect when the
+-- feature is not active.
+--
+-- To drop the columns manually on PostgreSQL:
+--   ALTER TABLE models DROP COLUMN IF EXISTS pii_filter;
+--   ALTER TABLE model_deployments DROP COLUMN IF EXISTS pii_filter;

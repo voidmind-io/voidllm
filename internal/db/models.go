@@ -18,7 +18,7 @@ const modelSelectColumns = "id, name, provider, model_type, base_url, api_key_en
 	"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 	"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
 	"is_active, source, created_by, created_at, updated_at, deleted_at, aliases, timeout, " +
-	"strategy, max_retries, fallback_model_id"
+	"strategy, max_retries, fallback_model_id, pii_filter"
 
 // Model represents a model record in the database.
 // This is the storage layer representation; see proxy.Model for the in-memory registry type.
@@ -61,6 +61,10 @@ type Model struct {
 	// FallbackModelID is the ID of the model to try when all deployments of
 	// this model are unavailable. Nil when no fallback is configured.
 	FallbackModelID *string
+	// PIIFilter explicitly enables or disables PII anonymization for requests
+	// routed to this model. Nil means not set — inherit the network-level default.
+	// true enables anonymization; false disables it.
+	PIIFilter *bool
 }
 
 // CreateModelParams holds the input for creating a model.
@@ -95,6 +99,10 @@ type CreateModelParams struct {
 	MaxRetries *int
 	// FallbackModelID is the ID of the fallback model. Nil means no fallback.
 	FallbackModelID *string
+	// PIIFilter, when non-nil, stores the PII anonymization override for this
+	// model. true enables anonymization; false disables it. Nil stores NULL
+	// (inherit network-level default).
+	PIIFilter *bool
 }
 
 // UpdateModelParams holds optional fields for updating a model.
@@ -128,6 +136,17 @@ type UpdateModelParams struct {
 	// FallbackModelID, when non-nil, replaces the stored fallback model ID.
 	// Set to a pointer to an empty string to clear the fallback.
 	FallbackModelID *string
+	// PIIFilter, when non-nil, replaces the stored PII anonymization override.
+	// To clear the override and revert to the network-level default, set this
+	// to a special sentinel — use UpdateModelClearPIIFilter instead, or set a
+	// non-nil pointer containing the desired bool.
+	// Note: to express "clear to NULL", callers should use ClearPIIFilter bool
+	// (see below). This *bool field sets the column to 0 or 1 only.
+	PIIFilter *bool
+	// ClearPIIFilter, when true, sets the pii_filter column to NULL regardless
+	// of the PIIFilter pointer value. Allows callers to explicitly revert to the
+	// inherit-from-network-default state.
+	ClearPIIFilter bool
 }
 
 // CreateModel inserts a new model and returns the persisted record.
@@ -158,13 +177,13 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 		"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 		"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
 		"is_active, source, created_by, aliases, timeout, strategy, max_retries, " +
-		"fallback_model_id, created_at, updated_at) " +
+		"fallback_model_id, pii_filter, created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
 		p(7) + ", " + p(8) + ", " + p(9) + ", " +
 		p(10) + ", " + p(11) + ", " + p(12) + ", " + p(13) + ", " +
 		"1, " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " + p(18) + ", " + p(19) + ", " +
-		p(20) + ", " +
+		p(20) + ", " + p(21) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + modelSelectColumns +
@@ -193,6 +212,7 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 			strategy,
 			maxRetries,
 			params.FallbackModelID,
+			boolPtrToNullableInt(params.PIIFilter),
 		)
 		if execErr != nil {
 			return translateError(execErr)
@@ -385,6 +405,13 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 			argN++
 		}
 	}
+	if params.ClearPIIFilter {
+		setClauses = append(setClauses, "pii_filter = NULL")
+	} else if params.PIIFilter != nil {
+		setClauses = append(setClauses, "pii_filter = "+p(argN))
+		args = append(args, boolPtrToNullableInt(params.PIIFilter))
+		argN++
+	}
 
 	if len(setClauses) == 0 {
 		return d.GetModel(ctx, id)
@@ -522,11 +549,37 @@ func (d *DB) ListActiveModels(ctx context.Context) ([]Model, error) {
 	return models, nil
 }
 
+// boolPtrToNullableInt converts a *bool to a nullable integer value suitable
+// for storing in a SQLite/PostgreSQL INTEGER column that represents a
+// three-state boolean (NULL=inherit, 1=true, 0=false). A nil pointer returns
+// nil (stores NULL); true returns 1; false returns 0.
+func boolPtrToNullableInt(v *bool) any {
+	if v == nil {
+		return nil
+	}
+	if *v {
+		return 1
+	}
+	return 0
+}
+
+// nullableIntToBoolPtr converts a nullable integer column value (scanned as
+// *int64) back to a *bool. A nil pointer (NULL column) returns nil; 1 returns
+// a pointer to true; any other value returns a pointer to false.
+func nullableIntToBoolPtr(v *int64) *bool {
+	if v == nil {
+		return nil
+	}
+	b := *v == 1
+	return &b
+}
+
 // scanModel scans a single model row. The scanner may be a *sql.Row (from
 // QueryRowContext) or *sql.Rows (from QueryContext); both satisfy the interface.
 func scanModel(scanner interface{ Scan(...any) error }) (*Model, error) {
 	var m Model
 	var isActiveInt int
+	var piiFilterInt *int64
 	err := scanner.Scan(
 		&m.ID, &m.Name, &m.Provider, &m.ModelType, &m.BaseURL, &m.APIKeyEncrypted,
 		&m.MaxContextTokens, &m.InputPricePer1M, &m.OutputPricePer1M,
@@ -534,11 +587,13 @@ func scanModel(scanner interface{ Scan(...any) error }) (*Model, error) {
 		&isActiveInt, &m.Source, &m.CreatedBy,
 		&m.CreatedAt, &m.UpdatedAt, &m.DeletedAt, &m.Aliases, &m.Timeout,
 		&m.Strategy, &m.MaxRetries, &m.FallbackModelID,
+		&piiFilterInt,
 	)
 	if err != nil {
 		return nil, err
 	}
 	m.IsActive = isActiveInt == 1
+	m.PIIFilter = nullableIntToBoolPtr(piiFilterInt)
 	return &m, nil
 }
 
@@ -613,6 +668,7 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 				Timeout:          m.Timeout,
 				Strategy:         &strategy,
 				MaxRetries:       &maxRetries,
+				PIIFilter:        m.PIIFilter,
 			})
 			if createErr != nil {
 				return fmt.Errorf("sync yaml models: create %s: %w", m.Name, createErr)
@@ -680,6 +736,11 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 			Timeout:          &timeout,
 			Strategy:         &strategy,
 			MaxRetries:       &maxRetries,
+			// Sync the YAML pii_filter value. If the YAML does not set pii_filter
+			// (nil), we clear the column back to NULL so that a previously-set
+			// value does not persist after the YAML flag is removed.
+			PIIFilter:      m.PIIFilter,
+			ClearPIIFilter: m.PIIFilter == nil,
 		}
 
 		if m.APIKey != "" {
@@ -746,6 +807,7 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 				GCPLocation:     cd.GCPLocation,
 				Weight:          weight,
 				Priority:        cd.Priority,
+				PIIFilter:       cd.PIIFilter,
 			})
 			if createErr != nil {
 				return fmt.Errorf("create deployment %s: %w", cd.Name, createErr)
@@ -786,6 +848,10 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 			GCPLocation:     &gcpLocation,
 			Weight:          &weight,
 			Priority:        &priority,
+			// Sync the YAML pii_filter value. Clear to NULL when not set in YAML
+			// so that removing the flag from YAML also clears the DB column.
+			PIIFilter:      cd.PIIFilter,
+			ClearPIIFilter: cd.PIIFilter == nil,
 		}
 
 		if cd.APIKey != "" {
