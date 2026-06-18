@@ -2,6 +2,23 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.21] - 2026-06-19
+
+### Features
+- Usage analytics (LLM and MCP) and the audit log now resolve user, key, team, organization, and service-account IDs to human-readable names instead of showing raw UUIDs. Audit actor names are resolved org-scoped so cross-org identities are never exposed (#125)
+- The in-app "update available" dialog now renders release notes as formatted markdown instead of raw text (#132)
+
+### Fixes
+- Documentation: the README and pricing pages now show prices in EUR (matching billing) and list usage export as a Community feature, and the README gained an architecture overview, a "who it's for" section, and a production checklist (#131)
+
+### Security
+- Rebuilt the published container image on patched Alpine (3.21.7) and Go (1.26.4) to clear base-image and toolchain advisories. No application code changed (#126)
+
+### Dependencies
+- Go toolchain 1.26.1 → 1.26.4 and Alpine base image 3.21.6 → 3.21.7 (#126)
+
+---
+
 ## [0.0.20] - 2026-06-16
 
 ### Features
