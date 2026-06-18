@@ -40,6 +40,32 @@ VoidLLM is a self-hosted LLM proxy that sits between your applications and LLM p
 | Provider goes down, everything breaks | Multi-deployment load balancing with automatic failover |
 | Existing proxies log your prompts | Zero-knowledge proxy architecture - content never touches disk |
 
+## How it works
+
+```mermaid
+flowchart LR
+    App[Your app / SDK] -->|OpenAI-compatible| Proxy[VoidLLM proxy]
+    Proxy --> Gate[API key + RBAC<br/>rate limits + budgets]
+    Gate --> Router[Model alias + load balancing]
+    Router --> Providers[OpenAI / Anthropic / Azure<br/>Ollama / vLLM / custom]
+    Proxy -. metadata only .-> DB[(SQLite / PostgreSQL)]
+```
+
+Your apps speak the OpenAI API to VoidLLM. It authenticates the key, applies RBAC, rate limits and budgets, resolves the model alias, and routes to the right provider. Only **metadata** - who called, which model, token counts, latency - is written to the database. Prompt and response content passes through memory and is never persisted.
+
+## Who it's for
+
+**A good fit if you:**
+- Self-host LLM infrastructure (vLLM, Ollama) or use managed providers and need one control plane
+- Cannot log prompts or responses for privacy or compliance reasons
+- Need org/team/user/key RBAC, budgets, and model routing
+- Run multiple providers and want aliases, load balancing, and failover
+
+**Not the right fit if you:**
+- Want a hosted SaaS gateway - VoidLLM is self-hosted by design
+- Need full prompt/response logging or content-level observability - it's zero-knowledge by architecture
+- Need upstream MCP servers with per-user OAuth today - not yet supported
+
 ## Quick Start
 
 ```bash
@@ -47,13 +73,14 @@ VoidLLM is a self-hosted LLM proxy that sits between your applications and LLM p
 export VOIDLLM_ADMIN_KEY=$(openssl rand -base64 32)
 export VOIDLLM_ENCRYPTION_KEY=$(openssl rand -base64 32)
 
-# Start the LLM proxy with Docker
+# Start the proxy - no config file needed, VoidLLM boots with sensible defaults
 docker run -p 8080:8080 \
   -e VOIDLLM_ADMIN_KEY -e VOIDLLM_ENCRYPTION_KEY \
-  -v $(pwd)/voidllm.yaml:/etc/voidllm/voidllm.yaml:ro \
   -v voidllm_data:/data \
   ghcr.io/voidmind-io/voidllm:latest
 ```
+
+On first start VoidLLM prints bootstrap credentials to stdout (shown below) - no config file is required. Add models in the UI, or mount a `voidllm.yaml` to declare them (see [Configuration](#configuration)).
 
 ### Binary (no Docker needed)
 
@@ -112,6 +139,7 @@ Any OpenAI-compatible SDK works out of the box - just change the base URL to you
 | Rate limits | Requests per minute/day, most-restrictive-wins across levels |
 | Token budgets | Daily/monthly limits, real-time enforcement |
 | Usage tracking | Tokens, cost, duration, TTFT per request |
+| Usage export | CSV / JSON download |
 | Model aliases | Clients call `default`, you control where it routes |
 | MCP gateway | Proxy external MCP servers with access control and session management |
 | Code Mode | WASM-sandboxed JS for multi-tool orchestration |
@@ -119,22 +147,23 @@ Any OpenAI-compatible SDK works out of the box - just change the base URL to you
 | Database | SQLite (default) or PostgreSQL |
 | Deployment | Docker, Helm chart, graceful shutdown |
 | | |
-| **Pro ($49/mo)** | **Everything above, plus:** |
-| Cost reports | Model breakdown, daily trends |
-| Usage export | CSV download |
-| Data retention | Extended |
-| Support | Priority email |
+| **Pro (€49/mo · €490/yr)** | **Everything above, plus:** |
+| Unlimited orgs + teams | No limit on organizations or teams |
+| Cost reports | Model breakdown, daily trends, budget alerts |
+| Cross-org analytics | Usage and cost across all organizations |
+| Support | Priority email (48h) |
 | | |
-| **Enterprise ($149/mo)** | **Everything in Pro, plus:** |
+| **Enterprise (€149/mo · €1490/yr)** | **Everything in Pro, plus:** |
 | SSO / OIDC | Google, Azure AD, Okta, Keycloak, any provider |
 | Per-org SSO | Each organization gets its own Identity Provider |
 | Auto-provisioning | Users created from allowed email domains |
 | Group sync | OIDC groups mapped to VoidLLM teams |
 | Audit logs | Every admin action, filterable API + UI |
 | OpenTelemetry | OTLP/gRPC export, request ID correlation |
-| Support | Dedicated Slack |
+| Multi-instance | Redis-backed rate limits and budgets across replicas |
+| Support | Dedicated Slack (24h) |
 
-**Founding Member ($999 one-time):** All Enterprise features, lifetime license, Product Advisory Board, direct founder access. Limited spots.
+**Founding Member (€999 one-time):** All Enterprise features (current and future), lifetime license, Product Advisory Board, direct founder access, priority support, early access. Limited spots.
 
 Flat pricing - no per-user fees, no per-request charges. Self-hosted on your infrastructure.
 
@@ -313,6 +342,20 @@ cd ui && npm ci && npm run build && cd ..
 go run ./cmd/voidllm --config voidllm.yaml
 ```
 
+## Production Checklist
+
+- Use **PostgreSQL** instead of SQLite
+- Put VoidLLM behind **TLS / a reverse proxy**
+- **Isolate the admin UI/API** from public proxy traffic (separate `admin.port`, with TLS)
+- Use a strong `VOIDLLM_ENCRYPTION_KEY` (32+ bytes) and keep it in a **secrets manager**
+- Don't use `VOIDLLM_ADMIN_KEY` as a production API key - it's for bootstrap only
+- Set **resource limits** and **network policies** in Kubernetes
+- Scrape **`/metrics`** with Prometheus
+- Configure **database backups**
+- For multiple replicas, use **Redis** so rate limits and budgets are shared (they are per-process without it) - Enterprise
+
+See the [Security Hardening guide](docs/security/hardening.md) for the full list.
+
 ## Privacy
 
 This is not a feature toggle. It's an architectural decision that makes VoidLLM a privacy-first LLM proxy.
@@ -333,6 +376,13 @@ voidllm migrate --from sqlite:///data/voidllm.db --to postgres://user:pass@host/
 # License management (for Enterprise)
 voidllm license verify < license.jwt
 ```
+
+## Project
+
+- [Contributing](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md)
+- [Security Policy](SECURITY.md) - report vulnerabilities privately to security@voidmind.io
+- [Code of Conduct](CODE_OF_CONDUCT.md)
 
 ## License
 
