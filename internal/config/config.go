@@ -116,6 +116,13 @@ type DeploymentConfig struct {
 	// Priority is the preference rank for the "priority" strategy. Lower
 	// values indicate higher priority.
 	Priority int `yaml:"priority"`
+	// PIIFilter explicitly enables or disables PII anonymization for requests
+	// routed to this deployment. When set it overrides both the model-level
+	// pii_filter and the network-based default (see ModelConfig.PIIFilter).
+	// nil means "not set — defer to model-level flag or network default".
+	//
+	// UI/DB persistence of this flag is a follow-up; for now it is YAML-only.
+	PIIFilter *bool `yaml:"pii_filter"`
 }
 
 // LogValue implements slog.LogValuer to prevent API keys from appearing in logs.
@@ -163,6 +170,14 @@ type ModelConfig struct {
 	// the model-level Provider and BaseURL fields are ignored in favour of the
 	// per-deployment values, and Strategy must be set.
 	Deployments []DeploymentConfig `yaml:"deployments"`
+	// PIIFilter explicitly enables or disables PII anonymization for requests
+	// routed to this model. When set it overrides the network-based default
+	// (public destination = anonymize, private destination = pass through).
+	// A per-deployment pii_filter takes precedence over this model-level flag.
+	// nil means "not set — use the network-based default".
+	//
+	// UI/DB persistence of this flag is a follow-up; for now it is YAML-only.
+	PIIFilter *bool `yaml:"pii_filter"`
 }
 
 // LogValue implements slog.LogValuer to prevent API keys from appearing in logs.
@@ -444,6 +459,44 @@ func (r RetentionConfig) Enabled() bool {
 	return r.UsageEvents > 0 || r.AuditLogs > 0
 }
 
+// PIIPatternConfig defines a single custom PII detection pattern to add on
+// top of the built-in defaults. Both fields are required.
+type PIIPatternConfig struct {
+	// Type is the PII category label (e.g. "PASSPORT_NO"). It must be non-empty.
+	Type string `yaml:"type"`
+	// Regexp is a valid Go regular expression matching a single PII value.
+	Regexp string `yaml:"regexp"`
+}
+
+// PIIConfig controls in-memory PII anonymization of outbound LLM requests.
+// When enabled, PII detected in message content is replaced with
+// deterministic pseudonyms before the request leaves the proxy. The
+// pseudonyms are restored in the response so the caller receives the
+// original values. No PII is ever persisted or logged.
+type PIIConfig struct {
+	// Enabled activates PII anonymization. Defaults to false (opt-in).
+	// A pointer is used so that an explicit "enabled: false" in YAML can
+	// be distinguished from the zero value after unmarshalling.
+	Enabled *bool `yaml:"enabled"`
+	// Action is the anonymization strategy. Currently only "pseudonymize"
+	// is supported. Defaults to "pseudonymize".
+	Action string `yaml:"action"`
+	// Patterns is a list of additional custom PII patterns that are
+	// applied in addition to the built-in defaults. An empty list means
+	// only the built-in patterns are used.
+	Patterns []PIIPatternConfig `yaml:"patterns"`
+}
+
+// IsEnabled returns true only when PII anonymization has been explicitly
+// enabled. A nil pointer (field absent from YAML) returns false so that
+// PII anonymization is opt-in rather than on by default.
+func (p PIIConfig) IsEnabled() bool {
+	if p.Enabled == nil {
+		return false
+	}
+	return *p.Enabled
+}
+
 // SettingsConfig holds application-level settings.
 type SettingsConfig struct {
 	AdminKey      string `yaml:"admin_key" json:"-"`
@@ -472,6 +525,8 @@ type SettingsConfig struct {
 	// distinguished from the zero value after unmarshalling. Use
 	// GetSoftLimitThreshold to read the value.
 	SoftLimitThreshold *float64 `yaml:"soft_limit_threshold"`
+	// PII holds settings for in-memory PII anonymization. Disabled by default.
+	PII PIIConfig `yaml:"pii"`
 }
 
 // LogValue implements slog.LogValuer to prevent secrets from appearing in logs.
@@ -802,6 +857,15 @@ func (c *Config) setDefaults() {
 			d := 168 * time.Hour
 			c.Settings.MCP.CodeMode.SchemaTTL = &d
 		}
+	}
+
+	// PII anonymization — disabled by default (opt-in).
+	if c.Settings.PII.Enabled == nil {
+		disabled := false
+		c.Settings.PII.Enabled = &disabled
+	}
+	if c.Settings.PII.Action == "" {
+		c.Settings.PII.Action = "pseudonymize"
 	}
 
 	// Logging

@@ -115,6 +115,11 @@ models:
     pricing:
       input_per_1m:  0.50
       output_per_1m: 1.50
+    # pii_filter: false              # Explicit override: never anonymize for this model.
+    #                                # Default (absent): public destinations anonymize,
+    #                                # private/loopback destinations pass through as-is.
+    #                                # pii_filter: true  forces anonymization even on private URLs.
+    #                                # pii_filter: false disables anonymization even on public URLs.
 
   - name: gpt-oss-20b
     provider: vllm
@@ -177,6 +182,7 @@ models:
         azure_api_version: "2024-02-01"
         weight: 2                    # For weighted strategy
         priority: 1                  # For priority strategy (lower = higher priority)
+        # pii_filter: true           # Per-deployment override (takes precedence over model-level flag)
       - name: azure-west
         provider: azure
         base_url: https://westus.openai.azure.com
@@ -290,6 +296,17 @@ settings:
   #   allowed_domains: ["company.com"]
   #   default_role: "member"
   #   auto_provision: true
+
+  # PII anonymization - replace PII in outbound prompts with pseudonyms.
+  # Pseudonyms are restored in the response; no PII is ever persisted or logged.
+  # Applies only to external providers (openai, anthropic, azure, gemini, vertex).
+  # Disabled by default. Only "pseudonymize" is supported as action.
+  # pii:
+  #   enabled: false
+  #   action: pseudonymize
+  #   patterns:                     # custom patterns added to the built-in defaults
+  #     - type: PASSPORT_NO
+  #       regexp: '\b[A-Z]{1,3}[0-9]{6,9}\b'
 
 
 # =============================================================================
