@@ -10,8 +10,8 @@ Flat pricing - no per-user fees, no per-request charges, no per-token metering. 
 
 | | Community | Pro | Enterprise |
 |---|---|---|---|
-| **Price** | Free | $49/mo | $149/mo |
-| **Annual** | - | $490/yr | $1,490/yr |
+| **Price** | Free | €49/mo | €149/mo |
+| **Annual** | - | €490/yr | €1,490/yr |
 | **Use case** | Personal / evaluation | Teams & production | Organization-wide |
 
 ## What's in each tier
@@ -35,7 +35,7 @@ Everything you need to run an LLM proxy in production:
 
 No feature is time-limited or artificially crippled.
 
-### Pro ($49/mo)
+### Pro (€49/mo)
 
 Everything in Community, plus:
 
@@ -44,7 +44,7 @@ Everything in Community, plus:
 - Cross-org analytics
 - Priority email support (48h)
 
-### Enterprise ($149/mo)
+### Enterprise (€149/mo)
 
 Everything in Pro, plus:
 
@@ -55,7 +55,7 @@ Everything in Pro, plus:
 - Multi-instance support (Redis)
 - Dedicated Slack support (24h)
 
-### Founding Member ($999 one-time)
+### Founding Member (€999 one-time)
 
 All Enterprise features - current and future. No recurring fees.
 
@@ -70,7 +70,7 @@ All Enterprise features - current and future. No recurring fees.
 
 ## Annual billing
 
-Annual billing saves 2 months. Pro: $490/yr instead of $588. Enterprise: $1,490/yr instead of $1,788.
+Annual billing saves 2 months. Pro: €490/yr instead of €588. Enterprise: €1,490/yr instead of €1,788.
 
 ## License activation
 
