@@ -3,6 +3,7 @@ import apiClient from '../api/client'
 
 export interface MCPUsageDataPoint {
   group_key: string
+  group_label?: string
   total_calls: number
   success_count: number
   error_count: number

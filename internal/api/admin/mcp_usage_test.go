@@ -2,6 +2,7 @@ package admin_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http/httptest"
@@ -562,5 +563,189 @@ func TestGetSystemMCPUsage_MissingFrom_Returns400(t *testing.T) {
 	if resp.StatusCode != fiber.StatusBadRequest {
 		body, _ := io.ReadAll(resp.Body)
 		t.Errorf("status = %d, want 400; body: %s", resp.StatusCode, body)
+	}
+}
+
+// ---- MCP group_label enrichment tests ----------------------------------------
+
+// insertMCPToolCallWithKeyHTTP inserts a mcp_tool_calls row using a specific
+// key_id so the group_by=key label resolution can match an api_keys row.
+func insertMCPToolCallWithKeyHTTP(t *testing.T, database *db.DB, id, keyID, orgID, serverAlias, toolName string, createdAt time.Time) {
+	t.Helper()
+	query := fmt.Sprintf(
+		`INSERT INTO mcp_tool_calls
+			(id, key_id, key_type, org_id,
+			 server_alias, tool_name, duration_ms, status, code_mode, created_at)
+		 VALUES
+			('%s', '%s', 'user_key', '%s',
+			 '%s', '%s', 100, 'success', 0, '%s')`,
+		id, keyID, orgID,
+		serverAlias, toolName,
+		createdAt.UTC().Format(time.RFC3339),
+	)
+	if _, err := database.SQL().ExecContext(context.Background(), query); err != nil {
+		t.Fatalf("insertMCPToolCallWithKeyHTTP id=%q: %v", id, err)
+	}
+}
+
+// TestGetOrgMCPUsage_GroupByKey_HasGroupLabel verifies that when group_by=key
+// and the key exists in api_keys, each data point carries a populated
+// group_label matching the key name.
+func TestGetOrgMCPUsage_GroupByKey_HasGroupLabel(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestMCPUsage_GBKey_Label?mode=memory&cache=private")
+	org := mustCreateOrg(t, database, "MCP Key Label Org", "mcp-key-label-org")
+	testKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+	creator, err := database.CreateUser(context.Background(), db.CreateUserParams{
+		Email:       "mcp-key-label-creator@example.com",
+		DisplayName: "MCP Creator",
+	})
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	apiKey, err := database.CreateAPIKey(context.Background(), db.CreateAPIKeyParams{
+		KeyHash:   "dummy-hash-mcp-key-label",
+		KeyHint:   "vl_uk_...mcp",
+		KeyType:   "user_key",
+		Name:      "MCP Named Key",
+		OrgID:     org.ID,
+		CreatedBy: creator.ID,
+	})
+	if err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+
+	now := time.Now().UTC()
+	from := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	to := now.Add(time.Minute).Format(time.RFC3339)
+
+	insertMCPToolCallWithKeyHTTP(t, database, "mcp-gl-key-1", apiKey.ID, org.ID, "server-a", "tool-x", now.Add(-30*time.Minute))
+
+	req := httptest.NewRequest("GET", mcpUsageURL(org.ID, from, to, "key"), nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	var envelope struct {
+		Data []struct {
+			GroupKey   string `json:"group_key"`
+			GroupLabel string `json:"group_label"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(envelope.Data) == 0 {
+		t.Fatal("data is empty, want at least one row")
+	}
+
+	row := envelope.Data[0]
+	if row.GroupKey != apiKey.ID {
+		t.Errorf("group_key = %q, want %q", row.GroupKey, apiKey.ID)
+	}
+	if row.GroupLabel != "MCP Named Key" {
+		t.Errorf("group_label = %q, want %q", row.GroupLabel, "MCP Named Key")
+	}
+}
+
+// TestGetOrgMCPUsage_GroupByServer_NoGroupLabel verifies that group_by=server
+// data points do NOT carry a group_label (server is not a resolvable dimension;
+// omitempty means the JSON key is absent).
+func TestGetOrgMCPUsage_GroupByServer_NoGroupLabel(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestMCPUsage_GBServer_NoLabel?mode=memory&cache=private")
+	org := mustCreateOrg(t, database, "MCP Server Label Org", "mcp-server-label-org")
+	testKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+	now := time.Now().UTC()
+	from := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	to := now.Add(time.Minute).Format(time.RFC3339)
+
+	insertMCPToolCallHTTP(t, database, "mcp-gl-srv-1", org.ID, "", "server-alpha", "tool-y", "success", 80, false, now.Add(-30*time.Minute))
+
+	req := httptest.NewRequest("GET", mcpUsageURL(org.ID, from, to, "server"), nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	var envelope struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(envelope.Data) == 0 {
+		t.Fatal("data is empty, want at least one row")
+	}
+
+	row := envelope.Data[0]
+	if _, hasLabel := row["group_label"]; hasLabel {
+		t.Errorf("group_label must be absent for group_by=server, but present: %v", row["group_label"])
+	}
+}
+
+// TestGetOrgMCPUsage_GroupByStatus_NoGroupLabel verifies that group_by=status
+// data points do NOT carry a group_label.
+func TestGetOrgMCPUsage_GroupByStatus_NoGroupLabel(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestMCPUsage_GBStatus_NoLabel?mode=memory&cache=private")
+	org := mustCreateOrg(t, database, "MCP Status Label Org", "mcp-status-label-org")
+	testKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+	now := time.Now().UTC()
+	from := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	to := now.Add(time.Minute).Format(time.RFC3339)
+
+	insertMCPToolCallHTTP(t, database, "mcp-gl-st-1", org.ID, "", "server-b", "tool-z", "success", 60, false, now.Add(-30*time.Minute))
+
+	req := httptest.NewRequest("GET", mcpUsageURL(org.ID, from, to, "status"), nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	var envelope struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(envelope.Data) == 0 {
+		t.Fatal("data is empty, want at least one row")
+	}
+
+	row := envelope.Data[0]
+	if _, hasLabel := row["group_label"]; hasLabel {
+		t.Errorf("group_label must be absent for group_by=status, but present: %v", row["group_label"])
 	}
 }

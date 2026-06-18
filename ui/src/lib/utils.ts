@@ -31,3 +31,9 @@ export function formatCost(n: number): string {
 export function formatDate(iso: string): string {
   return new Date(iso).toLocaleString()
 }
+
+/** Truncate a UUID or long ID for use as a secondary display hint. */
+export function shortenId(id: string): string {
+  if (!id) return ''
+  return id.length <= 12 ? id : `${id.slice(0, 8)}…`
+}
