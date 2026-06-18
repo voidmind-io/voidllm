@@ -120,6 +120,10 @@ models:
     #                                # private/loopback destinations pass through as-is.
     #                                # pii_filter: true  forces anonymization even on private URLs.
     #                                # pii_filter: false disables anonymization even on public URLs.
+    #                                # WARNING: pii_filter: false sends prompt content (including any
+    #                                # PII) to this upstream IN CLEARTEXT, even for public endpoints.
+    #                                # This is a deliberate opt-out for upstreams you trust; only set
+    #                                # it when you are sure the destination is acceptable for raw data.
 
   - name: gpt-oss-20b
     provider: vllm

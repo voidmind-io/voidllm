@@ -1,12 +1,108 @@
 package pii
 
 import (
+	"encoding/json"
 	"errors"
 	"sort"
 	"strings"
 
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
+
+// knownContentPartTypes is the set of non-text content-part type values that
+// carry no textual content and should be skipped (not scanned, not rejected).
+// Any type value NOT in this set and NOT "text" triggers fail-closed.
+var knownContentPartTypes = map[string]bool{
+	"image_url":   true,
+	"input_audio": true,
+	"input_image": true,
+	"file":        true,
+	"image":       true,
+	"audio":       true,
+	"document":    true,
+	"video":       true,
+}
+
+// hasDuplicateKeys reports whether body contains a JSON object (at any level of
+// nesting) that has at least one duplicated key. It uses encoding/json's
+// token-streaming decoder (stdlib, no CGO). Duplicate keys are rejected because
+// JSON decoders that retain the first value rather than the last (or vice-versa)
+// can disagree on the effective content, enabling smuggling attacks where PII
+// appears in a first-occurrence key that the map-based scanner does not see but
+// the upstream LLM does.
+//
+// Returns (true, nil) when a duplicate is found, (false, nil) on a clean
+// document, and (false, err) when the token stream is malformed (the caller
+// should treat this as fail-closed regardless).
+func hasDuplicateKeys(body []byte) (bool, error) {
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	return scanForDuplicateKeys(dec)
+}
+
+// scanForDuplicateKeys reads tokens from dec to walk a single JSON value and
+// returns true on the first duplicate object key found at any nesting depth.
+// It is called recursively for nested objects and array elements.
+func scanForDuplicateKeys(dec *json.Decoder) (bool, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return false, err
+	}
+
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		// Scalar value (string, number, bool, null): no keys to check.
+		return false, nil
+	}
+
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for dec.More() {
+			// Read the key token.
+			keyTok, err := dec.Token()
+			if err != nil {
+				return false, err
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return false, errors.New("expected string key in JSON object")
+			}
+			if _, exists := seen[key]; exists {
+				return true, nil
+			}
+			seen[key] = struct{}{}
+			// Recurse into the value.
+			dup, err := scanForDuplicateKeys(dec)
+			if err != nil {
+				return false, err
+			}
+			if dup {
+				return true, nil
+			}
+		}
+		// Consume the closing '}'.
+		if _, err := dec.Token(); err != nil {
+			return false, err
+		}
+
+	case '[':
+		for dec.More() {
+			dup, err := scanForDuplicateKeys(dec)
+			if err != nil {
+				return false, err
+			}
+			if dup {
+				return true, nil
+			}
+		}
+		// Consume the closing ']'.
+		if _, err := dec.Token(); err != nil {
+			return false, err
+		}
+	}
+
+	return false, nil
+}
 
 // anonymizeWithDetectors replaces PII in all PII-bearing string fields of an
 // OpenAI-shaped request body. It handles chat completion, legacy completion,
@@ -57,8 +153,21 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 		return out, touched, err
 	}
 
+	// Fix #3: reject any body that contains duplicate JSON object keys anywhere
+	// in the document (recursive, all nesting levels). A body with duplicate keys
+	// can be parsed differently by different JSON implementations — the map-based
+	// scan below sees only the last value for each key, while some upstream servers
+	// retain the first. This creates a smuggling window where PII appears in an
+	// earlier duplicate that the scanner does not see. Fail-closed here eliminates
+	// the window; the !touched original-return path is also safe because dup-key
+	// bodies are rejected before reaching it.
+	if dup, dupErr := hasDuplicateKeys(body); dupErr != nil || dup {
+		return nil, errors.New("pii: request body could not be processed for anonymization")
+	}
+
 	var doc map[string]jsonx.RawMessage
-	if err := jsonx.Unmarshal(body, &doc); err != nil {
+	if err := jsonx.Unmarshal(body, &doc); err != nil || doc == nil {
+		// A JSON null body or a non-object body cannot be scanned: fail-closed.
 		return nil, errors.New("pii: request body could not be processed for anonymization")
 	}
 
@@ -137,13 +246,13 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 						}
 						continue
 					}
-					// Not a string: must be a number or a number-array (token IDs).
-					// Validate the element is an integer or an array-of-integers so
-					// that objects, bools, and other unexpected types are rejected.
-					if !isTokenElement(elem) {
+					// Not a string: must be an integer or an array-of-integers (token IDs).
+					// Validate the element so that objects, bools, floats, and other
+					// unexpected types are rejected (fail-closed).
+					if !isTokenElement(elem, 0) {
 						return nil, errors.New("pii: request body could not be processed for anonymization")
 					}
-					// Valid token-ID element (number or int[]): leave unchanged.
+					// Valid token-ID element (integer or int[]): leave unchanged.
 				}
 				if arrTouched {
 					newJSON, err := jsonx.Marshal(promptArr)
@@ -192,7 +301,7 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 					// Each element may be a string or an integer array (token array,
 					// int[][]). Scan string elements; leave integer and integer-array
 					// elements untouched. Fail-closed on any other shape (object,
-					// bool, null) — those are not valid OpenAI input element types.
+					// bool, null, float) — those are not valid OpenAI input element types.
 					var s string
 					if err := jsonx.Unmarshal(elem, &s); err == nil {
 						replaced, did, err := detect(s)
@@ -209,10 +318,10 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 						}
 						continue
 					}
-					// Not a string: must be a number or a number-array (token IDs).
-					// Validate the element so that objects, bools, and other
+					// Not a string: must be an integer or array-of-integers (token IDs).
+					// Validate the element so that objects, bools, floats, and other
 					// unexpected types are rejected (fail-closed).
-					if !isTokenElement(elem) {
+					if !isTokenElement(elem, 0) {
 						return nil, errors.New("pii: request body could not be processed for anonymization")
 					}
 					// Valid token-ID element: leave unchanged.
@@ -240,23 +349,25 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 	// never modified. "tools" present but not an array → fail-closed.
 	if rawTools, ok := doc["tools"]; ok {
 		var tools []jsonx.RawMessage
-		if err := jsonx.Unmarshal(rawTools, &tools); err != nil {
-			// "tools" is present but not an array: unsupported shape.
+		if err := jsonx.Unmarshal(rawTools, &tools); err != nil || tools == nil {
+			// "tools" is present but not an array (or is JSON null): unsupported shape.
 			return nil, errors.New("pii: request body could not be processed for anonymization")
 		}
 		toolsTouched := false
 		for i, rawTool := range tools {
 			var tool map[string]jsonx.RawMessage
-			if err := jsonx.Unmarshal(rawTool, &tool); err != nil {
-				continue
+			if err := jsonx.Unmarshal(rawTool, &tool); err != nil || tool == nil {
+				// tools[] element is not a JSON object (or is JSON null): unsupported shape → fail-closed.
+				return nil, errors.New("pii: request body could not be processed for anonymization")
 			}
 			rawFn, hasFn := tool["function"]
 			if !hasFn {
 				continue
 			}
 			var fn map[string]jsonx.RawMessage
-			if err := jsonx.Unmarshal(rawFn, &fn); err != nil {
-				continue
+			if err := jsonx.Unmarshal(rawFn, &fn); err != nil || fn == nil {
+				// tools[].function is not a JSON object (or is JSON null): unsupported shape → fail-closed.
+				return nil, errors.New("pii: request body could not be processed for anonymization")
 			}
 			fnTouched := false
 
@@ -322,14 +433,16 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 	rawMessages, hasMessages := doc["messages"]
 	if hasMessages {
 		var messages []jsonx.RawMessage
-		if err := jsonx.Unmarshal(rawMessages, &messages); err != nil {
+		if err := jsonx.Unmarshal(rawMessages, &messages); err != nil || messages == nil {
+			// "messages" is present but not an array (or is JSON null): unsupported shape.
 			return nil, errors.New("pii: request body could not be processed for anonymization")
 		}
 
 		for i, rawMsg := range messages {
 			var msg map[string]jsonx.RawMessage
-			if err := jsonx.Unmarshal(rawMsg, &msg); err != nil {
-				continue
+			if err := jsonx.Unmarshal(rawMsg, &msg); err != nil || msg == nil {
+				// messages[] element is not a JSON object (or is JSON null): unsupported shape → fail-closed.
+				return nil, errors.New("pii: request body could not be processed for anonymization")
 			}
 			msgTouched := false
 
@@ -377,44 +490,62 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 				} else {
 					// Array content (multi-modal parts) path.
 					var parts []jsonx.RawMessage
-					if err := jsonx.Unmarshal(rawContent, &parts); err == nil {
+					if err := jsonx.Unmarshal(rawContent, &parts); err == nil && parts != nil {
 						partsTouched := false
 						for j, rawPart := range parts {
 							var part map[string]jsonx.RawMessage
-							if err := jsonx.Unmarshal(rawPart, &part); err != nil {
-								continue
-							}
-							var partType string
-							if rawType, hasType := part["type"]; hasType {
-								_ = jsonx.Unmarshal(rawType, &partType)
-							}
-							if partType != "text" {
-								continue
-							}
-							rawText, hasText := part["text"]
-							if !hasText {
-								continue
-							}
-							var textVal string
-							if err := jsonx.Unmarshal(rawText, &textVal); err != nil {
-								continue
-							}
-							replaced, did, err := detect(textVal)
-							if err != nil {
+							if err := jsonx.Unmarshal(rawPart, &part); err != nil || part == nil {
+								// content array element is not a JSON object (or is JSON null) → fail-closed.
 								return nil, errors.New("pii: request body could not be processed for anonymization")
 							}
-							if did {
-								newJSON, err := jsonx.Marshal(replaced)
+							rawType, hasType := part["type"]
+							if !hasType {
+								// content array element has no "type" field → fail-closed:
+								// we cannot determine whether it carries text that needs scanning.
+								return nil, errors.New("pii: request body could not be processed for anonymization")
+							}
+							var partType string
+							if err := jsonx.Unmarshal(rawType, &partType); err != nil {
+								// "type" field is not a string → fail-closed.
+								return nil, errors.New("pii: request body could not be processed for anonymization")
+							}
+							if partType == "text" {
+								// Text part: scan and replace PII in the "text" field.
+								rawText, hasText := part["text"]
+								if !hasText {
+									// text part without a "text" field — nothing to scan; skip.
+									continue
+								}
+								var textVal string
+								if err := jsonx.Unmarshal(rawText, &textVal); err != nil {
+									// "text" field is not a string → fail-closed.
+									return nil, errors.New("pii: request body could not be processed for anonymization")
+								}
+								replaced, did, err := detect(textVal)
 								if err != nil {
 									return nil, errors.New("pii: request body could not be processed for anonymization")
 								}
-								part["text"] = jsonx.RawMessage(newJSON)
-								newPartJSON, err := jsonx.Marshal(part)
-								if err != nil {
-									return nil, errors.New("pii: request body could not be processed for anonymization")
+								if did {
+									newJSON, err := jsonx.Marshal(replaced)
+									if err != nil {
+										return nil, errors.New("pii: request body could not be processed for anonymization")
+									}
+									part["text"] = jsonx.RawMessage(newJSON)
+									newPartJSON, err := jsonx.Marshal(part)
+									if err != nil {
+										return nil, errors.New("pii: request body could not be processed for anonymization")
+									}
+									parts[j] = jsonx.RawMessage(newPartJSON)
+									partsTouched = true
 								}
-								parts[j] = jsonx.RawMessage(newPartJSON)
-								partsTouched = true
+							} else if knownContentPartTypes[partType] {
+								// Known non-text part (image_url, input_audio, file, etc.):
+								// carries no scannable text, pass through unchanged.
+								continue
+							} else {
+								// Unknown type: we cannot determine whether this part carries
+								// text that needs scanning → fail-closed (conservative).
+								return nil, errors.New("pii: request body could not be processed for anonymization")
 							}
 						}
 						if partsTouched {
@@ -438,8 +569,8 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 			// "arguments" is present but not a string → reject.
 			if rawFC, ok := msg["function_call"]; ok {
 				var fc map[string]jsonx.RawMessage
-				if err := jsonx.Unmarshal(rawFC, &fc); err != nil {
-					// "function_call" present but not an object: unsupported shape.
+				if err := jsonx.Unmarshal(rawFC, &fc); err != nil || fc == nil {
+					// "function_call" present but not an object (or is JSON null): unsupported shape.
 					return nil, errors.New("pii: request body could not be processed for anonymization")
 				}
 				if rawArgs, ok := fc["arguments"]; ok {
@@ -470,26 +601,28 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 
 			// messages[].tool_calls[].function.arguments.
 			// Fail-closed: when "tool_calls" is present but not an array → reject.
-			// When "arguments" is present but not a string within a tool call → reject.
+			// When an element is not an object, or "arguments" is not a string → reject.
 			if rawTC, ok := msg["tool_calls"]; ok {
 				var toolCalls []jsonx.RawMessage
-				if err := jsonx.Unmarshal(rawTC, &toolCalls); err != nil {
-					// "tool_calls" present but not an array: unsupported shape.
+				if err := jsonx.Unmarshal(rawTC, &toolCalls); err != nil || toolCalls == nil {
+					// "tool_calls" present but not an array (or is JSON null): unsupported shape.
 					return nil, errors.New("pii: request body could not be processed for anonymization")
 				}
 				tcTouched := false
 				for ti, rawCall := range toolCalls {
 					var call map[string]jsonx.RawMessage
-					if err := jsonx.Unmarshal(rawCall, &call); err != nil {
-						continue
+					if err := jsonx.Unmarshal(rawCall, &call); err != nil || call == nil {
+						// tool_calls[] element is not a JSON object (or is JSON null) → fail-closed.
+						return nil, errors.New("pii: request body could not be processed for anonymization")
 					}
 					rawCallFn, hasFn := call["function"]
 					if !hasFn {
 						continue
 					}
 					var callFn map[string]jsonx.RawMessage
-					if err := jsonx.Unmarshal(rawCallFn, &callFn); err != nil {
-						continue
+					if err := jsonx.Unmarshal(rawCallFn, &callFn); err != nil || callFn == nil {
+						// tool_calls[].function is not a JSON object (or is JSON null) → fail-closed.
+						return nil, errors.New("pii: request body could not be processed for anonymization")
 					}
 					rawArgs, hasArgs := callFn["arguments"]
 					if !hasArgs {
@@ -619,21 +752,42 @@ func deOverlap(spans []Span) []Span {
 }
 
 // isTokenElement reports whether raw is a valid OpenAI token-ID element: either
-// a JSON number (single token ID) or a JSON array whose every element is itself
-// a valid token-ID element (int[][]). Objects, booleans, null, and strings are
-// not token IDs and cause the function to return false. This is used to validate
-// non-string elements in the "prompt" and "input" array fields before passing
-// them through unscanned, ensuring that unexpected shapes are rejected
-// (fail-closed) rather than silently forwarded.
-func isTokenElement(raw jsonx.RawMessage) bool {
-	// A number: valid single token ID. Try to unmarshal as int64 first (exact
-	// for token IDs), then float64 (handles any numeric JSON literal).
+// a JSON integer (single token ID) or a JSON array whose every element is itself
+// a valid token-ID element (int[][]). Floats, objects, booleans, null, and
+// strings are not token IDs and cause the function to return false.
+//
+// depth limits recursion to prevent a stack-exhaustion DoS via pathologically
+// nested arrays. When depth > maxScanDepth the function returns false, which
+// causes the caller to fail-closed on that element.
+//
+// This is used to validate non-string elements in the "prompt" and "input"
+// array fields before passing them through unscanned, ensuring that unexpected
+// shapes are rejected (fail-closed) rather than silently forwarded.
+func isTokenElement(raw jsonx.RawMessage, depth int) bool {
+	if depth > maxScanDepth {
+		// Reject pathologically deep arrays to prevent stack exhaustion.
+		return false
+	}
+
+	// A JSON integer: valid single token ID. We require an exact integer
+	// (int64 unmarshal succeeds without loss). Floats/decimals are rejected
+	// because token IDs are always whole numbers; accepting floats would
+	// allow unexpected numeric shapes to pass through unscanned.
+	//
+	// Strategy: unmarshal as int64. If that succeeds, it is an integer.
+	// If the raw bytes contain a decimal point or exponent indicating a
+	// non-integer float, int64 unmarshal will fail, so we check the raw
+	// bytes for those markers before concluding it is not an integer.
 	var n int64
 	if jsonx.Unmarshal(raw, &n) == nil {
-		return true
-	}
-	var f float64
-	if jsonx.Unmarshal(raw, &f) == nil {
+		// Verify raw bytes do not contain a decimal point or exponent —
+		// some JSON libraries round floats to integers on unmarshal.
+		rawStr := string(raw)
+		for _, ch := range rawStr {
+			if ch == '.' || ch == 'e' || ch == 'E' {
+				return false // float-shaped literal, not a token ID
+			}
+		}
 		return true
 	}
 
@@ -641,21 +795,22 @@ func isTokenElement(raw jsonx.RawMessage) bool {
 	var arr []jsonx.RawMessage
 	if jsonx.Unmarshal(raw, &arr) == nil {
 		for _, elem := range arr {
-			if !isTokenElement(elem) {
+			if !isTokenElement(elem, depth+1) {
 				return false
 			}
 		}
 		return true
 	}
 
-	// Anything else (object, bool, null, string) is not a token ID.
+	// Anything else (object, bool, null, string, float) is not a token ID.
 	return false
 }
 
-// maxScanDepth is the maximum recursion depth for scanStringLeavesDepth.
-// A tools[].function.parameters JSON Schema is unlikely to exceed a handful of
-// nesting levels; 128 is a generous upper bound that still prevents a malicious
-// or pathologically nested schema from causing a goroutine stack overflow.
+// maxScanDepth is the maximum recursion depth for scanStringLeavesDepth and
+// for isTokenElement. A tools[].function.parameters JSON Schema is unlikely to
+// exceed a handful of nesting levels; 128 is a generous upper bound that still
+// prevents a malicious or pathologically nested document from causing a
+// goroutine stack overflow.
 const maxScanDepth = 128
 
 // scanStringLeaves recursively traverses a JSON value encoded as RawMessage

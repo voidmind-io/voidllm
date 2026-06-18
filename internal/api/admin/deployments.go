@@ -209,6 +209,14 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 		}
 	}
 
+	// Reload the local registry immediately so deployment changes (including
+	// pii_filter) take effect on this instance without waiting for a restart.
+	// Redis publish below covers other instances in a multi-node setup.
+	if h.ReloadModels != nil {
+		if reloadErr := h.ReloadModels(ctx); reloadErr != nil {
+			h.Log.ErrorContext(ctx, "create deployment: reload models", slog.String("error", reloadErr.Error()))
+		}
+	}
 	if h.Redis != nil {
 		if pubErr := h.Redis.PublishInvalidation(ctx, voidredis.ChannelModels, "reload"); pubErr != nil {
 			h.Log.ErrorContext(ctx, "create deployment: publish invalidation", slog.String("error", pubErr.Error()))
@@ -371,6 +379,14 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update deployment")
 	}
 
+	// Reload the local registry immediately so deployment changes (including
+	// pii_filter) take effect on this instance without waiting for a restart.
+	// Redis publish below covers other instances in a multi-node setup.
+	if h.ReloadModels != nil {
+		if reloadErr := h.ReloadModels(ctx); reloadErr != nil {
+			h.Log.ErrorContext(ctx, "update deployment: reload models", slog.String("error", reloadErr.Error()))
+		}
+	}
 	if h.Redis != nil {
 		if pubErr := h.Redis.PublishInvalidation(ctx, voidredis.ChannelModels, "reload"); pubErr != nil {
 			h.Log.ErrorContext(ctx, "update deployment: publish invalidation", slog.String("error", pubErr.Error()))
@@ -428,6 +444,14 @@ func (h *Handler) deleteDeployment(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to delete deployment")
 	}
 
+	// Reload the local registry immediately so the deleted deployment is no
+	// longer used for routing on this instance without waiting for a restart.
+	// Redis publish below covers other instances in a multi-node setup.
+	if h.ReloadModels != nil {
+		if reloadErr := h.ReloadModels(ctx); reloadErr != nil {
+			h.Log.ErrorContext(ctx, "delete deployment: reload models", slog.String("error", reloadErr.Error()))
+		}
+	}
 	if h.Redis != nil {
 		if pubErr := h.Redis.PublishInvalidation(ctx, voidredis.ChannelModels, "reload"); pubErr != nil {
 			h.Log.ErrorContext(ctx, "delete deployment: publish invalidation", slog.String("error", pubErr.Error()))
