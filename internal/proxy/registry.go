@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"sort"
 	"sync"
 	"time"
@@ -31,6 +33,22 @@ type Deployment struct {
 	GCPLocation string
 	Weight      int
 	Priority    int
+	// destPrivate is computed once at registry/config load time from the
+	// deployment's BaseURL host. It is true when the host is a loopback address
+	// (127.0.0.0/8, ::1), a private RFC-1918/ULA address (10/8, 172.16/12,
+	// 192.168/16, fc00::/7), a link-local address (169.254/16, fe80::/10), or
+	// the literal string "localhost". Named hosts other than "localhost" are
+	// classified as non-private (public) because no DNS lookup is performed on
+	// the hot path — the conservative default is to anonymize.
+	//
+	// The flag is immutable after registry load and read concurrently; it must
+	// not be mutated after the Deployment is stored in the registry.
+	destPrivate bool
+	// PIIFilter explicitly enables or disables PII anonymization for requests
+	// routed to this deployment. When non-nil it overrides both the model-level
+	// PIIFilter and the network-based default (destPrivate). The pointer is
+	// treated as immutable after registry load.
+	PIIFilter *bool
 }
 
 // LogValue implements slog.LogValuer to prevent the upstream API key from
@@ -79,6 +97,21 @@ type Model struct {
 	// non-empty, the model-level Provider, BaseURL, and APIKey are ignored
 	// in favour of the per-deployment values.
 	Deployments []Deployment
+	// destPrivate is computed once at registry/config load time from the
+	// model's BaseURL host (same rules as Deployment.destPrivate). It is used
+	// when Deployments is empty and a single candidate is synthesized from the
+	// model's own fields in tryModel. When Deployments is non-empty, the
+	// per-deployment destPrivate flags govern PII body selection.
+	//
+	// The flag is immutable after registry load and must not be mutated
+	// after the Model is stored in the registry.
+	destPrivate bool
+	// PIIFilter explicitly enables or disables PII anonymization for all
+	// deployments of this model when no per-deployment PIIFilter is set.
+	// When non-nil it overrides the network-based default (destPrivate).
+	// A per-deployment PIIFilter takes precedence over this field.
+	// The pointer is treated as immutable after registry load.
+	PIIFilter *bool
 }
 
 // LogValue implements slog.LogValuer to prevent the upstream API key from
@@ -99,6 +132,52 @@ type Registry struct {
 	models  map[string]*Model // canonical name → model
 	aliases map[string]string // alias → canonical name
 	sorted  []*Model          // pre-sorted by name for List()
+}
+
+// classifyDestPrivate reports whether the destination host in rawURL is a
+// private or loopback address. It returns true when the host is:
+//   - the literal string "localhost"
+//   - a loopback address (127.0.0.0/8 or ::1)
+//   - a private address per net.IP.IsPrivate: RFC-1918 (10/8, 172.16/12,
+//     192.168/16) and ULA (fc00::/7)
+//   - a link-local unicast address (169.254/16 or fe80::/10)
+//
+// Named hosts other than "localhost" are classified as non-private (public)
+// because no DNS lookup is performed on the hot path. The conservative default
+// — anonymize when the classification is uncertain — means unknown named hosts
+// are treated as external targets, so PII anonymization applies.
+//
+// The classification is derived entirely from the literal host string in
+// rawURL. It is computed once at registry/config load time and stored on the
+// Deployment or Model as an immutable bool so the hot path never re-derives it.
+//
+// The private-IP detection logic mirrors the SSRF protection in
+// internal/mcp/http_transport.go (NewSSRFSafeTransport): both use
+// ip.IsLoopback(), ip.IsPrivate(), and ip.IsLinkLocalUnicast() from the
+// standard library so the classification is consistent across subsystems.
+func classifyDestPrivate(rawURL string) bool {
+	if rawURL == "" {
+		return false // no URL configured → treat as public
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false // unparseable URL → treat as public
+	}
+	host := u.Hostname() // strips port
+	if host == "" {
+		return false
+	}
+	// Literal "localhost" is always private regardless of /etc/hosts overrides.
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Named host other than "localhost": no DNS lookup on the hot path.
+		// Classify as public (conservative: anonymize when uncertain).
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
 // NewRegistry builds a Registry from a slice of ModelConfig values. It returns
@@ -152,6 +231,8 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 				GCPLocation:     d.GCPLocation,
 				Weight:          d.Weight,
 				Priority:        d.Priority,
+				destPrivate:     classifyDestPrivate(d.BaseURL),
+				PIIFilter:       d.PIIFilter,
 			}
 		}
 
@@ -173,6 +254,8 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 			MaxRetries:        mc.MaxRetries,
 			Deployments:       deployments,
 			FallbackModelName: mc.Fallback,
+			destPrivate:       classifyDestPrivate(mc.BaseURL),
+			PIIFilter:         mc.PIIFilter,
 		}
 		r.models[mc.Name] = m
 	}
@@ -284,8 +367,16 @@ func (r *Registry) AddModel(m Model) {
 	aliases := make([]string, len(m.Aliases))
 	copy(aliases, m.Aliases)
 
+	// Re-derive destPrivate from each deployment's BaseURL so that models
+	// added via AddModel (e.g. from the Admin API) have the same classification
+	// as those loaded from config at startup. PIIFilter is carried over from
+	// the caller-supplied Deployment; the pointer is treated as immutable so
+	// shallow copying the pointer is safe.
 	deployments := make([]Deployment, len(m.Deployments))
-	copy(deployments, m.Deployments)
+	for i, d := range m.Deployments {
+		d.destPrivate = classifyDestPrivate(d.BaseURL)
+		deployments[i] = d
+	}
 
 	entry := &Model{
 		Name:              m.Name,
@@ -305,6 +396,8 @@ func (r *Registry) AddModel(m Model) {
 		MaxRetries:        m.MaxRetries,
 		Deployments:       deployments,
 		FallbackModelName: m.FallbackModelName,
+		destPrivate:       classifyDestPrivate(m.BaseURL),
+		PIIFilter:         m.PIIFilter,
 	}
 	r.models[m.Name] = entry
 
@@ -400,7 +493,10 @@ func (r *Registry) FallbackFor(currentName string, visited map[string]bool) (Mod
 }
 
 // copyModel returns a deep copy of m so callers cannot mutate the registry's
-// internal state. Slices (Aliases, Deployments) are copied into new backing arrays.
+// internal state. Slices (Aliases, Deployments) are copied into new backing
+// arrays. PIIFilter and Deployment.PIIFilter are pointer fields treated as
+// immutable after registry load, so shallow pointer copies are safe — callers
+// must not write through these pointers.
 func copyModel(m *Model) Model {
 	result := *m
 	result.Aliases = make([]string, len(m.Aliases))
