@@ -8,7 +8,7 @@ import { AreaChart, DonutChart, HorizontalBar } from '../../components/ui/charts
 import { useMe } from '../../hooks/useMe'
 import { useMCPUsage, useCrossOrgMCPUsage } from '../../hooks/useMCPUsage'
 import type { MCPUsageDataPoint } from '../../hooks/useMCPUsage'
-import { formatNumber } from '../../lib/utils'
+import { formatNumber, shortenId } from '../../lib/utils'
 import { exportData } from '../../lib/export'
 
 const TIME_RANGES = ['24h', '7d', '30d', '90d'] as const
@@ -60,9 +60,17 @@ function buildColumns(groupBy: string): Column<MCPUsageDataPoint>[] {
     {
       key: 'group_key',
       header: GROUP_BY_HEADERS[groupBy] ?? 'Group',
-      render: (row) => (
-        <span className="font-mono text-text-primary">{row.group_key}</span>
-      ),
+      render: (row) =>
+        row.group_label ? (
+          <span className="flex items-center gap-2">
+            <span className="text-text-primary">{row.group_label}</span>
+            <span className="font-mono text-xs text-text-tertiary" title={row.group_key}>
+              {shortenId(row.group_key)}
+            </span>
+          </span>
+        ) : (
+          <span className="font-mono text-text-primary">{row.group_key}</span>
+        ),
     },
     {
       key: 'total_calls',
@@ -121,6 +129,7 @@ function buildColumns(groupBy: string): Column<MCPUsageDataPoint>[] {
 
 const MCP_EXPORT_HEADERS = [
   { key: 'group_key', label: 'Group' },
+  { key: 'group_label', label: 'Name' },
   { key: 'total_calls', label: 'Total Calls' },
   { key: 'success_count', label: 'Success' },
   { key: 'error_count', label: 'Errors' },
@@ -421,7 +430,7 @@ export default function MCPUsagePage() {
             <h3 className="text-sm font-semibold text-text-primary mb-4">Top Servers by Calls</h3>
             <HorizontalBar
               items={topServers.map((d) => ({
-                label: d.group_key,
+                label: d.group_label || d.group_key,
                 value: d.total_calls,
                 detail: formatNumber(d.total_calls),
               }))}
@@ -432,7 +441,7 @@ export default function MCPUsagePage() {
             <h3 className="text-sm font-semibold text-text-primary mb-4">Top Tools by Calls</h3>
             <HorizontalBar
               items={topTools.map((d) => ({
-                label: d.group_key,
+                label: d.group_label || d.group_key,
                 value: d.total_calls,
                 detail: formatNumber(d.total_calls),
               }))}

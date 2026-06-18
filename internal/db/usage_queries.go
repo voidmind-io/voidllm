@@ -23,7 +23,12 @@ func coalesceSelectCol(groupCol string) string {
 type UsageAggregate struct {
 	// GroupKey is the value of the grouped column (e.g. model name, team ID, date).
 	// It is empty when no grouping is requested.
-	GroupKey         string
+	GroupKey string
+	// GroupLabel is the resolved human-readable name for the entity identified by
+	// GroupKey (e.g. key name/hint, user display name, team name, org name).
+	// It is populated by the handler layer after the aggregate query, not by SQL.
+	// Empty for non-resolvable dimensions such as model, day, or hour.
+	GroupLabel       string
 	TotalRequests    int64
 	PromptTokens     int64
 	CompletionTokens int64

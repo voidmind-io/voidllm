@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { shortenId } from '../lib/utils'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Table } from '../components/ui/Table'
 import type { Column } from '../components/ui/Table'
@@ -127,16 +128,6 @@ function statusBadgeVariant(code: number): BadgeVariant {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function shortenId(id: string): string {
-  if (!id) return '—'
-  if (id.length <= 12) return id
-  return `${id.slice(0, 8)}…`
-}
-
-// ---------------------------------------------------------------------------
 // Table columns
 // ---------------------------------------------------------------------------
 
@@ -149,12 +140,19 @@ const columns: Column<AuditEvent>[] = [
   {
     key: 'actor',
     header: 'Actor',
-    render: (row) => (
-      <span className="font-mono text-xs text-text-secondary" title={row.actor_id}>
-        <span className="text-text-tertiary mr-1">{row.actor_type}</span>
-        {shortenId(row.actor_id)}
-      </span>
-    ),
+    render: (row) =>
+      row.actor_name ? (
+        <span className="flex items-center gap-1.5" title={row.actor_id}>
+          <span className="text-text-tertiary">{row.actor_type}</span>
+          <span className="text-text-secondary">{row.actor_name}</span>
+          <span className="font-mono text-xs text-text-tertiary">{shortenId(row.actor_id)}</span>
+        </span>
+      ) : (
+        <span className="font-mono text-xs text-text-secondary" title={row.actor_id}>
+          <span className="text-text-tertiary mr-1">{row.actor_type}</span>
+          {shortenId(row.actor_id)}
+        </span>
+      ),
   },
   {
     key: 'action',

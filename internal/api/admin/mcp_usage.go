@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"log/slog"
 	"time"
 
@@ -24,6 +25,7 @@ type mcpUsageResponse struct {
 // an MCP usage response.
 type mcpUsageDataPoint struct {
 	GroupKey      string  `json:"group_key,omitempty"`
+	GroupLabel    string  `json:"group_label,omitempty"`
 	TotalCalls    int64   `json:"total_calls"`
 	SuccessCount  int64   `json:"success_count"`
 	ErrorCount    int64   `json:"error_count"`
@@ -111,6 +113,7 @@ func mcpAggregatesToDataPoints(aggs []db.MCPUsageAggregate) []mcpUsageDataPoint 
 	for i, a := range aggs {
 		data[i] = mcpUsageDataPoint{
 			GroupKey:      a.GroupKey,
+			GroupLabel:    a.GroupLabel,
 			TotalCalls:    a.TotalCalls,
 			SuccessCount:  a.SuccessCount,
 			ErrorCount:    a.ErrorCount,
@@ -120,6 +123,41 @@ func mcpAggregatesToDataPoints(aggs []db.MCPUsageAggregate) []mcpUsageDataPoint 
 		}
 	}
 	return data
+}
+
+// enrichMCPGroupLabels resolves entity IDs in the MCP aggregates to
+// human-readable labels for key/user/team/org groupings, mutating each
+// aggregate's GroupLabel in place. Resolution failure is non-fatal: it logs a
+// warning and leaves labels empty so the response still returns the raw group
+// keys. Dimensions such as server, tool, and status are not resolvable and
+// ResolveGroupLabels returns an empty map for them — they remain label-less.
+//
+// ResolveGroupLabels is intentionally unscoped (no org filter). This is safe
+// because the group-key IDs come from MCP usage rows the proxy wrote with
+// org-scoped key context — a user/key/team ID present in an org's usage
+// necessarily belongs to that org. Resolving its display name (including
+// soft-deleted entities, for historical reporting) does not cross tenant
+// boundaries under normal operation.
+func (h *Handler) enrichMCPGroupLabels(ctx context.Context, groupBy string, aggs []db.MCPUsageAggregate) {
+	ids := make([]string, 0, len(aggs))
+	for _, a := range aggs {
+		ids = append(ids, a.GroupKey)
+	}
+
+	labels, err := h.DB.ResolveGroupLabels(ctx, groupBy, ids)
+	if err != nil {
+		h.Log.WarnContext(ctx, "resolve usage group labels",
+			slog.String("group_by", groupBy),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
+	for i := range aggs {
+		if label, ok := labels[aggs[i].GroupKey]; ok {
+			aggs[i].GroupLabel = label
+		}
+	}
 }
 
 // GetOrgMCPUsage handles GET /api/v1/orgs/:org_id/mcp-usage.
@@ -164,6 +202,8 @@ func (h *Handler) GetOrgMCPUsage(c fiber.Ctx) error {
 		)
 		return apierror.InternalError(c, "failed to retrieve MCP usage data")
 	}
+
+	h.enrichMCPGroupLabels(c.Context(), groupBy, aggregates)
 
 	return c.JSON(mcpUsageResponse{
 		OrgID:   orgID,
@@ -215,6 +255,8 @@ func (h *Handler) GetSystemMCPUsage(c fiber.Ctx) error {
 		)
 		return apierror.InternalError(c, "failed to retrieve MCP usage data")
 	}
+
+	h.enrichMCPGroupLabels(c.Context(), groupBy, aggregates)
 
 	return c.JSON(mcpUsageResponse{
 		From:    from.UTC().Format(time.RFC3339),
