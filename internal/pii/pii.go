@@ -178,6 +178,21 @@ func (f *Filter) Touched() bool {
 	return len(f.rev) > 0
 }
 
+// pseudonyms returns a snapshot of every pseudonym that this filter has issued
+// so far. The returned slice contains the keys of the reverse map (pseudonym →
+// original). It is used by StreamRestorer to build a prefix index once per
+// request so that the rolling-buffer hold-back can be sized exactly.
+//
+// Callers must not mutate the returned strings; the slice itself may be
+// discarded after use.
+func (f *Filter) pseudonyms() []string {
+	out := make([]string, 0, len(f.rev))
+	for p := range f.rev {
+		out = append(out, p)
+	}
+	return out
+}
+
 // pseudonymFor returns the stable pseudonym for (typ, value), creating
 // and recording the mapping on first call. Subsequent calls with the same
 // arguments return the cached pseudonym so that repeated occurrences of

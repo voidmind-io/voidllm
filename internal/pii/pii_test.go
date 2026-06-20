@@ -291,12 +291,45 @@ func TestPseudonym_DifferentTypes(t *testing.T) {
 	}
 }
 
+// TestPseudonymConstants verifies that the package-level pseudonymLen and
+// pseudonymMarker constants match pseudonyms actually produced by Engine.NewFilter.
+// This test is the authoritative cross-check between the constants and the
+// pseudonym() implementation — if either changes without the other, this test
+// will catch the divergence.
+func TestPseudonymConstants(t *testing.T) {
+	t.Parallel()
+
+	eng := newTestEngine(t)
+	f := eng.NewFilter(testOrgID)
+
+	// Anonymize a body that will produce at least one pseudonym.
+	body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"email: const@example.com and IBAN DE12345678901234567890"}]}`)
+	_, err := f.AnonymizeJSON(body)
+	if err != nil {
+		t.Fatalf("AnonymizeJSON: %v", err)
+	}
+	if !f.Touched() {
+		t.Fatal("Touched() = false; no pseudonyms produced")
+	}
+
+	for p := range f.rev {
+		// Every pseudonym must be exactly pseudonymLen bytes.
+		if len(p) != pseudonymLen {
+			t.Errorf("pseudonym %q: len = %d, want pseudonymLen = %d", p, len(p), pseudonymLen)
+		}
+		// Every pseudonym must begin with pseudonymMarker.
+		if len(p) < len(pseudonymMarker) || p[:len(pseudonymMarker)] != pseudonymMarker {
+			t.Errorf("pseudonym %q does not start with pseudonymMarker %q", p, pseudonymMarker)
+		}
+	}
+}
+
 func TestPseudonym_FixedLengthPerType(t *testing.T) {
 	t.Parallel()
 
 	// All pseudonyms for a given type must have the same length.
 	// Format: "PII_<2-char abbr>_<24 hex chars>" = 4 + 2 + 1 + 24 = 31 chars.
-	expectedLen := len("PII_EM_") + 24 // 31 total
+	expectedLen := pseudonymLen
 
 	types := []struct {
 		typ    string

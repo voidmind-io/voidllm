@@ -419,20 +419,25 @@ func TestPIIFilter_StreamCap_FailClosed(t *testing.T) {
 	fullBody, _ := io.ReadAll(streamResp.Body)
 	bodyStr := string(fullBody)
 
-	// Fail-closed: the raw pseudonym must NOT appear in the client response.
-	// When the cap is exceeded, the handler writes nothing and flushes before
-	// returning, so the body should be empty or contain only SSE framing without
-	// pseudonym content.
+	// Fail-closed invariant: the raw pseudonym must NEVER appear in the client
+	// response. With the incremental StreamRestorer (Stage 0b), content is
+	// emitted token-by-token as it is safely restored. The pseudonym is always
+	// replaced by the original value BEFORE emission — it never reaches the
+	// wire in pseudonymized form, not even partially.
 	if strings.Contains(bodyStr, pseudo) {
 		t.Errorf("stream-cap fail-closed VIOLATED: pseudonym %q visible in client response\nbody: %s",
 			pseudo, bodyStr)
 	}
 
-	// The original PII email must also not appear (it was never restored because
-	// the stream was aborted before RestoreSSEStream ran).
-	if strings.Contains(bodyStr, piiTestEmail) {
-		t.Errorf("original PII email %q visible in client response after stream-cap abort", piiTestEmail)
-	}
+	// With the incremental restore path (Stage 0b), some chunks may have been
+	// emitted and correctly restored (original email visible) before the byte
+	// cap fired and aborted the stream. This is correct: the cap prevents
+	// unbounded memory growth, not correct restoration of already-emitted
+	// content. The security guarantee is "pseudonyms never reach the client",
+	// not "no content is emitted when the stream is oversized".
+	//
+	// We do NOT assert that piiTestEmail is absent — it may legitimately appear
+	// in correctly restored chunks that were emitted before the cap fired.
 }
 
 // TestPIIFilter_StreamCapNote documents the coverage gap for scanner.Err.
@@ -442,18 +447,19 @@ func TestPIIFilter_StreamCap_FailClosed(t *testing.T) {
 // httptest.Server and the Go HTTP client do not easily simulate transport-level
 // truncation on the streaming path.
 //
-// The fail-closed logic for scanner.Err is in handler.go's needsContentRestore
-// block (lines ~1119-1129): when scanErr != nil, the handler logs a warning and
-// returns without writing anything to the client.
+// The fail-closed logic for scanner.Err is in handler.go's PII scan loop:
+// when scanErr != nil after the loop, the handler sets streamAborted=true,
+// records a circuit breaker failure, and does not emit further content.
 //
-// Coverage at the unit level lives in stream_test.go (the RestoreSSEStream
-// function itself is tested with well-formed and broken inputs). This test
+// Coverage at the unit level lives in stream_test.go (the oracle
+// RestoreSSEStream function is tested with well-formed and broken inputs,
+// and StreamRestorer Push is tested directly in the pii package). This test
 // is intentionally a non-asserting placeholder documenting the gap.
 func TestPIIFilter_ScannerErr_CoverageGapDocumented(t *testing.T) {
 	t.Parallel()
 	t.Log("COVERAGE GAP: scanner.Err fail-closed path (mid-stream transport truncation) " +
 		"cannot be triggered deterministically via httptest.Server. " +
-		"The logic is covered by code inspection + stream_test.go unit tests on RestoreSSEStream.")
+		"The logic is covered by code inspection + pii package unit tests.")
 }
 
 // ── 9. classifyDestPrivate ────────────────────────────────────────────────────
