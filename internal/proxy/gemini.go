@@ -346,7 +346,7 @@ func (a *GeminiAdapter) TransformResponse(body []byte) ([]byte, error) {
 				Index: 0,
 				Message: openAIMessage{
 					Role:    "assistant",
-					Content: text,
+					Content: &text,
 				},
 				FinishReason: finishReason,
 			},

@@ -7,9 +7,10 @@ package proxy
 //         still exhaust the cap). Tested via
 //         TestPII_Review3_ByteCapOnDroppedAdapterLines.
 //
-// FIX 3: finish_reason "tool_calls"/"function_call" is now fail-closed.
-//         Anthropic tool-use stream → fail-closed integration test:
-//         TestPII_Review3_Anthropic_ToolUse_FailClosed.
+// L-017: Anthropic tool-use stream now translates correctly end-to-end.
+//         The adapter emits tool_calls header deltas; the stream completes
+//         normally. Integration test:
+//         TestPII_Review3_Anthropic_ToolUse_SuccessEndToEnd.
 //
 // FIX 4: truncated streams (no [DONE]) are logged with StatusBadGateway, not
 //         with the upstream 200. Tested via
@@ -137,25 +138,36 @@ func TestPII_Review3_ByteCapOnDroppedAdapterLines(t *testing.T) {
 	}
 }
 
-// ── FIX 3: Anthropic tool-use stream → fail-closed ───────────────────────────
+// ── L-017: Anthropic tool-use stream → correct end-to-end translation ────────
 
-// TestPII_Review3_Anthropic_ToolUse_FailClosed verifies the end-to-end
-// integration of FIX 3: when an Anthropic stream invokes a tool (stop_reason
-// "tool_use"), the adapter maps it to finish_reason:"tool_calls". Because
-// "tool_calls" is no longer in allowedFinishReasons, the StreamRestorer aborts
-// fail-closed — the client never receives a corrupt response (tool_calls finish
-// with no tool_calls body).
+// TestPII_Review3_Anthropic_ToolUse_SuccessEndToEnd verifies the end-to-end
+// integration of L-017: when an Anthropic stream invokes a tool (stop_reason
+// "tool_use"), the adapter now emits well-formed OpenAI tool_calls deltas that
+// the StreamRestorer accepts. The stream must complete normally with [DONE] and
+// the client must receive a tool_calls header delta (id, type:"function", name)
+// followed by finish_reason:"tool_calls".
+//
+// This test replaces the former TestPII_Review3_Anthropic_ToolUse_FailClosed
+// which guarded the pre-L-017 state where the adapter dropped tool_use
+// content_block_start events (leaving sawToolCall=false and causing the
+// StreamRestorer to reject finish_reason:"tool_calls" via fail-closed abort).
+// With L-017, the adapter correctly translates content_block_start(tool_use)
+// into a header delta, setting sawToolCall=true so the finish_reason is
+// accepted and the stream terminates cleanly.
 //
 // The mock upstream emits a native Anthropic tool_use stream:
 //   - message_start
-//   - content_block_start (tool_use type, no text)
+//   - content_block_start (tool_use, id="toolu_01", name="get_weather")
+//   - content_block_stop (no input_json_delta — header-only tool call)
 //   - message_delta with stop_reason:"tool_use"
-//   - message_stop → adapter emits "data: [DONE]"
+//   - message_stop
 //
-// The adapter produces finish_reason:"tool_calls" from the message_delta, which
-// the StreamRestorer rejects. The stream must be aborted (no [DONE] in output,
-// no corrupt tool_calls body).
-func TestPII_Review3_Anthropic_ToolUse_FailClosed(t *testing.T) {
+// The adapter translates this to OpenAI SSE:
+//   - role:"assistant" delta chunk
+//   - tool_calls header delta (index=0, id, type:"function", name, arguments:"")
+//   - finish_reason:"tool_calls" chunk
+//   - "data: [DONE]"
+func TestPII_Review3_Anthropic_ToolUse_SuccessEndToEnd(t *testing.T) {
 	t.Parallel()
 
 	engine := newTestPIIEngine(t)
@@ -180,10 +192,12 @@ func TestPII_Review3_Anthropic_ToolUse_FailClosed(t *testing.T) {
 			return
 		}
 
-		// Native Anthropic tool_use stream. The adapter translates:
-		//   message_start → role chunk (assistant)
-		//   content_block_start (tool_use) → nil (dropped)
-		//   message_delta (stop_reason="tool_use") → finish chunk with "tool_calls"
+		// Native Anthropic tool_use stream (header-only, no input_json_delta).
+		// The adapter (L-017) translates:
+		//   message_start → role:"assistant" chunk
+		//   content_block_start(tool_use) → tool_calls header delta (index=0, id, type, name, args:"")
+		//   content_block_stop → nil (dropped)
+		//   message_delta(stop_reason="tool_use") → finish chunk with finish_reason:"tool_calls"
 		//   message_stop → "data: [DONE]"
 		events := []string{
 			`event: message_start`,
@@ -235,22 +249,27 @@ func TestPII_Review3_Anthropic_ToolUse_FailClosed(t *testing.T) {
 	fullBody, _ := io.ReadAll(streamResp.Body)
 	fullStr := string(fullBody)
 
-	// FIX 3 invariant: the stream must be aborted — [DONE] must NOT appear.
-	// If [DONE] is present, finish_reason:"tool_calls" was accepted and the
-	// client received a corrupt response (tool_calls finish with no body).
-	if strings.Contains(fullStr, "[DONE]") {
-		t.Errorf("FIX 3: [DONE] present in Anthropic tool_use stream output; "+
-			"stream should be fail-closed on finish_reason:tool_calls\noutput: %s", fullStr)
+	// L-017 invariant: the stream must complete normally — [DONE] must appear.
+	// The adapter now emits a tool_calls header delta so sawToolCall=true in the
+	// StreamRestorer, which accepts finish_reason:"tool_calls" and allows [DONE].
+	if !strings.Contains(fullStr, "[DONE]") {
+		t.Errorf("L-017: [DONE] absent from Anthropic tool_use stream output; "+
+			"stream should complete normally after adapter translation\noutput: %s", fullStr)
 	}
 
-	// No PII_ fragment must appear (fail-closed means no partial emit).
+	// The tool_calls header chunk must be present.
+	if !strings.Contains(fullStr, `"tool_calls"`) {
+		t.Errorf("L-017: tool_calls delta absent from stream output\noutput: %s", fullStr)
+	}
+
+	// No PII_ fragment must appear in the stream output.
 	if strings.Contains(fullStr, "PII_") {
-		t.Errorf("SECURITY: PII_ fragment visible in tool_use fail-closed output\noutput: %s", fullStr)
+		t.Errorf("SECURITY: PII_ fragment visible in tool_use stream output\noutput: %s", fullStr)
 	}
 
 	// The pseudonym must not appear either.
 	if strings.Contains(fullStr, pseudo) {
-		t.Errorf("SECURITY: full pseudonym %q visible in tool_use fail-closed output\noutput: %s",
+		t.Errorf("SECURITY: full pseudonym %q visible in tool_use stream output\noutput: %s",
 			pseudo, fullStr)
 	}
 }

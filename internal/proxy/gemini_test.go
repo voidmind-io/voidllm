@@ -629,8 +629,14 @@ func TestGeminiTransformResponse(t *testing.T) {
 			}
 
 			ch := resp.Choices[0]
-			if tc.wantContent != "" && ch.Message.Content != tc.wantContent {
-				t.Errorf("choices[0].message.content = %q, want %q", ch.Message.Content, tc.wantContent)
+			if tc.wantContent != "" {
+				if ch.Message.Content == nil || *ch.Message.Content != tc.wantContent {
+					var got string
+					if ch.Message.Content != nil {
+						got = *ch.Message.Content
+					}
+					t.Errorf("choices[0].message.content = %q, want %q", got, tc.wantContent)
+				}
 			}
 			if tc.wantFinish != "" && ch.FinishReason != tc.wantFinish {
 				t.Errorf("choices[0].finish_reason = %q, want %q", ch.FinishReason, tc.wantFinish)
