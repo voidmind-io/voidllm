@@ -2,6 +2,18 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.22] - 2026-06-21
+
+### Features
+- PII anonymization (opt-in "de-tokenizer firewall"): when `settings.pii.enabled` is on, PII detected in outbound prompts is replaced with deterministic, per-organization pseudonyms before the request leaves to an external provider, and the original values are restored in the response. No prompt or response content, PII, or pseudonyms are ever persisted or logged. Public destinations are anonymized; private/loopback upstreams pass through, and the behavior is configurable per model/deployment via `pii_filter` (#134)
+- Token-by-token streaming for the PII firewall: pseudonyms are restored incrementally across SSE chunks — both message content and streamed tool-call arguments — instead of buffering the whole response (#135, #137)
+- Native tool-call support for the Anthropic and Gemini providers: OpenAI-style tool calls are translated to and from the Anthropic Messages and Gemini generateContent APIs across requests, non-streaming responses, and streaming, including alongside the PII firewall (#138, #139)
+
+### Fixes
+- The PII firewall no longer rejects messages with `null` content (such as assistant messages that carry only `tool_calls`), so multi-turn tool conversations work with anonymization enabled (#136)
+
+---
+
 ## [0.0.21] - 2026-06-19
 
 ### Features
