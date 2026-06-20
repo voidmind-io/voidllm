@@ -13,7 +13,7 @@ import (
 const deploymentSelectColumns = "id, model_id, name, provider, base_url, api_key_encrypted, " +
 	"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
 	"weight, priority, is_active, " +
-	"created_at, updated_at, deleted_at"
+	"created_at, updated_at, deleted_at, pii_filter"
 
 // Deployment represents a row in the model_deployments table.
 // Each deployment is a concrete upstream endpoint associated with a model.
@@ -37,6 +37,10 @@ type Deployment struct {
 	CreatedAt   string
 	UpdatedAt   string
 	DeletedAt   *string
+	// PIIFilter explicitly enables or disables PII anonymization for requests
+	// routed to this deployment. Nil means not set — inherit the model-level or
+	// network-level default. true enables anonymization; false disables it.
+	PIIFilter *bool
 }
 
 // CreateDeploymentParams holds the input for creating a deployment.
@@ -57,6 +61,10 @@ type CreateDeploymentParams struct {
 	// Priority is the routing preference for the priority strategy; lower value
 	// means higher priority. 0 is the highest priority.
 	Priority int
+	// PIIFilter, when non-nil, stores the PII anonymization override for this
+	// deployment. true enables anonymization; false disables it. Nil stores NULL
+	// (inherit model-level or network-level default).
+	PIIFilter *bool
 }
 
 // UpdateDeploymentParams holds optional fields for a partial deployment update.
@@ -76,6 +84,12 @@ type UpdateDeploymentParams struct {
 	Weight *int
 	// Priority, when non-nil, replaces the stored routing priority.
 	Priority *int
+	// PIIFilter, when non-nil, sets the PII anonymization override for this
+	// deployment. true enables anonymization; false disables it.
+	PIIFilter *bool
+	// ClearPIIFilter, when true, sets the pii_filter column to NULL regardless
+	// of the PIIFilter pointer value. Allows callers to revert to inherit-from-model.
+	ClearPIIFilter bool
 }
 
 // CreateDeployment inserts a new deployment and returns the persisted record.
@@ -95,12 +109,12 @@ func (d *DB) CreateDeployment(ctx context.Context, params CreateDeploymentParams
 	insertQuery := "INSERT INTO model_deployments " +
 		"(id, model_id, name, provider, base_url, api_key_encrypted, " +
 		"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
-		"weight, priority, is_active, " +
+		"weight, priority, is_active, pii_filter, " +
 		"created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
 		p(7) + ", " + p(8) + ", " + p(9) + ", " + p(10) + ", " + p(11) + ", " + p(12) + ", " +
-		"1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+		"1, " + p(13) + ", CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + deploymentSelectColumns +
 		" FROM model_deployments WHERE id = " + p(1) + " AND deleted_at IS NULL"
@@ -120,6 +134,7 @@ func (d *DB) CreateDeployment(ctx context.Context, params CreateDeploymentParams
 			params.GCPLocation,
 			weight,
 			params.Priority,
+			boolPtrToNullableInt(params.PIIFilter),
 		)
 		if execErr != nil {
 			return translateError(execErr)
@@ -272,6 +287,13 @@ func (d *DB) UpdateDeployment(ctx context.Context, id string, params UpdateDeplo
 		args = append(args, *params.Priority)
 		argN++
 	}
+	if params.ClearPIIFilter {
+		setClauses = append(setClauses, "pii_filter = NULL")
+	} else if params.PIIFilter != nil {
+		setClauses = append(setClauses, "pii_filter = "+p(argN))
+		args = append(args, boolPtrToNullableInt(params.PIIFilter))
+		argN++
+	}
 
 	if len(setClauses) == 0 {
 		return d.GetDeployment(ctx, id)
@@ -379,15 +401,18 @@ func (d *DB) ListDeploymentsByModelIDs(ctx context.Context, modelIDs []string) (
 func scanDeployment(scanner interface{ Scan(...any) error }) (*Deployment, error) {
 	var dep Deployment
 	var isActiveInt int
+	var piiFilterInt *int64
 	err := scanner.Scan(
 		&dep.ID, &dep.ModelID, &dep.Name, &dep.Provider, &dep.BaseURL, &dep.APIKeyEncrypted,
 		&dep.AzureDeployment, &dep.AzureAPIVersion, &dep.GCPProject, &dep.GCPLocation,
 		&dep.Weight, &dep.Priority,
 		&isActiveInt, &dep.CreatedAt, &dep.UpdatedAt, &dep.DeletedAt,
+		&piiFilterInt,
 	)
 	if err != nil {
 		return nil, err
 	}
 	dep.IsActive = isActiveInt == 1
+	dep.PIIFilter = nullableIntToBoolPtr(piiFilterInt)
 	return &dep, nil
 }

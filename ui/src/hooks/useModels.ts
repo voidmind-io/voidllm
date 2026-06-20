@@ -12,6 +12,7 @@ export interface DeploymentResponse {
   weight: number
   priority: number
   is_active: boolean
+  pii_filter?: boolean
   created_at: string
   updated_at: string
 }
@@ -36,6 +37,7 @@ export interface ModelResponse {
   strategy?: string
   max_retries?: number
   fallback_model_name?: string
+  pii_filter?: boolean
   deployments?: DeploymentResponse[]
 }
 
@@ -61,6 +63,7 @@ export interface CreateModelParams {
   strategy?: string
   max_retries?: number
   fallback_model_name?: string
+  pii_filter?: boolean
 }
 
 export interface CreateDeploymentParams {
@@ -99,6 +102,7 @@ export interface UpdateModelParams {
   timeout?: string
   aliases?: string[]
   fallback_model_name?: string | null
+  pii_filter?: boolean | null
 }
 
 export function useModels(cursor?: string) {

@@ -2094,6 +2094,94 @@ func TestListModels_FallbackAcrossPages(t *testing.T) {
 	}
 }
 
+// TestUpdateModel_PIIFilterTriState verifies the three distinct semantics of the
+// pii_filter field on a model PATCH:
+//
+//   - key present, true  → DB column set to 1 (true)
+//   - key present, false → DB column set to 0 (false)
+//   - key present, null  → DB column reset to NULL (revert to network default)
+//   - key absent         → DB column left unchanged (no-op)
+func TestUpdateModel_PIIFilterTriState(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestUpdateModel_PIIFilterTriState?mode=memory&cache=private"
+	app, database, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	m := mustCreateModelForDeployment(t, database, "pii-tristate-model")
+
+	patch := func(t *testing.T, rawBody string) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest("PATCH", modelItemURL(m.ID),
+			strings.NewReader(rawBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+testKey)
+		resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != fiber.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+		}
+		var got map[string]any
+		decodeBody(t, resp.Body, &got)
+		return got
+	}
+
+	dbPIIFilter := func(t *testing.T) *int64 {
+		t.Helper()
+		var v *int64
+		row := database.SQL().QueryRowContext(context.Background(),
+			"SELECT pii_filter FROM models WHERE id = ?", m.ID)
+		if err := row.Scan(&v); err != nil {
+			t.Fatalf("scan pii_filter: %v", err)
+		}
+		return v
+	}
+
+	// (a) pii_filter: true → DB must be 1.
+	resp := patch(t, `{"pii_filter": true}`)
+	if resp["pii_filter"] != true {
+		t.Errorf("(a) response pii_filter = %v, want true", resp["pii_filter"])
+	}
+	if v := dbPIIFilter(t); v == nil || *v != 1 {
+		t.Errorf("(a) DB pii_filter = %v, want 1", v)
+	}
+
+	// (b) pii_filter: false → DB must be 0.
+	resp = patch(t, `{"pii_filter": false}`)
+	if resp["pii_filter"] != false {
+		// The response field is omitempty so false may be absent; check DB.
+		_ = resp
+	}
+	if v := dbPIIFilter(t); v == nil || *v != 0 {
+		t.Errorf("(b) DB pii_filter = %v, want 0", v)
+	}
+
+	// (c) pii_filter: null → DB must become NULL (revert to network default).
+	resp = patch(t, `{"pii_filter": null}`)
+	if _, present := resp["pii_filter"]; present && resp["pii_filter"] != nil {
+		t.Errorf("(c) response pii_filter = %v, want absent or null", resp["pii_filter"])
+	}
+	if v := dbPIIFilter(t); v != nil {
+		t.Errorf("(c) DB pii_filter = %d, want NULL", *v)
+	}
+
+	// Prime the DB with true again so the no-op case (d) is detectable.
+	patch(t, `{"pii_filter": true}`)
+	if v := dbPIIFilter(t); v == nil || *v != 1 {
+		t.Fatalf("priming failed: DB pii_filter = %v, want 1", v)
+	}
+
+	// (d) pii_filter key absent → DB must be unchanged (still 1).
+	patch(t, `{"max_context_tokens": 4096}`)
+	if v := dbPIIFilter(t); v == nil || *v != 1 {
+		t.Errorf("(d) DB pii_filter = %v, want 1 (unchanged)", v)
+	}
+}
+
 // TestUpdateModel_ConcurrentFallbackMutations is a race-detector test that
 // verifies concurrent PATCH requests mutating fallback relationships do not
 // produce data races or panics (Fix C3). The exact final state is not asserted

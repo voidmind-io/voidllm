@@ -58,6 +58,10 @@ type createModelRequest struct {
 	// this model are unavailable. Requires an Enterprise license with the
 	// fallback_chains feature. Leave empty to disable fallback.
 	FallbackModelName string `json:"fallback_model_name,omitempty"`
+	// PIIFilter explicitly enables or disables PII anonymization for requests
+	// routed to this model. When omitted the network-level default is used.
+	// Pass true to force anonymization on, false to force it off.
+	PIIFilter *bool `json:"pii_filter,omitempty"`
 }
 
 // updateModelRequest is the JSON body accepted by UpdateModel.
@@ -92,6 +96,33 @@ type updateModelRequest struct {
 	// pointer to an empty string to clear the fallback. Requires Enterprise
 	// license with the fallback_chains feature when setting a non-empty value.
 	FallbackModelName *string `json:"fallback_model_name"`
+	// PIIFilter, when non-nil, replaces the PII anonymization override for this
+	// model. Pass true to force anonymization on, false to force it off, or
+	// omit the field entirely to leave the existing setting unchanged.
+	// Send the JSON key with a null value to clear the override and revert to
+	// the network-level default (NULL in the DB).
+	PIIFilter *bool `json:"pii_filter"`
+}
+
+// parsePIIFilterField inspects raw JSON bytes to determine how the pii_filter
+// key was supplied. It returns (present=false, isNull=false) when the key is
+// absent — the caller must not change the stored value. It returns
+// (present=true, isNull=true) when the key exists with a JSON null value —
+// the caller must clear the column to NULL. It returns (present=true,
+// isNull=false) when the key holds a concrete bool — the caller must write
+// that bool value. Standard JSON null bytes.Equal is used; no need for
+// constant-time comparison on a non-secret value.
+func parsePIIFilterField(body []byte) (present bool, isNull bool) {
+	var raw map[string]jsonx.RawMessage
+	if err := jsonx.Unmarshal(body, &raw); err != nil {
+		return false, false
+	}
+	v, ok := raw["pii_filter"]
+	if !ok {
+		return false, false
+	}
+	// encoding/json and sonic both represent JSON null as the four bytes "null".
+	return true, string(v) == "null"
 }
 
 // modelResponse is the JSON representation of a model returned by the API.
@@ -127,6 +158,9 @@ type modelResponse struct {
 	// FallbackModelName is the name of the fallback model, or empty when none
 	// is configured.
 	FallbackModelName string `json:"fallback_model_name,omitempty"`
+	// PIIFilter is the per-model PII anonymization override. Nil means the
+	// network-level default is used; true forces anonymization on; false off.
+	PIIFilter *bool `json:"pii_filter,omitempty"`
 	// Deployments contains the model's deployment entries when present.
 	Deployments []deploymentResponse `json:"deployments,omitempty"`
 	CreatedAt   string               `json:"created_at"`
@@ -193,6 +227,7 @@ func modelToResponse(m *db.Model, fallbackName string) modelResponse {
 		Strategy:          m.Strategy,
 		MaxRetries:        m.MaxRetries,
 		FallbackModelName: fallbackName,
+		PIIFilter:         m.PIIFilter,
 		CreatedAt:         m.CreatedAt,
 		UpdatedAt:         m.UpdatedAt,
 	}
@@ -232,6 +267,7 @@ func dbModelToProxy(m *db.Model, apiKeyPlaintext string, fallbackName string) pr
 		GCPLocation:       m.GCPLocation,
 		Timeout:           timeout,
 		FallbackModelName: fallbackName,
+		PIIFilter:         m.PIIFilter,
 	}
 }
 
@@ -529,6 +565,7 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		Strategy:         &req.Strategy,
 		MaxRetries:       &req.MaxRetries,
 		FallbackModelID:  fallbackModelID,
+		PIIFilter:        req.PIIFilter,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
@@ -728,6 +765,11 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&req); err != nil {
 		return apierror.BadRequest(c, "invalid request body")
 	}
+	// Capture body bytes before any further processing. c.Body() is safe to
+	// call after Bind().JSON() — Fiber retains the raw bytes on the request
+	// context throughout the handler lifetime.
+	rawBody := append([]byte(nil), c.Body()...)
+	piiPresent, piiIsNull := parsePIIFilterField(rawBody)
 
 	// Determine the effective strategy after this update so we know whether
 	// provider/base_url are required. If strategy is being cleared (pointer to
@@ -771,6 +813,20 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		}
 	}
 
+	// Resolve the tri-state pii_filter semantics:
+	//   - key absent in JSON  → do not touch the column (piiPresent=false)
+	//   - key present, null   → clear column to NULL    (piiIsNull=true)
+	//   - key present, bool   → write the bool value
+	var piiFilter *bool
+	var clearPIIFilter bool
+	if piiPresent {
+		if piiIsNull {
+			clearPIIFilter = true
+		} else {
+			piiFilter = req.PIIFilter
+		}
+	}
+
 	params := db.UpdateModelParams{
 		Name:             req.Name,
 		Provider:         req.Provider,
@@ -786,6 +842,8 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		Timeout:          req.Timeout,
 		Strategy:         req.Strategy,
 		MaxRetries:       req.MaxRetries,
+		PIIFilter:        piiFilter,
+		ClearPIIFilter:   clearPIIFilter,
 	}
 
 	if req.Aliases != nil {

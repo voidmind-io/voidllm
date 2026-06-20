@@ -27,6 +27,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/circuitbreaker"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/metrics"
+	"github.com/voidmind-io/voidllm/internal/pii"
 	"github.com/voidmind-io/voidllm/internal/ratelimit"
 	"github.com/voidmind-io/voidllm/internal/shutdown"
 	"github.com/voidmind-io/voidllm/internal/usage"
@@ -62,6 +63,10 @@ type ProxyHandler struct {
 	// request. Zero or negative disables fallback chaining entirely.
 	// Set from config.SettingsConfig.FallbackMaxDepth at startup.
 	FallbackMaxDepth int
+	// PIIEngine performs in-memory PII anonymization on outbound request
+	// bodies and restores original values in responses. A nil value
+	// disables PII anonymization entirely with zero overhead on the hot path.
+	PIIEngine *pii.Engine
 }
 
 // NewProxyHandler constructs a ProxyHandler with a pre-configured HTTP client.
@@ -181,12 +186,6 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		return err
 	}
 
-	if p.Tracer != nil {
-		trace.SpanFromContext(c.Context()).SetAttributes(
-			attribute.String("model.requested", envelope.Model),
-		)
-	}
-
 	keyInfo := auth.KeyInfoFromCtx(c)
 	requestID := apierror.RequestIDFromCtx(c)
 
@@ -205,6 +204,12 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		return err
 	}
 
+	// Set tracing attributes only after successful model resolution so that the
+	// raw, client-supplied model string (envelope.Model) never reaches the
+	// tracing backend. A client that embeds PII in the model field would
+	// otherwise persist that PII in spans — a Zero-Knowledge violation.
+	// model.Name is the canonical, registry-validated name; model.Provider is
+	// set by the registry loader and is never derived from client input.
 	if p.Tracer != nil {
 		trace.SpanFromContext(c.Context()).SetAttributes(
 			attribute.String("model.canonical", model.Name),
@@ -222,9 +227,96 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 	// request's fallback chain so that runtime cycles are detected and broken.
 	visited := make(map[string]bool)
 
-	// currentModel and currentBody may be replaced on each fallback iteration.
+	// currentModel may be replaced on each fallback iteration.
 	currentModel := model
-	currentBody := body
+
+	// PII anonymization: create a per-request filter and pre-anonymize the
+	// body ONCE before the fallback loop. We hold both the original body
+	// and an anonymized body in parallel. On each hop we choose which body
+	// to send based on the ACTUAL provider resolved for that hop (after
+	// applyDeployment). This is the only correct approach: the initial model
+	// provider may differ from the deployment or fallback provider, and a
+	// later hop could route to an external provider even when the primary
+	// was internal.
+	//
+	// Design: the filter is created with the authenticated key's OrgID so
+	// that pseudonyms are tenant-scoped. The filter lives until the response
+	// is fully handled (including inside the streaming goroutine, which
+	// captures it by value on the heap). The filter is never accessed from
+	// multiple goroutines.
+	//
+	// Fail-closed: if anonymization fails (parse error, mapping cap exceeded),
+	// the request is rejected immediately. We never forward the original body
+	// when the engine is enabled and anonymization cannot be guaranteed.
+	var piiFilter *pii.Filter
+	var anonBody []byte // anonymized body; nil when PII engine is disabled
+	if p.PIIEngine != nil {
+		// OrgID is always non-empty for authenticated requests because the auth
+		// middleware (internal/auth) validates the API key and rejects requests
+		// with no matching key. The only path with a nil keyInfo is test code or
+		// an unauthenticated bypass — neither is possible on the production hot
+		// path (auth middleware is always wired before Handle). If keyInfo is nil
+		// here, orgID defaults to "" which still produces valid pseudonyms scoped
+		// to the empty-string tenant; anonymization is still applied.
+		orgID := ""
+		if keyInfo != nil {
+			orgID = keyInfo.OrgID
+		}
+		piiFilter = p.PIIEngine.NewFilter(orgID)
+		var anonErr error
+		anonBody, anonErr = piiFilter.AnonymizeJSON(body)
+		if anonErr != nil {
+			// Fail-closed: reject the request rather than risk sending PII
+			// to an external provider on any hop in the fallback chain.
+			return apierror.Send(c, fiber.StatusUnprocessableEntity,
+				"pii_policy", "request rejected by PII policy")
+		}
+	}
+
+	// shouldAnonymize reports whether PII anonymization must be applied for the
+	// given deployment. The decision follows this priority order:
+	//
+	//  1. dep.PIIFilter != nil  → use *dep.PIIFilter (explicit per-deployment)
+	//  2. model.PIIFilter != nil → use *model.PIIFilter (explicit per-model)
+	//  3. default               → anonymize when the destination is NOT private
+	//                             (!dep.destPrivate), pass through when private
+	//
+	// An explicit pii_filter: true on a private destination forces anonymization;
+	// an explicit pii_filter: false on a public destination suppresses it (trusted
+	// public endpoint). The default (nil flag) uses the network-based heuristic
+	// so that self-hosted models on loopback/private IPs are never anonymized by
+	// default, while cloud-provider endpoints are always anonymized by default.
+	//
+	// The model captured here is the ORIGINAL resolved model (before any fallback
+	// hop replaces currentModel). Within a single hop, currentModel is passed into
+	// tryModel which passes it as the model arg; the closure below captures the
+	// outer currentModel by reference, so it always reflects the model for the
+	// current hop. This is correct: each hop's shouldAnonymize reads the model
+	// for that hop, not the original requested model.
+	shouldAnonymize := func(dep Deployment, m Model) bool {
+		if dep.PIIFilter != nil {
+			return *dep.PIIFilter
+		}
+		if m.PIIFilter != nil {
+			return *m.PIIFilter
+		}
+		return !dep.destPrivate
+	}
+
+	// pickBody returns the body that should be sent to a given deployment.
+	// It delegates to shouldAnonymize and selects the anonymized body when
+	// the PII engine is active and anonymization is required. The model
+	// argument is the hop-local model (after applyDeployment in tryModel).
+	//
+	// The anonymous function signature matches what tryModel expects: only
+	// a Deployment is passed as the first argument. We capture currentModel
+	// by reference so the closure always sees the active hop's model.
+	pickBody := func(dep Deployment) []byte {
+		if piiFilter != nil && shouldAnonymize(dep, currentModel) {
+			return anonBody
+		}
+		return body
+	}
 
 	// Per-model timeout overrides the global stream duration limit when set.
 	// Recomputed on each iteration in case the fallback model has a different timeout.
@@ -256,7 +348,11 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		visited[currentModel.Name] = true
 
 		var tryErr error
-		resp, cancelUpstream, adapter, usedDep, lastErr, lastStatus, tryErr = p.tryModel(c, currentModel, currentBody, envelope)
+		// pickBody is passed as a closure so tryModel can evaluate the correct
+		// body variant per deployment, after applyDeployment has resolved the
+		// effective provider. This is the fix for VULN-001: the body selection
+		// must happen inside the deployment loop, not at the loop's call site.
+		resp, cancelUpstream, adapter, usedDep, lastErr, lastStatus, tryErr = p.tryModel(c, currentModel, pickBody, envelope)
 		if tryErr != nil {
 			// tryModel wrote an error response to c (errResponseSent) or
 			// returned a framework error. Either way, stop immediately.
@@ -310,7 +406,11 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			}
 		}
 
-		newBody, berr := rewriteModelInBody(currentBody, next.Name)
+		// Rewrite the model field in both the original and anonymized bodies
+		// so that the next hop uses the correct model name regardless of
+		// which body variant is ultimately sent. The rewrite only modifies
+		// the "model" field, not any content field.
+		newBody, berr := rewriteModelInBody(body, next.Name)
 		if berr != nil {
 			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "fallback: cannot rewrite request body; stopping chain",
 				slog.String("from", currentModel.Name),
@@ -319,6 +419,19 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			)
 			// Preserve the primary's error; do not leak the body-rewrite error.
 			break
+		}
+		body = newBody
+		if anonBody != nil {
+			newAnonBody, anonBerr := rewriteModelInBody(anonBody, next.Name)
+			if anonBerr != nil {
+				p.Log.LogAttrs(c.Context(), slog.LevelWarn, "fallback: cannot rewrite anonymized request body; stopping chain",
+					slog.String("from", currentModel.Name),
+					slog.String("to", next.Name),
+					slog.String("error", anonBerr.Error()),
+				)
+				break
+			}
+			anonBody = newAnonBody
 		}
 
 		// We have a fallback target, access is permitted, and the body has been
@@ -341,8 +454,11 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			cancelUpstream = nil
 		}
 
-		currentBody = newBody
 		currentModel = next
+		// The correct body variant (original vs anonymized) for the next hop
+		// is selected inside tryModel via the pickBody closure, after
+		// applyDeployment resolves the effective provider for each deployment.
+		// No per-hop body pre-selection is needed here.
 		effectiveStreamDur = maxStreamDur
 		if currentModel.Timeout > 0 {
 			effectiveStreamDur = currentModel.Timeout
@@ -366,18 +482,27 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			breaker = p.CircuitBreakers.Get(deploymentKey(currentModel.Name, usedDep.Name))
 		}
 		return p.handleStreamingResponse(c, resp, cancelUpstream, currentModel,
-			keyInfo, adapter, startTime, requestID, requestedModelName, effectiveStreamDur, trackDone, breaker)
+			keyInfo, adapter, startTime, requestID, requestedModelName, effectiveStreamDur, maxRespBody, trackDone, breaker, piiFilter)
 	}
 
 	defer cancelUpstream()
 	return p.handleBufferedResponse(c, resp, currentModel, keyInfo, adapter,
-		startTime, requestID, requestedModelName, maxRespBody)
+		startTime, requestID, requestedModelName, maxRespBody, piiFilter)
 }
 
 // tryModel attempts to forward the request to the given model using its
 // configured deployment candidates. It selects candidates via the Router (or
 // synthesises a single candidate), iterates them in order, and returns as soon
 // as one succeeds or returns a non-retryable status.
+//
+// pickBody is called once per deployment with the fully resolved Deployment
+// value (after applyDeployment). It returns the correct body variant (original
+// or anonymized) based on the deployment's pre-computed TrustedInternal flag.
+// This is the only correct place to perform this selection: the model-level
+// provider may differ from the deployment provider, and a deployment on a
+// public-internet host must receive the anonymized body regardless of the
+// model-level provider field. When PII anonymization is disabled, pickBody
+// always returns the original body.
 //
 // Return values:
 //   - resp: the upstream response, or nil if all candidates failed.
@@ -392,7 +517,7 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 func (p *ProxyHandler) tryModel(
 	c fiber.Ctx,
 	model Model,
-	body []byte,
+	pickBody func(dep Deployment) []byte,
 	envelope requestEnvelope,
 ) (*http.Response, context.CancelFunc, Adapter, Deployment, error, int, error) {
 	// Build the ordered list of deployment candidates. When Router is nil or
@@ -402,6 +527,11 @@ func (p *ProxyHandler) tryModel(
 	if p.Router != nil && len(model.Deployments) > 0 {
 		candidates = p.Router.Pick(model)
 	} else {
+		// Synthesize a single deployment from the model's own fields.
+		// destPrivate and PIIFilter are copied from the model's pre-computed
+		// fields so that single-deployment models receive the same PII decision
+		// as multi-deployment models. Both fields are immutable after registry
+		// load; the pointer copy for PIIFilter is safe.
 		candidates = []Deployment{{
 			Name:            model.Name,
 			Provider:        model.Provider,
@@ -412,6 +542,8 @@ func (p *ProxyHandler) tryModel(
 			GCPProject:      model.GCPProject,
 			GCPLocation:     model.GCPLocation,
 			Weight:          1,
+			destPrivate:     model.destPrivate,
+			PIIFilter:       model.PIIFilter,
 		}}
 	}
 
@@ -446,8 +578,16 @@ func (p *ProxyHandler) tryModel(
 		m := model
 		applyDeployment(&m, d)
 
+		// Select the correct body variant for this specific deployment.
+		// The security boundary is the deployment's TrustedInternal flag, which
+		// was pre-computed from the BaseURL host at registry load time. We pass
+		// the full Deployment so pickBody can read the flag directly. This is
+		// evaluated AFTER applyDeployment so the per-deployment BaseURL is used,
+		// not the model-level BaseURL which may differ.
+		effectiveBody := pickBody(d)
+
 		var buildErr error
-		req, cancelUpstream, currentAdapter, buildErr = p.buildUpstreamRequest(c, m, body, envelope)
+		req, cancelUpstream, currentAdapter, buildErr = p.buildUpstreamRequest(c, m, effectiveBody, envelope)
 		if buildErr != nil {
 			return nil, nil, nil, Deployment{}, nil, 0, buildErr
 		}
@@ -840,7 +980,10 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 // goroutine records success or failure after the stream completes.
 // requestedModelName is the canonical name the client originally asked for;
 // it may differ from model.Name when a fallback was activated.
-func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response, cancelUpstream context.CancelFunc, model Model, keyInfo *auth.KeyInfo, adapter Adapter, startTime time.Time, requestID string, requestedModelName string, maxStreamDuration time.Duration, trackDone func(), breaker *circuitbreaker.Breaker) error {
+// maxRespBody is the aggregate byte cap for the PII-buffered streaming path;
+// it is the same limit used for non-streaming responses.
+// filter may be nil when PII anonymization is disabled.
+func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response, cancelUpstream context.CancelFunc, model Model, keyInfo *auth.KeyInfo, adapter Adapter, startTime time.Time, requestID string, requestedModelName string, maxStreamDuration time.Duration, maxRespBody int, trackDone func(), breaker *circuitbreaker.Breaker, filter *pii.Filter) error {
 	copyResponseHeaders(c, resp)
 	c.Set("Content-Type", "text/event-stream")
 	c.Set("Cache-Control", "no-cache")
@@ -881,53 +1024,220 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 		extractor := &streamUsageExtractor{}
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024) // up to 4MB per SSE line
+
+		// PII streaming strategy (Stage 0a — content-aware restore):
+		//
+		// When PII was detected (filter.Touched()), pseudonym tokens in the
+		// response may be split across SSE event boundaries by the LLM
+		// tokenizer. For example, "PII_EM_1bd7" may appear as the delta.content
+		// in event 1 and "5caa...restofhex" in event 2. In the raw SSE byte
+		// stream the full token never appears as a contiguous byte sequence, so
+		// a strings.Replacer running over joined raw bytes cannot find it.
+		//
+		// The correct fix: extract delta.content per choice index from each
+		// event's JSON payload, concatenate, apply Restore over the assembled
+		// string (where the token is always contiguous), then re-emit valid SSE.
+		// pii.RestoreSSEStream implements this content-aware restore.
+		//
+		// Trade-offs:
+		//   - PII-hit requests receive the full restored content in one or two
+		//     synthetic SSE chunks instead of token-by-token. This is correct
+		//     and leak-free. Stage 0b: optional incremental cross-event rolling
+		//     buffer for token-by-token streaming; the buffered content-aware
+		//     restore here is correct and leak-free.
+		//   - Tool-call streaming with PII anonymization is fail-closed: if any
+		//     choice carries tool_calls deltas, RestoreSSEStream returns an
+		//     error and the request is aborted (no un-restored content reaches
+		//     the client).
+		//
+		// For non-PII or filter-nil requests, the original per-line passthrough
+		// is used with zero overhead.
+		// needsContentRestore is true when PII was detected: the response must
+		// be buffered so that pseudonyms can be restored before delivery to the
+		// client. The name reflects the purpose (restore content), not the
+		// detection mechanism.
+		needsContentRestore := filter != nil && filter.Touched()
+
 		var ttftMS *int
 		firstChunk := true
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			if firstChunk && bytes.HasPrefix(line, []byte("data: ")) {
-				t := int(time.Since(startTime).Milliseconds())
-				ttftMS = &t
-				firstChunk = false
-				metrics.ProxyTTFTSeconds.WithLabelValues(model.Name).Observe(float64(t) / 1000)
+
+		// maxPIIStreamBytes is the aggregate byte cap for the buffered PII
+		// streaming path. Collecting unlimited SSE lines into memory would
+		// allow a malicious upstream to exhaust the proxy's heap. We use the
+		// effective response body limit (maxRespBody) as the cap so that the
+		// PII path never holds more bytes than the non-streaming path would.
+		// On breach we fail-closed: no un-restored content is emitted.
+		maxPIIStreamBytes := maxRespBody
+
+		if needsContentRestore {
+			// Content-aware buffered path: read ALL SSE lines, check scanner.Err
+			// BEFORE emitting, then call RestoreSSEStream which extracts content
+			// per choice, reassembles across event boundaries, applies Restore,
+			// and returns synthetic SSE lines with the restored content.
+			//
+			// scanner.Err() is checked before emit (Finding 5): a truncated or
+			// oversized scan must abort before any un-restored content is written.
+			// Aggregate byte cap (Finding 6): we count raw bytes accumulated and
+			// fail-closed if the total exceeds maxPIIStreamBytes.
+			var sseLines [][]byte
+			var totalBytes int
+			var streamCapExceeded bool
+			for scanner.Scan() {
+				line := scanner.Bytes()
+
+				// Enforce aggregate byte cap BEFORE copying the line into heap
+				// memory. This prevents the overshooting line from being allocated
+				// when the limit is already reached. +1 accounts for the newline.
+				totalBytes += len(line) + 1
+				if totalBytes > maxPIIStreamBytes {
+					streamCapExceeded = true
+					break
+				}
+
+				// Copy: scanner.Bytes() is reused on the next Scan call.
+				lineCopy := make([]byte, len(line))
+				copy(lineCopy, line)
+
+				if firstChunk && bytes.HasPrefix(lineCopy, []byte("data:")) {
+					t := int(time.Since(startTime).Milliseconds())
+					ttftMS = &t
+					firstChunk = false
+					metrics.ProxyTTFTSeconds.WithLabelValues(model.Name).Observe(float64(t) / 1000)
+				}
+				if adapter != nil {
+					lineCopy = adapter.TransformStreamLine(lineCopy)
+					if lineCopy == nil {
+						continue // adapter says skip this line
+					}
+				}
+				extractor.observe(lineCopy)
+				sseLines = append(sseLines, lineCopy)
 			}
-			if adapter != nil {
-				line = adapter.TransformStreamLine(line)
-				if line == nil {
-					continue // adapter says skip this line
+
+			// Check scanner.Err() BEFORE emitting any content (Finding 5).
+			// A scan error (truncated stream, oversized line, transport failure)
+			// means the accumulated sseLines may be incomplete. Emitting a partial
+			// restore could leak un-restored pseudonyms. Fail-closed: log and return
+			// without writing anything to the client.
+			if scanErr := scanner.Err(); scanErr != nil {
+				p.Log.LogAttrs(context.Background(), slog.LevelWarn,
+					"pii: stream read error before restore; stream aborted to prevent pseudonym leak",
+					slog.String("error", scanErr.Error()),
+				)
+				if breaker != nil {
+					breaker.RecordFailure()
+				}
+				_ = w.Flush()
+				return
+			}
+
+			if streamCapExceeded {
+				p.Log.LogAttrs(context.Background(), slog.LevelWarn,
+					"pii: aggregate stream size limit exceeded; stream aborted to prevent memory exhaustion")
+				if breaker != nil {
+					breaker.RecordFailure()
+				}
+				_ = w.Flush()
+				return
+			}
+
+			// Content-aware restore: extract delta.content per choice, apply
+			// Restore over the assembled string (where split tokens are now
+			// contiguous), and re-emit valid SSE. Fail-closed on parse error.
+			restoredLines, restoreErr := pii.RestoreSSEStream(sseLines, filter.Restore)
+			if restoreErr != nil {
+				// Fail-closed: cannot safely restore content. Write nothing;
+				// log the error without any content detail (zero-knowledge).
+				p.Log.LogAttrs(context.Background(), slog.LevelWarn,
+					"pii: sse restore failed; stream aborted to prevent pseudonym leak")
+				if breaker != nil {
+					breaker.RecordFailure()
+				}
+				_ = w.Flush()
+				return
+			}
+
+			// Record circuit breaker success after successful restore. The outer
+			// scanErr check after the if/else block only runs for the non-buffered
+			// path; in the buffered PII path we handle all outcomes here.
+			if breaker != nil {
+				breaker.RecordSuccess()
+			}
+
+			writeErr := false
+			for _, b := range restoredLines {
+				if b == nil {
+					// nil element signals a blank SSE event separator line.
+					if err := w.WriteByte('\n'); err != nil {
+						writeErr = true
+						break
+					}
+					continue
+				}
+				if _, err := w.Write(b); err != nil {
+					writeErr = true
+					break
+				}
+				if err := w.WriteByte('\n'); err != nil {
+					writeErr = true
+					break
 				}
 			}
-			// Always observe the (possibly transformed) line. Transformed
-			// lines are OpenAI-shaped (Azure passthrough, Anthropic → OpenAI),
-			// and raw passthrough lines are already OpenAI-shaped, so the
-			// extractor can parse usage from all of them.
-			extractor.observe(line)
-			if _, err := w.Write(line); err != nil {
-				break // client disconnected
+			if !writeErr {
+				_ = w.Flush()
 			}
-			if err := w.WriteByte('\n'); err != nil {
-				break // client disconnected
-			}
-			if err := w.Flush(); err != nil {
-				break // client disconnected
-			}
-		}
-		scanErr := scanner.Err()
-		if scanErr != nil {
-			p.Log.LogAttrs(context.Background(), slog.LevelWarn,
-				"streaming scan error",
-				slog.String("error", scanErr.Error()),
-			)
-		}
+		} else {
+			// Non-buffered path: per-line passthrough with no PII overhead.
+			for scanner.Scan() {
+				line := scanner.Bytes()
+				if firstChunk && bytes.HasPrefix(line, []byte("data: ")) {
+					t := int(time.Since(startTime).Milliseconds())
+					ttftMS = &t
+					firstChunk = false
+					metrics.ProxyTTFTSeconds.WithLabelValues(model.Name).Observe(float64(t) / 1000)
+				}
+				if adapter != nil {
+					line = adapter.TransformStreamLine(line)
+					if line == nil {
+						continue // adapter says skip this line
+					}
+				}
+				// Always observe the (possibly transformed) line. Transformed
+				// lines are OpenAI-shaped (Azure passthrough, Anthropic → OpenAI),
+				// and raw passthrough lines are already OpenAI-shaped, so the
+				// extractor can parse usage from all of them.
+				extractor.observe(line)
 
-		// Record the circuit breaker outcome now that we know whether the
-		// stream completed successfully. A scan error (transport failure,
-		// context cancellation) counts as a failure; a clean EOF does not.
-		if breaker != nil {
+				if _, err := w.Write(line); err != nil {
+					break // client disconnected
+				}
+				if err := w.WriteByte('\n'); err != nil {
+					break // client disconnected
+				}
+				if err := w.Flush(); err != nil {
+					break // client disconnected
+				}
+			}
+		}
+		// In the non-buffered path, check scanner.Err() here and record the
+		// circuit breaker outcome. In the buffered PII path, both checks
+		// and the breaker recording are handled inside the needsContentRestore
+		// block above (which also returns early on error), so we skip breaker
+		// recording here for that path to avoid double-counting.
+		if !needsContentRestore {
+			scanErr := scanner.Err()
 			if scanErr != nil {
-				breaker.RecordFailure()
-			} else {
-				breaker.RecordSuccess()
+				p.Log.LogAttrs(context.Background(), slog.LevelWarn,
+					"streaming scan error",
+					slog.String("error", scanErr.Error()),
+				)
+			}
+			if breaker != nil {
+				if scanErr != nil {
+					breaker.RecordFailure()
+				} else {
+					breaker.RecordSuccess()
+				}
 			}
 		}
 
@@ -955,7 +1265,8 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 // body to the client. Usage is logged asynchronously on success.
 // requestedModelName is the canonical name the client originally asked for;
 // it may differ from model.Name when a fallback was activated.
-func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, model Model, keyInfo *auth.KeyInfo, adapter Adapter, startTime time.Time, requestID string, requestedModelName string, maxResponseBody int) error {
+// filter may be nil when PII anonymization is disabled.
+func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, model Model, keyInfo *auth.KeyInfo, adapter Adapter, startTime time.Time, requestID string, requestedModelName string, maxResponseBody int, filter *pii.Filter) error {
 	// Content-Length pre-check: fast-reject optimization to avoid allocating
 	// memory for obviously oversized responses. Not the security boundary —
 	// io.LimitReader on the next line handles chunked/unknown-length responses.
@@ -1014,6 +1325,18 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 	} else {
 		finalBody = responseBody
 		usageBody = responseBody // already OpenAI-shaped
+	}
+
+	// PII restore: replace pseudonyms with original values on all responses,
+	// including 4xx and 5xx. Provider error messages sometimes echo back
+	// parts of the request (e.g. the model name or request fields); if a
+	// pseudonym appears in an error body, the client must see the original
+	// value. Restoring on non-2xx is a no-op when the provider did not echo
+	// any pseudonym — and when it did, restoring is the correct behaviour.
+	// filter.Touched() guards against the cost of building the Replacer on
+	// requests where no PII was detected.
+	if filter != nil && filter.Touched() {
+		finalBody = filter.Restore(finalBody)
 	}
 
 	if err := c.Send(finalBody); err != nil {

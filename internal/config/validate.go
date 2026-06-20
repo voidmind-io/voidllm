@@ -358,6 +358,23 @@ func (c *Config) validate() error {
 		}
 	}
 
+	// --- settings.pii ---
+	if c.Settings.PII.IsEnabled() {
+		if c.Settings.PII.Action != "pseudonymize" {
+			errs = append(errs, fmt.Errorf("settings.pii.action: only \"pseudonymize\" is supported, got %q", c.Settings.PII.Action))
+		}
+		for i, p := range c.Settings.PII.Patterns {
+			if p.Type == "" {
+				errs = append(errs, fmt.Errorf("settings.pii.patterns[%d].type: must not be empty", i))
+			}
+			if p.Regexp == "" {
+				errs = append(errs, fmt.Errorf("settings.pii.patterns[%d].regexp: must not be empty", i))
+			} else if _, reErr := regexp.Compile(p.Regexp); reErr != nil {
+				errs = append(errs, fmt.Errorf("settings.pii.patterns[%d].regexp: invalid regexp: %w", i, reErr))
+			}
+		}
+	}
+
 	// --- settings.retention ---
 	const maxRetention = 10 * 365 * 24 * time.Hour // 10 years
 	if c.Settings.Retention.UsageEvents < 0 {

@@ -38,6 +38,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	voidotel "github.com/voidmind-io/voidllm/internal/otel"
+	"github.com/voidmind-io/voidllm/internal/pii"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 	"github.com/voidmind-io/voidllm/internal/ratelimit"
 	voidredis "github.com/voidmind-io/voidllm/internal/redis"
@@ -370,6 +371,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 					GCPLocation:     dep.GCPLocation,
 					Weight:          dep.Weight,
 					Priority:        dep.Priority,
+					PIIFilter:       dep.PIIFilter,
 				})
 			}
 
@@ -396,6 +398,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 				MaxRetries:        m.MaxRetries,
 				Deployments:       deployments,
 				FallbackModelName: fallbackName,
+				PIIFilter:         m.PIIFilter,
 			})
 		}
 		gateFallback(registry, licHolder)
@@ -669,6 +672,15 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	proxyHandler.MaxResponseBody = cfg.Server.Proxy.MaxResponseBody
 	proxyHandler.MaxStreamDuration = cfg.Server.Proxy.MaxStreamDuration
 	proxyHandler.FallbackMaxDepth = cfg.Settings.FallbackMaxDepth
+
+	if cfg.Settings.PII.IsEnabled() {
+		piiEngine, piiErr := buildPIIEngine(encKey, cfg.Settings.PII, log)
+		if piiErr != nil {
+			redisCancel()
+			return nil, fmt.Errorf("pii engine: %w", piiErr)
+		}
+		proxyHandler.PIIEngine = piiEngine
+	}
 
 	loginThrottle := auth.NewLoginThrottle()
 
@@ -1454,7 +1466,55 @@ func (a *Application) cleanup(ctx context.Context) {
 		)
 	}
 
+	// Zero PII Engine secret material before zeroing the main keys.
+	// The Engine holds a copy of the derived pseudonym secret; Close zeroes it.
+	if a.proxyHandler != nil && a.proxyHandler.PIIEngine != nil {
+		a.proxyHandler.PIIEngine.Close()
+	}
+
 	// Zero sensitive key material after all components are stopped.
 	crypto.ZeroKey(a.hmacSecret)
 	crypto.ZeroKey(a.encKey)
+}
+
+// buildPIIEngine constructs a pii.Engine from the installation encryption key
+// and the PII configuration. The pseudonym secret is derived from encKey using
+// HKDF with the info string "voidllm-pii-pseudonym-v1", keeping it independent
+// from the key-hashing HMAC secret ("voidllm-hmac-key") and preventing cross-
+// subsystem secret reuse.
+//
+// Returns an error on any failure (HKDF error, bad custom regexp). The caller
+// must treat an error as a startup failure — running without a functional PII
+// engine when PII is enabled would silently drop the anonymization guarantee.
+// The local piiSecret copy is zeroed after the engine is constructed so that
+// the derived secret does not linger in the Go heap beyond its required lifetime.
+func buildPIIEngine(encKey []byte, cfg config.PIIConfig, log *slog.Logger) (*pii.Engine, error) {
+	// Derive a 32-byte pseudonym secret via HKDF-SHA256.
+	hkdfReader := hkdf.New(sha256.New, encKey, nil, []byte("voidllm-pii-pseudonym-v1"))
+	piiSecret := make([]byte, 32)
+	if _, err := io.ReadFull(hkdfReader, piiSecret); err != nil {
+		return nil, fmt.Errorf("derive pseudonym secret: %w", err)
+	}
+	// Zero the local copy once the engine has taken its own internal copy.
+	defer crypto.ZeroKey(piiSecret)
+
+	// Build detector list: start with built-in defaults.
+	patterns := pii.DefaultPatterns()
+
+	// Append custom patterns from config.
+	for _, cp := range cfg.Patterns {
+		patterns = append(patterns, pii.Pattern{Type: cp.Type, Regexp: cp.Regexp})
+	}
+
+	detector, err := pii.NewRegexDetector(patterns)
+	if err != nil {
+		return nil, fmt.Errorf("compile detector patterns: %w", err)
+	}
+
+	log.LogAttrs(context.Background(), slog.LevelInfo,
+		"pii anonymization enabled",
+		slog.Int("builtin_patterns", len(pii.DefaultPatterns())),
+		slog.Int("custom_patterns", len(cfg.Patterns)),
+	)
+	return pii.NewEngine(piiSecret, []pii.Detector{detector}), nil
 }

@@ -28,6 +28,9 @@ type createDeploymentRequest struct {
 	GCPLocation string `json:"gcp_location"`
 	Weight      int    `json:"weight"`
 	Priority    int    `json:"priority"`
+	// PIIFilter explicitly enables or disables PII anonymization for requests
+	// routed to this deployment. Omit to inherit from the model or network default.
+	PIIFilter *bool `json:"pii_filter,omitempty"`
 }
 
 // updateDeploymentRequest is the JSON body accepted by updateDeployment.
@@ -45,6 +48,10 @@ type updateDeploymentRequest struct {
 	GCPLocation *string `json:"gcp_location"`
 	Weight      *int    `json:"weight"`
 	Priority    *int    `json:"priority"`
+	// PIIFilter, when non-nil, replaces the PII anonymization override for
+	// this deployment. Pass true to force anonymization on, false to force it off.
+	// Omit the field entirely to leave the existing setting unchanged.
+	PIIFilter *bool `json:"pii_filter"`
 }
 
 // deploymentResponse is the JSON representation of a deployment returned by the API.
@@ -64,8 +71,12 @@ type deploymentResponse struct {
 	Weight      int    `json:"weight"`
 	Priority    int    `json:"priority"`
 	IsActive    bool   `json:"is_active"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
+	// PIIFilter is the per-deployment PII anonymization override. Nil means
+	// inherit from the model-level or network-level default; true forces
+	// anonymization on; false forces it off.
+	PIIFilter *bool  `json:"pii_filter,omitempty"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 // deploymentAAD returns the additional authenticated data used when encrypting
@@ -90,6 +101,7 @@ func deploymentToResponse(d *db.Deployment) deploymentResponse {
 		Weight:          d.Weight,
 		Priority:        d.Priority,
 		IsActive:        d.IsActive,
+		PIIFilter:       d.PIIFilter,
 		CreatedAt:       d.CreatedAt,
 		UpdatedAt:       d.UpdatedAt,
 	}
@@ -173,6 +185,7 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 		GCPLocation:     req.GCPLocation,
 		Weight:          req.Weight,
 		Priority:        req.Priority,
+		PIIFilter:       req.PIIFilter,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
@@ -196,6 +209,14 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 		}
 	}
 
+	// Reload the local registry immediately so deployment changes (including
+	// pii_filter) take effect on this instance without waiting for a restart.
+	// Redis publish below covers other instances in a multi-node setup.
+	if h.ReloadModels != nil {
+		if reloadErr := h.ReloadModels(ctx); reloadErr != nil {
+			h.Log.ErrorContext(ctx, "create deployment: reload models", slog.String("error", reloadErr.Error()))
+		}
+	}
 	if h.Redis != nil {
 		if pubErr := h.Redis.PublishInvalidation(ctx, voidredis.ChannelModels, "reload"); pubErr != nil {
 			h.Log.ErrorContext(ctx, "create deployment: publish invalidation", slog.String("error", pubErr.Error()))
@@ -283,6 +304,10 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&req); err != nil {
 		return apierror.BadRequest(c, "invalid request body")
 	}
+	// Capture body bytes for field-presence detection before any further
+	// processing. c.Body() is safe to call after Bind().JSON() in Fiber v3.
+	rawBody := append([]byte(nil), c.Body()...)
+	piiPresent, piiIsNull := parsePIIFilterField(rawBody)
 
 	if req.Provider != nil && !provider.ValidProviders[*req.Provider] {
 		return apierror.BadRequest(c, "provider must be one of: "+strings.Join(provider.Names(), ", "))
@@ -305,6 +330,20 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 		return apierror.Send(c, fiber.StatusNotFound, "not_found", "deployment not found")
 	}
 
+	// Resolve the tri-state pii_filter semantics:
+	//   - key absent in JSON  → do not touch the column (piiPresent=false)
+	//   - key present, null   → clear column to NULL    (piiIsNull=true)
+	//   - key present, bool   → write the bool value
+	var piiFilter *bool
+	var clearPIIFilter bool
+	if piiPresent {
+		if piiIsNull {
+			clearPIIFilter = true
+		} else {
+			piiFilter = req.PIIFilter
+		}
+	}
+
 	params := db.UpdateDeploymentParams{
 		Name:            req.Name,
 		Provider:        req.Provider,
@@ -315,6 +354,8 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 		GCPLocation:     req.GCPLocation,
 		Weight:          req.Weight,
 		Priority:        req.Priority,
+		PIIFilter:       piiFilter,
+		ClearPIIFilter:  clearPIIFilter,
 	}
 
 	if req.APIKey != nil {
@@ -338,6 +379,14 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update deployment")
 	}
 
+	// Reload the local registry immediately so deployment changes (including
+	// pii_filter) take effect on this instance without waiting for a restart.
+	// Redis publish below covers other instances in a multi-node setup.
+	if h.ReloadModels != nil {
+		if reloadErr := h.ReloadModels(ctx); reloadErr != nil {
+			h.Log.ErrorContext(ctx, "update deployment: reload models", slog.String("error", reloadErr.Error()))
+		}
+	}
 	if h.Redis != nil {
 		if pubErr := h.Redis.PublishInvalidation(ctx, voidredis.ChannelModels, "reload"); pubErr != nil {
 			h.Log.ErrorContext(ctx, "update deployment: publish invalidation", slog.String("error", pubErr.Error()))
@@ -395,6 +444,14 @@ func (h *Handler) deleteDeployment(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to delete deployment")
 	}
 
+	// Reload the local registry immediately so the deleted deployment is no
+	// longer used for routing on this instance without waiting for a restart.
+	// Redis publish below covers other instances in a multi-node setup.
+	if h.ReloadModels != nil {
+		if reloadErr := h.ReloadModels(ctx); reloadErr != nil {
+			h.Log.ErrorContext(ctx, "delete deployment: reload models", slog.String("error", reloadErr.Error()))
+		}
+	}
 	if h.Redis != nil {
 		if pubErr := h.Redis.PublishInvalidation(ctx, voidredis.ChannelModels, "reload"); pubErr != nil {
 			h.Log.ErrorContext(ctx, "delete deployment: publish invalidation", slog.String("error", pubErr.Error()))

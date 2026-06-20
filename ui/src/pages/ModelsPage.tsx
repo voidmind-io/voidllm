@@ -70,6 +70,39 @@ const STRATEGY_OPTIONS = [
   { value: 'priority', label: 'Priority' },
 ]
 
+// Tri-state: 'default' maps to undefined (omit from request), 'true' / 'false' map to boolean.
+const PII_FILTER_OPTIONS = [
+  {
+    value: 'default',
+    label: 'Default (network-based)',
+    description: 'Private endpoints pass through; public endpoints are anonymized.',
+  },
+  {
+    value: 'true',
+    label: 'Always anonymize',
+    description: 'PII is stripped from every request to this model.',
+  },
+  {
+    value: 'false',
+    label: 'Never (trusted endpoint)',
+    description: 'No anonymization — use only for private, trusted endpoints.',
+  },
+]
+
+/** Converts the PII filter Select string value back to the API boolean. */
+function piiFilterToParam(value: string): boolean | undefined {
+  if (value === 'true') return true
+  if (value === 'false') return false
+  return undefined
+}
+
+/** Converts an API boolean (or undefined/null) to the Select string value. */
+function piiFilterFromResponse(value: boolean | undefined | null): string {
+  if (value === true) return 'true'
+  if (value === false) return 'false'
+  return 'default'
+}
+
 const typeLabels: Record<string, string> = {
   chat: 'Chat',
   embedding: 'Embedding',
@@ -460,6 +493,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const [azureDeployment, setAzureDeployment] = useState('')
   const [azureApiVersion, setAzureApiVersion] = useState('')
   const [timeout, setTimeout] = useState('')
+  const [piiFilter, setPiiFilter] = useState('default')
 
   // Load-balanced fields
   const [strategy, setStrategy] = useState('round-robin')
@@ -499,6 +533,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     setStrategy('round-robin')
     setMaxRetries('')
     setFallbackModelName('')
+    setPiiFilter('default')
     setDeployments([])
     setShowDeploymentForm(false)
     setEditingDeployment(null)
@@ -640,6 +675,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       }
       if (timeout.trim()) params.timeout = timeout.trim()
       if (parsedAliases.length > 0) params.aliases = parsedAliases
+      const piiFilterValue = piiFilterToParam(piiFilter)
+      if (piiFilterValue !== undefined) params.pii_filter = piiFilterValue
 
       createModel.mutate(params, {
         onSuccess: () => {
@@ -679,6 +716,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       }
       if (timeout.trim()) params.timeout = timeout.trim()
       if (parsedAliases.length > 0) params.aliases = parsedAliases
+      const piiFilterValueLB = piiFilterToParam(piiFilter)
+      if (piiFilterValueLB !== undefined) params.pii_filter = piiFilterValueLB
 
       try {
         const model = await createModel.mutateAsync(params)
@@ -1142,6 +1181,18 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
               description="Per-model upstream timeout. Empty = use global default."
               disabled={isPending}
             />
+            <div>
+              <Select
+                label="PII Filter"
+                options={PII_FILTER_OPTIONS}
+                value={piiFilter}
+                onChange={setPiiFilter}
+                disabled={isPending}
+              />
+              <p className="text-xs text-text-tertiary mt-1">
+                Controls PII anonymization for requests to this model. Default applies network-based rules.
+              </p>
+            </div>
           </div>
         </details>
 
@@ -1191,6 +1242,7 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
   const [azureApiVersion, setAzureApiVersion] = useState(model.azure_api_version ?? '')
   const [timeout, setTimeout] = useState(model.timeout ?? '')
   const [fallbackModelName, setFallbackModelName] = useState(model.fallback_model_name ?? '')
+  const [piiFilter, setPiiFilter] = useState(() => piiFilterFromResponse(model.pii_filter))
 
   const updateModel = useUpdateModel()
   const { toast } = useToast()
@@ -1273,6 +1325,18 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
       // Empty string sent as empty string — backend treats it as "clear"
       // Non-empty string sent as the chosen name
       params.fallback_model_name = fallbackModelName || ''
+    }
+
+    const newPiiFilter = piiFilterToParam(piiFilter)
+    const currentPiiFilter = model.pii_filter
+    // Only include in the patch when the value differs from what the server has.
+    // null and undefined both mean "default", so compare normalized values.
+    const piiFilterChanged =
+      newPiiFilter !== currentPiiFilter &&
+      !(newPiiFilter === undefined && (currentPiiFilter === undefined || currentPiiFilter === null))
+    if (piiFilterChanged) {
+      // Send null to clear (reset to default), boolean to set explicitly.
+      params.pii_filter = newPiiFilter ?? null
     }
 
     if (Object.keys(params).length === 0) {
@@ -1421,6 +1485,18 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
           description="Comma-separated. Must be globally unique."
           disabled={updateModel.isPending}
         />
+        <div>
+          <Select
+            label="PII Filter"
+            options={PII_FILTER_OPTIONS}
+            value={piiFilter}
+            onChange={setPiiFilter}
+            disabled={updateModel.isPending}
+          />
+          <p className="text-xs text-text-tertiary mt-1">
+            Controls PII anonymization for requests to this model. Default applies network-based rules.
+          </p>
+        </div>
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="secondary" onClick={onClose} disabled={updateModel.isPending}>
             Cancel
