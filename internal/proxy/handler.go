@@ -1025,167 +1025,199 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024) // up to 4MB per SSE line
 
-		// PII streaming strategy (Stage 0a — content-aware restore):
+		// needsContentRestore is true when PII was detected in the request: the
+		// response must be processed through pii.StreamRestorer so that pseudonyms
+		// are restored before content reaches the client.
 		//
-		// When PII was detected (filter.Touched()), pseudonym tokens in the
-		// response may be split across SSE event boundaries by the LLM
-		// tokenizer. For example, "PII_EM_1bd7" may appear as the delta.content
-		// in event 1 and "5caa...restofhex" in event 2. In the raw SSE byte
-		// stream the full token never appears as a contiguous byte sequence, so
-		// a strings.Replacer running over joined raw bytes cannot find it.
+		// StreamRestorer operates incrementally: it is pushed one raw upstream SSE
+		// line at a time and emits restored content as soon as the per-choice carry
+		// buffer cannot be the start of any known pseudonym (known-pseudonym-prefix
+		// hold-back). This delivers token-by-token streaming to the client while
+		// guaranteeing that a pseudonym split across SSE event boundaries is never
+		// emitted in pieces.
 		//
-		// The correct fix: extract delta.content per choice index from each
-		// event's JSON payload, concatenate, apply Restore over the assembled
-		// string (where the token is always contiguous), then re-emit valid SSE.
-		// pii.RestoreSSEStream implements this content-aware restore.
+		// Fail-closed contract: any protocol violation (tool_calls in delta,
+		// function_call, duplicate data: in one event, content after finish_reason,
+		// upstream error object, non-empty carry at [DONE]) sets the restorer to
+		// aborted state. The scan loop breaks immediately and no further content is
+		// written to the client.
 		//
-		// Trade-offs:
-		//   - PII-hit requests receive the full restored content in one or two
-		//     synthetic SSE chunks instead of token-by-token. This is correct
-		//     and leak-free. Stage 0b: optional incremental cross-event rolling
-		//     buffer for token-by-token streaming; the buffered content-aware
-		//     restore here is correct and leak-free.
-		//   - Tool-call streaming with PII anonymization is fail-closed: if any
-		//     choice carries tool_calls deltas, RestoreSSEStream returns an
-		//     error and the request is aborted (no un-restored content reaches
-		//     the client).
-		//
-		// For non-PII or filter-nil requests, the original per-line passthrough
-		// is used with zero overhead.
-		// needsContentRestore is true when PII was detected: the response must
-		// be buffered so that pseudonyms can be restored before delivery to the
-		// client. The name reflects the purpose (restore content), not the
-		// detection mechanism.
+		// When false (no PII detected or filter is nil), the original per-line
+		// passthrough is used with zero overhead.
 		needsContentRestore := filter != nil && filter.Touched()
 
 		var ttftMS *int
 		firstChunk := true
-
-		// maxPIIStreamBytes is the aggregate byte cap for the buffered PII
-		// streaming path. Collecting unlimited SSE lines into memory would
-		// allow a malicious upstream to exhaust the proxy's heap. We use the
-		// effective response body limit (maxRespBody) as the cap so that the
-		// PII path never holds more bytes than the non-streaming path would.
-		// On breach we fail-closed: no un-restored content is emitted.
-		maxPIIStreamBytes := maxRespBody
+		// streamIncomplete is true when the streaming loop ended without a clean
+		// [DONE] sentinel (abort or truncation — not a client disconnect). The usage
+		// event for an incomplete stream is logged with http.StatusBadGateway so
+		// that the record accurately reflects the stream was not successful, while
+		// still capturing the partial token counts that the upstream consumed.
+		streamIncomplete := false
 
 		if needsContentRestore {
-			// Content-aware buffered path: read ALL SSE lines, check scanner.Err
-			// BEFORE emitting, then call RestoreSSEStream which extracts content
-			// per choice, reassembles across event boundaries, applies Restore,
-			// and returns synthetic SSE lines with the restored content.
+			// Incremental PII restore path (Stage 0b).
 			//
-			// scanner.Err() is checked before emit (Finding 5): a truncated or
-			// oversized scan must abort before any un-restored content is written.
-			// Aggregate byte cap (Finding 6): we count raw bytes accumulated and
-			// fail-closed if the total exceeds maxPIIStreamBytes.
-			var sseLines [][]byte
-			var totalBytes int
-			var streamCapExceeded bool
+			// StreamRestorer maintains a per-choice rolling carry buffer of at
+			// most pseudonymLen-1 bytes. Content is emitted incrementally as
+			// soon as the carry cannot be the prefix of any known pseudonym.
+			// This delivers token-by-token streaming to the client rather than
+			// buffering the full response, while preserving the fail-closed
+			// guarantee: a pseudonym that is split across SSE event boundaries
+			// by the LLM tokenizer is never emitted in pieces.
+			//
+			// The adapter runs BEFORE the restorer on each line, so the restorer
+			// always sees OpenAI-shaped SSE regardless of the upstream provider.
+			//
+			// Fail-closed contract:
+			//   - Protocol violations (tool_calls, duplicate data: in one event,
+			//     content after finish_reason, upstream error object) → abort,
+			//     nothing more emitted.
+			//   - [DONE] with non-empty carry (truncated pseudonym) → abort.
+			//   - scanner.Err() non-nil → abort (no partial restore emitted).
+			//   - Aggregate input byte cap exceeded → abort (memory exhaustion guard).
+			//
+			// On terminal=true (clean [DONE] received), the loop is broken via
+			// break (not early return) so that the post-stream usage-logging and
+			// metrics code below still runs.
+			restorer := pii.NewStreamRestorer(filter, model.Name)
+			// streamAborted is true when a genuine upstream or protocol error
+			// occurred — triggers breaker.RecordFailure().
+			streamAborted := false
+			// clientDisconnected is true when a write to the client failed (the
+			// client hung up mid-stream). This is not an upstream fault and must
+			// NOT be recorded as a circuit-breaker failure.
+			clientDisconnected := false
+			// piiTotalInputBytes tracks the total raw bytes read from the upstream
+			// on the PII path. This guards against a malicious or malfunctioning
+			// upstream that sends an unbounded stream, exhausting proxy heap.
+			// We use maxRespBody as the cap (same limit as non-streaming buffered path).
+			var piiTotalInputBytes int
+
+			writeSSELines := func(lines [][]byte) bool {
+				for _, b := range lines {
+					if b == nil {
+						if err := w.WriteByte('\n'); err != nil {
+							return false
+						}
+						continue
+					}
+					if _, err := w.Write(b); err != nil {
+						return false
+					}
+					if err := w.WriteByte('\n'); err != nil {
+						return false
+					}
+					if err := w.Flush(); err != nil {
+						// Flush failure means the client disconnected.
+						return false
+					}
+				}
+				return true
+			}
+
+			// terminalSeen is true when Push returns terminal=true (clean [DONE]
+			// received from the upstream). A stream that ends via EOF without
+			// ever seeing [DONE] is a truncated/incomplete response and must NOT
+			// be recorded as a circuit-breaker success.
+			terminalSeen := false
+
+		piiScanLoop:
 			for scanner.Scan() {
 				line := scanner.Bytes()
 
-				// Enforce aggregate byte cap BEFORE copying the line into heap
-				// memory. This prevents the overshooting line from being allocated
-				// when the limit is already reached. +1 accounts for the newline.
-				totalBytes += len(line) + 1
-				if totalBytes > maxPIIStreamBytes {
-					streamCapExceeded = true
-					break
-				}
-
-				// Copy: scanner.Bytes() is reused on the next Scan call.
-				lineCopy := make([]byte, len(line))
-				copy(lineCopy, line)
-
-				if firstChunk && bytes.HasPrefix(lineCopy, []byte("data:")) {
+				if firstChunk && bytes.HasPrefix(line, []byte("data:")) {
 					t := int(time.Since(startTime).Milliseconds())
 					ttftMS = &t
 					firstChunk = false
 					metrics.ProxyTTFTSeconds.WithLabelValues(model.Name).Observe(float64(t) / 1000)
 				}
+
+				// Aggregate input byte cap on RAW scanner bytes (+1 for the
+				// stripped newline), BEFORE the adapter runs. Adapter-dropped
+				// lines (nil return) still count against the cap: a provider that
+				// sends unbounded keepalive/ping lines would otherwise bypass the
+				// cap entirely and stream forever until the upstream timeout fires.
+				piiTotalInputBytes += len(line) + 1
+				if piiTotalInputBytes > maxRespBody {
+					p.Log.LogAttrs(context.Background(), slog.LevelWarn,
+						"pii: aggregate input stream size limit exceeded; stream aborted to prevent memory exhaustion")
+					streamAborted = true
+					break piiScanLoop
+				}
+
 				if adapter != nil {
-					lineCopy = adapter.TransformStreamLine(lineCopy)
-					if lineCopy == nil {
+					line = adapter.TransformStreamLine(line)
+					if line == nil {
 						continue // adapter says skip this line
 					}
 				}
-				extractor.observe(lineCopy)
-				sseLines = append(sseLines, lineCopy)
+				extractor.observe(line)
+
+				// Copy: scanner.Bytes() is reused on the next Scan call.
+				lineCopy := make([]byte, len(line))
+				copy(lineCopy, line)
+
+				outLines, terminal, pushErr := restorer.Push(lineCopy)
+				if pushErr != nil {
+					p.Log.LogAttrs(context.Background(), slog.LevelWarn,
+						"pii: incremental stream restore error; stream aborted to prevent pseudonym leak",
+						slog.String("error", pushErr.Error()),
+					)
+					streamAborted = true
+					break piiScanLoop
+				}
+				if len(outLines) > 0 {
+					if !writeSSELines(outLines) {
+						// The client disconnected mid-stream (write or flush
+						// error). This is not an upstream fault — do not
+						// penalise the circuit breaker.
+						clientDisconnected = true
+						break piiScanLoop
+					}
+				}
+				if terminal {
+					terminalSeen = true
+					// Clean [DONE] received. Break — do NOT early-return —
+					// so post-stream usage/metrics code below still executes.
+					break piiScanLoop
+				}
 			}
 
-			// Check scanner.Err() BEFORE emitting any content (Finding 5).
-			// A scan error (truncated stream, oversized line, transport failure)
-			// means the accumulated sseLines may be incomplete. Emitting a partial
-			// restore could leak un-restored pseudonyms. Fail-closed: log and return
-			// without writing anything to the client.
-			if scanErr := scanner.Err(); scanErr != nil {
+			scanErr := scanner.Err()
+			if scanErr != nil {
 				p.Log.LogAttrs(context.Background(), slog.LevelWarn,
-					"pii: stream read error before restore; stream aborted to prevent pseudonym leak",
+					"pii: stream scan error; stream aborted to prevent pseudonym leak",
 					slog.String("error", scanErr.Error()),
 				)
-				if breaker != nil {
-					breaker.RecordFailure()
-				}
-				_ = w.Flush()
-				return
+				streamAborted = true
 			}
 
-			if streamCapExceeded {
-				p.Log.LogAttrs(context.Background(), slog.LevelWarn,
-					"pii: aggregate stream size limit exceeded; stream aborted to prevent memory exhaustion")
-				if breaker != nil {
-					breaker.RecordFailure()
-				}
-				_ = w.Flush()
-				return
+			// Mark the stream as incomplete when it ended without a clean [DONE]
+			// sentinel (abort or truncation, excluding client disconnects). This
+			// propagates to the usage event status code so truncated streams are
+			// not recorded as successful 200 events.
+			if (streamAborted || !terminalSeen) && !clientDisconnected {
+				streamIncomplete = true
 			}
 
-			// Content-aware restore: extract delta.content per choice, apply
-			// Restore over the assembled string (where split tokens are now
-			// contiguous), and re-emit valid SSE. Fail-closed on parse error.
-			restoredLines, restoreErr := pii.RestoreSSEStream(sseLines, filter.Restore)
-			if restoreErr != nil {
-				// Fail-closed: cannot safely restore content. Write nothing;
-				// log the error without any content detail (zero-knowledge).
-				p.Log.LogAttrs(context.Background(), slog.LevelWarn,
-					"pii: sse restore failed; stream aborted to prevent pseudonym leak")
-				if breaker != nil {
-					breaker.RecordFailure()
-				}
-				_ = w.Flush()
-				return
-			}
-
-			// Record circuit breaker success after successful restore. The outer
-			// scanErr check after the if/else block only runs for the non-buffered
-			// path; in the buffered PII path we handle all outcomes here.
 			if breaker != nil {
-				breaker.RecordSuccess()
-			}
-
-			writeErr := false
-			for _, b := range restoredLines {
-				if b == nil {
-					// nil element signals a blank SSE event separator line.
-					if err := w.WriteByte('\n'); err != nil {
-						writeErr = true
-						break
-					}
-					continue
-				}
-				if _, err := w.Write(b); err != nil {
-					writeErr = true
-					break
-				}
-				if err := w.WriteByte('\n'); err != nil {
-					writeErr = true
-					break
+				switch {
+				case streamAborted:
+					breaker.RecordFailure()
+				case clientDisconnected:
+					// Client hung up — neither success nor failure on the upstream side.
+				case !terminalSeen:
+					// Upstream closed the connection without sending [DONE].
+					// This is a truncated response — treat as upstream failure.
+					p.Log.LogAttrs(context.Background(), slog.LevelWarn,
+						"pii: upstream stream ended without [DONE] sentinel; treating as failure")
+					breaker.RecordFailure()
+				default:
+					breaker.RecordSuccess()
 				}
 			}
-			if !writeErr {
-				_ = w.Flush()
-			}
+			_ = w.Flush()
 		} else {
 			// Non-buffered path: per-line passthrough with no PII overhead.
 			for scanner.Scan() {
@@ -1218,13 +1250,7 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 					break // client disconnected
 				}
 			}
-		}
-		// In the non-buffered path, check scanner.Err() here and record the
-		// circuit breaker outcome. In the buffered PII path, both checks
-		// and the breaker recording are handled inside the needsContentRestore
-		// block above (which also returns early on error), so we skip breaker
-		// recording here for that path to avoid double-counting.
-		if !needsContentRestore {
+			// Check scanner.Err() and record the circuit breaker outcome.
 			scanErr := scanner.Err()
 			if scanErr != nil {
 				p.Log.LogAttrs(context.Background(), slog.LevelWarn,
@@ -1253,7 +1279,16 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				streamUI = extractor.lastUsage
 			}
 			durationMS := int(time.Since(startTime).Milliseconds())
-			p.logUsageEvent(keyInfo, model, streamUI, durationMS, ttftMS, respStatusCode, requestID, requestedModelName)
+			// Use the upstream HTTP status for successful, complete streams. For
+			// aborted or truncated streams (no clean [DONE]) log StatusBadGateway
+			// so the usage record reflects that the stream did not complete
+			// successfully. Token counts are preserved: the upstream consumed those
+			// tokens regardless of whether the response reached the client intact.
+			eventStatusCode := respStatusCode
+			if streamIncomplete {
+				eventStatusCode = http.StatusBadGateway
+			}
+			p.logUsageEvent(keyInfo, model, streamUI, durationMS, ttftMS, eventStatusCode, requestID, requestedModelName)
 		}
 
 		metrics.ProxyDurationSeconds.WithLabelValues(model.Name, "true").Observe(time.Since(startTime).Seconds())
