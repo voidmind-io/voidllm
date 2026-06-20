@@ -1201,6 +1201,22 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				streamIncomplete = true
 			}
 
+			// Synthesize a content-free SSE error event when the stream is
+			// aborted by a PII policy violation, scanner error, timeout, or
+			// EOF-without-[DONE] — but NOT after client disconnect (the client
+			// is already gone) and NOT after a write failure (the client is
+			// also gone in that case). The error event is emitted WITHOUT a
+			// trailing [DONE] so that clients that ignore the error object read
+			// an incomplete stream (correct signal) rather than a successful one.
+			// Never flush carry bytes before or alongside the error event.
+			if !clientDisconnected && streamIncomplete {
+				const piiErrorEvent = "data: {\"error\":{\"message\":\"response withheld by PII policy\",\"type\":\"pii_restore_aborted\",\"code\":\"pii_restore_aborted\"}}"
+				_, _ = w.WriteString(piiErrorEvent)
+				_ = w.WriteByte('\n')
+				_ = w.WriteByte('\n')
+				_ = w.Flush()
+			}
+
 			if breaker != nil {
 				switch {
 				case streamAborted:
