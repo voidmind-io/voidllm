@@ -7,6 +7,18 @@ import (
 	"strings"
 )
 
+// pseudonymLen is the fixed byte length of every pseudonym produced by
+// pseudonym(). Format: "PII_" (4) + 2-char type abbrev + "_" (1) + 24 hex
+// chars = 31 bytes. All pseudonym values share this exact length regardless
+// of the PII type, which allows the rolling-buffer stream restorer to
+// pre-size its carry window precisely.
+const pseudonymLen = 31
+
+// pseudonymMarker is the fixed prefix shared by every pseudonym. The rolling-
+// buffer stream restorer uses this to determine which bytes in the carry buffer
+// could be the start of a pseudonym that must not be emitted prematurely.
+const pseudonymMarker = "PII_"
+
 // pseudonym derives a deterministic, fixed-length replacement token for a
 // PII value scoped to a specific organisation. The token format is:
 //
@@ -35,11 +47,11 @@ import (
 //     overwritten, mapping the pseudonym to the wrong original value. The
 //     96-bit tail makes this astronomically unlikely in practice.
 //
-//   - Fixed length per type: every EMAIL token is exactly 27 characters
-//     (PII_EM_xxxxxxxxxxxxxxxxxxxxxxxxxxxx). This property is preserved for
-//     Stage 0b's rolling-buffer streaming restore, where the buffer must
-//     know the exact byte length of each token to detect chunk-split
-//     boundaries.
+//   - Fixed length: every pseudonym is exactly 31 characters regardless of
+//     PII type (PII_<2-char abbrev>_<24 hex chars> = 4+2+1+24 = 31). This
+//     property is used by Stage 0b's rolling-buffer streaming restorer, which
+//     pre-sizes its per-choice carry window to pseudonymLen bytes so that it
+//     can detect chunk-split boundaries precisely without generic look-ahead.
 //
 //   - [A-Za-z0-9_] alphabet only: no special characters that JSON
 //     serializers, HTML escapers, or LLM tokenizers might alter. The token
