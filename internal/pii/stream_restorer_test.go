@@ -877,19 +877,17 @@ func TestStreamRestorer_FunctionCall_FailClosed(t *testing.T) {
 	}
 }
 
-// TestStreamRestorer_ToolCalls_FailClosed verifies that delta.tool_calls
-// (even an empty array []) causes errStreamAborted.
-func TestStreamRestorer_ToolCalls_FailClosed(t *testing.T) {
+// TestStreamRestorer_ToolCalls_InvalidShape_FailClosed verifies that malformed
+// or semantically invalid delta.tool_calls shapes cause errStreamAborted.
+// Stage 0c handles well-formed non-empty tool_calls arrays; this test covers
+// the shapes that remain fail-closed after Stage 0c.
+func TestStreamRestorer_ToolCalls_InvalidShape_FailClosed(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name    string
 		dataStr string
 	}{
-		{
-			name:    "non-empty tool_calls",
-			dataStr: `data: {"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"search","arguments":""}}]},"finish_reason":null}]}`,
-		},
 		{
 			name:    "empty tool_calls array",
 			dataStr: `data: {"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[]},"finish_reason":null}]}`,

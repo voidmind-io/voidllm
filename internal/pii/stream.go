@@ -3,13 +3,24 @@ package pii
 import (
 	"bytes"
 	"errors"
+	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
+
+// toolIDCharsetRe and toolNameCharsetRe are precompiled conservative charset
+// validators for tool-call id and function name respectively. Both use the
+// same charset — [A-Za-z0-9_.-]+ — which covers all known provider tool-call
+// id formats (e.g. "call_abc123") and valid OpenAI function names. Any
+// character outside this set (including '@', spaces, ':', non-ASCII) would
+// indicate an encoding anomaly and could carry PII. Such values fail-closed.
+var toolIDCharsetRe = regexp.MustCompile(`^[A-Za-z0-9_.+-]+$`)
+var toolNameCharsetRe = regexp.MustCompile(`^[A-Za-z0-9_.+-]+$`)
 
 // dataLinePrefix is the SSE field prefix per RFC 6202 §4.2. A "data" field
 // line MUST begin with "data:" — the space after the colon is optional.
@@ -48,19 +59,137 @@ const maxStreamChoices = 128
 // and causes fail-closed abort. An empty or null finish_reason is never
 // passed to this check (the caller guards with *rc.FinishReason != "").
 //
-// "tool_calls" and "function_call" are intentionally excluded: the Anthropic
-// adapter translates tool_use stop_reason to "tool_calls" but drops all
-// tool_use content deltas (they are not text and cannot be PII-restored).
-// This means the StreamRestorer would never see any tool_calls delta (so the
-// delta-level fail-closed check never fires), yet the stream closes with
-// finish_reason:"tool_calls" — producing a response with no tool_calls body
-// but the wrong finish_reason. Excluding these values from the allowlist
-// ensures that any stream involving tool use is fail-closed, regardless of
-// whether the tool_calls delta was visible to the restorer.
+// "tool_calls" is included here but is additionally gated at the choice level:
+// it is only accepted when cc.sawToolCall is true for that choice (i.e. at
+// least one fully-validated, non-empty tool-call element was processed). This
+// keeps the Anthropic adapter correctly fail-closed: the Anthropic adapter
+// translates tool_use stop_reason to "tool_calls" but drops all tool_use
+// content deltas, so sawToolCall is never set and the finish_reason is
+// rejected. For OpenAI/vLLM passthrough streams with real tool_calls deltas,
+// sawToolCall is set and the finish_reason is accepted.
+//
+// "function_call" is intentionally excluded: legacy singular delta.function_call
+// is always fail-closed and must not be authorized via the finish_reason allowlist.
 var allowedFinishReasons = map[string]bool{
 	"stop":           true,
 	"length":         true,
 	"content_filter": true,
+	"tool_calls":     true,
+}
+
+// maxToolCallsPerChoice is the maximum number of distinct tool-call indices
+// allowed per choice. A tool_calls array with more distinct indices than this
+// limit is a protocol violation and causes fail-closed abort. 64 covers all
+// realistic LLM use cases with generous headroom.
+const maxToolCallsPerChoice = 64
+
+// maxToolCallsTotal is the global cap on distinct tool-call carries across ALL
+// choices in a single streaming request. A request that emits more than this
+// number of distinct (choice, tool-index) pairs is a protocol violation and
+// causes fail-closed abort. 1024 is orders of magnitude above any realistic
+// use-case while still bounding memory growth from adversarial inputs.
+const maxToolCallsTotal = 1024
+
+// maxToolIDLen and maxToolNameLen bound the per-key retained state to prevent
+// unbounded memory growth from adversarial inputs.
+const maxToolIDLen = 256
+const maxToolNameLen = 256
+
+// canonicalPseudonymRe matches the canonical pseudonym shape: PII_ followed by
+// exactly 2 alphanumeric characters, then _, then exactly 24 lowercase hex
+// characters (total 31 bytes). This is the shape produced by pseudonym().
+// The regexp is compiled once at package load.
+var canonicalPseudonymRe = regexp.MustCompile(`PII_[A-Za-z0-9]{2}_[0-9a-f]{24}`)
+
+// isCanonicalPseudonym reports whether s contains a value matching the
+// canonical pseudonym shape (31 bytes: PII_<2alnum>_<24hex>). Any occurrence
+// — known to this filter or not — triggers the check; unknown canonical shapes
+// must fail-closed to uphold the "no pseudonym to client" guarantee.
+func isCanonicalPseudonym(s string) bool {
+	return canonicalPseudonymRe.MatchString(s)
+}
+
+// residualSubCanonicalTotal counts the number of times a sub-canonical PII_
+// marker (not a full canonical pseudonym shape) was observed in restored content
+// text. The counter is package-level, content-free (count only), and exported
+// for testing and metric collection. It is incremented atomically so it is safe
+// to read concurrently from multiple goroutines.
+//
+// A sub-canonical marker in content is passed through (the restorer cannot
+// recover what it did not anonymize, and blocking would cause false-positive
+// aborts on natural text). This counter lets operators detect anomalies without
+// recording any content value.
+var residualSubCanonicalTotal atomic.Int64
+
+// ResidualSubCanonicalCount returns the total number of sub-canonical PII_
+// markers observed in restored content across all requests since process start.
+// The value is informational only; it does not identify any specific request,
+// value, or user.
+func ResidualSubCanonicalCount() int64 {
+	return residualSubCanonicalTotal.Load()
+}
+
+// residualScan checks whether a canonical pseudonym spans the boundary between
+// previously-emitted bytes and the new fragment frag by inspecting the
+// accumulated view [emittedTail + frag]. It also checks for sub-canonical PII_
+// markers spanning that boundary.
+//
+// The tail field (a pointer to a []byte) holds the last pseudonymLen-1 (30)
+// bytes emitted in the lane. On each call residualScan:
+//  1. Builds check = *tail + frag (only the suffix of combined that is needed
+//     for pattern matching, bounded by len(frag)+pseudonymLen-1 bytes).
+//  2. If canonicalPseudonymRe matches check → fail-closed (errStreamAborted),
+//     regardless of inToolArgs.
+//  3. If strings.Contains(check, pseudonymMarker) and inToolArgs → fail-closed
+//     (sub-canonical marker in tool arguments is always fail-closed).
+//  4. If strings.Contains(check, pseudonymMarker) and !inToolArgs → increment
+//     residualSubCanonicalTotal (count-only; pass through).
+//  5. Updates *tail to the last min(len(check), pseudonymLen-1) bytes of check.
+//
+// The caller must call residualScan AFTER the Restore call, passing the
+// restored fragment as frag. residualScan does not read the lane's carry.
+//
+// Note: step 4 may over-count sub-canonical markers when the tail window
+// overlaps with the previous emission, causing a marker near an emission
+// boundary to be counted twice. The counter is an approximate anomaly signal
+// only — content-free and count-only — and should not be treated as an exact
+// occurrence tally.
+func residualScan(tail *[]byte, frag string, inToolArgs bool) error {
+	// Build the combined view: prior tail bytes + new fragment.
+	// We only need the last pseudonymLen-1 bytes of tail + all of frag to
+	// detect a pattern that begins in tail and ends in frag.
+	combined := make([]byte, 0, len(*tail)+len(frag))
+	combined = append(combined, *tail...)
+	combined = append(combined, frag...)
+
+	check := string(combined)
+
+	// Step 2: canonical pseudonym → fail-closed (both content and tool args).
+	if canonicalPseudonymRe.MatchString(check) {
+		return errStreamAborted
+	}
+
+	// Step 3/4: sub-canonical PII_ marker.
+	if strings.Contains(check, pseudonymMarker) {
+		if inToolArgs {
+			return errStreamAborted
+		}
+		// Content: count-only, pass through.
+		residualSubCanonicalTotal.Add(1)
+	}
+
+	// Step 5: update tail to last pseudonymLen-1 bytes of combined.
+	const tailLen = pseudonymLen - 1
+	if len(combined) <= tailLen {
+		*tail = combined
+	} else {
+		// Take only the last tailLen bytes.
+		suffix := make([]byte, tailLen)
+		copy(suffix, combined[len(combined)-tailLen:])
+		*tail = suffix
+	}
+
+	return nil
 }
 
 // choiceFormat is the detected format of a streaming choice's content field.
@@ -81,12 +210,41 @@ const (
 	formatRefusal
 )
 
+// toolCallCarry holds per-(choice, tool-call-index) state for tool_calls
+// argument restoration. Each distinct tool-call index within a choice gets
+// its own toolCallCarry, allocated on first observation.
+type toolCallCarry struct {
+	// argsCarry is the rolling buffer for function.arguments, analogous to
+	// choiceCarry.carry for content. Invariant: argsCarry is either empty or a
+	// proper prefix of a known pseudonym.
+	argsCarry []byte
+	// emittedTail holds the last min(len(emitted), pseudonymLen-1) bytes that
+	// have been emitted for this tool-call's arguments lane. It is used by
+	// residualScan to detect a canonical pseudonym that spans two consecutive
+	// emission fragments (cross-emission boundary detection).
+	emittedTail []byte
+	// headerSent is true after the first tool_calls chunk for this index has
+	// been emitted (which included id, type, and name).
+	headerSent bool
+	// id is the tool call id, stored from the first observation. Later
+	// fragments must repeat the same id or omit it.
+	id string
+	// name is the function name, stored from the first observation. Later
+	// fragments must repeat the same name or omit it.
+	name string
+}
+
 // choiceCarry holds the per-choice rolling-buffer state for StreamRestorer.
 type choiceCarry struct {
 	// carry is the accumulated, not-yet-emitted content bytes. Invariant: carry
 	// is either empty or a proper prefix of a known pseudonym — never arbitrary
 	// buffered text, never an emittable fragment.
 	carry []byte
+	// emittedTail holds the last min(len(emitted), pseudonymLen-1) bytes that
+	// have been emitted for this choice's content lane (delta.content, refusal,
+	// or text). It is used by residualScan to detect a canonical pseudonym that
+	// spans two consecutive emission fragments.
+	emittedTail []byte
 	// format is set on the first delta with content and never changes.
 	format choiceFormat
 	// role is emitted once with the first content chunk.
@@ -99,6 +257,13 @@ type choiceCarry struct {
 	// finished is true after a finish_reason has been seen; content after this
 	// point is a protocol violation (fail-closed).
 	finished bool
+	// toolCalls holds per-tool-call-index carry state. Keyed by the integer
+	// index from the upstream delta.tool_calls array.
+	toolCalls map[int]*toolCallCarry
+	// sawToolCall is true after at least one fully-validated, non-empty
+	// tool-call element has been processed for this choice. Empty/null
+	// tool_calls arrays do not set this flag.
+	sawToolCall bool
 }
 
 // StreamRestorer performs incremental, content-aware PII restore over a
@@ -114,15 +279,28 @@ type choiceCarry struct {
 // carry that is a proper prefix of ANY known pseudonym has length L, making the
 // first len(carry)-L bytes safe to emit.
 //
-// Availability trade-off: if the upstream response ends (via [DONE]) while any
-// per-choice carry is non-empty, the restorer returns errCarryNotEmpty and
-// aborts the stream fail-closed. This covers the case where natural content
-// happens to end on a proper prefix of a known pseudonym (e.g. the response
-// legitimately ends with a capital "P", "PI", "PII", or "PII_"). Because
-// truncation is indistinguishable from a partial pseudonym at the stream
-// boundary, the restorer cannot safely emit the held bytes. This is a
-// deliberate, leak-safe design choice: the alternative — emitting ambiguous
-// trailing bytes — risks exposing a real pseudonym fragment to the client.
+// # Guarantee precision
+//
+// The client never receives a canonical/exact pseudonym (PII_<2 alnum>_<24
+// hex>). A sub-canonical PII_-prefixed fragment in free CONTENT (e.g. "PII_X")
+// may pass through: it is not a restorable pseudonym and failing closed would
+// abort on natural text containing "PII_". Such fragments carry no PII — they
+// are opaque character sequences that were never inserted by the anonymizer. In
+// tool-call arguments, even sub-canonical PII_-prefixed fragments are
+// fail-closed because tool arguments must contain only structured data (no
+// natural text containing "PII_" is expected there).
+//
+// # Availability trade-off
+//
+// If the upstream response ends (via [DONE]) while any per-choice carry is
+// non-empty, the restorer returns errCarryNotEmpty and aborts the stream
+// fail-closed. This covers the case where natural content happens to end on a
+// proper prefix of a known pseudonym (e.g. the response legitimately ends with
+// a capital "P", "PI", "PII", or "PII_"). Because truncation is
+// indistinguishable from a partial pseudonym at the stream boundary, the
+// restorer cannot safely emit the held bytes. This is a deliberate, leak-safe
+// design choice: the alternative — emitting ambiguous trailing bytes — risks
+// exposing a real pseudonym fragment to the client.
 //
 // Concurrency: StreamRestorer is NOT safe for concurrent use. It is designed
 // for single-goroutine use inside the streaming SendStreamWriter closure.
@@ -161,6 +339,9 @@ type StreamRestorer struct {
 	// totalCarryBytes is the sum of carry lengths across all choices.
 	// Used to enforce maxPIIStreamBytes.
 	totalCarryBytes int
+	// totalToolCalls is the count of distinct toolCallCarry entries created
+	// across all choices. Used to enforce maxToolCallsTotal.
+	totalToolCalls int
 }
 
 // NewStreamRestorer creates a StreamRestorer for a single proxy request.
@@ -322,12 +503,29 @@ func (s *StreamRestorer) Push(line []byte) (out [][]byte, terminal bool, err err
 
 // handleDone processes the [DONE] sentinel.
 func (s *StreamRestorer) handleDone() ([][]byte, bool, error) {
-	// Verify all carries are empty. A non-empty carry means the upstream
-	// truncated a pseudonym — fail-closed.
+	// Verify all carries (content and tool-call arguments) are empty across
+	// all choices. A non-empty carry means the upstream truncated a pseudonym.
 	for _, cc := range s.choices {
 		if len(cc.carry) > 0 {
 			s.aborted = true
 			return nil, false, errCarryNotEmpty
+		}
+		for _, tc := range cc.toolCalls {
+			if len(tc.argsCarry) > 0 {
+				s.aborted = true
+				return nil, false, errCarryNotEmpty
+			}
+		}
+	}
+
+	// For every choice that streamed at least one validated tool call, a
+	// finish_reason must have been seen before [DONE]. OpenAI and vLLM always
+	// send finish_reason before [DONE]; if it is absent the stream is truncated
+	// or malformed — fail-closed. Non-tool choices are unaffected.
+	for _, cc := range s.choices {
+		if cc.sawToolCall && !cc.finished {
+			s.aborted = true
+			return nil, false, errStreamAborted
 		}
 	}
 
@@ -353,6 +551,36 @@ func (s *StreamRestorer) handleDone() ([][]byte, bool, error) {
 	return out, true, nil
 }
 
+// rawToolCallFunction is the typed representation of the function field inside
+// a tool_calls delta element.
+//
+// Name is a *string because sonic (the JSON library) correctly distinguishes
+// absent string key (nil) from explicit string value (non-nil).
+//
+// Arguments is parsed separately from the raw function map (not via a struct
+// tag) because sonic maps JSON null → nil *string, making it impossible to
+// distinguish `"arguments": null` from `"arguments"` being absent when both
+// are represented as *string. Instead, the validation loop in
+// handleToolCallsDelta checks the raw function JSON map directly: if the
+// "arguments" key is present, its value must be a JSON string; null or any
+// non-string type causes fail-closed abort.
+type rawToolCallFunction struct {
+	Name *string `json:"name"`
+	// Arguments is intentionally absent as a struct field; it is read from the
+	// raw function map in handleToolCallsDelta to support null detection.
+}
+
+// rawToolCall is the typed representation of one element in delta.tool_calls.
+// The Function field holds the raw JSON bytes of the function object so that
+// handleToolCallsDelta can parse it both as a typed struct (for Name) and as a
+// raw key-presence map (for Arguments null-vs-absent detection).
+type rawToolCall struct {
+	Index    *int              `json:"index"`
+	ID       *string           `json:"id"`
+	Type     *string           `json:"type"`
+	Function *jsonx.RawMessage `json:"function"`
+}
+
 // handleChoices processes a non-empty choices array from one upstream SSE chunk.
 func (s *StreamRestorer) handleChoices(rawChoices []jsonx.RawMessage) ([][]byte, bool, error) {
 	// Parse choices as typed structs.
@@ -360,7 +588,7 @@ func (s *StreamRestorer) handleChoices(rawChoices []jsonx.RawMessage) ([][]byte,
 		Role    *string `json:"role"`
 		Content *string `json:"content"`
 		Refusal *string `json:"refusal"`
-		// ToolCalls is parsed via the raw map for key-presence detection (see below).
+		// ToolCalls is parsed separately via rawDeltaMap for key-presence detection.
 	}
 	type rawChoice struct {
 		Index        *int              `json:"index"`
@@ -406,7 +634,9 @@ func (s *StreamRestorer) handleChoices(rawChoices []jsonx.RawMessage) ([][]byte,
 		hasDeltaContent := false
 		hasDeltaRefusal := false
 		hasTextContent := false
+		hasDeltaToolCalls := false
 		var contentStr string
+		var rawToolCallsJSON jsonx.RawMessage
 		// deltaHasRole is true when the upstream delta contained a "role" key
 		// (regardless of value). Used after cc is obtained to synthesize the
 		// canonical "assistant" role without ever storing the upstream value.
@@ -427,30 +657,24 @@ func (s *StreamRestorer) handleChoices(rawChoices []jsonx.RawMessage) ([][]byte,
 				return nil, false, errStreamAborted
 			}
 
-			// Audit every delta key for unknown content-bearing fields. Known
-			// content fields are content, refusal, and the legacy text field on
-			// the choice level. tool_calls and function_call are always
-			// fail-closed, regardless of whether they are null — key presence
-			// alone signals tool-call intent and that path is not safe to
-			// forward through the PII restorer. A null tool_calls or
-			// function_call unmarshals to nil in the typed struct and is
-			// indistinguishable from "field absent", so we check the raw map.
-			for k := range rawDeltaMap {
+			// Audit every delta key. Known content fields: content, refusal,
+			// tool_calls. Legacy function_call stays fail-closed. Unknown fields
+			// are conservatively dropped (envelope is synthesized, so unknown
+			// fields cannot leak pseudonyms).
+			for k, v := range rawDeltaMap {
 				switch k {
 				case "role", "content", "refusal":
-					// Explicitly handled fields.
+					// Explicitly handled fields — fall through.
 				case "tool_calls":
-					// Fail-closed: tool_calls key present (even if null/empty).
-					s.aborted = true
-					return nil, false, errStreamAborted
+					// tool_calls is handled below; capture raw JSON for typed parsing.
+					hasDeltaToolCalls = true
+					rawToolCallsJSON = v
 				case "function_call":
-					// function_call in delta: fail-closed regardless of value.
+					// Legacy singular delta.function_call: always fail-closed.
 					s.aborted = true
 					return nil, false, errStreamAborted
 				}
 				// All other unrecognised delta fields are conservatively ignored.
-				// They are not forwarded (the envelope is synthesized), so unknown
-				// fields cannot leak pseudonyms through unhandled paths.
 			}
 
 			if delta.Content != nil {
@@ -473,17 +697,23 @@ func (s *StreamRestorer) handleChoices(rawChoices []jsonx.RawMessage) ([][]byte,
 		// A single chunk must not mix content-bearing fields. Mixing any two of
 		// delta.content, delta.refusal, and choice-level text is a protocol
 		// violation: fail-closed.
-		activeFields := 0
+		activeContentFields := 0
 		if hasDeltaContent {
-			activeFields++
+			activeContentFields++
 		}
 		if hasDeltaRefusal {
-			activeFields++
+			activeContentFields++
 		}
 		if hasTextContent {
-			activeFields++
+			activeContentFields++
 		}
-		if activeFields > 1 {
+		if activeContentFields > 1 {
+			s.aborted = true
+			return nil, false, errStreamAborted
+		}
+
+		// tool_calls must not appear alongside content fields in the same chunk.
+		if hasDeltaToolCalls && activeContentFields > 0 {
 			s.aborted = true
 			return nil, false, errStreamAborted
 		}
@@ -512,10 +742,23 @@ func (s *StreamRestorer) handleChoices(rawChoices []jsonx.RawMessage) ([][]byte,
 			cc.role = "assistant"
 		}
 
-		// Fail-closed: content after finish_reason.
-		if cc.finished && activeFields > 0 {
+		// Fail-closed: content or tool_calls after finish_reason.
+		if cc.finished && (activeContentFields > 0 || hasDeltaToolCalls) {
 			s.aborted = true
 			return nil, false, errStreamAborted
+		}
+
+		// Format guard: tool_calls only valid when format is unknown or chat.
+		// If format is already locked to completion or refusal, tool_calls is
+		// a protocol violation.
+		if hasDeltaToolCalls {
+			switch cc.format {
+			case formatUnknown, formatChat:
+				// Valid.
+			default:
+				s.aborted = true
+				return nil, false, errStreamAborted
+			}
 		}
 
 		// Detect and lock in format. A choice that changes its content field
@@ -554,14 +797,54 @@ func (s *StreamRestorer) handleChoices(rawChoices []jsonx.RawMessage) ([][]byte,
 			}
 		}
 
+		// Cross-lane ownership within a choice: a pseudonym always lies entirely
+		// within one lane (content-kind or tool-index) of a given choice.
+		// While the content carry for this choice is non-empty, emitting from a
+		// tool-call lane of the SAME choice is fail-closed, and vice versa.
+		// Across different choices, independent carries are expected and valid
+		// (multiple choices may stream content simultaneously in separate lanes).
+		// Validate cross-lane constraints BEFORE processing so the operation is
+		// transactional: detect violations before emitting anything.
+		if hasDeltaToolCalls {
+			if err := s.checkCrossLane(choiceIdx, true, nil); err != nil {
+				s.aborted = true
+				return nil, false, err
+			}
+		}
+
+		// Reverse cross-lane check: when emitting content for this choice, verify
+		// that no tool-call lane of the SAME choice holds a non-empty argsCarry.
+		// This is the symmetric rule to checkCrossLane(emittingTool=true): if a
+		// tool argument carry is live, a content delta in the same choice is a
+		// cross-lane violation. Cross-CHOICE carries are independent and must not
+		// block each other.
+		if activeContentFields > 0 && cc.toolCalls != nil {
+			for _, tc := range cc.toolCalls {
+				if len(tc.argsCarry) > 0 {
+					s.aborted = true
+					return nil, false, errStreamAborted
+				}
+			}
+		}
+
 		// Process content through the rolling buffer.
-		if activeFields > 0 {
+		if activeContentFields > 0 {
 			emitLines, err := s.pushContent(choiceIdx, cc, contentStr)
 			if err != nil {
 				s.aborted = true
 				return nil, false, err
 			}
 			out = append(out, emitLines...)
+		}
+
+		// Process tool_calls delta.
+		if hasDeltaToolCalls {
+			toolLines, err := s.handleToolCallsDelta(choiceIdx, cc, rawToolCallsJSON)
+			if err != nil {
+				s.aborted = true
+				return nil, false, err
+			}
+			out = append(out, toolLines...)
 		}
 
 		// Process finish_reason.
@@ -579,12 +862,31 @@ func (s *StreamRestorer) handleChoices(rawChoices []jsonx.RawMessage) ([][]byte,
 				s.aborted = true
 				return nil, false, errStreamAborted
 			}
+			// Additional gate: "tool_calls" finish_reason requires that at least
+			// one fully-validated tool-call element was processed for this choice.
+			// Without this gate, the Anthropic adapter's translated tool_use→tool_calls
+			// finish_reason would slip through even though sawToolCall is false.
+			if reason == "tool_calls" && !cc.sawToolCall {
+				s.aborted = true
+				return nil, false, errStreamAborted
+			}
+			// Conversely: a choice that processed tool calls must finish with
+			// "tool_calls", not silently accept "stop" or any other reason.
+			if cc.sawToolCall && reason != "tool_calls" {
+				s.aborted = true
+				return nil, false, errStreamAborted
+			}
 			cc.finished = true
-			// Carry must be empty here by the rolling-buffer invariant. If it
-			// is not empty, the upstream truncated a pseudonym.
+			// All carries for this choice must be empty at finish time.
 			if len(cc.carry) > 0 {
 				s.aborted = true
 				return nil, false, errCarryNotEmpty
+			}
+			for _, tc := range cc.toolCalls {
+				if len(tc.argsCarry) > 0 {
+					s.aborted = true
+					return nil, false, errCarryNotEmpty
+				}
 			}
 			// Emit the finish chunk immediately.
 			line, err := s.buildFinishChunk(choiceIdx, cc.role, reason)
@@ -598,6 +900,325 @@ func (s *StreamRestorer) handleChoices(rawChoices []jsonx.RawMessage) ([][]byte,
 	}
 
 	return out, false, nil
+}
+
+// checkCrossLane enforces the within-choice cross-lane carry ownership invariant.
+// A pseudonym always lies entirely within one lane (content-kind or tool-index)
+// of a given choice. While the content carry for a choice is non-empty, emitting
+// from a tool-call lane of the SAME choice must fail-closed, and vice versa.
+// Across different choices, independent carries are expected and valid.
+//
+// emittingTool must be true when the caller is processing a tool_calls delta for
+// choiceIdx. toolIndices (if non-nil) lists the tool indices being written in
+// this chunk; any OTHER tool index for the same choice with a non-empty carry is
+// a cross-lane violation.
+//
+// This function only detects cross-lane violations within choiceIdx. Intra-lane
+// content continuation (same choice, same field kind) is always allowed.
+func (s *StreamRestorer) checkCrossLane(choiceIdx int, emittingTool bool, toolIndices []int) error {
+	cc, ok := s.choices[choiceIdx]
+	if !ok {
+		return nil
+	}
+	if emittingTool {
+		// Content carry and tool carry are different lanes within the same choice.
+		// If the content carry is non-empty, emitting a tool_calls delta is
+		// cross-lane — fail-closed.
+		if len(cc.carry) > 0 {
+			return errStreamAborted
+		}
+		// If emitting for specific tool indices, verify no OTHER tool index for
+		// this choice holds a non-empty argsCarry.
+		if len(toolIndices) > 0 && len(cc.toolCalls) > 0 {
+			emittingSet := make(map[int]struct{}, len(toolIndices))
+			for _, ti := range toolIndices {
+				emittingSet[ti] = struct{}{}
+			}
+			for ti, tc := range cc.toolCalls {
+				if _, active := emittingSet[ti]; active {
+					continue
+				}
+				if len(tc.argsCarry) > 0 {
+					return errStreamAborted
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// parsedToolElement holds the fully-decoded fields of one tool_calls delta
+// element after validation. It is populated during the validation pass in
+// handleToolCallsDelta and consumed during the emit pass.
+type parsedToolElement struct {
+	toolIdx int
+	// argsFragment is the decoded Go string value of the arguments field.
+	// hasArgs is true when the arguments key was present in the JSON; when
+	// false, argsFragment is the zero string and argsRaw is nil.
+	hasArgs      bool
+	argsFragment string
+}
+
+// handleToolCallsDelta processes the raw JSON of a delta.tool_calls array for
+// the given choice. It parses each element, validates the header state machine,
+// applies the rolling-buffer hold-back to function.arguments, and emits
+// synthesized tool_calls chunks.
+func (s *StreamRestorer) handleToolCallsDelta(choiceIdx int, cc *choiceCarry, rawJSON jsonx.RawMessage) ([][]byte, error) {
+	// Validate that the value is a JSON array, not null or any other type.
+	// A null tool_calls key ("tool_calls": null) is a protocol violation:
+	// key presence signals tool-call intent, and null is not an array.
+	// An empty array ("tool_calls": []) is similarly a protocol violation:
+	// the upstream is signaling tool-call intent with no actual tool calls.
+	// Both cases are fail-closed to prevent ambiguity.
+	trimmed := bytes.TrimSpace(rawJSON)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, errStreamAborted
+	}
+
+	// Parse as array — fail-closed if unparseable.
+	var elements []rawToolCall
+	if err := jsonx.Unmarshal(rawJSON, &elements); err != nil {
+		return nil, errStreamAborted
+	}
+
+	// An empty array is a protocol violation (see comment above).
+	if len(elements) == 0 {
+		return nil, errStreamAborted
+	}
+
+	// Enforce per-choice distinct-tool-call cap.
+	if cc.toolCalls == nil {
+		cc.toolCalls = make(map[int]*toolCallCarry)
+	}
+
+	// Validate all elements before emitting anything (transactional).
+	// seenInChunk detects duplicate indices within THIS chunk's tool_calls array.
+	seenInChunk := make(map[int]struct{}, len(elements))
+	// toolIndicesInChunk collects all tool indices referenced in this chunk
+	// for the cross-lane ownership check.
+	toolIndicesInChunk := make([]int, 0, len(elements))
+	// parsed holds the per-element decoded state built during validation and
+	// used in the emit pass to avoid re-parsing.
+	parsed := make([]parsedToolElement, len(elements))
+
+	for i := range elements {
+		el := &elements[i]
+		// Index is required.
+		if el.Index == nil {
+			return nil, errStreamAborted
+		}
+		toolIdx := *el.Index
+		if toolIdx < 0 || toolIdx >= maxToolCallsPerChoice {
+			return nil, errStreamAborted
+		}
+		// Duplicate index within this chunk is a protocol violation.
+		if _, dup := seenInChunk[toolIdx]; dup {
+			return nil, errStreamAborted
+		}
+		seenInChunk[toolIdx] = struct{}{}
+		toolIndicesInChunk = append(toolIndicesInChunk, toolIdx)
+		parsed[i].toolIdx = toolIdx
+
+		// Parse the function field as both a typed struct (for Name) and a raw
+		// key-presence map (for arguments null-vs-absent detection). Both parses
+		// target the same bytes; the raw map parse is authoritative for argument
+		// validation because sonic maps JSON null → nil *string, making a *string
+		// Arguments field unable to distinguish null from absent.
+		var fnName *string
+		var fnRawMap map[string]jsonx.RawMessage
+		if el.Function != nil {
+			var fnStruct rawToolCallFunction
+			if err := jsonx.Unmarshal(*el.Function, &fnStruct); err != nil {
+				return nil, errStreamAborted
+			}
+			fnName = fnStruct.Name
+			if err := jsonx.Unmarshal(*el.Function, &fnRawMap); err != nil {
+				return nil, errStreamAborted
+			}
+		}
+
+		tc, exists := cc.toolCalls[toolIdx]
+		if !exists {
+			// First observation of this index: enforce per-choice cap.
+			if len(cc.toolCalls) >= maxToolCallsPerChoice {
+				return nil, errStreamAborted
+			}
+			// Enforce global tool-call cap across all choices.
+			if s.totalToolCalls >= maxToolCallsTotal {
+				return nil, errStreamAborted
+			}
+			// First observation requires non-empty id, type=="function", function.name.
+			if el.ID == nil || *el.ID == "" {
+				return nil, errStreamAborted
+			}
+			if el.Type == nil || *el.Type != "function" {
+				return nil, errStreamAborted
+			}
+			if fnName == nil || *fnName == "" {
+				return nil, errStreamAborted
+			}
+			id := *el.ID
+			name := *fnName
+			// Validate id: must use only the conservative charset [A-Za-z0-9_.+-]
+			// and must not contain a PII_ marker or canonical pseudonym shape.
+			// Characters outside the charset (e.g. '@', spaces, ':', non-ASCII) can
+			// carry PII and are always fail-closed. Length is capped at maxToolIDLen.
+			if len(id) > maxToolIDLen {
+				return nil, errStreamAborted
+			}
+			if !toolIDCharsetRe.MatchString(id) {
+				return nil, errStreamAborted
+			}
+			if strings.Contains(id, pseudonymMarker) || isCanonicalPseudonym(id) {
+				return nil, errStreamAborted
+			}
+			// Validate name: same conservative charset and PII checks.
+			if len(name) > maxToolNameLen {
+				return nil, errStreamAborted
+			}
+			if !toolNameCharsetRe.MatchString(name) {
+				return nil, errStreamAborted
+			}
+			if strings.Contains(name, pseudonymMarker) || isCanonicalPseudonym(name) {
+				return nil, errStreamAborted
+			}
+			tc = &toolCallCarry{id: id, name: name}
+			cc.toolCalls[toolIdx] = tc
+			s.totalToolCalls++
+		} else {
+			// Subsequent fragment: id/type/name must be absent (nil pointer) or an
+			// exact repeat of the stored value. A present-but-empty string (non-nil
+			// pointer to "") is "present but empty" and is treated as a protocol
+			// violation — fail-closed — because a present key with an empty value is
+			// structurally anomalous and distinct from a legitimately absent key.
+			if el.ID != nil {
+				if *el.ID == "" || *el.ID != tc.id {
+					return nil, errStreamAborted
+				}
+			}
+			if el.Type != nil {
+				if *el.Type == "" || *el.Type != "function" {
+					return nil, errStreamAborted
+				}
+			}
+			if fnName != nil {
+				if *fnName == "" || *fnName != tc.name {
+					return nil, errStreamAborted
+				}
+			}
+		}
+
+		// Validate the arguments field. Use the raw function map to detect
+		// presence and type of the "arguments" key:
+		//   - key absent:          header-only fragment — valid, no arguments processing.
+		//   - key present + null:  fail-closed (JSON null is not a valid string).
+		//   - key present + string: decode and use as the fragment.
+		//   - key present + other (number, object, array, bool): fail-closed.
+		if rawArgsVal, argsKeyPresent := fnRawMap["arguments"]; argsKeyPresent {
+			trimmedArgs := bytes.TrimSpace(rawArgsVal)
+			// JSON null → fail-closed.
+			if bytes.Equal(trimmedArgs, []byte("null")) {
+				return nil, errStreamAborted
+			}
+			// Must be a JSON string (starts with '"').
+			if len(trimmedArgs) < 2 || trimmedArgs[0] != '"' {
+				return nil, errStreamAborted
+			}
+			// Unmarshal as string to confirm it is a valid JSON string value.
+			var argStr string
+			if err := jsonx.Unmarshal(rawArgsVal, &argStr); err != nil {
+				return nil, errStreamAborted
+			}
+			parsed[i].hasArgs = true
+			parsed[i].argsFragment = argStr
+		}
+	}
+
+	// Cross-lane check: verify that no OTHER tool index for this choice has a
+	// non-empty carry while we are emitting for toolIndicesInChunk.
+	if err := s.checkCrossLane(choiceIdx, true, toolIndicesInChunk); err != nil {
+		return nil, err
+	}
+
+	// Now emit: all validation above passed.
+	var out [][]byte
+	for i := range elements {
+		toolIdx := parsed[i].toolIdx
+		tc := cc.toolCalls[toolIdx]
+
+		// Only process arguments if the key was present in the JSON.
+		if !parsed[i].hasArgs {
+			// Header-only fragment (arguments key absent): emit header chunk if not yet sent.
+			if !tc.headerSent {
+				line, err := s.buildToolCallChunk(choiceIdx, toolIdx, cc, tc, "")
+				if err != nil {
+					return nil, errStreamAborted
+				}
+				out = append(out, line, nil)
+				tc.headerSent = true
+				cc.roleSent = true
+				cc.sawToolCall = true
+			}
+			continue
+		}
+
+		fragment := parsed[i].argsFragment
+
+		// Append fragment to argsCarry.
+		before := len(tc.argsCarry)
+		tc.argsCarry = append(tc.argsCarry, fragment...)
+		s.totalCarryBytes += len(tc.argsCarry) - before
+
+		if s.totalCarryBytes > maxPIIStreamBytes {
+			return nil, errStreamAborted
+		}
+
+		// Apply the same hold-back as content.
+		L := s.longestPseudonymPrefixSuffix(tc.argsCarry)
+		B := len(tc.argsCarry) - L
+
+		if B <= 0 {
+			// Nothing safe to emit yet; emit header if not yet sent.
+			if !tc.headerSent {
+				line, err := s.buildToolCallChunk(choiceIdx, toolIdx, cc, tc, "")
+				if err != nil {
+					return nil, errStreamAborted
+				}
+				out = append(out, line, nil)
+				tc.headerSent = true
+				cc.roleSent = true
+				cc.sawToolCall = true
+			}
+			continue
+		}
+
+		safe := tc.argsCarry[:B]
+		restored := string(s.filter.Restore(safe))
+
+		// Residual scan: detect a canonical or sub-canonical PII_ token spanning
+		// the boundary between the last emission and this fragment. Both canonical
+		// and sub-canonical tokens in tool arguments are fail-closed.
+		if err := residualScan(&tc.emittedTail, restored, true); err != nil {
+			return nil, err
+		}
+
+		// Advance carry.
+		carry := tc.argsCarry[B:]
+		tc.argsCarry = make([]byte, len(carry))
+		copy(tc.argsCarry, carry)
+		s.totalCarryBytes -= B
+
+		line, err := s.buildToolCallChunk(choiceIdx, toolIdx, cc, tc, restored)
+		if err != nil {
+			return nil, errStreamAborted
+		}
+		out = append(out, line, nil)
+		tc.headerSent = true
+		cc.roleSent = true
+		cc.sawToolCall = true
+	}
+
+	return out, nil
 }
 
 // pushContent appends content to the per-choice carry and emits safe bytes.
@@ -632,9 +1253,16 @@ func (s *StreamRestorer) pushContent(choiceIdx int, cc *choiceCarry, content str
 	copy(cc.carry, carry)
 	s.totalCarryBytes -= B
 
+	// Residual scan: detect a canonical or sub-canonical PII_ token spanning
+	// the boundary between the last emission and this fragment. For content:
+	// canonical tokens → fail-closed; sub-canonical → count-only, pass through.
+	restoredStr := string(restored)
+	if err := residualScan(&cc.emittedTail, restoredStr, false); err != nil {
+		return nil, err
+	}
+
 	// Build SSE output lines.
-	contentChunk := string(restored)
-	line, err := s.buildContentChunk(choiceIdx, cc, contentChunk)
+	line, err := s.buildContentChunk(choiceIdx, cc, restoredStr)
 	if err != nil {
 		return nil, errStreamAborted
 	}
@@ -778,6 +1406,36 @@ type sseFinishChoiceCompletion struct {
 	FinishReason string `json:"finish_reason"`
 }
 
+// sseToolCallFunction is the typed function field inside a synthesized tool_calls delta.
+type sseToolCallFunction struct {
+	// Name is emitted only on the first chunk for a given tool-call index.
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments"`
+}
+
+// sseToolCallElement is one element of the tool_calls array in a synthesized delta.
+// ID and Type are emitted only on the first chunk for a given tool-call index
+// (headerSent=false before emission); subsequent chunks omit them.
+type sseToolCallElement struct {
+	Index    int                 `json:"index"`
+	ID       string              `json:"id,omitempty"`
+	Type     string              `json:"type,omitempty"`
+	Function sseToolCallFunction `json:"function"`
+}
+
+// sseDeltaToolCalls is the typed delta for a tool_calls chunk.
+type sseDeltaToolCalls struct {
+	Role      string               `json:"role,omitempty"`
+	ToolCalls []sseToolCallElement `json:"tool_calls"`
+}
+
+// sseToolCallsChoice is a typed chat-completion choice carrying a tool_calls delta.
+type sseToolCallsChoice struct {
+	Index        int               `json:"index"`
+	Delta        sseDeltaToolCalls `json:"delta"`
+	FinishReason *string           `json:"finish_reason"`
+}
+
 // whitelistedUsage contains only the fields we re-emit from upstream usage chunks.
 type whitelistedUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
@@ -831,6 +1489,70 @@ func (s *StreamRestorer) buildContentChunk(choiceIdx int, cc *choiceCarry, conte
 		Created: s.created,
 		Model:   s.modelName,
 		Choices: choices,
+	}
+
+	payload, err := jsonx.Marshal(env)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte("data: "), payload...), nil
+}
+
+// buildToolCallChunk builds a data: SSE line carrying a tool_calls delta for
+// the given (choice index, tool-call index). The arguments field is set to the
+// already-restored string fragment (may be empty for header-only chunks). The
+// envelope (id, object, created, model) is synthesized locally — never copied
+// from the upstream response — to prevent pseudonym echo.
+//
+// On the first chunk for a given tool-call index (tc.headerSent==false), the
+// id, type, and function.name fields are emitted. On subsequent chunks they are
+// omitted (empty omitempty fields). The arguments fragment is always included,
+// even when empty, so the client receives complete JSON framing.
+//
+// Role synthesis: if this is the first emitted chunk for the choice
+// (cc.roleSent==false), the synthesized role "assistant" is included in the
+// delta — regardless of whether the upstream sent a role field. The upstream
+// role value is never echoed. Subsequent chunks omit the role (cc.roleSent is
+// set to true by the caller immediately after this function returns).
+func (s *StreamRestorer) buildToolCallChunk(choiceIdx int, toolIdx int, cc *choiceCarry, tc *toolCallCarry, argsFragment string) ([]byte, error) {
+	// Build the tool call element.
+	elem := sseToolCallElement{
+		Index: toolIdx,
+		Function: sseToolCallFunction{
+			Arguments: argsFragment,
+		},
+	}
+	if !tc.headerSent {
+		// Emit header fields only on the first chunk for this tool-call index.
+		elem.ID = tc.id
+		elem.Type = "function"
+		elem.Function.Name = tc.name
+	}
+
+	// Synthesize "assistant" role on the first emitted chunk for this choice.
+	// The upstream role value is never used — we always synthesize "assistant".
+	// This ensures tool-only streams deliver role:"assistant" to the client on
+	// the very first chunk, consistent with content streams.
+	role := ""
+	if !cc.roleSent {
+		role = "assistant"
+	}
+
+	delta := sseDeltaToolCalls{
+		Role:      role,
+		ToolCalls: []sseToolCallElement{elem},
+	}
+
+	env := sseEnvelope{
+		ID:      s.chunkID,
+		Object:  "chat.completion.chunk",
+		Created: s.created,
+		Model:   s.modelName,
+		Choices: []sseToolCallsChoice{{
+			Index:        choiceIdx,
+			Delta:        delta,
+			FinishReason: nil,
+		}},
 	}
 
 	payload, err := jsonx.Marshal(env)
