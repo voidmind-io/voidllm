@@ -1,6 +1,41 @@
 package proxy
 
-import "net/http"
+import (
+	"net/http"
+	"regexp"
+	"strings"
+)
+
+// forwardedPseudonymRe matches the canonical PII pseudonym shape produced by
+// the PII pipeline: PII_ followed by exactly 2 alphanumeric characters, then
+// _, then exactly 24 lowercase hex characters. This is an intentional local
+// copy of the pii package's canonicalPseudonymRe; importing that unexported
+// symbol would create a cross-package dependency from the hot proxy path into
+// the PII pipeline.
+var forwardedPseudonymRe = regexp.MustCompile(`PII_[A-Za-z0-9]{2}_[0-9a-f]{24}`)
+
+// forwardedPseudonymMarker is the fixed 4-byte prefix shared by every PII
+// pseudonym. Its presence as a substring in any forwarded field value is
+// sufficient to reject the value fail-closed.
+const forwardedPseudonymMarker = "PII_"
+
+// isForwardedPseudonym reports whether s could carry a PII pseudonym: either
+// it contains the pseudonym marker as a substring, or it matches the canonical
+// pseudonym shape. Either condition is sufficient to trigger fail-closed
+// rejection on the non-streaming response path.
+//
+// WHY this check exists: on the non-streaming response path the PII layer's
+// filter.Restore performs a global string replacement over the entire response
+// body. Tool-call id and function name fields are not field-aware-restored;
+// they are replaced as plain substrings. If a malicious or compromised upstream
+// returns a function name or tool id that happens to match a pseudonym in the
+// current request's reverse map, Restore would substitute the real PII value
+// into that field and the client would receive PII in tool_calls[].id or
+// tool_calls[].function.name. Rejecting pseudonym-shaped values fail-closed
+// prevents this substitution from reaching the client.
+func isForwardedPseudonym(s string) bool {
+	return strings.Contains(s, forwardedPseudonymMarker) || forwardedPseudonymRe.MatchString(s)
+}
 
 // UsageInfo holds token counts extracted from a completed upstream response.
 // For non-streaming responses the counts come from the response JSON; for
