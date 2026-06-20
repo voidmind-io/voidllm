@@ -1,6 +1,7 @@
 package pii
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"sort"
@@ -472,94 +473,101 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 			// Fail-closed: when "content" is present but is neither a string
 			// nor an array, the shape is unsupported for a covered field — reject.
 			if rawContent, ok := msg["content"]; ok {
-				var strContent string
-				if err := jsonx.Unmarshal(rawContent, &strContent); err == nil {
-					// String content path.
-					replaced, did, err := detect(strContent)
-					if err != nil {
-						return nil, errors.New("pii: request body could not be processed for anonymization")
-					}
-					if did {
-						newJSON, err := jsonx.Marshal(replaced)
+				// JSON null is the legitimate "no text content" shape used by
+				// assistant messages that carry only tool_calls (OpenAI spec).
+				// There is nothing to scan; tool_calls on the same message are
+				// handled separately below. Skip content scanning entirely —
+				// do NOT set msgTouched, do NOT 422.
+				if !bytes.Equal(bytes.TrimSpace([]byte(rawContent)), []byte("null")) {
+					var strContent string
+					if err := jsonx.Unmarshal(rawContent, &strContent); err == nil {
+						// String content path.
+						replaced, did, err := detect(strContent)
 						if err != nil {
 							return nil, errors.New("pii: request body could not be processed for anonymization")
 						}
-						msg["content"] = jsonx.RawMessage(newJSON)
-						msgTouched = true
-					}
-				} else {
-					// Array content (multi-modal parts) path.
-					var parts []jsonx.RawMessage
-					if err := jsonx.Unmarshal(rawContent, &parts); err == nil && parts != nil {
-						partsTouched := false
-						for j, rawPart := range parts {
-							var part map[string]jsonx.RawMessage
-							if err := jsonx.Unmarshal(rawPart, &part); err != nil || part == nil {
-								// content array element is not a JSON object (or is JSON null) → fail-closed.
-								return nil, errors.New("pii: request body could not be processed for anonymization")
-							}
-							rawType, hasType := part["type"]
-							if !hasType {
-								// content array element has no "type" field → fail-closed:
-								// we cannot determine whether it carries text that needs scanning.
-								return nil, errors.New("pii: request body could not be processed for anonymization")
-							}
-							var partType string
-							if err := jsonx.Unmarshal(rawType, &partType); err != nil {
-								// "type" field is not a string → fail-closed.
-								return nil, errors.New("pii: request body could not be processed for anonymization")
-							}
-							if partType == "text" {
-								// Text part: scan and replace PII in the "text" field.
-								rawText, hasText := part["text"]
-								if !hasText {
-									// text part without a "text" field — nothing to scan; skip.
-									continue
-								}
-								var textVal string
-								if err := jsonx.Unmarshal(rawText, &textVal); err != nil {
-									// "text" field is not a string → fail-closed.
-									return nil, errors.New("pii: request body could not be processed for anonymization")
-								}
-								replaced, did, err := detect(textVal)
-								if err != nil {
-									return nil, errors.New("pii: request body could not be processed for anonymization")
-								}
-								if did {
-									newJSON, err := jsonx.Marshal(replaced)
-									if err != nil {
-										return nil, errors.New("pii: request body could not be processed for anonymization")
-									}
-									part["text"] = jsonx.RawMessage(newJSON)
-									newPartJSON, err := jsonx.Marshal(part)
-									if err != nil {
-										return nil, errors.New("pii: request body could not be processed for anonymization")
-									}
-									parts[j] = jsonx.RawMessage(newPartJSON)
-									partsTouched = true
-								}
-							} else if knownContentPartTypes[partType] {
-								// Known non-text part (image_url, input_audio, file, etc.):
-								// carries no scannable text, pass through unchanged.
-								continue
-							} else {
-								// Unknown type: we cannot determine whether this part carries
-								// text that needs scanning → fail-closed (conservative).
-								return nil, errors.New("pii: request body could not be processed for anonymization")
-							}
-						}
-						if partsTouched {
-							newPartsJSON, err := jsonx.Marshal(parts)
+						if did {
+							newJSON, err := jsonx.Marshal(replaced)
 							if err != nil {
 								return nil, errors.New("pii: request body could not be processed for anonymization")
 							}
-							msg["content"] = jsonx.RawMessage(newPartsJSON)
+							msg["content"] = jsonx.RawMessage(newJSON)
 							msgTouched = true
 						}
 					} else {
-						// "content" is present but is neither a string nor an array:
-						// unsupported shape for a covered field → fail-closed.
-						return nil, errors.New("pii: request body could not be processed for anonymization")
+						// Array content (multi-modal parts) path.
+						var parts []jsonx.RawMessage
+						if err := jsonx.Unmarshal(rawContent, &parts); err == nil && parts != nil {
+							partsTouched := false
+							for j, rawPart := range parts {
+								var part map[string]jsonx.RawMessage
+								if err := jsonx.Unmarshal(rawPart, &part); err != nil || part == nil {
+									// content array element is not a JSON object (or is JSON null) → fail-closed.
+									return nil, errors.New("pii: request body could not be processed for anonymization")
+								}
+								rawType, hasType := part["type"]
+								if !hasType {
+									// content array element has no "type" field → fail-closed:
+									// we cannot determine whether it carries text that needs scanning.
+									return nil, errors.New("pii: request body could not be processed for anonymization")
+								}
+								var partType string
+								if err := jsonx.Unmarshal(rawType, &partType); err != nil {
+									// "type" field is not a string → fail-closed.
+									return nil, errors.New("pii: request body could not be processed for anonymization")
+								}
+								if partType == "text" {
+									// Text part: scan and replace PII in the "text" field.
+									rawText, hasText := part["text"]
+									if !hasText {
+										// text part without a "text" field — nothing to scan; skip.
+										continue
+									}
+									var textVal string
+									if err := jsonx.Unmarshal(rawText, &textVal); err != nil {
+										// "text" field is not a string → fail-closed.
+										return nil, errors.New("pii: request body could not be processed for anonymization")
+									}
+									replaced, did, err := detect(textVal)
+									if err != nil {
+										return nil, errors.New("pii: request body could not be processed for anonymization")
+									}
+									if did {
+										newJSON, err := jsonx.Marshal(replaced)
+										if err != nil {
+											return nil, errors.New("pii: request body could not be processed for anonymization")
+										}
+										part["text"] = jsonx.RawMessage(newJSON)
+										newPartJSON, err := jsonx.Marshal(part)
+										if err != nil {
+											return nil, errors.New("pii: request body could not be processed for anonymization")
+										}
+										parts[j] = jsonx.RawMessage(newPartJSON)
+										partsTouched = true
+									}
+								} else if knownContentPartTypes[partType] {
+									// Known non-text part (image_url, input_audio, file, etc.):
+									// carries no scannable text, pass through unchanged.
+									continue
+								} else {
+									// Unknown type: we cannot determine whether this part carries
+									// text that needs scanning → fail-closed (conservative).
+									return nil, errors.New("pii: request body could not be processed for anonymization")
+								}
+							}
+							if partsTouched {
+								newPartsJSON, err := jsonx.Marshal(parts)
+								if err != nil {
+									return nil, errors.New("pii: request body could not be processed for anonymization")
+								}
+								msg["content"] = jsonx.RawMessage(newPartsJSON)
+								msgTouched = true
+							}
+						} else {
+							// "content" is present but is neither a string nor an array:
+							// unsupported shape for a covered field → fail-closed.
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
 					}
 				}
 			}
