@@ -3,6 +3,7 @@ import apiClient from '../api/client'
 
 export interface UsageDataPoint {
   group_key: string
+  group_label?: string
   total_requests: number
   prompt_tokens: number
   completion_tokens: number

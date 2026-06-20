@@ -685,3 +685,305 @@ func TestGetOrgUsage_EventsOutsideRange_NotCounted(t *testing.T) {
 		t.Errorf("total_tokens = %v, want 150", totalTokens)
 	}
 }
+
+// insertUsageEventWithUserHTTP inserts a single usage_events row that includes
+// a user_id column so that group_by=user label resolution can be tested.
+func insertUsageEventWithUserHTTP(t *testing.T, database *db.DB, id, keyID, userID, orgID, modelName string, totalTokens int64, createdAt time.Time) {
+	t.Helper()
+	query := fmt.Sprintf(
+		`INSERT INTO usage_events
+			(id, key_id, key_type, org_id, user_id, model_name,
+			 prompt_tokens, completion_tokens, total_tokens, status_code, created_at)
+		 VALUES
+			('%s', '%s', 'user_key', '%s', '%s', '%s',
+			 0, %d, %d, 200, '%s')`,
+		id, keyID, orgID, userID, modelName,
+		totalTokens, totalTokens,
+		createdAt.UTC().Format(time.RFC3339),
+	)
+	if _, err := database.SQL().ExecContext(context.Background(), query); err != nil {
+		t.Fatalf("insertUsageEventWithUserHTTP id=%q: %v", id, err)
+	}
+}
+
+// ---- group_label enrichment tests -------------------------------------------
+
+// TestGetOrgUsage_GroupByKey_HasGroupLabel verifies that when group_by=key and
+// the key exists in api_keys, each data point carries a populated group_label.
+func TestGetOrgUsage_GroupByKey_HasGroupLabel(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestGetOrgUsage_GBKey_Label?mode=memory&cache=private")
+	org := mustCreateOrg(t, database, "Key Label Org", "key-label-org")
+	testKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+	// Create a real user + api_key so ResolveGroupLabels can find it.
+	creator, err := database.CreateUser(context.Background(), db.CreateUserParams{
+		Email:       "key-label-creator@example.com",
+		DisplayName: "Creator",
+	})
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	apiKey, err := database.CreateAPIKey(context.Background(), db.CreateAPIKeyParams{
+		KeyHash:   "dummy-hash-key-label-test",
+		KeyHint:   "vl_uk_...test",
+		KeyType:   "user_key",
+		Name:      "My Labeled Key",
+		OrgID:     org.ID,
+		CreatedBy: creator.ID,
+	})
+	if err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+
+	now := time.Now().UTC()
+	from := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	to := now.Add(time.Minute).Format(time.RFC3339)
+
+	// Insert a usage event whose key_id matches the real api_key row.
+	insertUsageEventHTTP(t, database, "gl-key-1", apiKey.ID, "", org.ID, "gpt-4",
+		100, 50, 150, now.Add(-30*time.Minute))
+
+	req := httptest.NewRequest("GET", usageURL(org.ID, from, to, "key"), nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	var envelope struct {
+		Data []struct {
+			GroupKey   string `json:"group_key"`
+			GroupLabel string `json:"group_label"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(envelope.Data) == 0 {
+		t.Fatal("data is empty, want at least one row")
+	}
+
+	row := envelope.Data[0]
+	if row.GroupKey != apiKey.ID {
+		t.Errorf("group_key = %q, want %q", row.GroupKey, apiKey.ID)
+	}
+	if row.GroupLabel != "My Labeled Key" {
+		t.Errorf("group_label = %q, want %q", row.GroupLabel, "My Labeled Key")
+	}
+}
+
+// TestGetOrgUsage_GroupByUser_HasGroupLabel verifies group_label is set for
+// group_by=user when the user exists in the users table.
+func TestGetOrgUsage_GroupByUser_HasGroupLabel(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestGetOrgUsage_GBUser_Label?mode=memory&cache=private")
+	org := mustCreateOrg(t, database, "User Label Org", "user-label-org")
+	testKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+	// Create a real user whose ID we'll embed in usage_events.user_id.
+	user, err := database.CreateUser(context.Background(), db.CreateUserParams{
+		Email:       "labeled-user@example.com",
+		DisplayName: "Labeled Display Name",
+	})
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	now := time.Now().UTC()
+	from := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	to := now.Add(time.Minute).Format(time.RFC3339)
+
+	insertUsageEventWithUserHTTP(t, database, "gl-user-1", "key-gl-user", user.ID, org.ID, "gpt-4",
+		200, now.Add(-30*time.Minute))
+
+	req := httptest.NewRequest("GET", usageURL(org.ID, from, to, "user"), nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	var envelope struct {
+		Data []struct {
+			GroupKey   string `json:"group_key"`
+			GroupLabel string `json:"group_label"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(envelope.Data) == 0 {
+		t.Fatal("data is empty, want at least one row")
+	}
+
+	row := envelope.Data[0]
+	if row.GroupKey != user.ID {
+		t.Errorf("group_key = %q, want %q", row.GroupKey, user.ID)
+	}
+	if row.GroupLabel != "Labeled Display Name" {
+		t.Errorf("group_label = %q, want %q", row.GroupLabel, "Labeled Display Name")
+	}
+}
+
+// TestGetOrgUsage_GroupByModel_NoGroupLabel verifies that group_by=model data
+// points do NOT carry a group_label field (non-resolvable dimension; omitempty
+// means the JSON key must be absent entirely).
+func TestGetOrgUsage_GroupByModel_NoGroupLabel(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestGetOrgUsage_GBModel_NoLabel?mode=memory&cache=private")
+	org := mustCreateOrg(t, database, "Model Label Org", "model-label-org")
+	testKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+	now := time.Now().UTC()
+	from := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	to := now.Add(time.Minute).Format(time.RFC3339)
+
+	insertUsageEventHTTP(t, database, "gl-model-1", "key-model", "", org.ID, "gpt-4o",
+		100, 50, 150, now.Add(-30*time.Minute))
+
+	req := httptest.NewRequest("GET", usageURL(org.ID, from, to, "model"), nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	// Decode into a raw map so we can detect the absence of "group_label".
+	var envelope struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(envelope.Data) == 0 {
+		t.Fatal("data is empty, want at least one row")
+	}
+
+	row := envelope.Data[0]
+	if _, hasLabel := row["group_label"]; hasLabel {
+		t.Errorf("group_label must be absent for group_by=model (omitempty), but it is present: %v", row["group_label"])
+	}
+}
+
+// TestGetOrgUsage_GroupByDay_NoGroupLabel verifies that group_by=day data
+// points also do not carry a group_label (omitempty absent in JSON).
+func TestGetOrgUsage_GroupByDay_NoGroupLabel(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestGetOrgUsage_GBDay_NoLabel?mode=memory&cache=private")
+	org := mustCreateOrg(t, database, "Day Label Org", "day-label-org")
+	testKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+	day := time.Date(2024, 4, 1, 12, 0, 0, 0, time.UTC)
+	from := time.Date(2024, 4, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
+	to := time.Date(2024, 4, 1, 23, 59, 59, 0, time.UTC).Format(time.RFC3339)
+
+	insertUsageEventHTTP(t, database, "gl-day-1", "key-day", "", org.ID, "gpt-4",
+		50, 20, 70, day)
+
+	req := httptest.NewRequest("GET", usageURL(org.ID, from, to, "day"), nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	var envelope struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(envelope.Data) == 0 {
+		t.Fatal("data is empty, want at least one row")
+	}
+
+	row := envelope.Data[0]
+	if _, hasLabel := row["group_label"]; hasLabel {
+		t.Errorf("group_label must be absent for group_by=day (omitempty), but present: %v", row["group_label"])
+	}
+}
+
+// TestGetOrgUsage_GroupByKey_UnknownKeyID_NoGroupLabel verifies that when the
+// key_id in usage_events does not exist in api_keys, the data point has no
+// group_label (absent due to omitempty) and the request succeeds.
+func TestGetOrgUsage_GroupByKey_UnknownKeyID_NoGroupLabel(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestGetOrgUsage_GBKey_Unknown?mode=memory&cache=private")
+	org := mustCreateOrg(t, database, "Unknown Key Org", "unknown-key-org")
+	testKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+	now := time.Now().UTC()
+	from := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	to := now.Add(time.Minute).Format(time.RFC3339)
+
+	// Insert event whose key_id does not correspond to any api_keys row.
+	insertUsageEventHTTP(t, database, "gl-unk-1", "nonexistent-key-id", "", org.ID, "gpt-4",
+		100, 50, 150, now.Add(-30*time.Minute))
+
+	req := httptest.NewRequest("GET", usageURL(org.ID, from, to, "key"), nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	var envelope struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(envelope.Data) == 0 {
+		t.Fatal("data is empty, want at least one row")
+	}
+
+	row := envelope.Data[0]
+	// group_key must be the raw ID; group_label must be absent (no entity found).
+	if row["group_key"] != "nonexistent-key-id" {
+		t.Errorf("group_key = %v, want %q", row["group_key"], "nonexistent-key-id")
+	}
+	if _, hasLabel := row["group_label"]; hasLabel {
+		t.Errorf("group_label must be absent when key is unknown, but present: %v", row["group_label"])
+	}
+}

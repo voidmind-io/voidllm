@@ -1,5 +1,5 @@
 # Stage 1: Build UI (arch-independent, runs on build platform)
-FROM --platform=$BUILDPLATFORM node:20-alpine@sha256:42d1d5b07c84257b55d409f4e6e3be3b55d42867afce975a5648a3f231bf7e81 AS ui-builder
+FROM --platform=$BUILDPLATFORM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS ui-builder
 WORKDIR /app/ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm ci
@@ -7,7 +7,7 @@ COPY ui/ ./
 RUN npm run build
 
 # Stage 2: Build Go binary (cross-compiles on build platform)
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:d337ecb3075f0ec76d81652b3fa52af47c3eba6c8ba9f93b835752df7ce62946 AS go-builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:3ad57304ad93bbec8548a0437ad9e06a455660655d9af011d58b993f6f615648 AS go-builder
 ARG TARGETOS
 ARG TARGETARCH
 RUN apk add --no-cache git
@@ -16,14 +16,15 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=ui-builder /app/ui/dist ./ui/dist
-ARG VERSION=0.0.20
+ARG VERSION=0.0.21
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w -X 'github.com/voidmind-io/voidllm/internal/api/health.Version=${VERSION}'" \
     -o /voidllm ./cmd/voidllm
 
 # Stage 3: Runtime
-FROM alpine:3.21@sha256:22e0ec13c0db6b3e1ba3280e831fc50ba7bffe58e81f31670a64b1afede247bc
-RUN apk add --no-cache ca-certificates tzdata \
+FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates tzdata \
     && addgroup -S voidllm && adduser -S -G voidllm voidllm \
     && mkdir -p /data && chown voidllm:voidllm /data
 COPY --from=go-builder /voidllm /usr/local/bin/voidllm

@@ -4,6 +4,7 @@ import { StatCard } from '../components/ui/StatCard'
 import { Banner } from '../components/ui/Banner'
 import { Dialog } from '../components/ui/Dialog'
 import { Button } from '../components/ui/Button'
+import { Markdown } from '../components/ui/Markdown'
 import { AreaChart } from '../components/ui/charts/AreaChart'
 import { DonutChart } from '../components/ui/charts/DonutChart'
 import { HorizontalBar } from '../components/ui/charts/HorizontalBar'
@@ -636,8 +637,8 @@ export default function DashboardPage() {
             You are running {updateInfo.current_version}
           </p>
           {updateInfo.release_notes != null && (
-            <div className="text-sm text-text-secondary whitespace-pre-wrap">
-              {updateInfo.release_notes}
+            <div className="text-sm text-text-secondary">
+              <Markdown>{updateInfo.release_notes}</Markdown>
             </div>
           )}
         </Dialog>

@@ -7,6 +7,7 @@ export interface AuditEvent {
   org_id: string
   actor_id: string
   actor_type: string
+  actor_name?: string
   actor_key_id: string
   action: string
   resource_type: string

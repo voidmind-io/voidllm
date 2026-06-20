@@ -19,6 +19,7 @@ type auditEventResponse struct {
 	OrgID        string `json:"org_id"`
 	ActorID      string `json:"actor_id"`
 	ActorType    string `json:"actor_type"`
+	ActorName    string `json:"actor_name,omitempty"`
 	ActorKeyID   string `json:"actor_key_id"`
 	Action       string `json:"action"`
 	ResourceType string `json:"resource_type"`
@@ -125,17 +126,68 @@ func (h *Handler) ListAuditLogs(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to retrieve audit logs")
 	}
 
+	// Collect actor IDs by type so we can resolve human-readable names in bulk.
+	var userIDs, saIDs []string
+	for _, ev := range result.Events {
+		if ev.ActorID == "" {
+			continue
+		}
+		switch ev.ActorType {
+		case "user":
+			userIDs = append(userIDs, ev.ActorID)
+		case "service_account":
+			saIDs = append(saIDs, ev.ActorID)
+		}
+	}
+
+	// Resolve actor IDs to display labels. system_admin uses an unscoped global
+	// lookup (by design — they can see all orgs). org_admin path is restricted to
+	// actors belonging to their own org to prevent cross-org name disclosure.
+	actorNames := map[string]string{}
+	if auth.HasRole(keyInfo.Role, auth.RoleSystemAdmin) {
+		userNames, err := h.DB.ResolveGroupLabels(c.Context(), "user", userIDs)
+		if err != nil {
+			h.Log.WarnContext(c.Context(), "resolve audit actor names", slog.String("error", err.Error()))
+			userNames = map[string]string{}
+		}
+		saNames, err := h.DB.ResolveGroupLabels(c.Context(), "service_account", saIDs)
+		if err != nil {
+			h.Log.WarnContext(c.Context(), "resolve audit actor names", slog.String("error", err.Error()))
+			saNames = map[string]string{}
+		}
+		for id, name := range userNames {
+			actorNames[id] = name
+		}
+		for id, name := range saNames {
+			actorNames[id] = name
+		}
+	} else {
+		// org_admin: orgID is already forced to keyInfo.OrgID above.
+		resolved, err := h.DB.ResolveOrgActorLabels(c.Context(), orgID, userIDs, saIDs)
+		if err != nil {
+			h.Log.WarnContext(c.Context(), "resolve audit actor names", slog.String("error", err.Error()))
+		} else {
+			actorNames = resolved
+		}
+	}
+
 	resp := auditListResponse{
 		Data:    make([]auditEventResponse, 0, len(result.Events)),
 		HasMore: result.HasMore,
 	}
 	for _, ev := range result.Events {
+		var actorName string
+		switch ev.ActorType {
+		case "user", "service_account":
+			actorName = actorNames[ev.ActorID]
+		}
 		resp.Data = append(resp.Data, auditEventResponse{
 			ID:           ev.ID,
 			Timestamp:    ev.Timestamp.UTC().Format(time.RFC3339),
 			OrgID:        ev.OrgID,
 			ActorID:      ev.ActorID,
 			ActorType:    ev.ActorType,
+			ActorName:    actorName,
 			ActorKeyID:   ev.ActorKeyID,
 			Action:       ev.Action,
 			ResourceType: ev.ResourceType,

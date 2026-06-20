@@ -8,7 +8,7 @@ import { AreaChart, DonutChart, HorizontalBar } from '../../components/ui/charts
 import { useMe } from '../../hooks/useMe'
 import { useUsage, useCrossOrgUsage } from '../../hooks/useUsage'
 import type { UsageDataPoint } from '../../hooks/useUsage'
-import { formatNumber, formatTokens, formatCost } from '../../lib/utils'
+import { formatNumber, formatTokens, formatCost, shortenId } from '../../lib/utils'
 import { exportData } from '../../lib/export'
 
 const TIME_RANGES = ['24h', '7d', '30d', '90d'] as const
@@ -56,9 +56,17 @@ function buildColumns(groupBy: string): Column<UsageDataPoint>[] {
     {
       key: 'group_key',
       header: GROUP_BY_HEADERS[groupBy] ?? 'Group',
-      render: (row) => (
-        <span className="font-mono text-text-primary">{row.group_key}</span>
-      ),
+      render: (row) =>
+        row.group_label ? (
+          <span className="flex items-center gap-2">
+            <span className="text-text-primary">{row.group_label}</span>
+            <span className="font-mono text-xs text-text-tertiary" title={row.group_key}>
+              {shortenId(row.group_key)}
+            </span>
+          </span>
+        ) : (
+          <span className="font-mono text-text-primary">{row.group_key}</span>
+        ),
     },
     {
       key: 'total_requests',
@@ -113,6 +121,7 @@ function buildColumns(groupBy: string): Column<UsageDataPoint>[] {
 
 const USAGE_EXPORT_HEADERS = [
   { key: 'group_key', label: 'Group' },
+  { key: 'group_label', label: 'Name' },
   { key: 'total_requests', label: 'Requests' },
   { key: 'prompt_tokens', label: 'Prompt Tokens' },
   { key: 'completion_tokens', label: 'Completion Tokens' },
@@ -385,7 +394,7 @@ export default function LLMUsagePage() {
           <h3 className="text-sm font-semibold text-text-primary mb-4">Top by Tokens</h3>
           <HorizontalBar
             items={top5.map((d) => ({
-              label: d.group_key,
+              label: d.group_label || d.group_key,
               value: d.total_tokens,
               detail: formatTokens(d.total_tokens),
             }))}

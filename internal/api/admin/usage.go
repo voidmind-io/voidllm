@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"log/slog"
 	"time"
 
@@ -22,6 +23,7 @@ type usageResponse struct {
 // usageDataPoint holds aggregated metrics for one group within a usage response.
 type usageDataPoint struct {
 	GroupKey         string  `json:"group_key,omitempty"`
+	GroupLabel       string  `json:"group_label,omitempty"`
 	TotalRequests    int64   `json:"total_requests"`
 	PromptTokens     int64   `json:"prompt_tokens"`
 	CompletionTokens int64   `json:"completion_tokens"`
@@ -145,6 +147,7 @@ func aggregatesToDataPoints(aggs []db.UsageAggregate) []usageDataPoint {
 	for i, a := range aggs {
 		data[i] = usageDataPoint{
 			GroupKey:         a.GroupKey,
+			GroupLabel:       a.GroupLabel,
 			TotalRequests:    a.TotalRequests,
 			PromptTokens:     a.PromptTokens,
 			CompletionTokens: a.CompletionTokens,
@@ -154,6 +157,38 @@ func aggregatesToDataPoints(aggs []db.UsageAggregate) []usageDataPoint {
 		}
 	}
 	return data
+}
+
+// enrichGroupLabels resolves entity IDs in the aggregates to human-readable
+// labels for key/user/team/org groupings, mutating each aggregate's GroupLabel
+// in place. Resolution failure is non-fatal: it logs a warning and leaves
+// labels empty so the response still returns the raw group keys.
+//
+// ResolveGroupLabels is intentionally unscoped (no org filter). This is safe
+// because the group-key IDs come from usage rows the proxy wrote with org-scoped
+// key context — a user/key/team ID present in an org's usage necessarily belongs
+// to that org. Resolving its display name (including soft-deleted entities, for
+// historical reporting) does not cross tenant boundaries under normal operation.
+func (h *Handler) enrichGroupLabels(ctx context.Context, groupBy string, aggs []db.UsageAggregate) {
+	ids := make([]string, 0, len(aggs))
+	for _, a := range aggs {
+		ids = append(ids, a.GroupKey)
+	}
+
+	labels, err := h.DB.ResolveGroupLabels(ctx, groupBy, ids)
+	if err != nil {
+		h.Log.WarnContext(ctx, "resolve usage group labels",
+			slog.String("group_by", groupBy),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
+	for i := range aggs {
+		if label, ok := labels[aggs[i].GroupKey]; ok {
+			aggs[i].GroupLabel = label
+		}
+	}
 }
 
 // GetOrgUsage handles GET /api/v1/orgs/:org_id/usage.
@@ -198,6 +233,8 @@ func (h *Handler) GetOrgUsage(c fiber.Ctx) error {
 		)
 		return apierror.InternalError(c, "failed to retrieve usage data")
 	}
+
+	h.enrichGroupLabels(c.Context(), groupBy, aggregates)
 
 	return c.JSON(usageResponse{
 		OrgID:   orgID,
@@ -249,6 +286,8 @@ func (h *Handler) SystemAdminUsage(c fiber.Ctx) error {
 		)
 		return apierror.InternalError(c, "failed to retrieve usage data")
 	}
+
+	h.enrichGroupLabels(c.Context(), groupBy, aggregates)
 
 	return c.JSON(usageResponse{
 		From:    from.UTC().Format(time.RFC3339),
@@ -308,6 +347,8 @@ func (h *Handler) MyUsage(c fiber.Ctx) error {
 		)
 		return apierror.InternalError(c, "failed to retrieve usage data")
 	}
+
+	h.enrichGroupLabels(c.Context(), groupBy, aggregates)
 
 	return c.JSON(usageResponse{
 		OrgID:   keyInfo.OrgID,
