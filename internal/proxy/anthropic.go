@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
@@ -14,8 +15,9 @@ import (
 // maxAnthropicToolBlocks is the adapter-level cap on the number of distinct
 // tool_use content blocks that may appear in a single stream. Streams that
 // exceed this limit have excess blocks silently dropped (the event returns nil).
-// This is a defense-in-depth DoS cap independent of any PII pipeline limits.
-const maxAnthropicToolBlocks = 1024
+// This is a defense-in-depth DoS cap independent of any PII pipeline limits,
+// aligned with maxToolCallsPerChoice=64 in the PII Stage 0c StreamRestorer.
+const maxAnthropicToolBlocks = 64
 
 // anthropicToolIDRe is the conservative charset used for tool ids and function
 // names forwarded to or received from Anthropic. Ids and names must match this
@@ -32,6 +34,7 @@ var anthropicToolIDRe = regexp.MustCompile(`^[A-Za-z0-9_.+\-]+$`)
 // requests because TransformStreamLine tracks per-stream state.
 type AnthropicAdapter struct {
 	msgID        string // populated by the first message_start event in a stream
+	modelName    string // stored from TransformRequest for use in TransformResponse
 	inputTokens  int    // accumulated from message_start usage
 	outputTokens int    // accumulated from message_delta usage
 
@@ -253,6 +256,14 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 		return nil, fmt.Errorf("anthropic transform request: unmarshal body: %w", err)
 	}
 
+	// Capture the model name for use in TransformResponse synthesis.
+	if raw, ok := doc["model"]; ok {
+		var name string
+		if err := jsonx.Unmarshal(raw, &name); err == nil {
+			a.modelName = name
+		}
+	}
+
 	// Collect declared tool names for tool_choice validation.
 	var declaredToolNames []string
 
@@ -397,7 +408,7 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 								Type string `json:"type"`
 								Text string `json:"text"`
 							}
-							var blocks []anthropicTextBlock
+							blocks := make([]anthropicTextBlock, 0, len(parts))
 							for _, p := range parts {
 								if p.Type == "text" {
 									blocks = append(blocks, anthropicTextBlock{
@@ -583,6 +594,19 @@ func (a *AnthropicAdapter) TransformResponse(body []byte) ([]byte, error) {
 			if block.Name != "" && !anthropicToolIDRe.MatchString(block.Name) {
 				return nil, errors.New("anthropic transform response: tool_use name contains invalid characters")
 			}
+			// FIX 1 (parity security): reject any tool_use id or name that contains
+			// or matches the PII pseudonym shape. On the non-streaming path,
+			// filter.Restore performs a global string replacement over the whole body;
+			// if a (malicious or compromised) upstream returns an id or name that
+			// matches a pseudonym in this request's reverse map, Restore would replace
+			// it with the real PII value and the client would see PII in
+			// tool_calls[].id or tool_calls[].function.name.
+			if isForwardedPseudonym(block.ID) {
+				return nil, errors.New("anthropic transform response: tool_use id rejected")
+			}
+			if isForwardedPseudonym(block.Name) {
+				return nil, errors.New("anthropic transform response: tool_use name rejected")
+			}
 			// FIX 7: if input is present, it must be a JSON object.
 			argsStr, err := serializeInputToArguments(block.Input)
 			if err != nil {
@@ -625,10 +649,21 @@ func (a *AnthropicAdapter) TransformResponse(body []byte) ([]byte, error) {
 		msg.ToolCalls = toolCalls
 	}
 
+	// FIX 2: synthesize id and model locally rather than forwarding upstream
+	// values. The upstream Anthropic id (ar.ID) and model (ar.Model) are
+	// forwarded strings that pass through filter.Restore; if a malicious or
+	// compromised upstream echoed a PII pseudonym into these fields, Restore
+	// would substitute real PII into a structural client field. Using a proxy-
+	// generated id (timestamp-based) and the client-requested model name
+	// (captured from TransformRequest) prevents this leak.
+	respModel := a.modelName
+	if respModel == "" {
+		respModel = "claude"
+	}
 	resp := openAIResponse{
-		ID:     ar.ID,
+		ID:     fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
 		Object: "chat.completion",
-		Model:  ar.Model,
+		Model:  respModel,
 		Choices: []openAIChoice{
 			{
 				Index:        0,
@@ -972,18 +1007,18 @@ func translateToolChoice(raw jsonx.RawMessage, declaredNames []string) (*anthrop
 	if !anthropicToolIDRe.MatchString(obj.Function.Name) {
 		return nil, errors.New("tool_choice function name contains invalid characters")
 	}
-	// FIX 6: named tool_choice must reference a declared tool.
-	if len(declaredNames) > 0 {
-		found := false
-		for _, n := range declaredNames {
-			if n == obj.Function.Name {
-				found = true
-				break
-			}
+	// FIX 4: a named tool_choice MUST reference a declared tool unconditionally.
+	// If there are no declared tools at all, or the name is not among them,
+	// fail-closed. A named tool_choice with no tools array is a protocol error.
+	found := false
+	for _, n := range declaredNames {
+		if n == obj.Function.Name {
+			found = true
+			break
 		}
-		if !found {
-			return nil, errors.New("tool_choice references undeclared tool")
-		}
+	}
+	if !found {
+		return nil, errors.New("tool_choice references undeclared tool")
 	}
 	return &anthropicToolChoice{Type: "tool", Name: obj.Function.Name}, nil
 }

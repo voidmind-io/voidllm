@@ -490,9 +490,11 @@ func TestAnthropicTransformResponse(t *testing.T) {
 		wantErr        bool
 	}{
 		{
-			name:           "basic response maps fields to OpenAI format",
+			// FIX 2: id is synthesized by the proxy (chatcmpl-<timestamp>), not
+			// forwarded from upstream. The upstream id "msg_01abc" must not appear
+			// in the response; the synthesized id must start with "chatcmpl-".
+			name:           "basic response maps fields to OpenAI format with synthesized id",
 			inputJSON:      `{"id":"msg_01abc","type":"message","model":"claude-3-5-sonnet-20240620","content":[{"type":"text","text":"Hello there"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`,
-			wantID:         "msg_01abc",
 			wantObject:     "chat.completion",
 			wantContent:    strPtr("Hello there"),
 			wantFinish:     "stop",
@@ -1279,7 +1281,11 @@ func TestAnthropicTransformRequest_ToolResultArrayContent(t *testing.T) {
 		if block.Type != "tool_result" {
 			t.Errorf("type = %q, want tool_result", block.Type)
 		}
-		// Content is an empty array (non-text parts are skipped).
+		// Must be literally "[]", not "null" — a nil Go slice marshals to null,
+		// but we want an explicit empty array for consistency with Gemini adapter.
+		if string(block.Content) == "null" {
+			t.Fatalf("tool_result.content is null; want [] (use make([]T, 0) not var []T)")
+		}
 		var blocks []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
@@ -3525,9 +3531,10 @@ func TestAnthropicStream_ToolUseCharsetValidation(t *testing.T) {
 // ── FIX 2: unconditional charset validation in translateToolChoice ────────────
 
 // TestAnthropicTranslateToolChoice_InvalidNameNoTools verifies that
-// translateToolChoice rejects a named function tool_choice whose name contains
-// invalid characters even when no tools are declared (declaredNames is empty).
-// This is the regression from the original conditional guard.
+// translateToolChoice rejects a named function tool_choice unconditionally when
+// the name is invalid OR when no tools are declared (declaredNames is empty).
+// FIX 4: a named tool_choice must reference a declared tool — if there are no
+// declared tools, or the name is not among them, the result is fail-closed.
 func TestAnthropicTranslateToolChoice_InvalidNameNoTools(t *testing.T) {
 	t.Parallel()
 
@@ -3547,20 +3554,22 @@ func TestAnthropicTranslateToolChoice_InvalidNameNoTools(t *testing.T) {
 			wantErr:       true,
 		},
 		{
-			name:          "valid function name accepted when no tools declared",
+			// FIX 4: a valid name but no declared tools is also fail-closed.
+			// A named tool_choice with no tools array is a protocol error.
+			name:          "valid function name with no declared tools is rejected fail-closed",
 			toolChoiceRaw: `{"type":"function","function":{"name":"valid_fn"}}`,
-			wantErr:       false,
+			wantErr:       true,
 		},
 	}
 
-	// Use no declared tools (empty tools list) so we hit the previously
-	// unchecked code path where declaredNames was empty.
+	// Use no declared tools (empty tools list) so we hit the fail-closed
+	// unconditional check.
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			// Build a request with NO tools array but with tool_choice (unusual but valid
-			// to construct to test the isolated translateToolChoice behavior).
+			// Build a request with NO tools array but with tool_choice (unusual but
+			// valid to construct to test the isolated translateToolChoice behavior).
 			raw := json.RawMessage(tc.toolChoiceRaw)
 			_, err := translateToolChoice(raw, nil)
 			if tc.wantErr && err == nil {
@@ -3701,4 +3710,221 @@ func TestAnthropicBuildTextMessage_NullContent(t *testing.T) {
 			t.Fatal("expected error for numeric content, got nil")
 		}
 	})
+}
+
+// ── FIX 1 (parity security): pseudonym-shaped tool_use id/name rejected ──────
+
+// TestAnthropicTransformResponse_PseudonymToolUse verifies that FIX 1 closes
+// the non-streaming PII leak in the Anthropic adapter's TransformResponse.
+// If a (malicious or compromised) upstream returns a tool_use id or name that
+// contains or matches the canonical PII pseudonym shape, TransformResponse must
+// return a content-free error rather than forwarding the value (where
+// filter.Restore would substitute real PII into the response body).
+func TestAnthropicTransformResponse_PseudonymToolUse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		inputJSON string
+	}{
+		{
+			name: "tool_use id matching canonical pseudonym shape is rejected",
+			// PII_EM_<24hex> is the shape of an email pseudonym (2-char type abbrev = EM).
+			inputJSON: `{"id":"msg_01","type":"message","model":"claude-3","content":[{"type":"tool_use","id":"PII_EM_aabbccddeeff00112233445566","name":"get_weather","input":{"location":"NYC"}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":3}}`,
+		},
+		{
+			name:      "tool_use name matching canonical pseudonym shape is rejected",
+			inputJSON: `{"id":"msg_02","type":"message","model":"claude-3","content":[{"type":"tool_use","id":"toolu_01","name":"PII_PN_aabbccddeeff00112233445566","input":{"q":"x"}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":3}}`,
+		},
+		{
+			name:      "tool_use id containing PII_ substring is rejected",
+			inputJSON: `{"id":"msg_03","type":"message","model":"claude-3","content":[{"type":"tool_use","id":"toolu_PII_something","name":"fn","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":3}}`,
+		},
+		{
+			name:      "tool_use name containing PII_ substring is rejected",
+			inputJSON: `{"id":"msg_04","type":"message","model":"claude-3","content":[{"type":"tool_use","id":"toolu_01","name":"fn_PII_suffix","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":3}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			a := &AnthropicAdapter{}
+			out, err := a.TransformResponse([]byte(tc.inputJSON))
+			if err == nil {
+				t.Fatalf("TransformResponse() = %s, want error for pseudonym-shaped tool_use field", out)
+			}
+			// Error must be content-free: must not echo back the pseudonym value.
+			errStr := err.Error()
+			if strings.Contains(errStr, "PII_EM_") || strings.Contains(errStr, "aabbcc") ||
+				strings.Contains(errStr, "PII_PN_") || strings.Contains(errStr, "PII_something") ||
+				strings.Contains(errStr, "PII_suffix") {
+				t.Errorf("error message leaks pseudonym content: %s", errStr)
+			}
+		})
+	}
+}
+
+// TestAnthropicTransformResponse_LegitToolUse confirms that a legitimate tool_use
+// block (no PII_ prefix in id or name) is not rejected by the pseudonym check.
+func TestAnthropicTransformResponse_LegitToolUse(t *testing.T) {
+	t.Parallel()
+
+	input := `{"id":"msg_01","type":"message","model":"claude-3","content":[{"type":"tool_use","id":"toolu_01","name":"get_weather","input":{"location":"London"}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5}}`
+	a := &AnthropicAdapter{}
+	out, err := a.TransformResponse([]byte(input))
+	if err != nil {
+		t.Fatalf("TransformResponse() error = %v for legitimate tool_use id/name", err)
+	}
+	if out == nil {
+		t.Fatal("TransformResponse() = nil, want non-nil for legitimate tool_use")
+	}
+}
+
+// ── FIX 2: synthesized id/model — upstream values not forwarded ───────────────
+
+// TestAnthropicTransformResponse_SynthesizedIDModel verifies that
+// TransformResponse synthesizes the response id and model locally, rather than
+// forwarding the upstream Anthropic id (which could carry a PII pseudonym that
+// filter.Restore would expand into real PII in a structural client field).
+func TestAnthropicTransformResponse_SynthesizedIDModel(t *testing.T) {
+	t.Parallel()
+
+	t.Run("upstream id is not forwarded to client", func(t *testing.T) {
+		t.Parallel()
+		upstream := `{"id":"msg_UPSTREAM_ID","type":"message","model":"claude-3-opus","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3}}`
+		a := &AnthropicAdapter{}
+		out, err := a.TransformResponse([]byte(upstream))
+		if err != nil {
+			t.Fatalf("TransformResponse() error = %v", err)
+		}
+		var resp openAIResponse
+		if err := json.Unmarshal(out, &resp); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		// The upstream id must not appear verbatim in the response.
+		if resp.ID == "msg_UPSTREAM_ID" {
+			t.Error("upstream id was forwarded verbatim to client; must be synthesized")
+		}
+		// Synthesized id must start with "chatcmpl-".
+		if !strings.HasPrefix(resp.ID, "chatcmpl-") {
+			t.Errorf("synthesized id = %q, want chatcmpl- prefix", resp.ID)
+		}
+	})
+
+	t.Run("upstream model is not forwarded when modelName captured from request", func(t *testing.T) {
+		t.Parallel()
+		upstream := `{"id":"msg_01","type":"message","model":"claude-upstream-model","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+		a := &AnthropicAdapter{}
+		// Simulate TransformRequest having set modelName.
+		a.modelName = "claude-3-sonnet-client-requested"
+		out, err := a.TransformResponse([]byte(upstream))
+		if err != nil {
+			t.Fatalf("TransformResponse() error = %v", err)
+		}
+		var resp openAIResponse
+		if err := json.Unmarshal(out, &resp); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		// Response model must be the client-requested name, not the upstream model.
+		if resp.Model == "claude-upstream-model" {
+			t.Error("upstream model name was forwarded verbatim; must use client-requested model")
+		}
+		if resp.Model != "claude-3-sonnet-client-requested" {
+			t.Errorf("model = %q, want claude-3-sonnet-client-requested", resp.Model)
+		}
+	})
+
+	t.Run("TransformRequest captures model name for response synthesis", func(t *testing.T) {
+		t.Parallel()
+		a := &AnthropicAdapter{}
+		input := `{"model":"my-claude-model","messages":[{"role":"user","content":"hi"}]}`
+		_, err := a.TransformRequest([]byte(input), Model{})
+		if err != nil {
+			t.Fatalf("TransformRequest() error = %v", err)
+		}
+		if a.modelName != "my-claude-model" {
+			t.Errorf("modelName = %q after TransformRequest, want my-claude-model", a.modelName)
+		}
+	})
+
+	t.Run("pseudonym in upstream id does not leak to client", func(t *testing.T) {
+		t.Parallel()
+		// A malicious upstream echoes a PII pseudonym into the id field.
+		// filter.Restore would substitute the real PII if we forwarded it.
+		// The synthesized id must not carry the pseudonym.
+		upstream := `{"id":"PII_EM_aabbccddeeff00112233445566","type":"message","model":"claude-3","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+		a := &AnthropicAdapter{}
+		out, err := a.TransformResponse([]byte(upstream))
+		if err != nil {
+			t.Fatalf("TransformResponse() error = %v", err)
+		}
+		outStr := string(out)
+		// The pseudonym must not appear in the output at all.
+		if strings.Contains(outStr, "PII_EM_aabbccddeeff00112233445566") {
+			t.Errorf("SECURITY: upstream pseudonym-shaped id leaked into response: %s", outStr)
+		}
+	})
+}
+
+// ── FIX 4: named tool_choice with no declared tools ───────────────────────────
+
+// TestAnthropicTransformRequest_Fix4_NamedToolChoiceNoTools verifies that a
+// named tool_choice without any declared tools fails closed unconditionally.
+func TestAnthropicTransformRequest_Fix4_NamedToolChoiceNoTools(t *testing.T) {
+	t.Parallel()
+
+	t.Run("named tool_choice with no tools array returns error", func(t *testing.T) {
+		t.Parallel()
+		// No tools declared, but tool_choice names a function.
+		input := `{"model":"claude-3","messages":[{"role":"user","content":"q"}],"tool_choice":{"type":"function","function":{"name":"get_data"}}}`
+		a := &AnthropicAdapter{}
+		_, err := a.TransformRequest([]byte(input), Model{})
+		if err == nil {
+			t.Fatal("expected error for named tool_choice with no tools declared, got nil")
+		}
+	})
+
+	t.Run("named tool_choice with tools but name not in list returns error", func(t *testing.T) {
+		t.Parallel()
+		input := `{
+			"model":"claude-3",
+			"messages":[{"role":"user","content":"q"}],
+			"tools":[{"type":"function","function":{"name":"fn_a","parameters":{}}}],
+			"tool_choice":{"type":"function","function":{"name":"fn_missing"}}
+		}`
+		a := &AnthropicAdapter{}
+		_, err := a.TransformRequest([]byte(input), Model{})
+		if err == nil {
+			t.Fatal("expected error for named tool_choice referencing undeclared function, got nil")
+		}
+	})
+
+	t.Run("named tool_choice with matching declared tool succeeds", func(t *testing.T) {
+		t.Parallel()
+		input := `{
+			"model":"claude-3",
+			"messages":[{"role":"user","content":"q"}],
+			"tools":[{"type":"function","function":{"name":"get_data","parameters":{}}}],
+			"tool_choice":{"type":"function","function":{"name":"get_data"}}
+		}`
+		a := &AnthropicAdapter{}
+		_, err := a.TransformRequest([]byte(input), Model{})
+		if err != nil {
+			t.Fatalf("unexpected error for valid named tool_choice: %v", err)
+		}
+	})
+}
+
+// ── FIX 5: tool block cap at 64 ───────────────────────────────────────────────
+
+// TestAnthropicToolBlockCap verifies that maxAnthropicToolBlocks is 64, aligned
+// with the PII Stage 0c StreamRestorer's maxToolCallsPerChoice=64.
+func TestAnthropicToolBlockCap(t *testing.T) {
+	t.Parallel()
+
+	if maxAnthropicToolBlocks != 64 {
+		t.Errorf("maxAnthropicToolBlocks = %d, want 64 (must match Stage 0c maxToolCallsPerChoice)", maxAnthropicToolBlocks)
+	}
 }
