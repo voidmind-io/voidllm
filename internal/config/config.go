@@ -468,6 +468,65 @@ type PIIPatternConfig struct {
 	Regexp string `yaml:"regexp"`
 }
 
+// PIIGazetteerTermConfig defines a set of inline operator-supplied terms for a
+// single PII type to detect via the gazetteer detector.
+type PIIGazetteerTermConfig struct {
+	// Type is the PII category label to assign to matched terms (e.g. "ORG").
+	// Must not be empty.
+	Type string `yaml:"type"`
+	// Values is the list of exact terms to match.
+	Values []string `yaml:"values"`
+}
+
+// PIIGazetteerOptionsConfig controls matching behaviour of the gazetteer detector.
+type PIIGazetteerOptionsConfig struct {
+	// CaseInsensitive folds case before matching. Defaults to true.
+	// A pointer is used so that an explicit "false" in YAML can be
+	// distinguished from the zero value (allowing the default of true to
+	// be applied by setDefaults).
+	CaseInsensitive *bool `yaml:"case_insensitive"`
+}
+
+// PIIGazetteerConfig controls the gazetteer-based PII detector. It is an
+// opt-in subsystem within pii: the outer pii.enabled flag must also be true
+// for any detection to occur.
+type PIIGazetteerConfig struct {
+	// Enabled activates the gazetteer detector. Defaults to false (opt-in).
+	// A pointer is used so that an explicit "enabled: false" can be
+	// distinguished from the zero value after unmarshalling.
+	Enabled *bool `yaml:"enabled"`
+	// Packs is the list of embedded pack names to load (e.g. "company-forms",
+	// "de-cities"). Unknown names cause a startup error.
+	Packs []string `yaml:"packs"`
+	// Dirs is a list of directory paths. Every *.txt file in each directory
+	// is loaded as a gazetteer file (same format as embedded packs). A
+	// nonexistent directory causes a startup error.
+	Dirs []string `yaml:"dirs"`
+	// Terms is a list of inline operator-supplied term sets. Empty type causes
+	// a startup error.
+	Terms []PIIGazetteerTermConfig `yaml:"terms"`
+	// Options controls matching behaviour.
+	Options PIIGazetteerOptionsConfig `yaml:"options"`
+}
+
+// IsEnabled returns true only when the gazetteer detector has been explicitly
+// enabled. A nil pointer (field absent from YAML) returns false.
+func (g PIIGazetteerConfig) IsEnabled() bool {
+	if g.Enabled == nil {
+		return false
+	}
+	return *g.Enabled
+}
+
+// IsCaseInsensitive returns whether case-insensitive matching is active.
+// A nil pointer (field absent from YAML) returns true (the default).
+func (o PIIGazetteerOptionsConfig) IsCaseInsensitive() bool {
+	if o.CaseInsensitive == nil {
+		return true
+	}
+	return *o.CaseInsensitive
+}
+
 // PIIConfig controls in-memory PII anonymization of outbound LLM requests.
 // When enabled, PII detected in message content is replaced with
 // deterministic pseudonyms before the request leaves the proxy. The
@@ -485,6 +544,9 @@ type PIIConfig struct {
 	// applied in addition to the built-in defaults. An empty list means
 	// only the built-in patterns are used.
 	Patterns []PIIPatternConfig `yaml:"patterns"`
+	// Gazetteer controls the optional gazetteer-based PII detector. Disabled
+	// by default; set gazetteer.enabled: true to activate.
+	Gazetteer PIIGazetteerConfig `yaml:"gazetteer"`
 }
 
 // IsEnabled returns true only when PII anonymization has been explicitly
@@ -866,6 +928,17 @@ func (c *Config) setDefaults() {
 	}
 	if c.Settings.PII.Action == "" {
 		c.Settings.PII.Action = "pseudonymize"
+	}
+
+	// PII gazetteer — disabled by default (opt-in).
+	if c.Settings.PII.Gazetteer.Enabled == nil {
+		disabled := false
+		c.Settings.PII.Gazetteer.Enabled = &disabled
+	}
+	// options.case_insensitive defaults to true (opt-out).
+	if c.Settings.PII.Gazetteer.Options.CaseInsensitive == nil {
+		v := true
+		c.Settings.PII.Gazetteer.Options.CaseInsensitive = &v
 	}
 
 	// Logging

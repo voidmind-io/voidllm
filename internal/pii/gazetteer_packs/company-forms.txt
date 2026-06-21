@@ -1,0 +1,89 @@
+# locale: universal
+# type: ORG
+#
+# Universal legal entity suffixes and company form abbreviations.
+# These are near-zero false-positive identifiers: they appear in natural text
+# only as part of a legal entity name and almost never as standalone words.
+# The list covers the major European and Anglo-Saxon jurisdictions.
+#
+# Germany / Austria / Switzerland
+GmbH
+mbH
+GmbH & Co. KG
+GmbH & Co KG
+AG
+UG
+gUG
+KG
+OHG
+e.V.
+e.K.
+PartG
+PartGmbB
+KGaA
+# European Union
+SE
+SCE
+EWIV
+# United Kingdom / Ireland / Commonwealth
+Ltd
+Ltd.
+Limited
+PLC
+Plc
+LLP
+CIC
+# United States / Canada
+Inc
+Inc.
+LLC
+L.L.C.
+Corp
+Corp.
+Corporation
+LP
+L.P.
+# France
+S.A.S.
+SAS
+SARL
+S.A.R.L.
+S.A.
+SA
+SNC
+# Italy
+S.r.l.
+SRL
+S.p.A.
+SPA
+# Netherlands / Belgium
+B.V.
+BV
+N.V.
+NV
+# Finland
+Oy
+Oyj
+# Sweden
+AB
+# Denmark / Norway
+A/S
+# Australia
+Pty Ltd
+Pty. Ltd.
+# Poland
+Sp. z o.o.
+S.A.
+SA
+# Spain / Portugal
+S.L.
+SL
+S.A.
+# Switzerland
+GmbH
+AG
+# Luxembourg
+S.à r.l.
+# Czech Republic / Slovakia
+s.r.o.
+a.s.

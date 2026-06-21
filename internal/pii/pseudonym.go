@@ -103,10 +103,18 @@ func normalizeValue(typ, value string) string {
 }
 
 // typeAbbrev maps a PII type name to a stable two-character uppercase
-// abbreviation used in the token format. Unknown types fall back to "XX"
-// so that new detector types do not break the token format.
+// abbreviation used in the token format. The returned value is always exactly
+// two characters in [A-Z0-9], which keeps the canonical pseudonym shape
+// (PII_<2 alnum>_<24 hex>) valid regardless of detector type.
+//
+// Known built-in and gazetteer types have fixed codes. For operator-supplied
+// custom types, the first two [A-Za-z0-9] characters of the uppercased type
+// are used; if fewer than two such characters exist, the shortfall is padded
+// using a byte from the FNV-1a hash of the type so distinct types get
+// distinct codes where possible.
 func typeAbbrev(typ string) string {
 	switch typ {
+	// Stage 0 regex types (unchanged).
 	case "EMAIL":
 		return "EM"
 	case "IBAN":
@@ -117,7 +125,67 @@ func typeAbbrev(typ string) string {
 		return "CC"
 	case "TAX_ID":
 		return "TX"
+	// Gazetteer types.
+	case "NAME":
+		return "NM"
+	case "PERSON":
+		return "PN"
+	case "CITY":
+		return "CT"
+	case "LOCATION":
+		return "LO"
+	case "ORG":
+		return "OR"
+	case "COMPANY":
+		return "CO"
 	default:
-		return "XX"
+		return stableAbbrev(typ)
 	}
+}
+
+// stableAbbrev derives a stable two-character [A-Z0-9] abbreviation for an
+// arbitrary PII type string. It takes the first two alphanumeric characters
+// from the uppercased type; if fewer than two are available, it pads using a
+// character derived from the FNV-1a hash of the full type name so that
+// distinct types produce distinct codes where possible.
+func stableAbbrev(typ string) string {
+	upper := strings.ToUpper(typ)
+	var chars [2]byte
+
+	idx := 0
+	for _, r := range upper {
+		if idx >= 2 {
+			break
+		}
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			chars[idx] = byte(r)
+			idx++
+		}
+	}
+
+	if idx < 2 {
+		// Pad with a character derived from FNV-1a so distinct types differ.
+		h := fnv1a(typ)
+		const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+		for ; idx < 2; idx++ {
+			chars[idx] = alphabet[h%uint32(len(alphabet))]
+			h = (h >> 5) | (h << 27) // cheap rotation to get a second character
+		}
+	}
+
+	return string(chars[:])
+}
+
+// fnv1a returns a 32-bit FNV-1a hash of s.
+func fnv1a(s string) uint32 {
+	const (
+		offset uint32 = 2166136261
+		prime  uint32 = 16777619
+	)
+	h := offset
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= prime
+	}
+	return h
 }

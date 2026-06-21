@@ -137,17 +137,29 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 	detect := func(text string) (string, bool, error) {
 		var spans []Span
 		for _, d := range detectors {
-			spans = append(spans, d.Find(text)...)
+			found, err := d.Find(text)
+			if err != nil {
+				return "", false, err
+			}
+			spans = append(spans, found...)
 		}
 		if len(spans) == 0 {
 			return text, false, nil
 		}
 		// Sort and de-overlap merged spans from all detectors.
+		// Primary: Start ascending. Secondary: End descending (longest first).
+		// Tertiary: Type ascending — ensures fully-identical intervals (same
+		// Start and End, different Type) always produce the same winner in
+		// deOverlap regardless of detector ordering or input order, making
+		// multi-turn pseudonym assignment fully deterministic.
 		sort.Slice(spans, func(i, j int) bool {
 			if spans[i].Start != spans[j].Start {
 				return spans[i].Start < spans[j].Start
 			}
-			return spans[i].End > spans[j].End // longest first on tie
+			if spans[i].End != spans[j].End {
+				return spans[i].End > spans[j].End // longest first on tie
+			}
+			return spans[i].Type < spans[j].Type // stable type tie-break
 		})
 		spans = deOverlap(spans)
 		out, touched, err := replaceSpansInText(text, spans, replace)
@@ -740,22 +752,60 @@ func replaceSpansInText(text string, spans []Span, replace func(typ, value strin
 	return b.String(), true, nil
 }
 
-// deOverlap removes overlapping spans from a Start-ascending sorted slice,
-// keeping the leftmost span and discarding any that starts before the
-// previous span ends.
+// deOverlap merges overlapping spans from a Start-ascending sorted slice
+// into their union intervals, guaranteeing that no byte flagged by any
+// detector is left unmasked.
+//
+// Algorithm: maintain an accumulated interval [curStart, curEnd) and the
+// "dominant" span for that interval (the one whose matched text covers the
+// most bytes; ties broken by the span seen first, i.e. leftmost). For each
+// subsequent span, if it overlaps or is adjacent to the accumulated interval,
+// extend the interval to max(curEnd, span.End) and update the dominant type
+// to the longest contributing span. When a span is strictly disjoint, flush
+// the accumulated interval as a single Span and start a new one.
+//
+// The Type of a merged span is taken from the longest contributing span
+// (largest End−Start); on a tie the first-seen (leftmost) span's type is
+// kept. The original text covered by the union is text[curStart:curEnd],
+// which is passed as a single value to replace() so that pseudonymization
+// treats the union as one PII entity and Restore always round-trips the
+// exact union substring.
+//
+// Privacy invariant: every byte in any input Span appears in exactly one
+// output Span — no byte is dropped. The merged output may over-mask the
+// gap bytes between two overlapping spans, which is acceptable: the
+// worst case is slight over-anonymization, never under-anonymization.
 func deOverlap(spans []Span) []Span {
 	if len(spans) == 0 {
 		return spans
 	}
-	result := spans[:1]
-	cursor := spans[0].End
+	result := make([]Span, 0, len(spans))
+
+	cur := spans[0]
+	curLen := cur.End - cur.Start
+
 	for _, s := range spans[1:] {
-		if s.Start < cursor {
+		if s.Start < cur.End {
+			// Overlapping or contained: merge into union.
+			// (s.Start == cur.End would be adjacent but is intentionally left
+			// disjoint; the condition is strictly less-than, not less-or-equal.)
+			if s.End > cur.End {
+				cur.End = s.End
+			}
+			// Prefer the type of the longest contributing span; ties keep cur.
+			sLen := s.End - s.Start
+			if sLen > curLen {
+				cur.Type = s.Type
+				curLen = sLen
+			}
 			continue
 		}
-		result = append(result, s)
-		cursor = s.End
+		// Disjoint: flush the accumulated span.
+		result = append(result, cur)
+		cur = s
+		curLen = cur.End - cur.Start
 	}
+	result = append(result, cur)
 	return result
 }
 

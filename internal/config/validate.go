@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -371,6 +372,41 @@ func (c *Config) validate() error {
 				errs = append(errs, fmt.Errorf("settings.pii.patterns[%d].regexp: must not be empty", i))
 			} else if _, reErr := regexp.Compile(p.Regexp); reErr != nil {
 				errs = append(errs, fmt.Errorf("settings.pii.patterns[%d].regexp: invalid regexp: %w", i, reErr))
+			}
+		}
+	}
+
+	// --- settings.pii.gazetteer ---
+	// Validate gazetteer config when it is enabled, regardless of whether the
+	// outer pii.enabled is set — this catches configuration mistakes early and
+	// lets operators verify pack names without enabling PII globally.
+	if c.Settings.PII.Gazetteer.IsEnabled() {
+		gaz := c.Settings.PII.Gazetteer
+
+		// Validate pack names against the known embedded registry.
+		knownPacks := map[string]bool{
+			"company-forms": true,
+			"de-cities":     true,
+		}
+		for _, packName := range gaz.Packs {
+			if !knownPacks[packName] {
+				errs = append(errs, fmt.Errorf("settings.pii.gazetteer.packs: unknown embedded pack %q", packName))
+			}
+		}
+
+		// Validate operator directories: must exist.
+		for _, dir := range gaz.Dirs {
+			if info, statErr := os.Stat(dir); statErr != nil {
+				errs = append(errs, fmt.Errorf("settings.pii.gazetteer.dirs: %q: %w", dir, statErr))
+			} else if !info.IsDir() {
+				errs = append(errs, fmt.Errorf("settings.pii.gazetteer.dirs: %q is not a directory", dir))
+			}
+		}
+
+		// Validate inline terms.
+		for i, entry := range gaz.Terms {
+			if entry.Type == "" {
+				errs = append(errs, fmt.Errorf("settings.pii.gazetteer.terms[%d].type: must not be empty", i))
 			}
 		}
 	}

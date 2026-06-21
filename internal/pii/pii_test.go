@@ -105,7 +105,10 @@ func TestRegexDetector_DefaultPatterns_Recognition(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			spans := d.Find(tc.text)
+			spans, err := d.Find(tc.text)
+			if err != nil {
+				t.Fatalf("Find(%q): unexpected error: %v", tc.text, err)
+			}
 			if len(spans) == 0 {
 				t.Fatalf("Find(%q): no spans, want at least one", tc.text)
 			}
@@ -134,7 +137,10 @@ func TestRegexDetector_NoMatchInCleanText(t *testing.T) {
 	}
 
 	text := "the quick brown fox jumps over the lazy dog"
-	spans := d.Find(text)
+	spans, err := d.Find(text)
+	if err != nil {
+		t.Fatalf("Find(%q): unexpected error: %v", text, err)
+	}
 	if len(spans) != 0 {
 		t.Errorf("Find(%q) = %+v, want no spans", text, spans)
 	}
@@ -152,7 +158,10 @@ func TestRegexDetector_NonOverlappingSpans(t *testing.T) {
 	}
 
 	text := "send to alice@example.com and bob@example.com today"
-	spans := d.Find(text)
+	spans, err := d.Find(text)
+	if err != nil {
+		t.Fatalf("Find(%q): unexpected error: %v", text, err)
+	}
 	if len(spans) != 2 {
 		t.Fatalf("Find(%q) = %+v, want 2 non-overlapping spans", text, spans)
 	}
@@ -999,13 +1008,25 @@ func TestTypeAbbrev(t *testing.T) {
 		typ  string
 		want string
 	}{
+		// Built-in Stage 0 regex types — fixed codes, unchanged.
 		{"EMAIL", "EM"},
 		{"IBAN", "IB"},
 		{"PHONE", "PH"},
 		{"CREDIT_CARD", "CC"},
 		{"TAX_ID", "TX"},
-		{"UNKNOWN_TYPE", "XX"},
-		{"", "XX"},
+		// Stage 1a gazetteer types — fixed codes.
+		{"NAME", "NM"},
+		{"PERSON", "PN"},
+		{"CITY", "CT"},
+		{"LOCATION", "LO"},
+		{"ORG", "OR"},
+		{"COMPANY", "CO"},
+		// Operator custom types — stable derivation from first two alnum chars of
+		// the uppercased type. The result is always 2 chars in [A-Z0-9].
+		{"UNKNOWN_TYPE", "UN"},
+		// Empty type: no alnum chars → derived from FNV-1a hash. The exact value
+		// is stable (deterministic hash), verified here as a regression anchor.
+		{"", string(stableAbbrev(""))},
 	}
 
 	for _, tc := range tests {
@@ -1063,17 +1084,26 @@ func TestReplaceSpansInText_Substitution(t *testing.T) {
 func TestDeOverlap(t *testing.T) {
 	t.Parallel()
 
+	// FIX 1: deOverlap now merges overlapping spans into their union instead
+	// of dropping later-starting spans. This prevents a short gazetteer span
+	// from suppressing a longer regex PII span (the phone-number regression).
+	//
+	// Scenario: A=[0,10) type A, B=[5,15) type B overlap; C=[15,20) is disjoint.
+	// Union of A and B is [0,15). Type is A (both have length 10, first wins).
+	// C passes through unchanged. Result: 2 spans: [0,15)/"A", [15,20)/"C".
 	spans := []Span{
 		{Start: 0, End: 10, Type: "A"},
-		{Start: 5, End: 15, Type: "B"},  // overlaps A
-		{Start: 15, End: 20, Type: "C"}, // non-overlapping
+		{Start: 5, End: 15, Type: "B"},  // overlaps A → merged into union
+		{Start: 15, End: 20, Type: "C"}, // non-overlapping, passes through
 	}
 	result := deOverlap(spans)
 	if len(result) != 2 {
 		t.Fatalf("deOverlap: got %d spans, want 2: %+v", len(result), result)
 	}
-	if result[0] != spans[0] {
-		t.Errorf("result[0] = %+v, want %+v", result[0], spans[0])
+	// The union of A and B spans [0,15); type is "A" (tie → first-seen wins).
+	wantUnion := Span{Start: 0, End: 15, Type: "A"}
+	if result[0] != wantUnion {
+		t.Errorf("result[0] = %+v, want %+v (union of overlapping spans)", result[0], wantUnion)
 	}
 	if result[1] != spans[2] {
 		t.Errorf("result[1] = %+v, want %+v", result[1], spans[2])

@@ -1511,10 +1511,29 @@ func buildPIIEngine(encKey []byte, cfg config.PIIConfig, log *slog.Logger) (*pii
 		return nil, fmt.Errorf("compile detector patterns: %w", err)
 	}
 
+	detectors := []pii.Detector{detector}
+
+	// When the gazetteer sub-system is also enabled, build and append it.
+	// The gazetteer detector is built at startup and adds zero overhead when
+	// disabled (it is simply not constructed and not appended to the slice).
+	if cfg.Gazetteer.IsEnabled() {
+		gazDetector, gazErr := pii.LoadGazetteerDetector(cfg.Gazetteer)
+		if gazErr != nil {
+			return nil, fmt.Errorf("build gazetteer detector: %w", gazErr)
+		}
+		detectors = append(detectors, gazDetector)
+		log.LogAttrs(context.Background(), slog.LevelInfo,
+			"pii gazetteer detector enabled",
+			slog.Int("packs", len(cfg.Gazetteer.Packs)),
+			slog.Int("dirs", len(cfg.Gazetteer.Dirs)),
+			slog.Int("inline_term_groups", len(cfg.Gazetteer.Terms)),
+		)
+	}
+
 	log.LogAttrs(context.Background(), slog.LevelInfo,
 		"pii anonymization enabled",
 		slog.Int("builtin_patterns", len(pii.DefaultPatterns())),
 		slog.Int("custom_patterns", len(cfg.Patterns)),
 	)
-	return pii.NewEngine(piiSecret, []pii.Detector{detector}), nil
+	return pii.NewEngine(piiSecret, detectors), nil
 }
