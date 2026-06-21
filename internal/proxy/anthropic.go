@@ -703,31 +703,31 @@ func (a *AnthropicAdapter) TransformResponse(body []byte) ([]byte, error) {
 //     carrying index and function.arguments:<partial_json>.
 //
 // FIX 4: the total number of distinct tool_use blocks is capped at
-// maxAnthropicToolBlocks. Blocks beyond the cap are dropped (nil returned).
-// Negative or oversized content-block indices are also rejected (nil returned).
+// maxAnthropicToolBlocks. Blocks beyond the cap abort the stream
+// (errStreamTransformAborted) rather than silently dropping a tool call.
+// Negative content-block indices are also rejected with abort.
 //
 // FIX 8: a duplicate content_block_start for an already-seen content-block
-// index is dropped (nil returned) rather than overwriting the mapping.
-// Residual: TransformStreamLine cannot signal a hard abort because it returns
-// []byte only; a malformed upstream tool stream may silently drop an affected
-// tool call. This is a correctness limitation, not a PII leak, tracked as a
-// follow-up (adapter abort-signal requires an interface change).
-func (a *AnthropicAdapter) TransformStreamLine(line []byte) []byte {
+// index aborts the stream (errStreamTransformAborted) rather than silently
+// overwriting or dropping the mapping. A duplicate indicates a malformed
+// upstream stream and the fail-closed signal lets the handler emit a
+// content-free error event instead of continuing with inconsistent state.
+func (a *AnthropicAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 	s := string(line)
 
 	// Blank line — SSE event delimiter, pass through.
 	if s == "" {
-		return line
+		return [][]byte{line}, nil
 	}
 
 	// Drop Anthropic event-type lines; OpenAI does not use them.
 	if strings.HasPrefix(s, "event:") {
-		return nil
+		return nil, nil
 	}
 
 	const dataPrefix = "data: "
 	if !strings.HasPrefix(s, dataPrefix) {
-		return line
+		return [][]byte{line}, nil
 	}
 
 	payload := []byte(s[len(dataPrefix):])
@@ -735,7 +735,7 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) []byte {
 	var event map[string]jsonx.RawMessage
 	if err := jsonx.Unmarshal(payload, &event); err != nil {
 		// Not valid JSON — pass through unchanged so the client can observe it.
-		return line
+		return [][]byte{line}, nil
 	}
 
 	var eventType string
@@ -764,7 +764,7 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) []byte {
 			a.msgID = "chatcmpl-proxy"
 		}
 		chunk := a.buildChunk(openAIChunkDelta{Role: "assistant"}, nil)
-		return appendDataPrefix(chunk)
+		return [][]byte{appendDataPrefix(chunk)}, nil
 
 	case "content_block_start":
 		// Only tool_use blocks produce output at this stage; text content_block_start
@@ -778,37 +778,36 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) []byte {
 			} `json:"content_block"`
 		}
 		if err := jsonx.Unmarshal(payload, &cbs); err != nil {
-			return nil
+			// Unparseable content_block_start — abort; we cannot track block state.
+			return nil, errStreamTransformAborted
 		}
 		if cbs.ContentBlock.Type != "tool_use" {
-			return nil
+			return nil, nil
 		}
 
-		// FIX 4: reject negative content-block indices.
+		// FIX 4: reject negative content-block indices — abort fail-closed.
 		if cbs.Index < 0 {
-			return nil
+			return nil, errStreamTransformAborted
 		}
-		// FIX 4: cap the total number of distinct tool_use blocks.
+		// FIX 4: cap the total number of distinct tool_use blocks — abort.
 		if a.toolCallCounter >= maxAnthropicToolBlocks {
-			return nil
+			return nil, errStreamTransformAborted
 		}
 
-		// FIX 8: reject duplicate content-block indices (do not overwrite).
+		// FIX 8: duplicate content-block index — abort (stream state is corrupt).
 		if a.blockToToolCall != nil {
 			if _, exists := a.blockToToolCall[cbs.Index]; exists {
-				// Duplicate — drop silently. See residual note in TransformStreamLine doc.
-				return nil
+				return nil, errStreamTransformAborted
 			}
 		}
 
 		// FIX 1 (streaming): charset-validate tool_use id and name before registering
-		// the block. Invalid values may carry PII pseudonyms; drop the block (nil)
-		// rather than forwarding it, consistent with other streaming drop behavior.
+		// the block. Invalid values may carry PII pseudonyms; abort fail-closed.
 		if cbs.ContentBlock.ID != "" && !anthropicToolIDRe.MatchString(cbs.ContentBlock.ID) {
-			return nil
+			return nil, errStreamTransformAborted
 		}
 		if cbs.ContentBlock.Name != "" && !anthropicToolIDRe.MatchString(cbs.ContentBlock.Name) {
-			return nil
+			return nil, errStreamTransformAborted
 		}
 
 		// Assign the next tool-call index to this content-block index.
@@ -832,7 +831,7 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) []byte {
 			},
 		}
 		chunk := a.buildChunk(openAIChunkDelta{ToolCalls: []openAIToolCall{tc}}, nil)
-		return appendDataPrefix(chunk)
+		return [][]byte{appendDataPrefix(chunk)}, nil
 
 	case "content_block_delta":
 		var cbd struct {
@@ -844,20 +843,23 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) []byte {
 			} `json:"delta"`
 		}
 		if err := jsonx.Unmarshal(payload, &cbd); err != nil {
-			return nil
+			// Unparseable delta — abort; content may be corrupted or malformed.
+			return nil, errStreamTransformAborted
 		}
 		switch cbd.Delta.Type {
 		case "text_delta":
 			chunk := a.buildChunk(openAIChunkDelta{Content: cbd.Delta.Text}, nil)
-			return appendDataPrefix(chunk)
+			return [][]byte{appendDataPrefix(chunk)}, nil
 		case "input_json_delta":
 			// Look up the tool-call index for this content-block index.
 			if a.blockToToolCall == nil {
-				return nil
+				// input_json_delta before any content_block_start — protocol violation.
+				return nil, errStreamTransformAborted
 			}
 			toolCallIdx, ok := a.blockToToolCall[cbd.Index]
 			if !ok {
-				return nil
+				// Delta references an unknown block index — protocol violation.
+				return nil, errStreamTransformAborted
 			}
 			// Emit arguments fragment delta: index + function.arguments only.
 			tcIdx := toolCallIdx
@@ -868,9 +870,10 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) []byte {
 				},
 			}
 			chunk := a.buildChunk(openAIChunkDelta{ToolCalls: []openAIToolCall{tc}}, nil)
-			return appendDataPrefix(chunk)
+			return [][]byte{appendDataPrefix(chunk)}, nil
 		default:
-			return nil
+			// Unknown delta type — drop silently (no state impact).
+			return nil, nil
 		}
 
 	case "message_delta":
@@ -883,21 +886,22 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) []byte {
 			} `json:"usage"`
 		}
 		if err := jsonx.Unmarshal(payload, &md); err != nil {
-			return nil
+			// Unparseable message_delta — abort; finish_reason would be lost.
+			return nil, errStreamTransformAborted
 		}
 		a.outputTokens = md.Usage.OutputTokens
 		reason := mapStopReason(md.Delta.StopReason)
 		chunk := a.buildChunk(openAIChunkDelta{}, &reason)
-		return appendDataPrefix(chunk)
+		return [][]byte{appendDataPrefix(chunk)}, nil
 
 	case "message_stop":
-		return []byte("data: [DONE]")
+		return [][]byte{[]byte("data: [DONE]")}, nil
 
 	case "ping", "content_block_stop":
-		return nil
+		return nil, nil
 
 	default:
-		return nil
+		return nil, nil
 	}
 }
 

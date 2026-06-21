@@ -972,6 +972,23 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 	return req, upstreamCancel, adapter, nil
 }
 
+// writeStreamAbortEvent writes a single content-free OpenAI-shaped SSE error
+// event to w and flushes. The event carries the provided code as both
+// "type" and "code" so that clients can distinguish abort reasons without any
+// upstream content appearing in the wire format. No trailing [DONE] is emitted;
+// the absence of [DONE] signals to well-behaved clients that the stream did not
+// complete successfully. The function intentionally ignores write errors because
+// by the time it is called the only objective is a best-effort notification —
+// the stream is already being torn down.
+func writeStreamAbortEvent(w *bufio.Writer, code string) {
+	// The message field is a static, content-free string. The code value is
+	// caller-controlled and must always be a static string constant (never
+	// derived from upstream content or user input) to ensure zero-knowledge.
+	msg := "stream aborted"
+	_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":%q,\"code\":%q}}\n\n", msg, code, code)
+	_ = w.Flush()
+}
+
 // handleStreamingResponse sets the SSE response headers and launches the
 // SendStreamWriter goroutine that pipes the upstream event stream to the client.
 // The goroutine owns cancelUpstream, resp.Body.Close, and the trackDone call —
@@ -1084,6 +1101,10 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			// streamAborted is true when a genuine upstream or protocol error
 			// occurred — triggers breaker.RecordFailure().
 			streamAborted := false
+			// adapterAborted is true when the adapter returned errStreamTransformAborted
+			// and the abort event has already been emitted to the client. The
+			// post-loop error-event block must not emit a second event in this case.
+			adapterAborted := false
 			// clientDisconnected is true when a write to the client failed (the
 			// client hung up mid-stream). This is not an upstream fault and must
 			// NOT be recorded as a circuit-breaker failure.
@@ -1147,10 +1168,60 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				}
 
 				if adapter != nil {
-					line = adapter.TransformStreamLine(line)
-					if line == nil {
+					adaptedLines, terr := adapter.TransformStreamLine(line)
+					if terr != nil {
+						p.Log.LogAttrs(context.Background(), slog.LevelWarn,
+							"pii: adapter stream transform error; stream aborted fail-closed")
+						streamAborted = true
+						adapterAborted = true
+						if !clientDisconnected {
+							writeStreamAbortEvent(w, "stream_transform_aborted")
+						}
+						break piiScanLoop
+					}
+					if len(adaptedLines) == 0 {
 						continue // adapter says skip this line
 					}
+					for i, al := range adaptedLines {
+						extractor.observe(al)
+
+						// Inject a blank SSE event separator into the restorer before
+						// each adapter output line after the first. An adapter may return
+						// multiple data: lines from a single upstream line (e.g. Gemini
+						// mixed text+functionCall chunk → text line + tool_calls line).
+						// The StreamRestorer treats a second data: line without a preceding
+						// blank separator as a protocol violation and aborts fail-closed.
+						// Push of an empty slice always returns (nil, false, nil) — no
+						// error handling is needed here.
+						if i > 0 && len(al) > 0 {
+							_, _, _ = restorer.Push([]byte{})
+						}
+
+						// Copy: scanner.Bytes() is reused; al may alias line.
+						alCopy := make([]byte, len(al))
+						copy(alCopy, al)
+
+						outLines, terminal, pushErr := restorer.Push(alCopy)
+						if pushErr != nil {
+							p.Log.LogAttrs(context.Background(), slog.LevelWarn,
+								"pii: incremental stream restore error; stream aborted to prevent pseudonym leak",
+								slog.String("error", pushErr.Error()),
+							)
+							streamAborted = true
+							break piiScanLoop
+						}
+						if len(outLines) > 0 {
+							if !writeSSELines(outLines) {
+								clientDisconnected = true
+								break piiScanLoop
+							}
+						}
+						if terminal {
+							terminalSeen = true
+							break piiScanLoop
+						}
+					}
+					continue
 				}
 				extractor.observe(line)
 
@@ -1204,12 +1275,13 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			// Synthesize a content-free SSE error event when the stream is
 			// aborted by a PII policy violation, scanner error, timeout, or
 			// EOF-without-[DONE] — but NOT after client disconnect (the client
-			// is already gone) and NOT after a write failure (the client is
-			// also gone in that case). The error event is emitted WITHOUT a
+			// is already gone), NOT after a write failure (the client is also
+			// gone), and NOT when the adapter already emitted its own abort
+			// event (adapterAborted). The error event is emitted WITHOUT a
 			// trailing [DONE] so that clients that ignore the error object read
 			// an incomplete stream (correct signal) rather than a successful one.
 			// Never flush carry bytes before or alongside the error event.
-			if !clientDisconnected && streamIncomplete {
+			if !clientDisconnected && !adapterAborted && streamIncomplete {
 				const piiErrorEvent = "data: {\"error\":{\"message\":\"response withheld by PII policy\",\"type\":\"pii_restore_aborted\",\"code\":\"pii_restore_aborted\"}}"
 				_, _ = w.WriteString(piiErrorEvent)
 				_ = w.WriteByte('\n')
@@ -1236,6 +1308,11 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			_ = w.Flush()
 		} else {
 			// Non-buffered path: per-line passthrough with no PII overhead.
+			// plainAborted tracks adapter-abort so the post-loop block can
+			// set streamIncomplete and record a breaker failure consistently
+			// with the PII path.
+			plainAborted := false
+		plainScanLoop:
 			for scanner.Scan() {
 				line := scanner.Bytes()
 				if firstChunk && bytes.HasPrefix(line, []byte("data: ")) {
@@ -1244,11 +1321,57 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 					firstChunk = false
 					metrics.ProxyTTFTSeconds.WithLabelValues(model.Name).Observe(float64(t) / 1000)
 				}
+
 				if adapter != nil {
-					line = adapter.TransformStreamLine(line)
-					if line == nil {
-						continue // adapter says skip this line
+					adaptedLines, terr := adapter.TransformStreamLine(line)
+					if terr != nil {
+						p.Log.LogAttrs(context.Background(), slog.LevelWarn,
+							"streaming: adapter stream transform error; stream aborted fail-closed")
+						plainAborted = true
+						streamIncomplete = true
+						writeStreamAbortEvent(w, "stream_transform_aborted")
+						if breaker != nil {
+							breaker.RecordFailure()
+						}
+						break plainScanLoop
 					}
+					if len(adaptedLines) == 0 {
+						continue plainScanLoop
+					}
+					// Each adapted output line is written as a self-contained SSE
+					// event: the line itself followed by "\n\n" (the SSE event
+					// terminator). Forwarded upstream blank lines (event separators)
+					// are skipped — they are now redundant because every event
+					// self-terminates.
+					//
+					// This model is byte-identical for the normal single-line case:
+					//   upstream: "data:{a}\n" + "\n"
+					//   old:      write "data:{a}\n" then forward blank as "\n"  → "data:{a}\n\n"
+					//   new:      write "data:{a}\n\n", skip blank               → "data:{a}\n\n"
+					//
+					// It also correctly terminates multi-output lines (Gemini
+					// text+functionCall → two lines), [DONE] from a blank-input
+					// adapter transform (Gemini doneSent), and the abort event
+					// injected by writeStreamAbortEvent (which already ends in \n\n).
+					for _, al := range adaptedLines {
+						if len(al) == 0 {
+							// Forwarded upstream blank line is the old event
+							// delimiter — skip it; the preceding event already
+							// self-terminated with \n\n.
+							continue
+						}
+						extractor.observe(al)
+						if _, err := w.Write(al); err != nil {
+							break plainScanLoop
+						}
+						if _, err := w.WriteString("\n\n"); err != nil {
+							break plainScanLoop
+						}
+						if err := w.Flush(); err != nil {
+							break plainScanLoop
+						}
+					}
+					continue plainScanLoop
 				}
 				// Always observe the (possibly transformed) line. Transformed
 				// lines are OpenAI-shaped (Azure passthrough, Anthropic → OpenAI),
@@ -1267,6 +1390,10 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				}
 			}
 			// Check scanner.Err() and record the circuit breaker outcome.
+			// When the adapter already aborted the stream (plainAborted=true),
+			// RecordFailure was already called inside the abort block; do not
+			// record again. A clean scanner exit after adapter abort (scanErr nil)
+			// must NOT be recorded as RecordSuccess.
 			scanErr := scanner.Err()
 			if scanErr != nil {
 				p.Log.LogAttrs(context.Background(), slog.LevelWarn,
@@ -1274,7 +1401,7 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 					slog.String("error", scanErr.Error()),
 				)
 			}
-			if breaker != nil {
+			if breaker != nil && !plainAborted {
 				if scanErr != nil {
 					breaker.RecordFailure()
 				} else {

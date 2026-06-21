@@ -779,7 +779,7 @@ func TestGeminiTransformStreamLine(t *testing.T) {
 			t.Parallel()
 
 			a := &GeminiAdapter{}
-			out := a.TransformStreamLine([]byte(tc.line))
+			out := transformLine1(a, []byte(tc.line))
 
 			if tc.wantNil {
 				if out != nil {
@@ -812,7 +812,7 @@ func TestGeminiTransformStreamLine_DoneSequence(t *testing.T) {
 	a := &GeminiAdapter{}
 
 	// 1. A normal mid-stream delta should produce a chunk without finish_reason.
-	mid := a.TransformStreamLine([]byte(`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"word "}]},"finishReason":""}],"usageMetadata":{}}`))
+	mid := transformLine1(a, []byte(`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"word "}]},"finishReason":""}],"usageMetadata":{}}`))
 	if mid == nil {
 		t.Fatal("mid-stream TransformStreamLine() = nil, want non-nil chunk")
 	}
@@ -822,7 +822,7 @@ func TestGeminiTransformStreamLine_DoneSequence(t *testing.T) {
 	}
 
 	// 2. Terminal chunk with finishReason should emit a chunk with finish_reason.
-	terminal := a.TransformStreamLine([]byte(`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":10,"totalTokenCount":15}}`))
+	terminal := transformLine1(a, []byte(`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":10,"totalTokenCount":15}}`))
 	if terminal == nil {
 		t.Fatal("terminal TransformStreamLine() = nil, want non-nil chunk")
 	}
@@ -835,13 +835,13 @@ func TestGeminiTransformStreamLine_DoneSequence(t *testing.T) {
 	}
 
 	// 3. The blank SSE delimiter immediately after must become data: [DONE].
-	done := a.TransformStreamLine([]byte(""))
+	done := transformLine1(a, []byte(""))
 	if string(done) != "data: [DONE]" {
 		t.Errorf("blank-after-terminal TransformStreamLine() = %q, want %q", done, "data: [DONE]")
 	}
 
 	// 4. The doneSent flag must be cleared so subsequent blank lines pass through normally.
-	afterDone := a.TransformStreamLine([]byte(""))
+	afterDone := transformLine1(a, []byte(""))
 	if string(afterDone) != "" {
 		t.Errorf("second-blank TransformStreamLine() = %q, want empty string", afterDone)
 	}
@@ -855,7 +855,7 @@ func TestGeminiTransformStreamLine_UsageAccumulation(t *testing.T) {
 	a := &GeminiAdapter{}
 
 	// Feed a chunk carrying usage metadata.
-	_ = a.TransformStreamLine([]byte(`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":8,"totalTokenCount":28}}`))
+	transformLineIgnore(a, []byte(`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":8,"totalTokenCount":28}}`))
 
 	usage := a.StreamUsage()
 	if usage.PromptTokens != 20 {
@@ -915,7 +915,7 @@ func TestGeminiStreamUsage(t *testing.T) {
 
 			a := &GeminiAdapter{}
 			for _, line := range tc.lines {
-				_ = a.TransformStreamLine([]byte(line))
+				transformLineIgnore(a, []byte(line))
 			}
 
 			got := a.StreamUsage()
@@ -1445,7 +1445,7 @@ func TestGeminiTransformStreamLine_ToolCalls(t *testing.T) {
 		t.Parallel()
 		line := `data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"location":"NYC"}}}]},"finishReason":"FUNCTION_CALL"}],"usageMetadata":{}}`
 		a := &GeminiAdapter{}
-		out := a.TransformStreamLine([]byte(line))
+		out := transformLine1(a, []byte(line))
 		if out == nil {
 			t.Fatal("TransformStreamLine() = nil, want non-nil for functionCall chunk")
 		}
@@ -1497,7 +1497,7 @@ func TestGeminiTransformStreamLine_ToolCalls(t *testing.T) {
 		// This verifies the content-free-drop fix.
 		line := `data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"fn","args":{}}}]},"finishReason":""}],"usageMetadata":{}}`
 		a := &GeminiAdapter{}
-		out := a.TransformStreamLine([]byte(line))
+		out := transformLine1(a, []byte(line))
 		if out == nil {
 			t.Fatal("TransformStreamLine() = nil for functionCall-only chunk (content-free-drop bug)")
 		}
@@ -1508,7 +1508,7 @@ func TestGeminiTransformStreamLine_ToolCalls(t *testing.T) {
 		a := &GeminiAdapter{}
 
 		line1 := `data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"fn_a","args":{}}}]},"finishReason":""}],"usageMetadata":{}}`
-		out1 := a.TransformStreamLine([]byte(line1))
+		out1 := transformLine1(a, []byte(line1))
 		if out1 == nil {
 			t.Fatal("first chunk: nil")
 		}
@@ -1516,7 +1516,7 @@ func TestGeminiTransformStreamLine_ToolCalls(t *testing.T) {
 		idx1 := *chunk1.Choices[0].Delta.ToolCalls[0].Index
 
 		line2 := `data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"fn_b","args":{}}}]},"finishReason":"FUNCTION_CALL"}],"usageMetadata":{}}`
-		out2 := a.TransformStreamLine([]byte(line2))
+		out2 := transformLine1(a, []byte(line2))
 		if out2 == nil {
 			t.Fatal("second chunk: nil")
 		}
@@ -1536,8 +1536,8 @@ func TestGeminiTransformStreamLine_ToolCalls(t *testing.T) {
 		a := &GeminiAdapter{}
 		// Emit terminal tool-call chunk.
 		line := `data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"fn","args":{}}}]},"finishReason":"FUNCTION_CALL"}],"usageMetadata":{}}`
-		_ = a.TransformStreamLine([]byte(line))
-		done := a.TransformStreamLine([]byte(""))
+		transformLineIgnore(a, []byte(line))
+		done := transformLine1(a, []byte(""))
 		if string(done) != "data: [DONE]" {
 			t.Errorf("blank after terminal = %q, want data: [DONE]", done)
 		}
@@ -2621,7 +2621,7 @@ func TestGeminiTransformStreamLine_ToolCalls_Detailed(t *testing.T) {
 			{"functionCall":{"name":"fn","args":{"k":"v"}}}
 		]},"finishReason":""}],"usageMetadata":{}}`
 		a := &GeminiAdapter{}
-		out := a.TransformStreamLine([]byte(line))
+		out := transformLine1(a, []byte(line))
 		if out == nil {
 			t.Fatal("functionCall-only chunk returned nil (content-free-drop bug)")
 		}
@@ -2640,7 +2640,7 @@ func TestGeminiTransformStreamLine_ToolCalls_Detailed(t *testing.T) {
 			{"functionCall":{"name":"get_weather","args":{"location":"NYC","unit":"celsius"}}}
 		]},"finishReason":"FUNCTION_CALL"}],"usageMetadata":{}}`
 		a := &GeminiAdapter{}
-		out := a.TransformStreamLine([]byte(line))
+		out := transformLine1(a, []byte(line))
 		if out == nil {
 			t.Fatal("functionCall chunk returned nil")
 		}
@@ -2690,7 +2690,7 @@ func TestGeminiTransformStreamLine_ToolCalls_Detailed(t *testing.T) {
 		line1 := `data: {"candidates":[{"content":{"role":"model","parts":[
 			{"functionCall":{"name":"fn_a","args":{}}}
 		]},"finishReason":""}],"usageMetadata":{}}`
-		out1 := a.TransformStreamLine([]byte(line1))
+		out1 := transformLine1(a, []byte(line1))
 		if out1 == nil {
 			t.Fatal("first functionCall chunk returned nil")
 		}
@@ -2698,7 +2698,7 @@ func TestGeminiTransformStreamLine_ToolCalls_Detailed(t *testing.T) {
 		line2 := `data: {"candidates":[{"content":{"role":"model","parts":[
 			{"functionCall":{"name":"fn_b","args":{"x":2}}}
 		]},"finishReason":"FUNCTION_CALL"}],"usageMetadata":{}}`
-		out2 := a.TransformStreamLine([]byte(line2))
+		out2 := transformLine1(a, []byte(line2))
 		if out2 == nil {
 			t.Fatal("second functionCall chunk returned nil")
 		}
@@ -2732,7 +2732,7 @@ func TestGeminiTransformStreamLine_ToolCalls_Detailed(t *testing.T) {
 			{"functionCall":{"name":"fn","args":{}}}
 		]},"finishReason":"FUNCTION_CALL"}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":4,"totalTokenCount":12}}`
 		a := &GeminiAdapter{}
-		out := a.TransformStreamLine([]byte(line))
+		out := transformLine1(a, []byte(line))
 		if out == nil {
 			t.Fatal("terminal functionCall chunk returned nil")
 		}
@@ -2747,7 +2747,7 @@ func TestGeminiTransformStreamLine_ToolCalls_Detailed(t *testing.T) {
 			t.Error("doneSent must be true after terminal functionCall chunk")
 		}
 		// Blank line after terminal chunk must become data: [DONE].
-		done := a.TransformStreamLine([]byte(""))
+		done := transformLine1(a, []byte(""))
 		if string(done) != "data: [DONE]" {
 			t.Errorf("blank-after-terminal = %q, want data: [DONE]", done)
 		}
@@ -2759,7 +2759,7 @@ func TestGeminiTransformStreamLine_ToolCalls_Detailed(t *testing.T) {
 			{"functionCall":{"name":"fn","args":{}}}
 		]},"finishReason":"FUNCTION_CALL"}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":10,"totalTokenCount":30}}`
 		a := &GeminiAdapter{}
-		_ = a.TransformStreamLine([]byte(line))
+		transformLineIgnore(a, []byte(line))
 		usage := a.StreamUsage()
 		if usage.PromptTokens != 20 {
 			t.Errorf("PromptTokens = %d, want 20", usage.PromptTokens)
@@ -2772,7 +2772,7 @@ func TestGeminiTransformStreamLine_ToolCalls_Detailed(t *testing.T) {
 		}
 	})
 
-	t.Run("tool-call counter cap: excess blocks beyond maxGeminiToolBlocks are dropped", func(t *testing.T) {
+	t.Run("tool-call counter cap: first block at cap aborts stream fail-closed", func(t *testing.T) {
 		t.Parallel()
 		a := &GeminiAdapter{}
 		// Prime the counter to one below the cap.
@@ -2782,7 +2782,7 @@ func TestGeminiTransformStreamLine_ToolCalls_Detailed(t *testing.T) {
 		lineAtCap := `data: {"candidates":[{"content":{"role":"model","parts":[
 			{"functionCall":{"name":"fn_last","args":{}}}
 		]},"finishReason":""}],"usageMetadata":{}}`
-		outAtCap := a.TransformStreamLine([]byte(lineAtCap))
+		outAtCap := transformLine1(a, []byte(lineAtCap))
 		if outAtCap == nil {
 			t.Fatal("chunk at cap-1 returned nil, expected to be allowed")
 		}
@@ -2791,34 +2791,28 @@ func TestGeminiTransformStreamLine_ToolCalls_Detailed(t *testing.T) {
 			t.Error("chunk at cap-1 should emit one tool call")
 		}
 
-		// Counter is now at maxGeminiToolBlocks. Next chunk must be dropped.
+		// Counter is now at maxGeminiToolBlocks. Next chunk must abort.
 		lineOverCap := `data: {"candidates":[{"content":{"role":"model","parts":[
 			{"functionCall":{"name":"fn_over","args":{}}}
 		]},"finishReason":""}],"usageMetadata":{}}`
-		outOverCap := a.TransformStreamLine([]byte(lineOverCap))
-		// When all tool call parts are dropped and there is no finishReason, result is nil.
-		if outOverCap != nil {
-			// The cap was not enforced — this is a failure.
-			// (If the chunk has no finishReason and all parts dropped, should be nil.)
-			t.Logf("note: over-cap chunk produced %q (may be empty finish chunk if finishReason present)", outOverCap)
+		_, overErr := a.TransformStreamLine([]byte(lineOverCap))
+		if overErr == nil {
+			t.Error("over-cap chunk: got nil error, want errStreamTransformAborted")
 		}
 	})
 
-	t.Run("invalid function name from upstream in stream is dropped, not panic", func(t *testing.T) {
+	t.Run("invalid function name from upstream aborts stream fail-closed", func(t *testing.T) {
 		t.Parallel()
 		// The model hallucinated a function name with spaces (invalid charset).
-		// The adapter should drop this block silently.
+		// The adapter must abort the stream rather than silently dropping the call.
 		line := `data: {"candidates":[{"content":{"role":"model","parts":[
 			{"functionCall":{"name":"bad name with spaces","args":{}}}
 		]},"finishReason":""}],"usageMetadata":{}}`
 		a := &GeminiAdapter{}
-		// Must not panic.
-		out := a.TransformStreamLine([]byte(line))
-		// When the only part has an invalid name and no finishReason, result is nil.
-		if out != nil {
-			t.Logf("note: invalid-name chunk produced %q (may be finish chunk if finishReason)", out)
+		_, err := a.TransformStreamLine([]byte(line))
+		if err == nil {
+			t.Error("invalid function name: got nil error, want errStreamTransformAborted")
 		}
-		// Counter still incremented past the invalid block.
 	})
 }
 
@@ -2836,7 +2830,7 @@ func TestGeminiTransformStreamLine_FinishReason_ToolCalls(t *testing.T) {
 	]},"finishReason":"FUNCTION_CALL"}],"usageMetadata":{}}`
 
 	a := &GeminiAdapter{}
-	out := a.TransformStreamLine([]byte(line))
+	out := transformLine1(a, []byte(line))
 	if out == nil {
 		t.Fatal("FUNCTION_CALL terminal chunk returned nil")
 	}
@@ -2856,11 +2850,10 @@ func TestGeminiTransformStreamLine_FinishReason_ToolCalls(t *testing.T) {
 	}
 }
 
-// TestGeminiTransformStreamLine_MixedTextAndFunctionCall documents the current
-// behaviour when a single Gemini chunk contains both text and functionCall parts:
-// the implementation emits only the tool-calls chunk, dropping the text.
-// This is noted as a known limitation (Stage-0c cannot handle mixed
-// content+tool_calls in one chunk, and Gemini should not produce this in practice).
+// TestGeminiTransformStreamLine_MixedTextAndFunctionCall verifies that a single
+// Gemini chunk containing both text and functionCall parts emits TWO SSE lines:
+// the text content chunk first, then the tool_calls chunk. Stage 0c processes
+// them as two independent events (content delta followed by tool_calls delta).
 func TestGeminiTransformStreamLine_MixedTextAndFunctionCall(t *testing.T) {
 	t.Parallel()
 
@@ -2871,24 +2864,35 @@ func TestGeminiTransformStreamLine_MixedTextAndFunctionCall(t *testing.T) {
 	]},"finishReason":"FUNCTION_CALL"}],"usageMetadata":{}}`
 
 	a := &GeminiAdapter{}
-	out := a.TransformStreamLine([]byte(line))
-	if out == nil {
-		t.Fatal("mixed text+functionCall chunk returned nil, expected non-nil")
+	outLines, err := a.TransformStreamLine([]byte(line))
+	if err != nil {
+		t.Fatalf("mixed chunk returned error: %v", err)
+	}
+	if len(outLines) != 2 {
+		t.Fatalf("mixed text+functionCall chunk: got %d lines, want 2 (text + tool_calls)", len(outLines))
 	}
 
-	chunk := parseChunk(t, out)
-	// The implementation emits only the tool-calls chunk in the mixed case.
-	// Text is dropped. This is documented behaviour (see comment in TransformStreamLine).
-	if len(chunk.Choices[0].Delta.ToolCalls) == 0 {
-		// If text was emitted instead, also acceptable — just verify non-nil output.
-		t.Logf("mixed chunk produced text delta (not tool_calls); behaviour: %+v", chunk.Choices[0].Delta)
+	// First line must be the text content chunk.
+	textChunk := parseChunk(t, outLines[0])
+	if textChunk.Choices[0].Delta.Content != "Thinking..." {
+		t.Errorf("first line (text): content = %q, want %q", textChunk.Choices[0].Delta.Content, "Thinking...")
 	}
-	// Either way, the output is valid and non-nil.
-	// NOTE: This test explicitly documents that text IS dropped when a mixed
-	// chunk arrives. If the implementation is fixed to emit both, this test
-	// should be updated. Current behaviour: text chunk is built but discarded
-	// (the `_ = out` line in TransformStreamLine), and the tool-calls chunk
-	// is returned instead.
+	if len(textChunk.Choices[0].Delta.ToolCalls) != 0 {
+		t.Error("first line (text): must not contain tool_calls")
+	}
+
+	// Second line must be the tool_calls chunk.
+	toolChunk := parseChunk(t, outLines[1])
+	if len(toolChunk.Choices[0].Delta.ToolCalls) == 0 {
+		t.Error("second line (tool_calls): must contain at least one tool call")
+	}
+	if toolChunk.Choices[0].FinishReason == nil || *toolChunk.Choices[0].FinishReason != "tool_calls" {
+		var got string
+		if toolChunk.Choices[0].FinishReason != nil {
+			got = *toolChunk.Choices[0].FinishReason
+		}
+		t.Errorf("second line (tool_calls): finish_reason = %q, want tool_calls", got)
+	}
 }
 
 // ── geminiSynthesiseToolCallID unit test ─────────────────────────────────────
@@ -3527,7 +3531,7 @@ func TestGeminiTransformStreamLine_FinishReasonPresenceBased(t *testing.T) {
 		// Real Gemini stream: functionCall and finishReason STOP arrive together.
 		line := `data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"NYC"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}`
 		a := &GeminiAdapter{}
-		out := a.TransformStreamLine([]byte(line))
+		out := transformLine1(a, []byte(line))
 		if out == nil {
 			t.Fatal("TransformStreamLine() = nil, want non-nil chunk")
 		}
@@ -3559,7 +3563,7 @@ func TestGeminiTransformStreamLine_FinishReasonPresenceBased(t *testing.T) {
 
 		// Chunk 1: functionCall part without finishReason (sets sawFunctionCall).
 		chunk1 := `data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"fn","args":{}}}]},"finishReason":""}],"usageMetadata":{}}`
-		out1 := a.TransformStreamLine([]byte(chunk1))
+		out1 := transformLine1(a, []byte(chunk1))
 		if out1 == nil {
 			t.Fatal("chunk 1 returned nil")
 		}
@@ -3569,7 +3573,7 @@ func TestGeminiTransformStreamLine_FinishReasonPresenceBased(t *testing.T) {
 
 		// Chunk 2: empty parts with finishReason STOP (finish chunk).
 		chunk2 := `data: {"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}`
-		out2 := a.TransformStreamLine([]byte(chunk2))
+		out2 := transformLine1(a, []byte(chunk2))
 		if out2 == nil {
 			t.Fatal("finish chunk returned nil")
 		}
@@ -3586,7 +3590,7 @@ func TestGeminiTransformStreamLine_FinishReasonPresenceBased(t *testing.T) {
 		t.Parallel()
 		a := &GeminiAdapter{}
 		line := `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"bye"}]},"finishReason":"STOP"}],"usageMetadata":{}}`
-		out := a.TransformStreamLine([]byte(line))
+		out := transformLine1(a, []byte(line))
 		if out == nil {
 			t.Fatal("TransformStreamLine() = nil")
 		}
@@ -3605,7 +3609,7 @@ func TestGeminiTransformStreamLine_FinishReasonPresenceBased(t *testing.T) {
 
 		// Single chunk: functionCall parts + finishReason STOP (real Gemini shape).
 		line := `data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_data","args":{"id":1}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":4,"totalTokenCount":12}}`
-		out := a.TransformStreamLine([]byte(line))
+		out := transformLine1(a, []byte(line))
 		if out == nil {
 			t.Fatal("terminal functionCall chunk returned nil")
 		}
@@ -3627,7 +3631,7 @@ func TestGeminiTransformStreamLine_FinishReasonPresenceBased(t *testing.T) {
 			t.Error("doneSent should be true")
 		}
 		// Blank line converts to [DONE].
-		done := a.TransformStreamLine([]byte(""))
+		done := transformLine1(a, []byte(""))
 		if string(done) != "data: [DONE]" {
 			t.Errorf("blank-after-terminal = %q, want data: [DONE]", done)
 		}

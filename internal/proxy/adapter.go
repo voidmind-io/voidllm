@@ -1,10 +1,17 @@
 package proxy
 
 import (
+	"errors"
 	"net/http"
 	"regexp"
 	"strings"
 )
+
+// errStreamTransformAborted is returned by TransformStreamLine when the
+// adapter detects a protocol violation that requires the stream to be torn
+// down fail-closed. It carries no content or caller values; the handler
+// converts it into a content-free SSE error event for the client.
+var errStreamTransformAborted = errors.New("stream transform aborted")
 
 // forwardedPseudonymRe matches the canonical PII pseudonym shape produced by
 // the PII pipeline: PII_ followed by exactly 2 alphanumeric characters, then
@@ -74,9 +81,22 @@ type Adapter interface {
 	TransformResponse(body []byte) ([]byte, error)
 
 	// TransformStreamLine processes a single line from an upstream SSE stream.
-	// It returns the (possibly rewritten) line to write to the client, or nil
-	// to signal that the line should be silently dropped.
-	TransformStreamLine(line []byte) []byte
+	// It returns zero or more OpenAI-shaped SSE output lines and an error:
+	//
+	//   - (lines, nil): emit the returned lines to the client. A nil or empty
+	//     slice means the upstream line is silently dropped (e.g. a Anthropic
+	//     ping or SSE event-type line that has no OpenAI equivalent).
+	//   - (nil, err): the stream must be aborted fail-closed. The error is a
+	//     sentinel (errStreamTransformAborted) that carries no content or PII;
+	//     it signals that the upstream produced a malformed or protocol-violating
+	//     line that cannot be safely forwarded. The handler tears the stream down
+	//     and emits a content-free error event to the client.
+	//
+	// A single-line result is the common case (one upstream line → one output
+	// line). Multiple output lines arise when a single upstream line must produce
+	// more than one downstream SSE event (e.g. a Gemini chunk that contains both
+	// text content and a functionCall part).
+	TransformStreamLine(line []byte) ([][]byte, error)
 
 	// StreamUsage returns the token counts accumulated during streaming.
 	// It is only meaningful after all TransformStreamLine calls have completed.
