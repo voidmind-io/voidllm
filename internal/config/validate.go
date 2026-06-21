@@ -387,6 +387,7 @@ func (c *Config) validate() error {
 		knownPacks := map[string]bool{
 			"company-forms": true,
 			"de-cities":     true,
+			"de-firstnames": true,
 		}
 		for _, packName := range gaz.Packs {
 			if !knownPacks[packName] {

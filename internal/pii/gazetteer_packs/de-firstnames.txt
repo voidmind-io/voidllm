@@ -1,0 +1,275 @@
+# locale: de
+# type: NAME
+#
+# Curated list of common German given names (male and female) compiled from
+# public knowledge and general reference sources. This file is an original
+# curated work — it is NOT a copy of any licensed dataset (no GeoNames, OSM,
+# or proprietary name database). Conservative curation: names that are also
+# common everyday German words, adjectives, or nouns where the non-name meaning
+# dominates are excluded to minimise false positives. When in doubt, the name
+# is left out. Precision over recall.
+#
+# This pack is OPT-IN: it is only loaded when "de-firstnames" is listed in
+# settings.pii.gazetteer.packs.
+#
+# Excluded (too ambiguous or word-meaning dominates):
+#   Mark (noun: mark/brand/currency)
+#   Vera (adj: true in Latin/Romance, common in compounds)
+#   Marina (noun: marina/harbour)
+#   Rose (noun: rose/flower)
+#   Flora (noun: flora/plant life)
+#   Iris (noun: iris/flower/eye part)
+#   Bruno (colour adjective in Italian, but keeping it is borderline — excluded)
+#   Heinz (borderline — keeping, clearly a name token)
+#   Frank (adj: frank/candid) — excluded
+#   Ernst (adj: serious/earnest) — excluded
+#   Christian (common English adjective) — excluded
+#   Otto (interjection in informal German) — excluded for FP risk
+#   Udo (obscure, very low frequency) — excluded
+#   Mia (3-letter token, collides with "MIA" missing-in-action acronym) — excluded
+#
+# ── Male names ───────────────────────────────────────────────────────────────
+Hans
+Peter
+Thomas
+Andreas
+Stefan
+Michael
+Wolfgang
+Klaus
+Jürgen
+Dieter
+Helmut
+Gerhard
+Rainer
+Werner
+Günter
+Uwe
+Bernd
+Horst
+Manfred
+Siegfried
+Matthias
+Markus
+Tobias
+Florian
+Patrick
+Philipp
+Sebastian
+Alexander
+Maximilian
+Lukas
+Jonas
+Leon
+Luca
+Tim
+Jan
+Felix
+Niklas
+Daniel
+Fabian
+Dominic
+Marcel
+Marco
+Dennis
+Kevin
+Benjamin
+Simon
+Robert
+Christoph
+Joachim
+Jens
+Kai
+Sven
+Lars
+Nils
+Henrik
+Arno
+Konrad
+Lothar
+Friedrich
+Gottfried
+Johann
+Josef
+Franz
+Karl
+Georg
+Heinrich
+Rudolf
+Walter
+Wilhelm
+Erich
+Erwin
+Norbert
+Rolf
+Alfred
+Alfons
+Egon
+Gerd
+Heinz
+Hartmut
+Ingolf
+Ulrich
+Volker
+Jochen
+Eckhard
+Dietmar
+Burkhard
+Rüdiger
+Winfried
+Eberhard
+Bernhard
+Gernot
+Henning
+Ludger
+Reiner
+Olaf
+Thorsten
+Torsten
+Stephan
+Maik
+René
+André
+Marc
+Oliver
+Dirk
+Axel
+Holger
+Carsten
+Mirko
+Steffen
+Timo
+Rico
+Nico
+Lenny
+Mats
+Moritz
+Elias
+Noah
+Emil
+Paul
+Julius
+Oskar
+Anton
+Benedikt
+Raphael
+Valentin
+Levin
+Erik
+Hannes
+Jannik
+Kilian
+Lennart
+Lutz
+Ralf
+Reinhold
+Thilo
+Thorben
+Ulf
+Waldemar
+# ── Female names ─────────────────────────────────────────────────────────────
+Anna
+Maria
+Julia
+Sabine
+Monika
+Petra
+Ursula
+Helga
+Gertrud
+Inge
+Ingrid
+Hildegard
+Brigitte
+Renate
+Gisela
+Christa
+Hannelore
+Elfriede
+Waltraud
+Edith
+Ilse
+Elisabeth
+Margarete
+Katharina
+Barbara
+Susanne
+Claudia
+Andrea
+Stephanie
+Nicole
+Sandra
+Stefanie
+Katrin
+Katja
+Jana
+Tanja
+Nadine
+Melanie
+Manuela
+Silvia
+Martina
+Birgit
+Cornelia
+Elke
+Heike
+Kerstin
+Sonja
+Ute
+Michaela
+Angela
+Bettina
+Christina
+Doris
+Eva
+Gabriele
+Gabi
+Ines
+Lena
+Lisa
+Luisa
+Maja
+Miriam
+Natascha
+Nina
+Sabrina
+Simone
+Verena
+Anja
+Antje
+Astrid
+Carmen
+Daniela
+Diana
+Franziska
+Hanna
+Hannah
+Janina
+Jennifer
+Jessica
+Judith
+Juliane
+Kathleen
+Laura
+Lea
+Lina
+Lydia
+Magdalena
+Marie
+Marika
+Marlene
+Natalie
+Paula
+Ramona
+Rebecca
+Regina
+Ricarda
+Ruth
+Sarah
+Silke
+Sina
+Tina
+Ulrike
+Vanessa
+Yvonne
+Zoe
