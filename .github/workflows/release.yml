@@ -22,7 +22,15 @@ jobs:
 
       - name: Extract version from tag
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # SemVer pre-release tags carry a hyphen (e.g. v0.0.22-beta.1).
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v3
 
@@ -34,6 +42,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image tags
+        id: tags
+        run: |
+          IMG=ghcr.io/voidmind-io/voidllm
+          # Stable releases get the immutable version tag plus :latest.
+          # Pre-releases (v*-beta.N) get the version tag plus a floating :beta,
+          # and NEVER :latest — so users on :latest stay on stable.
+          {
+            echo "tags<<EOF"
+            echo "${IMG}:${{ steps.version.outputs.version }}"
+            if [[ "${{ steps.version.outputs.prerelease }}" == "true" ]]; then
+              echo "${IMG}:beta"
+            else
+              echo "${IMG}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
@@ -42,9 +68,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: VERSION=${{ steps.version.outputs.version }}
-          tags: |
-            ghcr.io/voidmind-io/voidllm:${{ steps.version.outputs.version }}
-            ghcr.io/voidmind-io/voidllm:latest
+          tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=min
 
@@ -111,7 +135,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --generate-notes 2>/dev/null || true
+          # Mark pre-release tags (v*-beta.N) as GitHub pre-releases so they are
+          # not surfaced as the latest stable release. Hand-written notes created
+          # before the tag are preserved (create no-ops via || true, then upload).
+          PRERELEASE=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then PRERELEASE="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" --generate-notes $PRERELEASE 2>/dev/null || true
           gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.zip --clobber
 
   provenance:
