@@ -296,6 +296,7 @@ func isWordBoundary(runes []rune, startRune, endRune int) bool {
 var embeddedPackRegistry = map[string]string{
 	"company-forms": "gazetteer_packs/company-forms.txt",
 	"de-cities":     "gazetteer_packs/de-cities.txt",
+	"de-firstnames": "gazetteer_packs/de-firstnames.txt",
 }
 
 // loadEmbeddedPack loads a Gazetteer from an embedded pack file by name.
