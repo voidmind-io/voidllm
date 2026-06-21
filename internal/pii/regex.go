@@ -60,7 +60,10 @@ func NewRegexDetector(patterns []Pattern) (*RegexDetector, error) {
 // priority; among matches starting at the same position, the longest
 // match wins. This policy is equivalent to scanning the text left-to-right
 // and advancing past each accepted match.
-func (d *RegexDetector) Find(text string) []Span {
+//
+// RegexDetector never returns an error; the error return satisfies the
+// Detector interface and is always nil.
+func (d *RegexDetector) Find(text string) ([]Span, error) {
 	// Collect all raw matches from every pattern.
 	var raw []Span
 	for _, cp := range d.compiled {
@@ -70,7 +73,7 @@ func (d *RegexDetector) Find(text string) []Span {
 		}
 	}
 	if len(raw) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Sort: leftmost first; on tie, longest first (largest End first).
@@ -91,7 +94,7 @@ func (d *RegexDetector) Find(text string) []Span {
 		result = append(result, s)
 		cursor = s.End
 	}
-	return result
+	return result, nil
 }
 
 // DefaultPatterns returns the built-in set of conservative PII detection

@@ -40,11 +40,14 @@ type Span struct {
 // per-request state. All expensive initialisation (regexp compilation,
 // model loading) must happen in the constructor, not in Find.
 type Detector interface {
-	// Find returns all non-overlapping PII spans found in text.
-	// The returned slice may be nil or empty when no PII is detected.
+	// Find returns all non-overlapping PII spans found in text, or a
+	// non-nil error when a safety limit is exceeded. On error the caller
+	// must treat the input as unprocessable and fail closed — partial span
+	// results are never returned alongside an error. The returned slice
+	// may be nil or empty when no PII is detected.
 	// Overlapping matches are resolved according to each implementation's
 	// documented policy (typically: longest match or leftmost wins).
-	Find(text string) []Span
+	Find(text string) ([]Span, error)
 }
 
 // Engine is the shared, request-independent factory for PII filters. It

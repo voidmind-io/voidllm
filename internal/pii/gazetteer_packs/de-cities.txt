@@ -1,0 +1,82 @@
+# locale: de
+# type: CITY
+#
+# Curated set of unambiguous German city names for use as a template pack.
+# Only cities whose names are not common German words are included here to
+# minimise false positives. Avoid common-word cities such as "Essen", "Hof",
+# "Landsberg", "Neustadt", "Bad" (prefix), or "Berg" (suffix component).
+#
+# This pack is intentionally small. Operators should supplement it with their
+# own domain-specific gazetteer files via pii.gazetteer.dirs.
+Düsseldorf
+Dortmund
+Stuttgart
+Hannover
+Nürnberg
+Duisburg
+Bochum
+Wuppertal
+Bielefeld
+Bonn
+Mannheim
+Karlsruhe
+Wiesbaden
+Münster
+Augsburg
+Gelsenkirchen
+Mönchengladbach
+Braunschweig
+Chemnitz
+Kiel
+Aachen
+Magdeburg
+Freiburg im Breisgau
+Krefeld
+Lübeck
+Oberhausen
+Erfurt
+Mainz
+Rostock
+Kassel
+Hagen
+Hamm
+Saarbrücken
+Mülheim an der Ruhr
+Potsdam
+Ludwigshafen am Rhein
+Oldenburg
+Leverkusen
+Osnabrück
+Solingen
+Heidelberg
+Darmstadt
+Regensburg
+Ingolstadt
+Würzburg
+Fürth
+Wolfsburg
+Ulm
+Heilbronn
+Pforzheim
+Göttingen
+Bottrop
+Trier
+Recklinghausen
+Bremerhaven
+Jena
+Remscheid
+Erlangen
+Moers
+Siegen
+Salzgitter
+Gütersloh
+Hildesheim
+Kaiserslautern
+Cottbus
+Gera
+Iserlohn
+Schwerin
+Witten
+Zwickau
+Dessau
+Wilhelmshaven
