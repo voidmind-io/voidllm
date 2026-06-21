@@ -728,13 +728,20 @@ func transformRequest(t *testing.T, input string) map[string]json.RawMessage {
 }
 
 // runStream feeds each event line through a fresh AnthropicAdapter and returns
-// the non-nil outputs and the adapter itself for further inspection.
+// the non-nil outputs and the adapter itself for further inspection. It collects
+// all output lines from each call (multi-line output is flattened).
 func runStream(t *testing.T, a *AnthropicAdapter, events []string) [][]byte {
 	t.Helper()
 	var out [][]byte
 	for _, ev := range events {
-		if b := a.TransformStreamLine([]byte(ev)); b != nil {
-			out = append(out, b)
+		lines, err := a.TransformStreamLine([]byte(ev))
+		if err != nil {
+			t.Fatalf("runStream: TransformStreamLine returned error on %q: %v", ev, err)
+		}
+		for _, b := range lines {
+			if b != nil {
+				out = append(out, b)
+			}
 		}
 	}
 	return out
@@ -1741,10 +1748,10 @@ func TestAnthropicStream_ToolUseHeaderDelta(t *testing.T) {
 
 	a := &AnthropicAdapter{}
 	// Prime the adapter with a message_start to set the ID.
-	_ = a.TransformStreamLine([]byte(`data: {"type":"message_start","message":{"id":"msg_hdr","usage":{"input_tokens":5}}}`))
+	transformLineIgnore(a, []byte(`data: {"type":"message_start","message":{"id":"msg_hdr","usage":{"input_tokens":5}}}`))
 
 	line := `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_hdr","name":"get_data","input":{}}}`
-	out := a.TransformStreamLine([]byte(line))
+	out := transformLine1(a, []byte(line))
 	if out == nil {
 		t.Fatal("content_block_start(tool_use) returned nil, want header delta")
 	}
@@ -1791,10 +1798,10 @@ func TestAnthropicStream_ToolUseHeaderDelta_WireFormat(t *testing.T) {
 	t.Parallel()
 
 	a := &AnthropicAdapter{}
-	_ = a.TransformStreamLine([]byte(`data: {"type":"message_start","message":{"id":"msg_wire","usage":{"input_tokens":2}}}`))
+	transformLineIgnore(a, []byte(`data: {"type":"message_start","message":{"id":"msg_wire","usage":{"input_tokens":2}}}`))
 
 	line := `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_wire","name":"my_fn","input":{}}}`
-	out := a.TransformStreamLine([]byte(line))
+	out := transformLine1(a, []byte(line))
 	if out == nil {
 		t.Fatal("content_block_start(tool_use) returned nil, want header delta")
 	}
@@ -1825,11 +1832,11 @@ func TestAnthropicStream_InputJsonDeltaFragment_WireFormat(t *testing.T) {
 	t.Parallel()
 
 	a := &AnthropicAdapter{}
-	_ = a.TransformStreamLine([]byte(`data: {"type":"message_start","message":{"id":"msg_fwire","usage":{"input_tokens":2}}}`))
-	_ = a.TransformStreamLine([]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_fwire","name":"do_thing","input":{}}}`))
+	transformLineIgnore(a, []byte(`data: {"type":"message_start","message":{"id":"msg_fwire","usage":{"input_tokens":2}}}`))
+	transformLineIgnore(a, []byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_fwire","name":"do_thing","input":{}}}`))
 
 	fragLine := `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"x\":1}"}}`
-	out := a.TransformStreamLine([]byte(fragLine))
+	out := transformLine1(a, []byte(fragLine))
 	if out == nil {
 		t.Fatal("input_json_delta returned nil, want fragment delta")
 	}
@@ -1856,11 +1863,11 @@ func TestAnthropicStream_InputJsonDeltaFragment(t *testing.T) {
 
 	a := &AnthropicAdapter{}
 	// Register block 0 → tool-call 0 by sending a content_block_start first.
-	_ = a.TransformStreamLine([]byte(`data: {"type":"message_start","message":{"id":"msg_frag","usage":{"input_tokens":3}}}`))
-	_ = a.TransformStreamLine([]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_frag","name":"fn","input":{}}}`))
+	transformLineIgnore(a, []byte(`data: {"type":"message_start","message":{"id":"msg_frag","usage":{"input_tokens":3}}}`))
+	transformLineIgnore(a, []byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_frag","name":"fn","input":{}}}`))
 
 	fragLine := `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"x\":1}"}}`
-	out := a.TransformStreamLine([]byte(fragLine))
+	out := transformLine1(a, []byte(fragLine))
 	if out == nil {
 		t.Fatal("input_json_delta returned nil, want fragment delta")
 	}
@@ -1916,7 +1923,7 @@ func TestAnthropicStream_TextBlockThenToolUse_IndexMapping(t *testing.T) {
 	}
 	var results []result
 	for _, ev := range events {
-		out := a.TransformStreamLine([]byte(ev))
+		out := transformLine1(a, []byte(ev))
 		results = append(results, result{out: out, drop: out == nil})
 	}
 
@@ -1999,7 +2006,7 @@ func TestAnthropicStream_TwoToolUseBlocks_IndexMapping(t *testing.T) {
 
 	var chunks []openAIChunk
 	for _, ev := range events {
-		out := a.TransformStreamLine([]byte(ev))
+		out := transformLine1(a, []byte(ev))
 		if out != nil && !strings.HasPrefix(string(out), "data: [DONE]") {
 			chunks = append(chunks, parseChunk(t, out))
 		}
@@ -2096,9 +2103,9 @@ func TestAnthropicStream_TerminalEvents(t *testing.T) {
 
 			a := &AnthropicAdapter{}
 			// Set a known message ID so parseChunk can be used.
-			_ = a.TransformStreamLine([]byte(`data: {"type":"message_start","message":{"id":"msg_term","usage":{"input_tokens":5}}}`))
+			transformLineIgnore(a, []byte(`data: {"type":"message_start","message":{"id":"msg_term","usage":{"input_tokens":5}}}`))
 
-			out := a.TransformStreamLine([]byte(tc.line))
+			out := transformLine1(a, []byte(tc.line))
 
 			if tc.wantNil {
 				if out != nil {
@@ -2293,8 +2300,10 @@ func TestAnthropicTransformStreamLine(t *testing.T) {
 		name string
 		// line is the raw SSE line bytes sent by Anthropic's server.
 		line string
-		// wantNil means the adapter should drop this line.
+		// wantNil means the adapter should silently drop this line (no output, no error).
 		wantNil bool
+		// wantAbort means the adapter should return errStreamTransformAborted.
+		wantAbort bool
 		// wantExact, if non-empty, is the exact byte slice expected (for simple cases).
 		wantExact string
 		// checkFn performs structured assertions on the returned line.
@@ -2450,20 +2459,13 @@ func TestAnthropicTransformStreamLine(t *testing.T) {
 			},
 		},
 		{
-			name: "input_json_delta emits arguments fragment with correct tool-call index",
+			name: "input_json_delta on fresh adapter aborts (no block registered)",
 			line: `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"loc"}}`,
-			checkFn: func(t *testing.T, out []byte) {
-				t.Helper()
-				// This test requires the adapter to have already seen a content_block_start
-				// for index 0. We prime the adapter inline.
-				// NOTE: This test is intended to be called after the adapter has seen the
-				// content_block_start; the standalone test uses a fresh adapter so it will
-				// drop the delta (no known mapping). The intent is verified via the
-				// integration flow test below.
-				// Here we verify that a nil is returned when no block is registered.
-				// That behavior is tested in TestAnthropicStreamToolCallFlow.
-			},
-			wantNil: true, // fresh adapter has no block→toolcall mapping
+			// A fresh adapter has no block→toolcall mapping. An input_json_delta
+			// for an unregistered block index is a protocol violation — abort.
+			// The integration flow (with a primed adapter) is tested in
+			// TestAnthropicStreamToolCallFlow.
+			wantAbort: true,
 		},
 		{
 			name: "message_delta with stop_reason tool_use produces finish_reason tool_calls",
@@ -2490,7 +2492,25 @@ func TestAnthropicTransformStreamLine(t *testing.T) {
 			t.Parallel()
 
 			a := &AnthropicAdapter{}
-			out := a.TransformStreamLine([]byte(tc.line))
+			outLines, err := a.TransformStreamLine([]byte(tc.line))
+
+			if tc.wantAbort {
+				if err == nil {
+					t.Errorf("TransformStreamLine() error = nil, want errStreamTransformAborted")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("TransformStreamLine() unexpected error: %v", err)
+			}
+
+			out := func() []byte {
+				if len(outLines) == 0 {
+					return nil
+				}
+				return outLines[0]
+			}()
 
 			if tc.wantNil {
 				if out != nil {
@@ -2526,10 +2546,10 @@ func TestAnthropicTransformStreamLine_IDPropagation(t *testing.T) {
 	a := &AnthropicAdapter{}
 
 	startLine := []byte(`data: {"type":"message_start","message":{"id":"msg_propagate","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet-20240620"}}`)
-	_ = a.TransformStreamLine(startLine)
+	transformLineIgnore(a, startLine)
 
 	deltaLine := []byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}`)
-	out := a.TransformStreamLine(deltaLine)
+	out := transformLine1(a, deltaLine)
 	if out == nil {
 		t.Fatal("TransformStreamLine(content_block_delta) = nil, want non-nil")
 	}
@@ -2572,7 +2592,7 @@ func TestAnthropicStreamToolCallFlow(t *testing.T) {
 	}
 	var results []result
 	for _, ev := range events {
-		out := a.TransformStreamLine([]byte(ev))
+		out := transformLine1(a, []byte(ev))
 		results = append(results, result{line: out, drop: out == nil})
 	}
 
@@ -2705,7 +2725,7 @@ func TestAnthropicStreamMultipleToolCalls(t *testing.T) {
 
 	var chunks []openAIChunk
 	for _, ev := range events {
-		out := a.TransformStreamLine([]byte(ev))
+		out := transformLine1(a, []byte(ev))
 		if out != nil && !strings.HasPrefix(string(out), "data: [DONE]") {
 			chunks = append(chunks, parseChunk(t, out))
 		}
@@ -2770,7 +2790,7 @@ func TestAnthropicStreamTextAndToolMixed(t *testing.T) {
 	}
 	var results []lineResult
 	for _, ev := range events {
-		out := a.TransformStreamLine([]byte(ev))
+		out := transformLine1(a, []byte(ev))
 		results = append(results, lineResult{out: out, drop: out == nil})
 	}
 
@@ -3039,36 +3059,41 @@ func TestAnthropicErrorStrings(t *testing.T) {
 // ── FIX 4: streaming state cap ────────────────────────────────────────────────
 
 // TestAnthropicStream_ToolBlockCap verifies that streaming content_block_start
-// events for more than maxAnthropicToolBlocks distinct tool_use blocks are
-// silently dropped — the adapter does not grow the map beyond the cap.
+// events for exactly maxAnthropicToolBlocks distinct tool_use blocks are accepted,
+// and that the first block beyond the cap causes errStreamTransformAborted (the
+// adapter signals fail-closed rather than silently dropping the excess call).
 func TestAnthropicStream_ToolBlockCap(t *testing.T) {
 	t.Parallel()
 
 	a := &AnthropicAdapter{}
 	// Prime with message_start.
-	_ = a.TransformStreamLine([]byte(`data: {"type":"message_start","message":{"id":"msg_cap","usage":{"input_tokens":1}}}`))
+	transformLineIgnore(a, []byte(`data: {"type":"message_start","message":{"id":"msg_cap","usage":{"input_tokens":1}}}`))
 
-	accepted := 0
-	dropped := 0
-	for i := 0; i < maxAnthropicToolBlocks+10; i++ {
+	// Accept exactly maxAnthropicToolBlocks blocks.
+	for i := 0; i < maxAnthropicToolBlocks; i++ {
 		line := fmt.Sprintf(
 			`data: {"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":"toolu_%d","name":"fn_%d","input":{}}}`,
 			i, i, i,
 		)
-		out := a.TransformStreamLine([]byte(line))
-		if out != nil {
-			accepted++
-		} else {
-			dropped++
+		lines, err := a.TransformStreamLine([]byte(line))
+		if err != nil {
+			t.Fatalf("block %d (within cap): got error %v, want nil", i, err)
+		}
+		if len(lines) == 0 {
+			t.Errorf("block %d (within cap): got no output, want header delta", i)
 		}
 	}
 
-	if accepted != maxAnthropicToolBlocks {
-		t.Errorf("accepted = %d, want %d (cap)", accepted, maxAnthropicToolBlocks)
+	// The next block must abort.
+	overCapLine := fmt.Sprintf(
+		`data: {"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":"toolu_%d","name":"fn_%d","input":{}}}`,
+		maxAnthropicToolBlocks, maxAnthropicToolBlocks, maxAnthropicToolBlocks,
+	)
+	_, overErr := a.TransformStreamLine([]byte(overCapLine))
+	if overErr == nil {
+		t.Error("block over cap: got nil error, want errStreamTransformAborted")
 	}
-	if dropped != 10 {
-		t.Errorf("dropped = %d, want 10 (excess beyond cap)", dropped)
-	}
+
 	// The map must not exceed the cap.
 	if len(a.blockToToolCall) > maxAnthropicToolBlocks {
 		t.Errorf("blockToToolCall len = %d, exceeds cap %d", len(a.blockToToolCall), maxAnthropicToolBlocks)
@@ -3076,17 +3101,18 @@ func TestAnthropicStream_ToolBlockCap(t *testing.T) {
 }
 
 // TestAnthropicStream_NegativeIndex verifies that a content_block_start with a
-// negative index is silently dropped (FIX 4 defense against oversized indices).
+// negative index aborts the stream fail-closed (FIX 4 defense against malformed
+// upstream tool streams).
 func TestAnthropicStream_NegativeIndex(t *testing.T) {
 	t.Parallel()
 
 	a := &AnthropicAdapter{}
-	_ = a.TransformStreamLine([]byte(`data: {"type":"message_start","message":{"id":"msg_neg","usage":{"input_tokens":1}}}`))
+	transformLineIgnore(a, []byte(`data: {"type":"message_start","message":{"id":"msg_neg","usage":{"input_tokens":1}}}`))
 
 	line := `data: {"type":"content_block_start","index":-1,"content_block":{"type":"tool_use","id":"toolu_neg","name":"fn","input":{}}}`
-	out := a.TransformStreamLine([]byte(line))
-	if out != nil {
-		t.Errorf("negative index: got %q, want nil (drop)", out)
+	_, err := a.TransformStreamLine([]byte(line))
+	if err == nil {
+		t.Error("negative index: got nil error, want errStreamTransformAborted")
 	}
 	if a.toolCallCounter != 0 {
 		t.Errorf("toolCallCounter = %d, want 0 (negative index must not increment counter)", a.toolCallCounter)
@@ -3413,56 +3439,33 @@ func TestAnthropicFix7_ResponseInputValidation(t *testing.T) {
 // ── FIX 8: duplicate content-block index ──────────────────────────────────────
 
 // TestAnthropicStream_DuplicateContentBlockIndex verifies that a duplicate
-// content_block_start for an already-seen content-block index is silently
-// dropped (returns nil) rather than overwriting the existing mapping.
-// The first registration remains intact; subsequent deltas continue to route
-// correctly to the original tool call.
+// content_block_start for an already-seen content-block index aborts the stream
+// (returns errStreamTransformAborted) rather than silently overwriting the
+// existing mapping. A duplicate indicates a malformed upstream tool stream and
+// must be treated as a protocol violation fail-closed.
 func TestAnthropicStream_DuplicateContentBlockIndex(t *testing.T) {
 	t.Parallel()
 
 	a := &AnthropicAdapter{}
-	_ = a.TransformStreamLine([]byte(`data: {"type":"message_start","message":{"id":"msg_dup","usage":{"input_tokens":1}}}`))
+	transformLineIgnore(a, []byte(`data: {"type":"message_start","message":{"id":"msg_dup","usage":{"input_tokens":1}}}`))
 
 	// Register content-block index 0 → tool-call index 0.
-	first := a.TransformStreamLine([]byte(
+	firstLines, firstErr := a.TransformStreamLine([]byte(
 		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_first","name":"fn_first","input":{}}}`,
 	))
-	if first == nil {
-		t.Fatal("first content_block_start: got nil, want header delta")
+	if firstErr != nil {
+		t.Fatalf("first content_block_start: got error %v, want nil", firstErr)
+	}
+	if len(firstLines) == 0 {
+		t.Fatal("first content_block_start: got no lines, want header delta")
 	}
 
-	// Duplicate registration for the same index — must be dropped.
-	dup := a.TransformStreamLine([]byte(
+	// Duplicate registration for the same index — must abort.
+	_, dupErr := a.TransformStreamLine([]byte(
 		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_dup","name":"fn_dup","input":{}}}`,
 	))
-	if dup != nil {
-		t.Errorf("duplicate content_block_start: got %q, want nil (must be dropped)", dup)
-	}
-
-	// toolCallCounter must still be 1 (the duplicate must not increment it).
-	if a.toolCallCounter != 1 {
-		t.Errorf("toolCallCounter = %d after duplicate, want 1", a.toolCallCounter)
-	}
-
-	// The mapping for index 0 must still point to the first tool call (0).
-	if a.blockToToolCall[0] != 0 {
-		t.Errorf("blockToToolCall[0] = %d after duplicate, want 0 (original mapping preserved)", a.blockToToolCall[0])
-	}
-
-	// Subsequent input_json_delta for index 0 must still route to tool-call 0.
-	frag := a.TransformStreamLine([]byte(
-		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"x\":1}"}}`,
-	))
-	if frag == nil {
-		t.Fatal("input_json_delta after duplicate: got nil, want fragment delta")
-	}
-	chunk := parseChunk(t, frag)
-	if len(chunk.Choices) != 1 || len(chunk.Choices[0].Delta.ToolCalls) != 1 {
-		t.Fatalf("fragment chunk structure unexpected: %+v", chunk)
-	}
-	tc := chunk.Choices[0].Delta.ToolCalls[0]
-	if tc.Index == nil || *tc.Index != 0 {
-		t.Errorf("fragment tool-call index = %v, want 0", tc.Index)
+	if dupErr == nil {
+		t.Error("duplicate content_block_start: got nil error, want errStreamTransformAborted")
 	}
 }
 
@@ -3470,35 +3473,35 @@ func TestAnthropicStream_DuplicateContentBlockIndex(t *testing.T) {
 
 // TestAnthropicStream_ToolUseCharsetValidation verifies that a streaming
 // content_block_start event for a tool_use block whose id or name contains
-// invalid characters is silently dropped (returns nil), matching the fail-closed
-// behavior of the non-streaming TransformResponse path.
+// invalid characters aborts the stream fail-closed (errStreamTransformAborted),
+// matching the fail-closed behavior of the non-streaming TransformResponse path.
 func TestAnthropicStream_ToolUseCharsetValidation(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		line    string
-		wantNil bool
+		name      string
+		line      string
+		wantAbort bool
 	}{
 		{
-			name:    "invalid id with @ is dropped",
-			line:    `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"bad@id","name":"good_name","input":{}}}`,
-			wantNil: true,
+			name:      "invalid id with @ aborts stream",
+			line:      `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"bad@id","name":"good_name","input":{}}}`,
+			wantAbort: true,
 		},
 		{
-			name:    "invalid name with space is dropped",
-			line:    `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_ok","name":"bad name","input":{}}}`,
-			wantNil: true,
+			name:      "invalid name with space aborts stream",
+			line:      `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_ok","name":"bad name","input":{}}}`,
+			wantAbort: true,
 		},
 		{
-			name:    "invalid id with @ in name position is dropped",
-			line:    `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_ok","name":"a@b","input":{}}}`,
-			wantNil: true,
+			name:      "invalid id with @ in name position aborts stream",
+			line:      `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_ok","name":"a@b","input":{}}}`,
+			wantAbort: true,
 		},
 		{
-			name:    "valid id and name produces header delta",
-			line:    `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_valid","name":"get_weather","input":{}}}`,
-			wantNil: false,
+			name:      "valid id and name produces header delta",
+			line:      `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_valid","name":"get_weather","input":{}}}`,
+			wantAbort: false,
 		},
 	}
 
@@ -3508,20 +3511,23 @@ func TestAnthropicStream_ToolUseCharsetValidation(t *testing.T) {
 
 			a := &AnthropicAdapter{}
 			// Prime with message_start.
-			_ = a.TransformStreamLine([]byte(`data: {"type":"message_start","message":{"id":"msg_cs","usage":{"input_tokens":1}}}`))
+			transformLineIgnore(a, []byte(`data: {"type":"message_start","message":{"id":"msg_cs","usage":{"input_tokens":1}}}`))
 
-			out := a.TransformStreamLine([]byte(tc.line))
-			if tc.wantNil {
-				if out != nil {
-					t.Errorf("got %q, want nil (block must be dropped for invalid charset)", out)
+			outLines, err := a.TransformStreamLine([]byte(tc.line))
+			if tc.wantAbort {
+				if err == nil {
+					t.Errorf("got nil error, want errStreamTransformAborted (block must abort for invalid charset)")
 				}
 				// Verify the tool-call counter was not incremented.
 				if a.toolCallCounter != 0 {
-					t.Errorf("toolCallCounter = %d after dropped block, want 0", a.toolCallCounter)
+					t.Errorf("toolCallCounter = %d after aborted block, want 0", a.toolCallCounter)
 				}
 			} else {
-				if out == nil {
-					t.Fatal("got nil, want header delta for valid id/name")
+				if err != nil {
+					t.Fatalf("got error %v, want nil for valid id/name", err)
+				}
+				if len(outLines) == 0 {
+					t.Fatal("got no output lines, want header delta for valid id/name")
 				}
 			}
 		})

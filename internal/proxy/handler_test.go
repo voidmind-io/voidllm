@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -2118,5 +2120,92 @@ func TestHandle_FallbackChainBlockedAtMidHop(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Errorf("status = %d, want %d (model-b's last error); body: %s",
 			resp.StatusCode, http.StatusBadGateway, body)
+	}
+}
+
+// ── writeStreamAbortEvent unit tests ─────────────────────────────────────────
+
+// TestWriteStreamAbortEvent verifies that writeStreamAbortEvent writes a
+// content-free OpenAI-shaped SSE error event that is terminated by a blank line
+// (two newlines) and contains the caller-supplied code with no trailing [DONE].
+func TestWriteStreamAbortEvent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		code string
+	}{
+		{code: "stream_transform_aborted"},
+		{code: "pii_restore_aborted"},
+		{code: "custom_code"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.code, func(t *testing.T) {
+			t.Parallel()
+
+			var buf bytes.Buffer
+			w := bufio.NewWriter(&buf)
+			writeStreamAbortEvent(w, tc.code)
+			// writeStreamAbortEvent flushes internally.
+
+			output := buf.String()
+
+			// Must start with "data: ".
+			if !strings.HasPrefix(output, "data: ") {
+				t.Errorf("output does not start with 'data: ': %q", output)
+			}
+			// Must contain the code in the error object.
+			if !strings.Contains(output, tc.code) {
+				t.Errorf("output does not contain code %q: %q", tc.code, output)
+			}
+			// Must end with double newline (SSE event terminator).
+			if !strings.HasSuffix(output, "\n\n") {
+				t.Errorf("output does not end with \\n\\n: %q", output)
+			}
+			// Must NOT contain [DONE].
+			if strings.Contains(output, "[DONE]") {
+				t.Errorf("output must not contain [DONE]: %q", output)
+			}
+			// The JSON must be parseable and contain expected fields.
+			raw := strings.TrimPrefix(strings.TrimRight(output, "\n"), "data: ")
+			var obj struct {
+				Error struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+					Code    string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+				t.Fatalf("output JSON unparseable: %v; output: %q", err, output)
+			}
+			if obj.Error.Type != tc.code {
+				t.Errorf("error.type = %q, want %q", obj.Error.Type, tc.code)
+			}
+			if obj.Error.Code != tc.code {
+				t.Errorf("error.code = %q, want %q", obj.Error.Code, tc.code)
+			}
+			if obj.Error.Message == "" {
+				t.Error("error.message is empty, want non-empty content-free string")
+			}
+		})
+	}
+}
+
+// TestErrStreamTransformAborted verifies that errStreamTransformAborted is a
+// non-nil, content-free sentinel error with a stable string representation.
+func TestErrStreamTransformAborted(t *testing.T) {
+	t.Parallel()
+
+	if errStreamTransformAborted == nil {
+		t.Fatal("errStreamTransformAborted is nil")
+	}
+	// Must be a simple, content-free string.
+	msg := errStreamTransformAborted.Error()
+	if msg == "" {
+		t.Error("errStreamTransformAborted.Error() is empty")
+	}
+	// Must not contain caller-controlled or upstream content.
+	if strings.Contains(msg, "PII") || strings.Contains(msg, "upstream") {
+		t.Errorf("errStreamTransformAborted.Error() contains unexpected content: %q", msg)
 	}
 }

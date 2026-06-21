@@ -733,7 +733,15 @@ func (a *GeminiAdapter) TransformResponse(body []byte) ([]byte, error) {
 //
 // The content-free-chunk drop (~line 441 in the original) is corrected: a
 // chunk that carries only functionCall parts (no text) is NOT dropped.
-func (a *GeminiAdapter) TransformStreamLine(line []byte) []byte {
+//
+// Mixed text+functionCall chunks emit two separate SSE lines: the text content
+// chunk first, then the tool_calls chunk. Stage 0c processes them as two
+// independent events. Previously the text was silently discarded.
+//
+// Invalid/excess tool call parts abort the stream (errStreamTransformAborted)
+// rather than silently dropping a call, so the client receives a content-free
+// error event instead of a quietly incomplete tool-call set.
+func (a *GeminiAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 	s := string(line)
 
 	// Blank SSE event delimiter.
@@ -743,27 +751,27 @@ func (a *GeminiAdapter) TransformStreamLine(line []byte) []byte {
 			// so the client sees it as a properly delimited event, then clear
 			// the flag so subsequent blank lines pass through normally.
 			a.doneSent = false
-			return []byte("data: [DONE]")
+			return [][]byte{[]byte("data: [DONE]")}, nil
 		}
-		return line
+		return [][]byte{line}, nil
 	}
 
 	const dataPrefix = "data: "
 	if !strings.HasPrefix(s, dataPrefix) {
-		return nil
+		return nil, nil
 	}
 
 	payload := []byte(s[len(dataPrefix):])
 
 	// Gemini may send "[DONE]" itself in some environments — pass it through.
 	if strings.TrimSpace(string(payload)) == "[DONE]" {
-		return line
+		return [][]byte{line}, nil
 	}
 
 	var gr geminiResponse
 	if err := jsonx.Unmarshal(payload, &gr); err != nil {
 		// Not a valid Gemini JSON payload — drop the line.
-		return nil
+		return nil, nil
 	}
 
 	var deltaText string
@@ -818,19 +826,19 @@ func (a *GeminiAdapter) TransformStreamLine(line []byte) []byte {
 	// original check "deltaText == "" && finishReason == nil" was broadened here
 	// to also require len(toolCallParts) == 0. This is the content-free-drop fix.
 	if deltaText == "" && finishReason == nil && len(toolCallParts) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	// If there are both text content and tool call parts in the same chunk,
-	// emit a text chunk first, then the tool call chunk. However, Gemini
-	// typically does not mix text and functionCall in the same chunk. For
-	// simplicity (and because Stage 0c rejects mixed content+tool_calls in the
-	// same chunk), emit text chunks via the normal path and tool call chunks
-	// via a separate emission. When both are present, emit text first by
-	// building a text-only delta here and handling tool calls below.
+	// Build the text chunk when there is delta text. When there are also tool
+	// call parts in the same chunk, emit the text chunk first and the tool_calls
+	// chunk second (two lines returned). Stage 0c processes them as independent
+	// events: content chunk followed by tool_calls chunk is valid.
 	//
-	// In practice Gemini always sends one finishReason with either the last
-	// text part or the functionCall parts — not both simultaneously.
+	// In practice Gemini always sends one finishReason with either the last text
+	// part or the functionCall parts — not both simultaneously. When both arrive
+	// in one chunk (rare), the text chunk carries no finishReason and the
+	// tool_calls chunk carries the finishReason, preserving correct ordering.
+	var textLine []byte
 	if deltaText != "" {
 		chunk := openAIChunk{
 			ID:     fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
@@ -839,8 +847,8 @@ func (a *GeminiAdapter) TransformStreamLine(line []byte) []byte {
 				{
 					Index: 0,
 					Delta: openAIChunkDelta{Content: deltaText},
-					// Do not set finishReason here when there are also tool calls
-					// to emit; set it on the tool-calls chunk below.
+					// Do not set finishReason on the text chunk when there are also
+					// tool calls to emit; the finishReason goes on the tool_calls chunk.
 					FinishReason: func() *string {
 						if len(toolCallParts) == 0 {
 							return finishReason
@@ -852,49 +860,40 @@ func (a *GeminiAdapter) TransformStreamLine(line []byte) []byte {
 		}
 		out, err := jsonx.Marshal(chunk)
 		if err != nil {
-			return nil
+			return nil, errStreamTransformAborted
 		}
 		if finishReason != nil && len(toolCallParts) == 0 {
 			a.doneSent = true
 		}
-		// If there are also tool call parts, we cannot return here — we need
-		// to emit both. For the common case (only text), return now.
 		if len(toolCallParts) == 0 {
-			return appendDataPrefix(out)
+			// Text-only chunk — return immediately.
+			return [][]byte{appendDataPrefix(out)}, nil
 		}
-		// Mixed chunk: text has been built. Fall through to emit tool calls
-		// as a separate chunk. (We discard the text chunk here — in the rare
-		// mixed case only the tool calls chunk is returned. This is acceptable
-		// because Stage 0c cannot handle mixed content+tool_calls in one chunk,
-		// and Gemini should not produce this combination in practice.)
-		_ = out
+		// Mixed chunk: save the text line; fall through to build the tool_calls
+		// chunk and return both.
+		textLine = appendDataPrefix(out)
 	}
 
 	// Emit tool call deltas.
 	if len(toolCallParts) > 0 {
 		var tcs []openAIToolCall
 		for _, fc := range toolCallParts {
-			// Cap per-stream tool-call count (defence-in-depth).
+			// Cap per-stream tool-call count (defence-in-depth) — abort fail-closed.
 			if a.streamToolCallCounter >= maxGeminiToolBlocks {
-				// Excess blocks are dropped.
-				break
+				return nil, errStreamTransformAborted
 			}
-			// FIX 3: reject empty function name — fail-closed (drop this block).
+			// FIX 3: reject empty function name — abort fail-closed.
 			if fc.Name == "" {
-				a.streamToolCallCounter++
-				continue
+				return nil, errStreamTransformAborted
 			}
-			// Charset-validate the name received from upstream.
+			// Charset-validate the name received from upstream — abort fail-closed.
 			if !anthropicToolIDRe.MatchString(fc.Name) {
-				// Invalid name — drop this block, continue with others.
-				a.streamToolCallCounter++
-				continue
+				return nil, errStreamTransformAborted
 			}
-			// Serialise args → JSON string.
+			// Serialise args → JSON string — abort on failure.
 			argsStr, err := serializeInputToArguments(fc.Args)
 			if err != nil {
-				a.streamToolCallCounter++
-				continue
+				return nil, errStreamTransformAborted
 			}
 			id := geminiSynthesiseToolCallID(a.streamToolCallCounter)
 			tcIdx := a.streamToolCallCounter
@@ -917,50 +916,30 @@ func (a *GeminiAdapter) TransformStreamLine(line []byte) []byte {
 			a.sawFunctionCall = true
 		}
 
-		if len(tcs) > 0 {
-			chunk := openAIChunk{
-				ID:     fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
-				Object: "chat.completion.chunk",
-				Choices: []openAIChunkChoice{
-					{
-						Index:        0,
-						Delta:        openAIChunkDelta{ToolCalls: tcs},
-						FinishReason: finishReason,
-					},
+		chunk := openAIChunk{
+			ID:     fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
+			Object: "chat.completion.chunk",
+			Choices: []openAIChunkChoice{
+				{
+					Index:        0,
+					Delta:        openAIChunkDelta{ToolCalls: tcs},
+					FinishReason: finishReason,
 				},
-			}
-			out, err := jsonx.Marshal(chunk)
-			if err != nil {
-				return nil
-			}
-			if finishReason != nil {
-				a.doneSent = true
-			}
-			return appendDataPrefix(out)
+			},
 		}
-
-		// All tool call parts were dropped (invalid names or args). If we have a
-		// finishReason, still need to emit the finish chunk with no delta.
+		out, err := jsonx.Marshal(chunk)
+		if err != nil {
+			return nil, errStreamTransformAborted
+		}
 		if finishReason != nil {
-			chunk := openAIChunk{
-				ID:     fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
-				Object: "chat.completion.chunk",
-				Choices: []openAIChunkChoice{
-					{
-						Index:        0,
-						Delta:        openAIChunkDelta{},
-						FinishReason: finishReason,
-					},
-				},
-			}
-			out, err := jsonx.Marshal(chunk)
-			if err != nil {
-				return nil
-			}
 			a.doneSent = true
-			return appendDataPrefix(out)
 		}
-		return nil
+		toolLine := appendDataPrefix(out)
+		if textLine != nil {
+			// Mixed chunk: return text first, then tool_calls.
+			return [][]byte{textLine, toolLine}, nil
+		}
+		return [][]byte{toolLine}, nil
 	}
 
 	// Pure finish-reason chunk (no text, no tool calls) — emit finish chunk.
@@ -978,13 +957,13 @@ func (a *GeminiAdapter) TransformStreamLine(line []byte) []byte {
 		}
 		out, err := jsonx.Marshal(chunk)
 		if err != nil {
-			return nil
+			return nil, errStreamTransformAborted
 		}
 		a.doneSent = true
-		return appendDataPrefix(out)
+		return [][]byte{appendDataPrefix(out)}, nil
 	}
 
-	return nil
+	return nil, nil
 }
 
 // StreamUsage returns the token counts accumulated during the Gemini stream.

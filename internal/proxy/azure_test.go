@@ -258,8 +258,15 @@ func TestAzureTransformStreamLine_Passthrough(t *testing.T) {
 			t.Parallel()
 
 			a := &AzureAdapter{}
-			got := a.TransformStreamLine([]byte(tc.input))
+			outLines, err := a.TransformStreamLine([]byte(tc.input))
 
+			if err != nil {
+				t.Fatalf("TransformStreamLine() unexpected error: %v", err)
+			}
+			if len(outLines) != 1 {
+				t.Fatalf("TransformStreamLine() returned %d lines, want 1", len(outLines))
+			}
+			got := outLines[0]
 			if string(got) != tc.input {
 				t.Errorf("TransformStreamLine() = %q, want %q (passthrough unchanged)", got, tc.input)
 			}

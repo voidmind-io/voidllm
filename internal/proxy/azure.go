@@ -51,9 +51,10 @@ func (a *AzureAdapter) TransformResponse(body []byte) ([]byte, error) {
 }
 
 // TransformStreamLine returns the line unchanged; Azure streams are already in
-// OpenAI SSE format.
-func (a *AzureAdapter) TransformStreamLine(line []byte) []byte {
-	return line
+// OpenAI SSE format. The single-element slice preserves the exact current
+// passthrough behaviour.
+func (a *AzureAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
+	return [][]byte{line}, nil
 }
 
 // StreamUsage returns a zero UsageInfo. Azure streams the OpenAI wire format,
