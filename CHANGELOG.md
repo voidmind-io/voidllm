@@ -5,11 +5,13 @@ All notable changes to VoidLLM are documented in this file.
 ## [0.0.22] - 2026-06-21
 
 ### Features
-- PII anonymization (opt-in, early/beta): structured PII (IBAN, email, phone, credit card, tax ID) in outbound prompts is replaced with deterministic per-organization pseudonyms before the request leaves to an external provider, and restored in the response, including token-by-token while streaming (message content and tool-call arguments). No prompt or response content, PII, or pseudonyms are ever persisted or logged. Detection is currently regex-based only; names and other free-form PII are not yet caught (gazetteer- and NER-based detection are planned). Off by default (#134, #135, #137)
+- PII anonymization (opt-in, early/beta): structured PII (IBAN, email, phone, credit card, tax ID) in outbound prompts is replaced with deterministic per-organization pseudonyms before the request leaves to an external provider, and restored in the response, including token-by-token while streaming (message content and tool-call arguments). No prompt or response content, PII, or pseudonyms are ever persisted or logged. Structured detection is regex-based; unstructured PII (names, places, operator terms) is covered by the opt-in gazetteer below; transformer-based NER is planned. Off by default (#134, #135, #137)
+- Gazetteer-based detection (opt-in): an in-process, language-neutral matcher catches unstructured PII the regex misses - names, places, company forms, and operator-supplied terms (customer/project/employee names). Curated German first-name and city packs are bundled; operators can load their own term lists for any language. No model/NER required. Off by default (#143, #145)
 - Native tool-call support for the Anthropic and Gemini providers: OpenAI-style tool calls are translated to and from the Anthropic Messages and Gemini generateContent APIs across requests, responses, and streaming, including alongside the PII firewall (#138, #139)
 
 ### Fixes
 - The PII firewall no longer rejects messages with `null` content (e.g. assistant messages carrying only `tool_calls`), so multi-turn tool conversations work with anonymization enabled (#136)
+- Streaming tool calls are delivered more reliably: provider adapters can emit multiple events per upstream chunk and fail closed on a malformed tool stream instead of silently dropping a tool call (#144)
 
 ---
 
