@@ -22,7 +22,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -o /voidllm ./cmd/voidllm
 
 # Stage 3: Runtime
-FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 RUN apk upgrade --no-cache \
     && apk add --no-cache ca-certificates tzdata \
     && addgroup -S voidllm && adduser -S -G voidllm voidllm \
