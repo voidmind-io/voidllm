@@ -19,12 +19,12 @@ This is **opt-in and off by default** (`settings.pii.enabled`).
 ```
 client                    VoidLLM                     provider
   |                          |                            |
-  |-- "Call Julia about  --->|                            |
-  |    the invoice"          |-- "Call PII_NM_cb0aaf... ->|
+  |-- "Call Tina about   --->|                            |
+  |    the invoice"          |-- "Call PII_NM_4f2c9a... ->|
   |                          |    about the invoice"      |
   |                          |                            |
-  |                          |<-- "I called PII_NM_cb0a..."
-  |<-- "I called Julia" -----|                            |
+  |                          |<-- "I called PII_NM_4f2c9a..."
+  |<-- "I called Tina"  <----|                            |
 ```
 
 1. The request body is scanned in memory for known identifier patterns.
@@ -42,11 +42,11 @@ Nothing is persisted. No prompt content, no PII, and no pseudonyms are ever writ
 
 Consider:
 
-> "Julia has been diagnosed with hepatitis."
+> "Tina has been diagnosed with hepatitis."
 
 The provider receives:
 
-> "PII_NM_cb0aafece87d54ec8450f25a has been diagnosed with hepatitis."
+> "PII_NM_4f2c9a1be07d35ac8b61e02d has been diagnosed with hepatitis."
 
 The provider still learns that **someone has that diagnosis** - health data, a special category under GDPR Article 9. It only fails to learn **who**. In most sensitive sentences the name is the least sensitive part.
 
