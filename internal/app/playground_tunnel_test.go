@@ -642,3 +642,129 @@ func TestSetupRoutes_AdminTimeoutsCappedWhenProxyLarger(t *testing.T) {
 		t.Errorf("admin BodyLimit = %d, want capped at %d", cfg.BodyLimit, maxAdminTunnelBodyLimit)
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Tunnel stream budget: the budget setupRoutes derives for the playground
+// tunnel must always stay strictly below the WriteTimeout of whichever app
+// actually enforces the socket deadline (a.adminApp in dual-port mode) — see
+// tunnelStreamBudget in routes.go. A fixed budget constant (the pre-fix
+// approach) can exceed that deadline whenever the admin app's effective
+// WriteTimeout sits strictly between the 30s floor and the
+// maxAdminTunnelTimeout cap — e.g. a configured proxy.WriteTimeout of 90s.
+// ──────────────────────────────────────────────────────────────────────────
+
+// TestTunnelStreamBudget_UnitTable exercises tunnelStreamBudget directly
+// across the regimes that matter: below the headroom, at/above the headroom,
+// and the "no deadline configured" case. In every case where writeTimeout is
+// positive, the returned budget must itself be strictly less than
+// writeTimeout and strictly positive.
+func TestTunnelStreamBudget_UnitTable(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		writeTimeout time.Duration
+	}{
+		{"unlimited (zero)", 0},
+		{"far below headroom", 5 * time.Second},
+		{"exactly the headroom", adminTunnelStreamHeadroom},
+		{"just above the headroom", adminTunnelStreamHeadroom + time.Second},
+		{"the 30s admin floor", 30 * time.Second},
+		{"the 90s regression case", 90 * time.Second},
+		{"the 120s admin cap", maxAdminTunnelTimeout},
+		{"far above any admin cap", 300 * time.Second},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			budget := tunnelStreamBudget(tc.writeTimeout)
+
+			if tc.writeTimeout <= 0 {
+				if budget != 0 {
+					t.Errorf("writeTimeout=%v: budget = %v, want 0 (no deadline to cap)", tc.writeTimeout, budget)
+				}
+				return
+			}
+
+			if budget <= 0 {
+				t.Errorf("writeTimeout=%v: budget = %v, want a positive duration", tc.writeTimeout, budget)
+			}
+			if budget >= tc.writeTimeout {
+				t.Errorf("writeTimeout=%v: budget = %v, want strictly less than writeTimeout (INVARIANT violated)", tc.writeTimeout, budget)
+			}
+		})
+	}
+}
+
+// TestSetupRoutes_TunnelStreamBudget_StrictlyBelowAdminWriteTimeout is the
+// end-to-end regression test for the "fixed constant vs. effective
+// WriteTimeout" bug: it drives newTunnelTestApp (the real setupRoutes dual-port
+// path) across proxy.WriteTimeout configurations that land the admin app's
+// effective WriteTimeout below the cap, at the cap, and above the cap, and
+// asserts a.tunnelStreamBudget is always strictly less than — and always
+// positive relative to — a.adminApp.Config().WriteTimeout.
+//
+// The 90s case is the exact configuration that previously reproduced the
+// bug: the fixed maxAdminTunnelStreamDuration constant (105s) exceeded the
+// 90s admin WriteTimeout, so the fasthttp socket deadline fired before the
+// proxy's own stream timer ever got a chance to run its deliberate teardown.
+func TestSetupRoutes_TunnelStreamBudget_StrictlyBelowAdminWriteTimeout(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		writeTimeout time.Duration
+		adminPort    int
+	}{
+		{"below the 30s floor", 5 * time.Second, 18454},
+		{"the 90s regression configuration", 90 * time.Second, 18455},
+		{"above the 120s cap", 300 * time.Second, 18456},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			upstream, _ := tunnelUpstream(t)
+			proxyCfg := config.ProxyConfig{WriteTimeout: tc.writeTimeout}
+			a := newTunnelTestApp(t, upstream.URL, 18500+i, tc.adminPort, proxyCfg)
+
+			adminWriteTimeout := a.adminApp.Config().WriteTimeout
+			if adminWriteTimeout <= 0 {
+				t.Fatalf("test setup: admin WriteTimeout = %v, want a positive deadline", adminWriteTimeout)
+			}
+
+			if a.tunnelStreamBudget <= 0 {
+				t.Fatalf("tunnelStreamBudget = %v, want a positive duration for adminWriteTimeout=%v", a.tunnelStreamBudget, adminWriteTimeout)
+			}
+			if a.tunnelStreamBudget >= adminWriteTimeout {
+				t.Errorf("tunnelStreamBudget = %v >= admin WriteTimeout %v — the socket deadline can fire before the proxy's own stream timer (INVARIANT violated)",
+					a.tunnelStreamBudget, adminWriteTimeout)
+			}
+		})
+	}
+}
+
+// TestSetupRoutes_TunnelStreamBudget_SinglePortUnlimitedWriteTimeout covers
+// single-port mode with the default (unlimited) proxy.WriteTimeout: there is
+// no socket deadline to race against, so setupRoutes must not derive an
+// artificial cap — a.tunnelStreamBudget stays 0 and playgroundTunnel skips
+// calling proxy.SetTunnelStreamCap entirely.
+func TestSetupRoutes_TunnelStreamBudget_SinglePortUnlimitedWriteTimeout(t *testing.T) {
+	t.Parallel()
+
+	upstream, _ := tunnelUpstream(t)
+	a := newTunnelTestApp(t, upstream.URL, 18457, 0, config.ProxyConfig{})
+	if a.adminApp != nil {
+		t.Fatalf("adminApp should be nil in single-port mode")
+	}
+
+	if a.proxyApp.Config().WriteTimeout != 0 {
+		t.Fatalf("test setup: proxyApp WriteTimeout = %v, want 0 (unlimited)", a.proxyApp.Config().WriteTimeout)
+	}
+	if a.tunnelStreamBudget != 0 {
+		t.Errorf("tunnelStreamBudget = %v, want 0 when the hosting app has no WriteTimeout configured", a.tunnelStreamBudget)
+	}
+}

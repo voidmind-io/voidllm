@@ -1417,6 +1417,31 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 					slog.String("error", scanErr.Error()),
 				)
 			}
+
+			// A non-nil scanner error means the loop ended abnormally — most
+			// commonly the stream-duration timer firing and cancelling the
+			// upstream request context (see streamTimer above), but also any
+			// genuine transport failure. This is distinct from BOTH a clean
+			// EOF (the upstream finished sending and closed normally:
+			// bufio.Scanner treats EOF as terminal but never reports it via
+			// Err, so scanErr is nil) and a client disconnect (a write/flush
+			// failure breaks the loop WITHOUT ever calling scanner.Scan()
+			// again, so scanErr also stays nil in that case — Err() only
+			// reflects errors encountered by Scan itself). Only the
+			// genuinely abnormal case is treated as incomplete: the client is
+			// told, via the same content-free abort event the PII path
+			// already emits on this class of failure, and the usage event
+			// below is logged as incomplete rather than a false 200.
+			//
+			// plainAborted is excluded because the adapter-abort branch above
+			// already emitted its own abort event and set streamIncomplete —
+			// emitting a second event here would violate the "exactly once"
+			// contract callers of writeStreamAbortEvent must uphold.
+			if scanErr != nil && !plainAborted {
+				streamIncomplete = true
+				writeStreamAbortEvent(w, "stream_incomplete")
+			}
+
 			if breaker != nil && !plainAborted {
 				if scanErr != nil {
 					breaker.RecordFailure()

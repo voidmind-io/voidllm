@@ -49,25 +49,54 @@ const maxAdminTunnelTimeout = 120 * time.Second
 // still capping the memory a single unauthenticated admin request can pin.
 const maxAdminTunnelBodyLimit = 8 << 20 // 8 MiB
 
-// maxAdminTunnelStreamDuration bounds how long a playground-tunnel request may
-// keep streaming before ProxyHandler.Handle tears it down itself (clean
-// upstream cancellation plus a terminal SSE abort event — see
-// proxy.SetTunnelStreamCap).
+// adminTunnelStreamHeadroom is the safety margin subtracted from the
+// effective WriteTimeout of whichever Fiber app hosts the playground tunnel
+// (a.proxyApp in single-port mode, a.adminApp in dual-port mode) when
+// deriving the tunnel's stream-duration budget — see tunnelStreamBudget. It
+// must leave enough time for ProxyHandler.Handle to notice its own stream
+// timer fire, cancel the upstream connection, and flush the terminal SSE
+// abort event to the client — all strictly before the socket's absolute
+// WriteTimeout deadline.
+const adminTunnelStreamHeadroom = 15 * time.Second
+
+// tunnelStreamBudget derives the playground tunnel's stream-duration budget
+// from writeTimeout, the effective WriteTimeout of the Fiber app that will
+// serve the tunnel route.
 //
-// This MUST stay strictly below maxAdminTunnelTimeout, with real headroom for
-// the final flush. In fasthttp 1.71, WriteTimeout is a single absolute socket
-// write deadline set once before response serialization begins — it is never
-// refreshed by successful SSE flushes. If a tunneled stream is still
-// producing tokens when the admin app's capped WriteTimeout (see
-// maxAdminTunnelTimeout) elapses, the connection is simply killed: the client
-// gets a partial response, no terminal [DONE], and none of the deliberate
-// abort events the proxy emits elsewhere — indistinguishable from a network
-// failure. Firing the proxy's own stream timer first guarantees the client
-// always sees the deliberate, well-formed teardown path instead.
+// INVARIANT: the returned budget (when non-zero) must always be strictly
+// less than writeTimeout. In fasthttp 1.71, WriteTimeout is a single
+// absolute socket write deadline set once before response serialization
+// begins — it is never refreshed by successful SSE flushes. If a tunneled
+// stream is still producing tokens when writeTimeout elapses, the connection
+// is simply killed: the client gets a partial response, no terminal [DONE],
+// and none of the deliberate abort events the proxy emits elsewhere —
+// indistinguishable from a network failure. Firing the proxy's own stream
+// timer first (see proxy.SetTunnelStreamCap) guarantees the client always
+// sees the deliberate, well-formed teardown path instead. A fixed budget
+// (the previous approach) violates this invariant whenever writeTimeout ends
+// up below the fixed value — e.g. a dual-port admin WriteTimeout adopted
+// from a configured proxy.WriteTimeout of 90s, which sits strictly between
+// the 30s floor and the maxAdminTunnelTimeout cap.
 //
-// Do not raise this value without raising maxAdminTunnelTimeout by at least
-// as much first — the two constants must be changed together.
-const maxAdminTunnelStreamDuration = 105 * time.Second
+// writeTimeout <= 0 means the hosting app has no write deadline at all (an
+// explicitly configured unlimited WriteTimeout); there is then no socket
+// deadline to race against, so 0 is returned and playgroundTunnel skips
+// calling proxy.SetTunnelStreamCap entirely — the request falls back to the
+// model/global stream duration exactly as an untunneled request would.
+func tunnelStreamBudget(writeTimeout time.Duration) time.Duration {
+	if writeTimeout <= 0 {
+		return 0
+	}
+	budget := writeTimeout - adminTunnelStreamHeadroom
+	if budget <= 0 {
+		// The configured WriteTimeout is smaller than the headroom itself
+		// (an unusually short deployment configuration). Fall back to half
+		// the deadline: still strictly less than writeTimeout, preserving
+		// the invariant above, and always positive for any writeTimeout > 0.
+		budget = writeTimeout / 2
+	}
+	return budget
+}
 
 // playgroundTunnel returns a Fiber handler that delegates authenticated
 // requests under /api/v1/playground/* to the hot-path proxy handler,
@@ -84,15 +113,21 @@ const maxAdminTunnelStreamDuration = 105 * time.Second
 // The handler's own isAllowedPath check still gates which upstream endpoints
 // are reachable through the tunnel — it is not bypassed or duplicated here.
 //
-// It also calls proxy.SetTunnelStreamCap with maxAdminTunnelStreamDuration so
-// that a streaming completion tunneled through this handler is torn down by
-// Handle's own stream timer before the admin app's capped WriteTimeout (see
-// maxAdminTunnelTimeout) can kill the socket outright. This only ever
-// shortens the stream budget for tunneled requests — direct /v1/* traffic
-// never calls SetTunnelStreamCap and is completely unaffected.
+// It also calls proxy.SetTunnelStreamCap with a.tunnelStreamBudget (derived
+// by setupRoutes — see tunnelStreamBudget) so that a streaming completion
+// tunneled through this handler is torn down by Handle's own stream timer
+// before the hosting app's WriteTimeout (see maxAdminTunnelTimeout in
+// dual-port mode) can kill the socket outright. This only ever shortens the
+// stream budget for tunneled requests — direct /v1/* traffic never calls
+// SetTunnelStreamCap and is completely unaffected. When a.tunnelStreamBudget
+// is zero (the hosting app has no WriteTimeout configured), SetTunnelStreamCap
+// is skipped entirely; the request falls back to the model/global stream
+// duration unmodified.
 func (a *Application) playgroundTunnel() fiber.Handler {
 	return func(c fiber.Ctx) error {
-		proxy.SetTunnelStreamCap(c, maxAdminTunnelStreamDuration)
+		if a.tunnelStreamBudget > 0 {
+			proxy.SetTunnelStreamCap(c, a.tunnelStreamBudget)
+		}
 		rest := strings.TrimPrefix(c.Path(), playgroundTunnelPrefix)
 		c.Path("/v1/" + rest)
 		return a.proxyHandler.Handle(c)
@@ -171,6 +206,11 @@ func (a *Application) setupRoutes() {
 		a.warnIfSinglePortTLS(adminPort)
 		admin.RegisterRoutes(a.proxyApp, a.adminHandler, a.keyCache, a.hmacSecret, a.auditLogger)
 
+		// The playground tunnel shares a.proxyApp in single-port mode, so its
+		// stream budget is derived from a.proxyApp's own (uncapped) WriteTimeout
+		// — see tunnelStreamBudget.
+		a.tunnelStreamBudget = tunnelStreamBudget(a.proxyApp.Config().WriteTimeout)
+
 		// Playground tunnel: registered unconditionally on the app that serves
 		// the SPA so the UI can use one URL regardless of single/dual-port mode.
 		// Must be registered before the SPA catch-all.
@@ -240,6 +280,11 @@ func (a *Application) setupRoutes() {
 	a.adminApp.Get("/health", health.Liveness())
 	a.adminApp.Get("/metrics", health.Metrics())
 	admin.RegisterRoutes(a.adminApp, a.adminHandler, a.keyCache, a.hmacSecret, a.auditLogger)
+
+	// The playground tunnel lives on a.adminApp in dual-port mode, so its
+	// stream budget is derived from a.adminApp's clamped WriteTimeout
+	// (adminWriteTimeout above) — see tunnelStreamBudget.
+	a.tunnelStreamBudget = tunnelStreamBudget(a.adminApp.Config().WriteTimeout)
 
 	// Playground tunnel: registered unconditionally on the app that serves the
 	// SPA so the UI can use one URL regardless of single/dual-port mode. In
