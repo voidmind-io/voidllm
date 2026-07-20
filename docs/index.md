@@ -38,6 +38,7 @@ Privacy-first LLM proxy and AI gateway. Self-hosted, single binary, sub-500us ov
 
 - [RBAC](security/rbac.md) - roles, permissions, access control hierarchy
 - [Privacy](security/privacy.md) - zero-knowledge architecture, GDPR
+- [PII Anonymization](security/pii.md) - opt-in identifier pseudonymization (early/beta)
 - [Hardening](security/hardening.md) - security checklist, TLS, network policies
 
 ## Enterprise

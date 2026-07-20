@@ -61,6 +61,12 @@ VoidLLM implements data minimization (GDPR Article 5(1)(c)) and Privacy by Desig
 - Content data is never collected because there is no code path to collect it
 - Usage events are the smallest possible record: a few integers and strings per request
 
+## Anonymizing what you send upstream
+
+The guarantees above describe what VoidLLM itself stores. They say nothing about what the **upstream provider** receives - by default it receives your prompt as written.
+
+VoidLLM can optionally pseudonymize personal identifiers before the request leaves for an external provider, and restore them in the response. This is opt-in, off by default, and currently early/beta. See [PII Anonymization](pii.md) - in particular the section on what it does *not* protect.
+
 ## Comparison
 
 | | VoidLLM | Typical proxy |
