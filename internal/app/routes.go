@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -14,6 +15,60 @@ import (
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
+
+// playgroundTunnelPrefix is the route prefix for the authenticated,
+// same-origin playground tunnel. See playgroundTunnel for details.
+const playgroundTunnelPrefix = "/api/v1/playground/"
+
+// maxAdminTunnelTimeout bounds how far setupRoutes may raise the admin app's
+// ReadTimeout/WriteTimeout to accommodate the playground tunnel's streaming
+// completions in dual-port mode.
+//
+// Fiber v3 has no per-route timeout: ReadTimeout/WriteTimeout are per-app
+// config, so whatever value is adopted for the tunnel also applies to every
+// OTHER route on the admin app — including the UNAUTHENTICATED ones (e.g.
+// POST /api/v1/auth/login, POST /api/v1/invites/redeem, GET
+// /api/v1/auth/providers, GET /api/v1/invites/peek). Adopting the proxy's
+// configured timeout unbounded would let a slowloris-style attacker exhaust
+// admin-app connection slots far more cheaply whenever an operator
+// configures a generous proxy timeout (e.g. 300s) than with Fiber's short
+// default. Do not remove this cap without also solving that exposure.
+//
+// The playground tunnel exists for the interactive Playground, where a human
+// is waiting at a browser — 120s is ample for that use case. Operators who
+// need longer-running completions should drive them against the proxy port
+// directly, which carries no such cap.
+const maxAdminTunnelTimeout = 120 * time.Second
+
+// maxAdminTunnelBodyLimit bounds how far setupRoutes may raise the admin
+// app's BodyLimit for the same reason as maxAdminTunnelTimeout: BodyLimit is
+// per-app in Fiber v3, so raising it for the playground tunnel raises it for
+// every unauthenticated admin endpoint too. Playground prompts are typed
+// into a browser, so 8 MiB is far beyond realistic interactive use, while
+// still capping the memory a single unauthenticated admin request can pin.
+const maxAdminTunnelBodyLimit = 8 << 20 // 8 MiB
+
+// playgroundTunnel returns a Fiber handler that delegates authenticated
+// requests under /api/v1/playground/* to the hot-path proxy handler,
+// in-process. It exists so the embedded dashboard Playground (served from
+// the SPA-serving app) always has a same-origin route to the proxy, even in
+// dual-port mode where /v1/* is intentionally NOT mounted on the admin app
+// (see setupRoutes). There is no network hop and no CORS involved — the
+// request is handled by the same Fiber app instance.
+//
+// The request path is rewritten from "/api/v1/playground/<rest>" to
+// "/v1/<rest>" before delegating, so that ProxyHandler.Handle derives the
+// same upstream path it would for a direct /v1/<rest> request (see
+// handler.go: upstreamPath := path.Clean(strings.TrimPrefix(c.Path(), "/v1/"))).
+// The handler's own isAllowedPath check still gates which upstream endpoints
+// are reachable through the tunnel — it is not bypassed or duplicated here.
+func (a *Application) playgroundTunnel() fiber.Handler {
+	return func(c fiber.Ctx) error {
+		rest := strings.TrimPrefix(c.Path(), playgroundTunnelPrefix)
+		c.Path("/v1/" + rest)
+		return a.proxyHandler.Handle(c)
+	}
+}
 
 // warnIfSinglePortTLS emits one WARN when admin TLS is configured but the
 // admin port is sharing the proxy port (TLS termination unsupported there).
@@ -87,6 +142,11 @@ func (a *Application) setupRoutes() {
 		a.warnIfSinglePortTLS(adminPort)
 		admin.RegisterRoutes(a.proxyApp, a.adminHandler, a.keyCache, a.hmacSecret, a.auditLogger)
 
+		// Playground tunnel: registered unconditionally on the app that serves
+		// the SPA so the UI can use one URL regardless of single/dual-port mode.
+		// Must be registered before the SPA catch-all.
+		a.proxyApp.All(playgroundTunnelPrefix+"*", auth.Middleware(a.keyCache, a.hmacSecret), a.playgroundTunnel())
+
 		// Swagger UI is served after API routes but before the SPA catch-all.
 		registerSwaggerHandlers(a.proxyApp)
 
@@ -96,10 +156,43 @@ func (a *Application) setupRoutes() {
 	}
 
 	// Dual-port mode: proxy and admin run on separate ports.
+	//
+	// ReadTimeout/WriteTimeout/BodyLimit are raised above the admin app's own
+	// 30s/DefaultBodyLimit floors when the proxy is configured more generously:
+	// the playground tunnel (/api/v1/playground/*, see playgroundTunnel)
+	// forwards streaming LLM completions through this app in dual-port mode,
+	// and a shorter timeout or body limit here would silently cut those
+	// requests off.
+	//
+	// The adopted value is capped at maxAdminTunnelTimeout / maxAdminTunnelBodyLimit
+	// — see those constants for why the cap must never be removed.
+	adminReadTimeout := 30 * time.Second
+	if a.cfg.Server.Proxy.ReadTimeout > adminReadTimeout {
+		adminReadTimeout = a.cfg.Server.Proxy.ReadTimeout
+	}
+	if adminReadTimeout > maxAdminTunnelTimeout {
+		adminReadTimeout = maxAdminTunnelTimeout
+	}
+	adminWriteTimeout := 30 * time.Second
+	if a.cfg.Server.Proxy.WriteTimeout > adminWriteTimeout {
+		adminWriteTimeout = a.cfg.Server.Proxy.WriteTimeout
+	}
+	if adminWriteTimeout > maxAdminTunnelTimeout {
+		adminWriteTimeout = maxAdminTunnelTimeout
+	}
+	adminBodyLimit := fiber.DefaultBodyLimit
+	if a.cfg.Server.Proxy.MaxRequestBody > adminBodyLimit {
+		adminBodyLimit = a.cfg.Server.Proxy.MaxRequestBody
+	}
+	if adminBodyLimit > maxAdminTunnelBodyLimit {
+		adminBodyLimit = maxAdminTunnelBodyLimit
+	}
+
 	a.adminApp = fiber.New(fiber.Config{
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   30 * time.Second,
+		ReadTimeout:    adminReadTimeout,
+		WriteTimeout:   adminWriteTimeout,
 		IdleTimeout:    60 * time.Second,
+		BodyLimit:      adminBodyLimit,
 		ReadBufferSize: 16384, // 16 KB — default 4 KB too small for browser headers
 		JSONEncoder:    func(v any) ([]byte, error) { return jsonx.Marshal(v) },
 		JSONDecoder:    func(data []byte, v any) error { return jsonx.Unmarshal(data, v) },
@@ -118,6 +211,14 @@ func (a *Application) setupRoutes() {
 	a.adminApp.Get("/health", health.Liveness())
 	a.adminApp.Get("/metrics", health.Metrics())
 	admin.RegisterRoutes(a.adminApp, a.adminHandler, a.keyCache, a.hmacSecret, a.auditLogger)
+
+	// Playground tunnel: registered unconditionally on the app that serves the
+	// SPA so the UI can use one URL regardless of single/dual-port mode. In
+	// dual-port mode the SPA (and therefore this route) lives on the admin
+	// app; /v1/* itself is deliberately NOT mounted here (see setupRoutes
+	// single-port branch and package docs). Must be registered before the SPA
+	// catch-all.
+	a.adminApp.All(playgroundTunnelPrefix+"*", auth.Middleware(a.keyCache, a.hmacSecret), a.playgroundTunnel())
 
 	// Swagger UI is served after API routes but before the SPA catch-all.
 	registerSwaggerHandlers(a.adminApp)

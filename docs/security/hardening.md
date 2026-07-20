@@ -35,6 +35,7 @@ The Helm chart and Docker image include production security defaults:
   ```
 - **Network policies** - restrict pod-to-pod traffic in Kubernetes
 - **SSRF protection** - VoidLLM blocks connections to private/loopback IPs by default (configurable via `settings.mcp.allow_private_urls`)
+- **Playground tunnel on the admin port** - in dual-port mode the admin port also serves the embedded dashboard's Playground tunnel, which carries streaming LLM responses. Its read/write timeouts are therefore raised above a pure control-plane's needs, capped at 120s so this does not weaken the admin port's exposure to unauthenticated endpoints (login, invite redemption, etc). Don't expose the admin port to untrusted networks, and put a reverse proxy with its own connection timeouts in front of it.
 
 ## API Keys
 
