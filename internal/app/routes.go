@@ -14,6 +14,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
+	"github.com/voidmind-io/voidllm/internal/proxy"
 )
 
 // playgroundTunnelPrefix is the route prefix for the authenticated,
@@ -48,6 +49,26 @@ const maxAdminTunnelTimeout = 120 * time.Second
 // still capping the memory a single unauthenticated admin request can pin.
 const maxAdminTunnelBodyLimit = 8 << 20 // 8 MiB
 
+// maxAdminTunnelStreamDuration bounds how long a playground-tunnel request may
+// keep streaming before ProxyHandler.Handle tears it down itself (clean
+// upstream cancellation plus a terminal SSE abort event — see
+// proxy.SetTunnelStreamCap).
+//
+// This MUST stay strictly below maxAdminTunnelTimeout, with real headroom for
+// the final flush. In fasthttp 1.71, WriteTimeout is a single absolute socket
+// write deadline set once before response serialization begins — it is never
+// refreshed by successful SSE flushes. If a tunneled stream is still
+// producing tokens when the admin app's capped WriteTimeout (see
+// maxAdminTunnelTimeout) elapses, the connection is simply killed: the client
+// gets a partial response, no terminal [DONE], and none of the deliberate
+// abort events the proxy emits elsewhere — indistinguishable from a network
+// failure. Firing the proxy's own stream timer first guarantees the client
+// always sees the deliberate, well-formed teardown path instead.
+//
+// Do not raise this value without raising maxAdminTunnelTimeout by at least
+// as much first — the two constants must be changed together.
+const maxAdminTunnelStreamDuration = 105 * time.Second
+
 // playgroundTunnel returns a Fiber handler that delegates authenticated
 // requests under /api/v1/playground/* to the hot-path proxy handler,
 // in-process. It exists so the embedded dashboard Playground (served from
@@ -62,8 +83,16 @@ const maxAdminTunnelBodyLimit = 8 << 20 // 8 MiB
 // handler.go: upstreamPath := path.Clean(strings.TrimPrefix(c.Path(), "/v1/"))).
 // The handler's own isAllowedPath check still gates which upstream endpoints
 // are reachable through the tunnel — it is not bypassed or duplicated here.
+//
+// It also calls proxy.SetTunnelStreamCap with maxAdminTunnelStreamDuration so
+// that a streaming completion tunneled through this handler is torn down by
+// Handle's own stream timer before the admin app's capped WriteTimeout (see
+// maxAdminTunnelTimeout) can kill the socket outright. This only ever
+// shortens the stream budget for tunneled requests — direct /v1/* traffic
+// never calls SetTunnelStreamCap and is completely unaffected.
 func (a *Application) playgroundTunnel() fiber.Handler {
 	return func(c fiber.Ctx) error {
+		proxy.SetTunnelStreamCap(c, maxAdminTunnelStreamDuration)
 		rest := strings.TrimPrefix(c.Path(), playgroundTunnelPrefix)
 		c.Path("/v1/" + rest)
 		return a.proxyHandler.Handle(c)

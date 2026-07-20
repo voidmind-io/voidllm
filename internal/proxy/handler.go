@@ -320,10 +320,7 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 
 	// Per-model timeout overrides the global stream duration limit when set.
 	// Recomputed on each iteration in case the fallback model has a different timeout.
-	effectiveStreamDur := maxStreamDur
-	if currentModel.Timeout > 0 {
-		effectiveStreamDur = currentModel.Timeout
-	}
+	effectiveStreamDur := p.effectiveStreamDuration(c, maxStreamDur, currentModel)
 
 	maxDepth := p.FallbackMaxDepth
 	if maxDepth <= 0 {
@@ -459,10 +456,7 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		// is selected inside tryModel via the pickBody closure, after
 		// applyDeployment resolves the effective provider for each deployment.
 		// No per-hop body pre-selection is needed here.
-		effectiveStreamDur = maxStreamDur
-		if currentModel.Timeout > 0 {
-			effectiveStreamDur = currentModel.Timeout
-		}
+		effectiveStreamDur = p.effectiveStreamDuration(c, maxStreamDur, currentModel)
 	}
 
 	// All candidates (and fallback chain) exhausted without a usable response.
@@ -705,6 +699,28 @@ func (p *ProxyHandler) resolveEffectiveLimits() (maxRequestBody, maxResponseBody
 		maxStreamDuration = defaultMaxStreamDuration
 	}
 	return maxRequestBody, maxResponseBody, maxStreamDuration
+}
+
+// effectiveStreamDuration returns the stream duration budget for a single hop:
+// model.Timeout when configured, otherwise maxStreamDur. When c carries a
+// tunnel stream-duration cap (set via SetTunnelStreamCap), the result is
+// further capped at that value — never extended — so that a request tunneled
+// through an in-process proxy such as the admin app's playground tunnel is
+// always torn down by the proxy's own stream timer (clean upstream
+// cancellation plus a terminal abort event) before any shorter, unrefreshed
+// socket write deadline further down the stack can kill the connection
+// instead. Requests that never call SetTunnelStreamCap take this codepath
+// with zero behavioral change: tunnelStreamCapFromCtx reports ok=false and
+// the model/global duration is returned unmodified.
+func (p *ProxyHandler) effectiveStreamDuration(c fiber.Ctx, maxStreamDur time.Duration, model Model) time.Duration {
+	d := maxStreamDur
+	if model.Timeout > 0 {
+		d = model.Timeout
+	}
+	if tunnelCap, ok := tunnelStreamCapFromCtx(c); ok && tunnelCap > 0 && tunnelCap < d {
+		d = tunnelCap
+	}
+	return d
 }
 
 // initShutdownTracking registers the request with ShutdownState and returns a

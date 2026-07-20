@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log/slog"
@@ -378,38 +379,82 @@ func TestPlaygroundTunnel_PathRewriting_DisallowedPathRejected(t *testing.T) {
 // startTunnelListener starts fiberApp on a real TCP listener (fiber's
 // app.Test harness buffers responses and is unsuitable for asserting on
 // streaming behaviour) and returns its base URL.
+//
+// The listener is closed explicitly in a t.Cleanup registered here, in
+// addition to (and ahead of, since t.Cleanup runs LIFO) the fiberApp.Shutdown
+// call registered by newTunnelTestApp; a listener close racing with, or
+// preceding, Shutdown is safe — net.Listener.Close is idempotent-safe to call
+// from both and any resulting "already closed" error is immaterial to the
+// test outcome.
 func startTunnelListener(t *testing.T, fiberApp *fiber.App) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("net.Listen: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
+
+	// listenErr is buffered so the goroutine can never block on send: whether
+	// or not the test ever reads from it (e.g. it may still be running when
+	// Shutdown finally makes Listener return), the goroutine always completes.
+	listenErr := make(chan error, 1)
 	go func() {
-		// Listener is closed by fiberApp.Shutdown via t.Cleanup in newTunnelTestApp.
-		_ = fiberApp.Listener(ln, fiber.ListenConfig{DisableStartupMessage: true})
+		listenErr <- fiberApp.Listener(ln, fiber.ListenConfig{DisableStartupMessage: true})
 	}()
 
-	addr := ln.Addr().String()
+	baseURL := "http://" + ln.Addr().String()
+	// probeClient issues a real HTTP request rather than a bare TCP dial: a
+	// successful dial only proves the socket is bound, which net.Listen above
+	// already guaranteed — it does NOT prove fiberApp has reached its serving
+	// loop and can actually handle a request. /healthz is registered
+	// unconditionally by setupRoutes, so any response (regardless of status)
+	// proves the app is serving.
+	probeClient := &http.Client{Timeout: 200 * time.Millisecond}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, dialErr := net.Dial("tcp", addr)
-		if dialErr == nil {
-			_ = conn.Close()
-			break
+		select {
+		case err := <-listenErr:
+			t.Fatalf("fiberApp.Listener exited before becoming ready: %v", err)
+		default:
+		}
+
+		resp, probeErr := probeClient.Get(baseURL + "/healthz")
+		if probeErr == nil {
+			_ = resp.Body.Close()
+			return baseURL
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return "http://" + addr
+	t.Fatalf("timed out waiting for tunnel listener to become ready at %s", baseURL)
+	return ""
 }
 
+// TestPlaygroundTunnel_Streaming proves the tunnel delivers SSE events to the
+// client as they arrive, not only once the full upstream response has been
+// read. A wrapper that buffered the entire response before forwarding
+// anything would still pass a test that merely io.ReadAll's the final body
+// (the shape of the previous version of this test) — it would not pass this
+// one: the upstream deliberately blocks after its first event until the test
+// has confirmed that event was already readable on the client side, and only
+// then sends the second. If the tunnel buffered, the client's read of the
+// first event would itself block waiting for the (blocked) upstream to
+// finish, deadlocking until the bounded timeouts below fire and fail the test.
 func TestPlaygroundTunnel_Streaming(t *testing.T) {
 	t.Parallel()
 
-	chunks := []string{
-		`data: {"choices":[{"delta":{"content":"Hello"}}]}`,
-		`data: {"choices":[{"delta":{"content":" World"}}]}`,
-		`data: [DONE]`,
-	}
+	const (
+		firstChunk  = `data: {"choices":[{"delta":{"content":"Hello"}}]}`
+		secondChunk = `data: {"choices":[{"delta":{"content":" World"}}]}`
+		doneChunk   = `data: [DONE]`
+	)
+
+	// firstChunkObserved is closed by the test once it has read the first SSE
+	// event off the wire. The upstream handler blocks on it before sending the
+	// second event.
+	firstChunkObserved := make(chan struct{})
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -418,11 +463,27 @@ func TestPlaygroundTunnel_Streaming(t *testing.T) {
 			t.Error("upstream responseWriter does not implement http.Flusher")
 			return
 		}
-		for _, chunk := range chunks {
-			fmt.Fprintln(w, chunk)
-			fmt.Fprintln(w)
-			flusher.Flush()
+
+		fmt.Fprintln(w, firstChunk)
+		fmt.Fprintln(w)
+		flusher.Flush()
+
+		select {
+		case <-firstChunkObserved:
+		case <-time.After(3 * time.Second):
+			// The client never confirmed receipt of the first event within the
+			// bound. Write nothing further: the response simply ends here, so
+			// the test's subsequent read fails on the missing chunks below
+			// instead of this goroutine (and the test) hanging forever.
+			return
 		}
+
+		fmt.Fprintln(w, secondChunk)
+		fmt.Fprintln(w)
+		flusher.Flush()
+		fmt.Fprintln(w, doneChunk)
+		fmt.Fprintln(w)
+		flusher.Flush()
 	}))
 	t.Cleanup(upstream.Close)
 
@@ -438,6 +499,10 @@ func TestPlaygroundTunnel_Streaming(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+rawKey)
 
+	// client.Timeout bounds the ENTIRE round trip, including body reads. If
+	// the tunnel buffered the response instead of streaming it, the read of
+	// the first SSE event below would block until this fires, failing the
+	// test deterministically rather than hanging.
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -453,13 +518,34 @@ func TestPlaygroundTunnel_Streaming(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	reader := bufio.NewReader(resp.Body)
+
+	// Read exactly the first SSE event (data line + its blank terminator).
+	// This blocks until bytes are actually available on the wire — which is
+	// the property under test.
+	firstLine, err := reader.ReadString('\n')
 	if err != nil {
-		t.Fatalf("read streaming response: %v", err)
+		t.Fatalf("read first SSE event: %v", err)
 	}
-	bodyStr := string(body)
-	for _, want := range chunks {
-		if !strings.Contains(bodyStr, want) {
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("read first SSE event terminator: %v", err)
+	}
+	if !strings.Contains(firstLine, firstChunk) {
+		t.Fatalf("first SSE event = %q, want to contain %q", firstLine, firstChunk)
+	}
+
+	// The upstream is blocked waiting for this signal, so closing it here
+	// proves the assertion above observed the first event strictly before the
+	// second and [DONE] events could have been sent.
+	close(firstChunkObserved)
+
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read remaining streaming response: %v", err)
+	}
+	restStr := string(rest)
+	for _, want := range []string{secondChunk, doneChunk} {
+		if !strings.Contains(restStr, want) {
 			t.Errorf("streaming response missing chunk %q", want)
 		}
 	}
