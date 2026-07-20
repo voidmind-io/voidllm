@@ -117,6 +117,34 @@ function ConfigLabel({ htmlFor, children }: { htmlFor?: string; children: React.
 }
 
 // ---------------------------------------------------------------------------
+// Build a user-facing error message from a failed fetch Response.
+//
+// Reads the body ONCE as text (res.json() would consume it, and cloning
+// after consumption fails), then attempts to parse it as JSON. Falls back
+// to the raw text body, and finally to a bare status code - never
+// res.statusText, which is empty over HTTP/2.
+// ---------------------------------------------------------------------------
+function asNonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() !== '' ? value : null
+}
+
+async function errorMessageFromResponse(res: Response): Promise<string> {
+  const text = await res.text().catch(() => '')
+  let parsed: unknown = null
+  try {
+    parsed = text ? JSON.parse(text) : null
+  } catch {
+    // non-JSON body (e.g. text/plain "Method Not Allowed") - fall through to the raw text
+  }
+  const textFallback = text.trim() || `HTTP ${res.status}`
+  const raw =
+    asNonEmptyString((parsed as { error?: { message?: unknown } } | null)?.error?.message) ??
+    asNonEmptyString((parsed as { message?: unknown } | null)?.message) ??
+    textFallback
+  return raw.length > 200 ? raw.slice(0, 200) + '...' : raw
+}
+
+// ---------------------------------------------------------------------------
 // Cosine similarity helper
 // ---------------------------------------------------------------------------
 function cosineSimilarity(a: number[], b: number[]): number {
@@ -293,13 +321,7 @@ export default function PlaygroundPage() {
       }
 
       if (!res.ok) {
-        const body = await res.json().catch(() => null)
-        const raw =
-          (body as { error?: { message?: string } } | null)?.error?.message ??
-          (body as { message?: string } | null)?.message ??
-          `HTTP ${res.status}: ${res.statusText}`
-        const errMessage = raw.length > 200 ? raw.slice(0, 200) + '...' : raw
-        setError(errMessage)
+        setError(await errorMessageFromResponse(res))
         return
       }
 
@@ -432,9 +454,7 @@ export default function PlaygroundPage() {
       body: JSON.stringify({ model, input }),
     })
     if (!res.ok) {
-      const body = await res.json().catch(() => null) as { error?: { message?: string } } | null
-      const msg = body?.error?.message ?? `HTTP ${res.status}`
-      throw new Error(msg.length > 200 ? msg.slice(0, 200) + '...' : msg)
+      throw new Error(await errorMessageFromResponse(res))
     }
     const data = (await res.json()) as { data?: { embedding?: number[] }[] }
     return (data.data ?? []).map((d) => d.embedding ?? [])
