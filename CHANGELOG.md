@@ -2,7 +2,7 @@
 
 All notable changes to VoidLLM are documented in this file.
 
-## [0.0.22] - 2026-06-21
+## [0.0.22] - 2026-07-21
 
 ### Features
 - PII anonymization (opt-in, early/beta): structured PII (IBAN, email, phone, credit card, tax ID) in outbound prompts is replaced with deterministic per-organization pseudonyms before the request leaves to an external provider, and restored in the response, including token-by-token while streaming (message content and tool-call arguments). No prompt or response content, PII, or pseudonyms are ever persisted or logged. Structured detection is regex-based; unstructured PII (names, places, operator terms) is covered by the opt-in gazetteer below; transformer-based NER is planned. Off by default (#134, #135, #137)
@@ -12,6 +12,12 @@ All notable changes to VoidLLM are documented in this file.
 ### Fixes
 - The PII firewall no longer rejects messages with `null` content (e.g. assistant messages carrying only `tool_calls`), so multi-turn tool conversations work with anonymization enabled (#136)
 - Streaming tool calls are delivered more reliably: provider adapters can emit multiple events per upstream chunk and fail closed on a malformed tool stream instead of silently dropping a tool call (#144)
+- The dashboard Playground works in dual-port mode. It previously issued a same-origin request to the proxy API, which is not served on the admin port, so every request failed with 405 - in the topology the hardening guide recommends. Requests now go through an authenticated same-origin route that hands off to the proxy internally, so nothing needs configuring and access control, limits and anonymization apply unchanged (#153)
+- Streaming responses that end without their terminal are no longer recorded as successful. The proxy now tracks how a stream ended and reports a truncated one as incomplete, while a client that simply hangs up is no longer counted as an upstream failure. Clients also receive an explicit error event when a stream is cut short instead of the connection merely stopping (#153)
+- The Playground error banner shows the server's message for non-JSON errors instead of a bare status code, which was empty over HTTP/2 (#154)
+
+### Documentation
+- PII anonymization is now documented, including what it does *not* protect: it removes the link between a statement and a named person, but the statement itself still reaches the provider (#155)
 
 ---
 
