@@ -707,6 +707,78 @@ models:
 			wantErr: false,
 		},
 		{
+			name: "write_timeout absurdly small positive value error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+    write_timeout: 1ns
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+`,
+			wantErr:     true,
+			errContains: "server.proxy.write_timeout",
+		},
+		{
+			name: "write_timeout just under the 1s floor error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+    write_timeout: 999ms
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+`,
+			wantErr:     true,
+			errContains: "server.proxy.write_timeout",
+		},
+		{
+			name: "write_timeout at the 1s floor is ok",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+    write_timeout: 1s
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+`,
+			wantErr: false,
+		},
+		{
+			// write_timeout: 0 is defaulted to 120s by setDefaults before
+			// validate runs, so it never reaches the floor check.
+			name: "write_timeout zero gets defaulted no error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+    write_timeout: 0s
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+`,
+			wantErr: false,
+		},
+		{
 			name: "retention usage_events negative error",
 			yaml: `
 server:

@@ -1,0 +1,770 @@
+package app
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gofiber/fiber/v3"
+
+	"github.com/voidmind-io/voidllm/internal/api/admin"
+	"github.com/voidmind-io/voidllm/internal/auth"
+	"github.com/voidmind-io/voidllm/internal/cache"
+	"github.com/voidmind-io/voidllm/internal/config"
+	"github.com/voidmind-io/voidllm/internal/proxy"
+	"github.com/voidmind-io/voidllm/pkg/keygen"
+)
+
+// testTunnelHMACSecret is a fixed HMAC secret used across the playground
+// tunnel tests to hash and verify test API keys via auth.Middleware.
+var testTunnelHMACSecret = []byte("playground-tunnel-test-hmac-secret-32b")
+
+// tunnelCapturedRequest records the last request received by a test upstream
+// server so assertions can be made against the path/method the proxy handler
+// actually forwarded.
+type tunnelCapturedRequest struct {
+	Method string
+	Path   string
+}
+
+// tunnelUpstream starts an httptest.Server that records the last request it
+// received into a *tunnelCapturedRequest and always replies with a canned
+// chat-completion-shaped JSON body.
+func tunnelUpstream(t *testing.T) (*httptest.Server, *tunnelCapturedRequest) {
+	t.Helper()
+	captured := &tunnelCapturedRequest{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured.Method = r.Method
+		captured.Path = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"x","object":"chat.completion","choices":[]}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, captured
+}
+
+// newTunnelTestApp builds a minimal, real *Application wired for setupRoutes:
+// a proxy handler forwarding to upstreamURL for "test-model", an in-memory
+// key cache, and a bare admin handler (never invoked by these tests — its
+// routes are registered but not exercised). adminPort mirrors
+// config.AdminConfig.Port semantics: 0 (or equal to proxyPort) selects
+// single-port mode, any other value selects dual-port mode.
+func newTunnelTestApp(t *testing.T, upstreamURL string, proxyPort, adminPort int, proxyCfg config.ProxyConfig) *Application {
+	t.Helper()
+
+	reg, err := proxy.NewRegistry([]config.ModelConfig{
+		{
+			Name:     "test-model",
+			Provider: "vllm",
+			BaseURL:  upstreamURL,
+			APIKey:   "upstream-secret",
+		},
+	})
+	if err != nil {
+		t.Fatalf("proxy.NewRegistry: %v", err)
+	}
+
+	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
+	proxyHandler := proxy.NewProxyHandler(reg, silent)
+
+	proxyCfg.Port = proxyPort
+
+	a := &Application{
+		cfg: &config.Config{
+			Server: config.ServerConfig{
+				Proxy: proxyCfg,
+				Admin: config.AdminConfig{Port: adminPort},
+			},
+		},
+		log:          silent,
+		keyCache:     cache.New[string, auth.KeyInfo](),
+		hmacSecret:   testTunnelHMACSecret,
+		proxyHandler: proxyHandler,
+		adminHandler: &admin.Handler{Log: silent},
+	}
+	a.setupRoutes()
+
+	t.Cleanup(func() {
+		_ = a.proxyApp.Shutdown()
+		if a.adminApp != nil {
+			_ = a.adminApp.Shutdown()
+		}
+	})
+	return a
+}
+
+// issueTunnelTestKey generates a plaintext API key, hashes it with the app's
+// HMAC secret, and seeds it into the app's key cache with keyInfo. Returns
+// the plaintext key, suitable for use in an Authorization: Bearer header.
+func issueTunnelTestKey(t *testing.T, a *Application, keyInfo auth.KeyInfo) string {
+	t.Helper()
+	rawKey, err := keygen.Generate(keygen.KeyTypeUser)
+	if err != nil {
+		t.Fatalf("keygen.Generate: %v", err)
+	}
+	a.keyCache.Set(keygen.Hash(rawKey, a.hmacSecret), keyInfo)
+	return rawKey
+}
+
+// tunnelTestTimeout is the per-request timeout passed to fiber's app.Test.
+var tunnelTestTimeout = fiber.TestConfig{Timeout: 5 * time.Second}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Dual-port mode: the tunnel must reach the proxy handler from the admin app.
+// ──────────────────────────────────────────────────────────────────────────
+
+func TestPlaygroundTunnel_DualPort_ChatCompletionsReachesProxy(t *testing.T) {
+	t.Parallel()
+
+	upstream, captured := tunnelUpstream(t)
+	a := newTunnelTestApp(t, upstream.URL, 18080, 18443, config.ProxyConfig{})
+	rawKey := issueTunnelTestKey(t, a, auth.KeyInfo{ID: "key-1", OrgID: "org-1", Role: "member"})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playground/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawKey)
+
+	resp, err := a.adminApp.Test(req, tunnelTestTimeout)
+	if err != nil {
+		t.Fatalf("adminApp.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d, body = %s", resp.StatusCode, http.StatusOK, body)
+	}
+	if captured.Path != "/chat/completions" {
+		t.Errorf("upstream path = %q, want %q", captured.Path, "/chat/completions")
+	}
+}
+
+func TestPlaygroundTunnel_DualPort_EmbeddingsReachesProxy(t *testing.T) {
+	t.Parallel()
+
+	upstream, captured := tunnelUpstream(t)
+	a := newTunnelTestApp(t, upstream.URL, 18081, 18444, config.ProxyConfig{})
+	rawKey := issueTunnelTestKey(t, a, auth.KeyInfo{ID: "key-2", OrgID: "org-1", Role: "member"})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playground/embeddings",
+		strings.NewReader(`{"model":"test-model","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawKey)
+
+	resp, err := a.adminApp.Test(req, tunnelTestTimeout)
+	if err != nil {
+		t.Fatalf("adminApp.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d, body = %s", resp.StatusCode, http.StatusOK, body)
+	}
+	if captured.Path != "/embeddings" {
+		t.Errorf("upstream path = %q, want %q", captured.Path, "/embeddings")
+	}
+}
+
+// TestPlaygroundTunnel_DualPort_V1NotServedOnAdminApp is a regression test:
+// /v1/* must remain unmounted on the admin app in dual-port mode. Only the
+// authenticated /api/v1/playground/* tunnel reaches the proxy handler there.
+func TestPlaygroundTunnel_DualPort_V1NotServedOnAdminApp(t *testing.T) {
+	t.Parallel()
+
+	upstream, captured := tunnelUpstream(t)
+	a := newTunnelTestApp(t, upstream.URL, 18082, 18445, config.ProxyConfig{})
+	rawKey := issueTunnelTestKey(t, a, auth.KeyInfo{ID: "key-3", OrgID: "org-1", Role: "member"})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawKey)
+
+	resp, err := a.adminApp.Test(req, tunnelTestTimeout)
+	if err != nil {
+		t.Fatalf("adminApp.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// /v1/* has no registered POST route on the admin app in dual-port mode —
+	// only the GET "/*" SPA catch-all exists. Fiber therefore replies with
+	// 405 Method Not Allowed (this was the exact pre-fix symptom described in
+	// the issue), not 200/502 from the proxy handler. Decisively, the proxy
+	// handler was never invoked, so the upstream never saw the request.
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (POST /v1/* must not be routed on the admin app), body = %s",
+			resp.StatusCode, http.StatusMethodNotAllowed, body)
+	}
+	if captured.Path != "" {
+		t.Fatalf("SECURITY: /v1/* reached the proxy handler on the admin app in dual-port mode; upstream saw path %q", captured.Path)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Single-port mode: the tunnel must also work, and /v1/* is unchanged.
+// ──────────────────────────────────────────────────────────────────────────
+
+func TestPlaygroundTunnel_SinglePort_TunnelAndV1BothWork(t *testing.T) {
+	t.Parallel()
+
+	upstream, captured := tunnelUpstream(t)
+	a := newTunnelTestApp(t, upstream.URL, 18083, 0, config.ProxyConfig{})
+	if a.adminApp != nil {
+		t.Fatalf("adminApp should be nil in single-port mode")
+	}
+	rawKey := issueTunnelTestKey(t, a, auth.KeyInfo{ID: "key-4", OrgID: "org-1", Role: "member"})
+
+	// The tunnel works on the single combined app.
+	tunnelReq := httptest.NewRequest(http.MethodPost, "/api/v1/playground/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[]}`))
+	tunnelReq.Header.Set("Content-Type", "application/json")
+	tunnelReq.Header.Set("Authorization", "Bearer "+rawKey)
+
+	resp, err := a.proxyApp.Test(tunnelReq, tunnelTestTimeout)
+	if err != nil {
+		t.Fatalf("proxyApp.Test (tunnel): %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("tunnel status = %d, want %d, body = %s", resp.StatusCode, http.StatusOK, body)
+	}
+	if captured.Path != "/chat/completions" {
+		t.Errorf("upstream path = %q, want %q", captured.Path, "/chat/completions")
+	}
+
+	// Direct /v1/* still works unchanged.
+	v1Req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[]}`))
+	v1Req.Header.Set("Content-Type", "application/json")
+	v1Req.Header.Set("Authorization", "Bearer "+rawKey)
+
+	resp2, err := a.proxyApp.Test(v1Req, tunnelTestTimeout)
+	if err != nil {
+		t.Fatalf("proxyApp.Test (/v1/*): %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("/v1/* status = %d, want %d, body = %s", resp2.StatusCode, http.StatusOK, body)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Auth: the tunnel enforces the same Bearer-key middleware as /v1/*.
+// ──────────────────────────────────────────────────────────────────────────
+
+func TestPlaygroundTunnel_Auth_MissingKey(t *testing.T) {
+	t.Parallel()
+
+	upstream, _ := tunnelUpstream(t)
+	a := newTunnelTestApp(t, upstream.URL, 18084, 18446, config.ProxyConfig{})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playground/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.adminApp.Test(req, tunnelTestTimeout)
+	if err != nil {
+		t.Fatalf("adminApp.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+func TestPlaygroundTunnel_Auth_InvalidKey(t *testing.T) {
+	t.Parallel()
+
+	upstream, _ := tunnelUpstream(t)
+	a := newTunnelTestApp(t, upstream.URL, 18085, 18447, config.ProxyConfig{})
+
+	invalidKey, err := keygen.Generate(keygen.KeyTypeUser)
+	if err != nil {
+		t.Fatalf("keygen.Generate: %v", err)
+	}
+	// Deliberately NOT seeded into a.keyCache — hash lookup will miss.
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playground/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+invalidKey)
+
+	resp, err := a.adminApp.Test(req, tunnelTestTimeout)
+	if err != nil {
+		t.Fatalf("adminApp.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Path handling: rewrite to the canonical /v1/<rest> path, isAllowedPath
+// still gates disallowed endpoints reached through the tunnel.
+// ──────────────────────────────────────────────────────────────────────────
+
+func TestPlaygroundTunnel_PathRewriting_AllowedPath(t *testing.T) {
+	t.Parallel()
+
+	upstream, captured := tunnelUpstream(t)
+	a := newTunnelTestApp(t, upstream.URL, 18086, 18448, config.ProxyConfig{})
+	rawKey := issueTunnelTestKey(t, a, auth.KeyInfo{ID: "key-5", OrgID: "org-1", Role: "member"})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playground/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawKey)
+
+	resp, err := a.adminApp.Test(req, tunnelTestTimeout)
+	if err != nil {
+		t.Fatalf("adminApp.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d, body = %s", resp.StatusCode, http.StatusOK, body)
+	}
+	if captured.Path != "/chat/completions" {
+		t.Errorf("upstream path = %q, want %q", captured.Path, "/chat/completions")
+	}
+}
+
+func TestPlaygroundTunnel_PathRewriting_DisallowedPathRejected(t *testing.T) {
+	t.Parallel()
+
+	upstream, captured := tunnelUpstream(t)
+	a := newTunnelTestApp(t, upstream.URL, 18087, 18449, config.ProxyConfig{})
+	rawKey := issueTunnelTestKey(t, a, auth.KeyInfo{ID: "key-6", OrgID: "org-1", Role: "member"})
+
+	// "fine-tunes" is not in isAllowedPath's allow-list.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playground/fine-tunes",
+		strings.NewReader(`{"model":"test-model"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawKey)
+
+	resp, err := a.adminApp.Test(req, tunnelTestTimeout)
+	if err != nil {
+		t.Fatalf("adminApp.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d, body = %s", resp.StatusCode, http.StatusBadRequest, body)
+	}
+	if captured.Path != "" {
+		t.Errorf("upstream should never have been called for a disallowed path, got path %q", captured.Path)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Streaming: SSE responses pass through the tunnel unbuffered.
+// ──────────────────────────────────────────────────────────────────────────
+
+// startTunnelListener starts fiberApp on a real TCP listener (fiber's
+// app.Test harness buffers responses and is unsuitable for asserting on
+// streaming behaviour) and returns its base URL.
+//
+// The listener is closed explicitly in a t.Cleanup registered here, in
+// addition to (and ahead of, since t.Cleanup runs LIFO) the fiberApp.Shutdown
+// call registered by newTunnelTestApp; a listener close racing with, or
+// preceding, Shutdown is safe — net.Listener.Close is idempotent-safe to call
+// from both and any resulting "already closed" error is immaterial to the
+// test outcome.
+func startTunnelListener(t *testing.T, fiberApp *fiber.App) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
+
+	// listenErr is buffered so the goroutine can never block on send: whether
+	// or not the test ever reads from it (e.g. it may still be running when
+	// Shutdown finally makes Listener return), the goroutine always completes.
+	listenErr := make(chan error, 1)
+	go func() {
+		listenErr <- fiberApp.Listener(ln, fiber.ListenConfig{DisableStartupMessage: true})
+	}()
+
+	baseURL := "http://" + ln.Addr().String()
+	// probeClient issues a real HTTP request rather than a bare TCP dial: a
+	// successful dial only proves the socket is bound, which net.Listen above
+	// already guaranteed — it does NOT prove fiberApp has reached its serving
+	// loop and can actually handle a request. /healthz is registered
+	// unconditionally by setupRoutes, so any response (regardless of status)
+	// proves the app is serving.
+	probeClient := &http.Client{Timeout: 200 * time.Millisecond}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-listenErr:
+			t.Fatalf("fiberApp.Listener exited before becoming ready: %v", err)
+		default:
+		}
+
+		resp, probeErr := probeClient.Get(baseURL + "/healthz")
+		if probeErr == nil {
+			_ = resp.Body.Close()
+			return baseURL
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for tunnel listener to become ready at %s", baseURL)
+	return ""
+}
+
+// TestPlaygroundTunnel_Streaming proves the tunnel delivers SSE events to the
+// client as they arrive, not only once the full upstream response has been
+// read. A wrapper that buffered the entire response before forwarding
+// anything would still pass a test that merely io.ReadAll's the final body
+// (the shape of the previous version of this test) — it would not pass this
+// one: the upstream deliberately blocks after its first event until the test
+// has confirmed that event was already readable on the client side, and only
+// then sends the second. If the tunnel buffered, the client's read of the
+// first event would itself block waiting for the (blocked) upstream to
+// finish, deadlocking until the bounded timeouts below fire and fail the test.
+func TestPlaygroundTunnel_Streaming(t *testing.T) {
+	t.Parallel()
+
+	const (
+		firstChunk  = `data: {"choices":[{"delta":{"content":"Hello"}}]}`
+		secondChunk = `data: {"choices":[{"delta":{"content":" World"}}]}`
+		doneChunk   = `data: [DONE]`
+	)
+
+	// firstChunkObserved is closed by the test once it has read the first SSE
+	// event off the wire. The upstream handler blocks on it before sending the
+	// second event.
+	firstChunkObserved := make(chan struct{})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("upstream responseWriter does not implement http.Flusher")
+			return
+		}
+
+		fmt.Fprintln(w, firstChunk)
+		fmt.Fprintln(w)
+		flusher.Flush()
+
+		select {
+		case <-firstChunkObserved:
+		case <-time.After(3 * time.Second):
+			// The client never confirmed receipt of the first event within the
+			// bound. Write nothing further: the response simply ends here, so
+			// the test's subsequent read fails on the missing chunks below
+			// instead of this goroutine (and the test) hanging forever.
+			return
+		}
+
+		fmt.Fprintln(w, secondChunk)
+		fmt.Fprintln(w)
+		flusher.Flush()
+		fmt.Fprintln(w, doneChunk)
+		fmt.Fprintln(w)
+		flusher.Flush()
+	}))
+	t.Cleanup(upstream.Close)
+
+	a := newTunnelTestApp(t, upstream.URL, 18088, 18450, config.ProxyConfig{})
+	rawKey := issueTunnelTestKey(t, a, auth.KeyInfo{ID: "key-7", OrgID: "org-1", Role: "member"})
+	baseURL := startTunnelListener(t, a.adminApp)
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/v1/playground/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawKey)
+
+	// client.Timeout bounds the ENTIRE round trip, including body reads. If
+	// the tunnel buffered the response instead of streaming it, the read of
+	// the first SSE event below would block until this fires, failing the
+	// test deterministically rather than hanging.
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	reader := bufio.NewReader(resp.Body)
+
+	// Read exactly the first SSE event (data line + its blank terminator).
+	// This blocks until bytes are actually available on the wire — which is
+	// the property under test.
+	firstLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read first SSE event: %v", err)
+	}
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("read first SSE event terminator: %v", err)
+	}
+	if !strings.Contains(firstLine, firstChunk) {
+		t.Fatalf("first SSE event = %q, want to contain %q", firstLine, firstChunk)
+	}
+
+	// The upstream is blocked waiting for this signal, so closing it here
+	// proves the assertion above observed the first event strictly before the
+	// second and [DONE] events could have been sent.
+	close(firstChunkObserved)
+
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read remaining streaming response: %v", err)
+	}
+	restStr := string(rest)
+	for _, want := range []string{secondChunk, doneChunk} {
+		if !strings.Contains(restStr, want) {
+			t.Errorf("streaming response missing chunk %q", want)
+		}
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Admin app timeouts / body limit: adopt the proxy's configured values so
+// the tunnel can carry long-lived streaming completions, but only within
+// [floor, maxAdminTunnelTimeout] / [floor, maxAdminTunnelBodyLimit] — see
+// those constants in routes.go for why the cap exists (Fiber v3 has no
+// per-route timeout, so an unbounded value here would also apply to the
+// admin app's unauthenticated endpoints).
+// ──────────────────────────────────────────────────────────────────────────
+
+// TestSetupRoutes_AdminTimeoutsFloorWhenProxySmaller covers the regime where
+// the proxy's configured values are BELOW the admin app's own floor: the
+// floor (30s / fiber.DefaultBodyLimit) applies.
+func TestSetupRoutes_AdminTimeoutsFloorWhenProxySmaller(t *testing.T) {
+	t.Parallel()
+
+	upstream, _ := tunnelUpstream(t)
+	// Proxy configured with values below the admin app's own 30s/4MB floor.
+	proxyCfg := config.ProxyConfig{
+		ReadTimeout:    5 * time.Second,
+		WriteTimeout:   5 * time.Second,
+		MaxRequestBody: 1024,
+	}
+	a := newTunnelTestApp(t, upstream.URL, 18090, 18452, proxyCfg)
+
+	cfg := a.adminApp.Config()
+	if cfg.ReadTimeout != 30*time.Second {
+		t.Errorf("admin ReadTimeout = %v, want the 30s floor", cfg.ReadTimeout)
+	}
+	if cfg.WriteTimeout != 30*time.Second {
+		t.Errorf("admin WriteTimeout = %v, want the 30s floor", cfg.WriteTimeout)
+	}
+	if cfg.BodyLimit != fiber.DefaultBodyLimit {
+		t.Errorf("admin BodyLimit = %d, want Fiber's default floor %d", cfg.BodyLimit, fiber.DefaultBodyLimit)
+	}
+}
+
+// TestSetupRoutes_AdminTimeoutsAdoptProxyBetweenFloorAndCap covers the
+// regime where the proxy's configured values sit strictly between the floor
+// and maxAdminTunnelTimeout/maxAdminTunnelBodyLimit: the proxy's values are
+// adopted as-is.
+func TestSetupRoutes_AdminTimeoutsAdoptProxyBetweenFloorAndCap(t *testing.T) {
+	t.Parallel()
+
+	upstream, _ := tunnelUpstream(t)
+	proxyCfg := config.ProxyConfig{
+		ReadTimeout:    60 * time.Second,
+		WriteTimeout:   90 * time.Second,
+		MaxRequestBody: 6 * 1024 * 1024,
+	}
+	a := newTunnelTestApp(t, upstream.URL, 18089, 18451, proxyCfg)
+
+	cfg := a.adminApp.Config()
+	if cfg.ReadTimeout != proxyCfg.ReadTimeout {
+		t.Errorf("admin ReadTimeout = %v, want the adopted proxy value %v", cfg.ReadTimeout, proxyCfg.ReadTimeout)
+	}
+	if cfg.WriteTimeout != proxyCfg.WriteTimeout {
+		t.Errorf("admin WriteTimeout = %v, want the adopted proxy value %v", cfg.WriteTimeout, proxyCfg.WriteTimeout)
+	}
+	if cfg.BodyLimit != proxyCfg.MaxRequestBody {
+		t.Errorf("admin BodyLimit = %d, want the adopted proxy value %d", cfg.BodyLimit, proxyCfg.MaxRequestBody)
+	}
+}
+
+// TestSetupRoutes_AdminTimeoutsCappedWhenProxyLarger covers the regime where
+// the proxy's configured values are ABOVE maxAdminTunnelTimeout /
+// maxAdminTunnelBodyLimit: the cap applies instead of the proxy value. This
+// is the security-relevant regression test — without the cap, a generous
+// proxy timeout would be adopted unbounded onto the admin app's
+// unauthenticated endpoints (e.g. POST /api/v1/auth/login).
+func TestSetupRoutes_AdminTimeoutsCappedWhenProxyLarger(t *testing.T) {
+	t.Parallel()
+
+	upstream, _ := tunnelUpstream(t)
+	proxyCfg := config.ProxyConfig{
+		ReadTimeout:    150 * time.Second,
+		WriteTimeout:   300 * time.Second,
+		MaxRequestBody: 30 * 1024 * 1024,
+	}
+	a := newTunnelTestApp(t, upstream.URL, 18091, 18453, proxyCfg)
+
+	cfg := a.adminApp.Config()
+	if cfg.ReadTimeout != maxAdminTunnelTimeout {
+		t.Errorf("admin ReadTimeout = %v, want capped at %v", cfg.ReadTimeout, maxAdminTunnelTimeout)
+	}
+	if cfg.WriteTimeout != maxAdminTunnelTimeout {
+		t.Errorf("admin WriteTimeout = %v, want capped at %v", cfg.WriteTimeout, maxAdminTunnelTimeout)
+	}
+	if cfg.BodyLimit != maxAdminTunnelBodyLimit {
+		t.Errorf("admin BodyLimit = %d, want capped at %d", cfg.BodyLimit, maxAdminTunnelBodyLimit)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Tunnel stream budget: the budget setupRoutes derives for the playground
+// tunnel must always stay strictly below the WriteTimeout of whichever app
+// actually enforces the socket deadline (a.adminApp in dual-port mode) — see
+// tunnelStreamBudget in routes.go. A fixed budget constant (the pre-fix
+// approach) can exceed that deadline whenever the admin app's effective
+// WriteTimeout sits strictly between the 30s floor and the
+// maxAdminTunnelTimeout cap — e.g. a configured proxy.WriteTimeout of 90s.
+// ──────────────────────────────────────────────────────────────────────────
+
+// TestTunnelStreamBudget_UnitTable exercises tunnelStreamBudget directly
+// across the regimes that matter: below the headroom, at/above the headroom,
+// and the "no deadline configured" case. In every case where writeTimeout is
+// positive, the returned budget must itself be strictly less than
+// writeTimeout and strictly positive.
+func TestTunnelStreamBudget_UnitTable(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		writeTimeout time.Duration
+	}{
+		{"unlimited (zero)", 0},
+		{"far below headroom", 5 * time.Second},
+		{"exactly the headroom", adminTunnelStreamHeadroom},
+		{"just above the headroom", adminTunnelStreamHeadroom + time.Second},
+		{"the 30s admin floor", 30 * time.Second},
+		{"the 90s regression case", 90 * time.Second},
+		{"the 120s admin cap", maxAdminTunnelTimeout},
+		{"far above any admin cap", 300 * time.Second},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			budget := tunnelStreamBudget(tc.writeTimeout)
+
+			if tc.writeTimeout <= 0 {
+				if budget != 0 {
+					t.Errorf("writeTimeout=%v: budget = %v, want 0 (no deadline to cap)", tc.writeTimeout, budget)
+				}
+				return
+			}
+
+			if budget <= 0 {
+				t.Errorf("writeTimeout=%v: budget = %v, want a positive duration", tc.writeTimeout, budget)
+			}
+			if budget >= tc.writeTimeout {
+				t.Errorf("writeTimeout=%v: budget = %v, want strictly less than writeTimeout (INVARIANT violated)", tc.writeTimeout, budget)
+			}
+		})
+	}
+}
+
+// TestSetupRoutes_TunnelStreamBudget_StrictlyBelowAdminWriteTimeout is the
+// end-to-end regression test for the "fixed constant vs. effective
+// WriteTimeout" bug: it drives newTunnelTestApp (the real setupRoutes dual-port
+// path) across proxy.WriteTimeout configurations that land the admin app's
+// effective WriteTimeout below the cap, at the cap, and above the cap, and
+// asserts a.tunnelStreamBudget is always strictly less than — and always
+// positive relative to — a.adminApp.Config().WriteTimeout.
+//
+// The 90s case is the exact configuration that previously reproduced the
+// bug: the fixed maxAdminTunnelStreamDuration constant (105s) exceeded the
+// 90s admin WriteTimeout, so the fasthttp socket deadline fired before the
+// proxy's own stream timer ever got a chance to run its deliberate teardown.
+func TestSetupRoutes_TunnelStreamBudget_StrictlyBelowAdminWriteTimeout(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		writeTimeout time.Duration
+		adminPort    int
+	}{
+		{"below the 30s floor", 5 * time.Second, 18454},
+		{"the 90s regression configuration", 90 * time.Second, 18455},
+		{"above the 120s cap", 300 * time.Second, 18456},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			upstream, _ := tunnelUpstream(t)
+			proxyCfg := config.ProxyConfig{WriteTimeout: tc.writeTimeout}
+			a := newTunnelTestApp(t, upstream.URL, 18500+i, tc.adminPort, proxyCfg)
+
+			adminWriteTimeout := a.adminApp.Config().WriteTimeout
+			if adminWriteTimeout <= 0 {
+				t.Fatalf("test setup: admin WriteTimeout = %v, want a positive deadline", adminWriteTimeout)
+			}
+
+			if a.tunnelStreamBudget <= 0 {
+				t.Fatalf("tunnelStreamBudget = %v, want a positive duration for adminWriteTimeout=%v", a.tunnelStreamBudget, adminWriteTimeout)
+			}
+			if a.tunnelStreamBudget >= adminWriteTimeout {
+				t.Errorf("tunnelStreamBudget = %v >= admin WriteTimeout %v — the socket deadline can fire before the proxy's own stream timer (INVARIANT violated)",
+					a.tunnelStreamBudget, adminWriteTimeout)
+			}
+		})
+	}
+}
+
+// TestSetupRoutes_TunnelStreamBudget_SinglePortUnlimitedWriteTimeout covers
+// single-port mode with the default (unlimited) proxy.WriteTimeout: there is
+// no socket deadline to race against, so setupRoutes must not derive an
+// artificial cap — a.tunnelStreamBudget stays 0 and playgroundTunnel skips
+// calling proxy.SetTunnelStreamCap entirely.
+func TestSetupRoutes_TunnelStreamBudget_SinglePortUnlimitedWriteTimeout(t *testing.T) {
+	t.Parallel()
+
+	upstream, _ := tunnelUpstream(t)
+	a := newTunnelTestApp(t, upstream.URL, 18457, 0, config.ProxyConfig{})
+	if a.adminApp != nil {
+		t.Fatalf("adminApp should be nil in single-port mode")
+	}
+
+	if a.proxyApp.Config().WriteTimeout != 0 {
+		t.Fatalf("test setup: proxyApp WriteTimeout = %v, want 0 (unlimited)", a.proxyApp.Config().WriteTimeout)
+	}
+	if a.tunnelStreamBudget != 0 {
+		t.Errorf("tunnelStreamBudget = %v, want 0 when the hosting app has no WriteTimeout configured", a.tunnelStreamBudget)
+	}
+}

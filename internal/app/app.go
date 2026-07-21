@@ -96,6 +96,15 @@ type Application struct {
 	proxyApp *fiber.App
 	adminApp *fiber.App
 
+	// tunnelStreamBudget is the stream-duration cap playgroundTunnel passes to
+	// proxy.SetTunnelStreamCap. It is derived in setupRoutes from the effective
+	// WriteTimeout of whichever Fiber app ends up hosting the tunnel route
+	// (a.proxyApp in single-port mode, a.adminApp in dual-port mode) — see
+	// tunnelStreamBudget in routes.go for the derivation and its invariant.
+	// Zero means "no cap": the hosting app has no WriteTimeout configured, so
+	// there is no socket deadline for the proxy's own stream timer to race.
+	tunnelStreamBudget time.Duration
+
 	// otelShutdown flushes and closes the OTel TracerProvider on shutdown.
 	// It is nil when OTel tracing is not enabled.
 	otelShutdown func(context.Context) error

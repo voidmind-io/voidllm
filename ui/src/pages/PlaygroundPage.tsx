@@ -43,6 +43,13 @@ const MAX_MESSAGES = 50
 const DEFAULT_TEMPERATURE = 0.7
 const DEFAULT_MAX_TOKENS = 4096
 
+// Same-origin tunnel routes (authenticated, mounted on the admin app in both
+// single-port and dual-port mode) - never call /v1/* directly from the UI,
+// since /v1/* is only mounted on the proxy app and is unreachable from the
+// admin origin when the two are split across ports.
+const CHAT_ENDPOINT = '/api/v1/playground/chat/completions'
+const EMBEDDINGS_ENDPOINT = '/api/v1/playground/embeddings'
+
 const typeLabels: Record<string, string> = {
   chat: 'Chat',
   completion: 'Completion',
@@ -296,7 +303,7 @@ export default function PlaygroundPage() {
     const startTime = Date.now()
 
     try {
-      const res = await fetch('/v1/chat/completions', {
+      const res = await fetch(CHAT_ENDPOINT, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -445,7 +452,7 @@ export default function PlaygroundPage() {
 
   async function fetchEmbeddings(input: string | string[]): Promise<number[][]> {
     const token = apiKey.trim() || localStorage.getItem(LOCAL_STORAGE_KEY) || ''
-    const res = await fetch('/v1/embeddings', {
+    const res = await fetch(EMBEDDINGS_ENDPOINT, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

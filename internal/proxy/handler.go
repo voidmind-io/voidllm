@@ -320,10 +320,7 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 
 	// Per-model timeout overrides the global stream duration limit when set.
 	// Recomputed on each iteration in case the fallback model has a different timeout.
-	effectiveStreamDur := maxStreamDur
-	if currentModel.Timeout > 0 {
-		effectiveStreamDur = currentModel.Timeout
-	}
+	effectiveStreamDur := p.effectiveStreamDuration(c, maxStreamDur, currentModel)
 
 	maxDepth := p.FallbackMaxDepth
 	if maxDepth <= 0 {
@@ -459,10 +456,7 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		// is selected inside tryModel via the pickBody closure, after
 		// applyDeployment resolves the effective provider for each deployment.
 		// No per-hop body pre-selection is needed here.
-		effectiveStreamDur = maxStreamDur
-		if currentModel.Timeout > 0 {
-			effectiveStreamDur = currentModel.Timeout
-		}
+		effectiveStreamDur = p.effectiveStreamDuration(c, maxStreamDur, currentModel)
 	}
 
 	// All candidates (and fallback chain) exhausted without a usable response.
@@ -705,6 +699,28 @@ func (p *ProxyHandler) resolveEffectiveLimits() (maxRequestBody, maxResponseBody
 		maxStreamDuration = defaultMaxStreamDuration
 	}
 	return maxRequestBody, maxResponseBody, maxStreamDuration
+}
+
+// effectiveStreamDuration returns the stream duration budget for a single hop:
+// model.Timeout when configured, otherwise maxStreamDur. When c carries a
+// tunnel stream-duration cap (set via SetTunnelStreamCap), the result is
+// further capped at that value — never extended — so that a request tunneled
+// through an in-process proxy such as the admin app's playground tunnel is
+// always torn down by the proxy's own stream timer (clean upstream
+// cancellation plus a terminal abort event) before any shorter, unrefreshed
+// socket write deadline further down the stack can kill the connection
+// instead. Requests that never call SetTunnelStreamCap take this codepath
+// with zero behavioral change: tunnelStreamCapFromCtx reports ok=false and
+// the model/global duration is returned unmodified.
+func (p *ProxyHandler) effectiveStreamDuration(c fiber.Ctx, maxStreamDur time.Duration, model Model) time.Duration {
+	d := maxStreamDur
+	if model.Timeout > 0 {
+		d = model.Timeout
+	}
+	if tunnelCap, ok := tunnelStreamCapFromCtx(c); ok && tunnelCap > 0 && tunnelCap < d {
+		d = tunnelCap
+	}
+	return d
 }
 
 // initShutdownTracking registers the request with ShutdownState and returns a
@@ -972,21 +988,38 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 	return req, upstreamCancel, adapter, nil
 }
 
+// doneLine is the exact SSE data line OpenAI-compatible upstreams (and our
+// own provider adapters — see AnthropicAdapter's message_stop handling and
+// GeminiAdapter's doneSent logic) emit to signal a clean end of stream. The
+// plain (non-PII) streaming path compares each line it actually writes to
+// the client against this value to detect the terminal event — see
+// handleStreamingResponse's post-loop classification block.
+var doneLine = []byte("data: [DONE]")
+
 // writeStreamAbortEvent writes a single content-free OpenAI-shaped SSE error
 // event to w and flushes. The event carries the provided code as both
 // "type" and "code" so that clients can distinguish abort reasons without any
 // upstream content appearing in the wire format. No trailing [DONE] is emitted;
 // the absence of [DONE] signals to well-behaved clients that the stream did not
-// complete successfully. The function intentionally ignores write errors because
-// by the time it is called the only objective is a best-effort notification —
-// the stream is already being torn down.
-func writeStreamAbortEvent(w *bufio.Writer, code string) {
+// complete successfully.
+//
+// It returns whether the event was fully written and flushed. The function
+// never logs and never retries — by the time it is called the only objective
+// is a best-effort notification and the stream is already being torn down —
+// but callers on the plain streaming path use the reported outcome to tell a
+// genuine delivery from a client that turned out to already be gone (a write
+// failure here means there is nobody left to receive the notification, i.e.
+// a disconnect, not a truncated response the client was successfully told
+// about). Callers that do not need this distinction may ignore the result.
+func writeStreamAbortEvent(w *bufio.Writer, code string) bool {
 	// The message field is a static, content-free string. The code value is
 	// caller-controlled and must always be a static string constant (never
 	// derived from upstream content or user input) to ensure zero-knowledge.
 	msg := "stream aborted"
-	_, _ = fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":%q,\"code\":%q}}\n\n", msg, code, code)
-	_ = w.Flush()
+	if _, err := fmt.Fprintf(w, "data: {\"error\":{\"message\":%q,\"type\":%q,\"code\":%q}}\n\n", msg, code, code); err != nil {
+		return false
+	}
+	return w.Flush() == nil
 }
 
 // handleStreamingResponse sets the SSE response headers and launches the
@@ -1308,10 +1341,39 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			_ = w.Flush()
 		} else {
 			// Non-buffered path: per-line passthrough with no PII overhead.
-			// plainAborted tracks adapter-abort so the post-loop block can
-			// set streamIncomplete and record a breaker failure consistently
-			// with the PII path.
+			//
+			// plainAborted tracks adapter-abort: the abort branch below
+			// already writes exactly one abort event and records the
+			// breaker failure inline, so the post-loop classification must
+			// not touch either again.
+			//
+			// clientDisconnected tracks a write/newline/flush failure — the
+			// client is already gone. It is checked FIRST in the
+			// classification below because a write failure can race with a
+			// pending scanner error (the upstream tearing down and the
+			// client vanishing can surface as concurrent failures) and must
+			// win: there is nobody left to receive an abort event either way.
+			// It can also be set RETROACTIVELY, after the loop, when a
+			// scanner error (or an EOF without [DONE]) leads the
+			// classification below to attempt delivering the abort event and
+			// that delivery itself fails — that outcome means the client was
+			// already gone, so it is reclassified as a disconnect rather than
+			// left as an "incomplete stream the client was notified about."
+			//
+			// terminalSeen mirrors the PII path's field of the same name. In the
+			// adapter branch it becomes true after a synthesized [DONE] event is
+			// written; in raw passthrough it becomes true only after the complete
+			// event containing the sole "data: [DONE]" field and its separator are
+			// flushed. A write failure while delivering either is a disconnect,
+			// not a completion. The loop then stops so later upstream activity
+			// cannot downgrade an already-completed stream.
 			plainAborted := false
+			clientDisconnected := false
+			terminalSeen := false
+			rawEventOpen := false
+			rawEventDataLines := 0
+			rawEventHasDoneLine := false
+
 		plainScanLoop:
 			for scanner.Scan() {
 				line := scanner.Bytes()
@@ -1327,11 +1389,18 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 					if terr != nil {
 						p.Log.LogAttrs(context.Background(), slog.LevelWarn,
 							"streaming: adapter stream transform error; stream aborted fail-closed")
-						plainAborted = true
-						streamIncomplete = true
-						writeStreamAbortEvent(w, "stream_transform_aborted")
-						if breaker != nil {
-							breaker.RecordFailure()
+						if writeStreamAbortEvent(w, "stream_transform_aborted") {
+							plainAborted = true
+							streamIncomplete = true
+							if breaker != nil {
+								breaker.RecordFailure()
+							}
+						} else {
+							// The abort event itself failed to reach the client —
+							// it is already gone. Reclassify as a disconnect so
+							// the post-loop switch's precedence (disconnect wins
+							// over everything) applies, mirroring case 4 below.
+							clientDisconnected = true
 						}
 						break plainScanLoop
 					}
@@ -1362,38 +1431,87 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 						}
 						extractor.observe(al)
 						if _, err := w.Write(al); err != nil {
+							clientDisconnected = true
 							break plainScanLoop
 						}
 						if _, err := w.WriteString("\n\n"); err != nil {
+							clientDisconnected = true
 							break plainScanLoop
 						}
 						if err := w.Flush(); err != nil {
+							clientDisconnected = true
+							break plainScanLoop
+						}
+						// The line and its "\n\n" event terminator were fully
+						// written and flushed — only now is it safe to record
+						// the terminal. Nothing after [DONE] may be processed
+						// or written, so stop scanning immediately.
+						if bytes.Equal(al, doneLine) {
+							terminalSeen = true
 							break plainScanLoop
 						}
 					}
 					continue plainScanLoop
 				}
-				// Always observe the (possibly transformed) line. Transformed
-				// lines are OpenAI-shaped (Azure passthrough, Anthropic → OpenAI),
-				// and raw passthrough lines are already OpenAI-shaped, so the
-				// extractor can parse usage from all of them.
-				extractor.observe(line)
+				// Raw passthrough (no adapter transform): preserve the upstream
+				// event structure line-for-line. In particular, several data fields,
+				// metadata fields, and comments may all belong to one event and must
+				// not be separated by proxy-inserted blank lines. With ScanLines,
+				// LF-framed streams are forwarded byte-for-byte, CRLF is normalized
+				// to LF, and lone-CR framing is not supported.
+				if len(line) > 0 {
+					rawEventOpen = true
+					fieldName, _, _ := bytes.Cut(line, []byte(":"))
+					if bytes.Equal(fieldName, []byte("data")) {
+						rawEventDataLines++
+						if bytes.Equal(line, doneLine) {
+							rawEventHasDoneLine = true
+						}
+					}
+					extractor.observe(line)
+				}
 
 				if _, err := w.Write(line); err != nil {
-					break // client disconnected
+					clientDisconnected = true
+					break plainScanLoop
 				}
 				if err := w.WriteByte('\n'); err != nil {
-					break // client disconnected
+					clientDisconnected = true
+					break plainScanLoop
 				}
 				if err := w.Flush(); err != nil {
-					break // client disconnected
+					clientDisconnected = true
+					break plainScanLoop
+				}
+
+				if len(line) == 0 {
+					isTerminalEvent := rawEventOpen && rawEventDataLines == 1 && rawEventHasDoneLine
+					rawEventOpen = false
+					rawEventDataLines = 0
+					rawEventHasDoneLine = false
+					if isTerminalEvent {
+						terminalSeen = true
+						break plainScanLoop
+					}
 				}
 			}
-			// Check scanner.Err() and record the circuit breaker outcome.
-			// When the adapter already aborted the stream (plainAborted=true),
-			// RecordFailure was already called inside the abort block; do not
-			// record again. A clean scanner exit after adapter abort (scanErr nil)
-			// must NOT be recorded as RecordSuccess.
+
+			// EOF or a scanner error can arrive after a non-blank line. Close
+			// that event before classification so any injected abort event starts
+			// at a fresh boundary. A lone [DONE] event becomes terminal only after
+			// this successfully writes and flushes its missing separator.
+			if adapter == nil && !clientDisconnected && !terminalSeen && rawEventOpen {
+				if err := w.WriteByte('\n'); err != nil {
+					clientDisconnected = true
+				} else if err := w.Flush(); err != nil {
+					clientDisconnected = true
+				} else if rawEventDataLines == 1 && rawEventHasDoneLine {
+					terminalSeen = true
+				}
+			}
+
+			// scanErr is logged unconditionally for observability whenever
+			// non-nil, independent of how it is ultimately classified below.
 			scanErr := scanner.Err()
 			if scanErr != nil {
 				p.Log.LogAttrs(context.Background(), slog.LevelWarn,
@@ -1401,11 +1519,88 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 					slog.String("error", scanErr.Error()),
 				)
 			}
-			if breaker != nil && !plainAborted {
-				if scanErr != nil {
-					breaker.RecordFailure()
+
+			// Classify how the scan loop ended, in strict precedence order.
+			// Exactly one case applies; see the field comments above the loop
+			// for the reasoning behind the ordering.
+			switch {
+			case clientDisconnected:
+				// Case 1: the client is already gone (a write, newline, or
+				// flush failed). This takes precedence over everything else,
+				// including a pending scanner error, because a write failure
+				// racing with an upstream read error is still fundamentally a
+				// disconnect — there is nobody left to receive an abort
+				// event. No abort event is written; streamIncomplete is left
+				// untouched here (a disconnect has its own usage semantics,
+				// handled by the breaker switch below, not the incomplete/502
+				// path).
+
+			case plainAborted:
+				// Case 2: the adapter transform reported
+				// errStreamTransformAborted. The abort branch above already
+				// wrote exactly one abort event, set streamIncomplete, and
+				// recorded the breaker failure — nothing more to do here.
+
+			case terminalSeen:
+				// Case 3: a clean "data: [DONE]" line was actually written to
+				// the client. The stream completed successfully. The scan
+				// loop broke out the instant [DONE] was flushed, so nothing
+				// the upstream does afterward (e.g. tearing the connection
+				// down immediately after its final event) is ever observed
+				// here: no abort event, no downgrade.
+
+			default:
+				// Case 4: the loop ended without ever writing [DONE] to the
+				// client — either scanner.Err() reports a genuine error
+				// (stream-duration timeout firing and cancelling the upstream
+				// context — see streamTimer above — upstream reset, or
+				// malformed framing) or the upstream closed the connection
+				// cleanly without ever sending [DONE] (a silently truncated
+				// response; bufio.Scanner treats EOF as terminal but never
+				// reports it via Err, so scanErr is nil in that sub-case too).
+				// Both are incomplete from the client's perspective, so we
+				// attempt to deliver the same content-free abort event the
+				// PII path already emits for this failure class.
+				//
+				// Framing invariant: upstream blank separators are forwarded, and
+				// an event still open at EOF/error is explicitly closed above. The
+				// abort event therefore always starts at a fresh SSE event boundary.
+				if writeStreamAbortEvent(w, "stream_incomplete") {
+					streamIncomplete = true
 				} else {
+					// The client turned out to already be gone by the time we
+					// tried to deliver the abort event — e.g. it disconnected
+					// at the same moment the scanner hit its own error. This
+					// is a disconnect, not a truncated response the client
+					// was actually told about: reclassify as case 1 so the
+					// breaker switch below records neither success nor
+					// failure, and the stream is not marked incomplete for a
+					// notification nobody received.
+					//
+					// This reclassification is best-effort by nature: a write to
+					// an already-departed client frequently still succeeds
+					// because the bytes only reach a socket buffer, so the
+					// failure is not observable here. Such a request is then
+					// recorded as incomplete (502) with a breaker failure even
+					// though nobody was listening. That mislabels a rare race in
+					// metrics only - no content is affected - and detecting it
+					// reliably is not possible at this layer, which is why no
+					// test covers that particular interleaving.
+					clientDisconnected = true
+				}
+			}
+
+			if breaker != nil && !plainAborted {
+				switch {
+				case clientDisconnected:
+					// Client hung up — neither success nor failure on the
+					// upstream side.
+				case terminalSeen:
 					breaker.RecordSuccess()
+				default:
+					// Scanner error before [DONE], or a clean EOF that never
+					// reached [DONE] — treat as an upstream failure.
+					breaker.RecordFailure()
 				}
 			}
 		}
