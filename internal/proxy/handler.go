@@ -1364,14 +1364,10 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			// becomes true once a clean "data: [DONE]" line has actually been
 			// WRITTEN to the client (never before a successful write — a
 			// write failure on the [DONE] line itself is a disconnect, not a
-			// completion). Unlike the PII path, this loop does not break out
-			// when terminalSeen becomes true; it keeps scanning exactly as
-			// before this fix, so a scanner error the upstream produces right
-			// after its final event (e.g. tearing down the connection
-			// immediately after [DONE]) is still observed here. The post-loop
-			// classification below is what makes that harmless: once
-			// terminalSeen is true, a later scanner error can no longer
-			// downgrade an already-completed stream.
+			// completion). Like the PII path, this loop breaks out of the scan
+			// immediately once terminalSeen becomes true: nothing observed
+			// after a fully-delivered [DONE] may downgrade an
+			// already-completed stream, so scanning simply stops there.
 			plainAborted := false
 			clientDisconnected := false
 			terminalSeen := false
@@ -1391,11 +1387,18 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 					if terr != nil {
 						p.Log.LogAttrs(context.Background(), slog.LevelWarn,
 							"streaming: adapter stream transform error; stream aborted fail-closed")
-						plainAborted = true
-						streamIncomplete = true
-						writeStreamAbortEvent(w, "stream_transform_aborted")
-						if breaker != nil {
-							breaker.RecordFailure()
+						if writeStreamAbortEvent(w, "stream_transform_aborted") {
+							plainAborted = true
+							streamIncomplete = true
+							if breaker != nil {
+								breaker.RecordFailure()
+							}
+						} else {
+							// The abort event itself failed to reach the client —
+							// it is already gone. Reclassify as a disconnect so
+							// the post-loop switch's precedence (disconnect wins
+							// over everything) applies, mirroring case 4 below.
+							clientDisconnected = true
 						}
 						break plainScanLoop
 					}
@@ -1439,9 +1442,11 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 						}
 						// The line and its "\n\n" event terminator were fully
 						// written and flushed — only now is it safe to record
-						// the terminal.
+						// the terminal. Nothing after [DONE] may be processed
+						// or written, so stop scanning immediately.
 						if bytes.Equal(al, doneLine) {
 							terminalSeen = true
+							break plainScanLoop
 						}
 					}
 					continue plainScanLoop
@@ -1466,8 +1471,11 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				}
 				// The line was fully written and flushed — only now is it
 				// safe to record the terminal (see clientDisconnected above).
+				// Nothing after [DONE] may be processed or written, so stop
+				// scanning immediately.
 				if bytes.Equal(line, doneLine) {
 					terminalSeen = true
+					break plainScanLoop
 				}
 			}
 
@@ -1504,11 +1512,11 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 
 			case terminalSeen:
 				// Case 3: a clean "data: [DONE]" line was actually written to
-				// the client. The stream completed successfully. A scanner
-				// error observed on a LATER Scan() call (e.g. the upstream
-				// tearing the connection down immediately after its final
-				// event) does not retroactively un-complete an
-				// already-delivered stream: no abort event, no downgrade.
+				// the client. The stream completed successfully. The scan
+				// loop broke out the instant [DONE] was flushed, so nothing
+				// the upstream does afterward (e.g. tearing the connection
+				// down immediately after its final event) is ever observed
+				// here: no abort event, no downgrade.
 
 			default:
 				// Case 4: the loop ended without ever writing [DONE] to the
