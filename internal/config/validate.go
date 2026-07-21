@@ -55,6 +55,21 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Errorf("server.proxy.port: must be between 1 and 65535, got %d", c.Server.Proxy.Port))
 	}
 
+	// --- server.proxy.write_timeout ---
+	// A configured (non-zero) write timeout below this floor is rejected
+	// rather than silently accepted: tunnelStreamBudget (internal/app/routes.go)
+	// derives the playground tunnel's stream-duration budget from this value
+	// via "writeTimeout - headroom", falling back to "writeTimeout / 2" when
+	// that difference is not positive. For an absurdly small but still
+	// positive write_timeout (e.g. 1ns) that fallback truncates to zero,
+	// which tunnelStreamBudget's caller treats as "no deadline configured" —
+	// silently discarding a real, operator-configured deadline instead of
+	// enforcing it. Rejecting values below one second keeps the derived
+	// budget always meaningfully positive.
+	if c.Server.Proxy.WriteTimeout > 0 && c.Server.Proxy.WriteTimeout < time.Second {
+		errs = append(errs, fmt.Errorf("server.proxy.write_timeout: must be at least 1s, got %s", c.Server.Proxy.WriteTimeout))
+	}
+
 	// --- server.proxy.max_request_body ---
 	if c.Server.Proxy.MaxRequestBody > 100*1024*1024 {
 		errs = append(errs, fmt.Errorf("server.proxy.max_request_body: must not exceed 100 MB"))
