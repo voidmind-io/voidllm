@@ -339,6 +339,13 @@ func TestStreamTermination_CleanEOFAfterDone_IsSuccess(t *testing.T) {
 	if n := countSegmentsContaining(body, `"error"`); n != 0 {
 		t.Errorf("unexpected abort event(s): %d\noutput: %s", n, body)
 	}
+	// The raw passthrough branch self-terminates every line with "\n\n"
+	// rather than relying on the upstream's own trailing blank line, so
+	// [DONE] must reach the wire blank-terminated regardless of what the
+	// upstream sends after it.
+	if !strings.Contains(body, "data: [DONE]\n\n") {
+		t.Errorf("wire output missing blank-terminated \"data: [DONE]\\n\\n\"\noutput: %q", body)
+	}
 
 	if status := waitForLoggedStatusCode(t, d); status != http.StatusOK {
 		t.Errorf("usage status_code = %d, want 200", status)
@@ -449,6 +456,81 @@ func TestStreamTermination_ScannerErrorBeforeDone_IsIncompleteAndWellFormed(t *t
 	}
 	if !strings.Contains(body, `"content":"a"`) {
 		t.Fatalf("sanity check failed: initial chunk never observed\noutput: %s", body)
+	}
+	assertWellFormedSSEFraming(t, body)
+
+	if status := waitForLoggedStatusCode(t, d); status != http.StatusBadGateway {
+		t.Errorf("usage status_code = %d, want %d", status, http.StatusBadGateway)
+	}
+}
+
+// ── row: scanner error right after a non-blank line, no trailing blank ────
+
+// TestStreamTermination_RawPassthrough_AbortAfterNonBlankLine_IsSeparateEvent
+// guards the raw passthrough branch's own SSE framing specifically: unlike
+// TestStreamTermination_ScannerErrorBeforeDone_IsIncompleteAndWellFormed, the
+// upstream here never sends a trailing blank line after its last content
+// chunk before the abrupt close. The old raw branch wrote only "line + \n"
+// and relied on that upstream blank to close the event — without it, the
+// injected abort event landed in the SAME still-open SSE event as the
+// preceding content chunk ("data: <chunk>\ndata: <abort>\n\n"), which a real
+// SSE client merges into a single malformed field. The fixed branch
+// self-terminates every line with "\n\n" the instant it is written, so the
+// content chunk and the abort event must always land in two separate,
+// individually parseable "\n\n"-delimited segments.
+func TestStreamTermination_RawPassthrough_AbortAfterNonBlankLine_IsSeparateEvent(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("upstream: no Flusher")
+			return
+		}
+		// Deliberately no trailing blank line after the content chunk.
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"a"}}]}`+"\n")
+		flusher.Flush()
+
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("upstream: no Hijacker")
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		// Abrupt close right after the non-blank data line — no trailing
+		// blank ever arrives, so the proxy's own framing must close the
+		// event, not the upstream's.
+		conn.Close()
+	}))
+	t.Cleanup(upstream.Close)
+
+	reg := terminationRegistry(t, "abort-after-nonblank", upstream.URL)
+	h, _, d := newTerminationTestHandler(t, reg)
+
+	baseURL, rawKey := startAuthedTestServer(t, h, terminationKeyInfo("org-abort-after-nonblank"))
+	body := doStreamRequest(t, baseURL, rawKey, "abort-after-nonblank")
+
+	var segments []string
+	for _, seg := range strings.Split(body, "\n\n") {
+		seg = strings.TrimSpace(seg)
+		if seg != "" {
+			segments = append(segments, seg)
+		}
+	}
+	if len(segments) != 2 {
+		t.Fatalf("segments = %d, want exactly 2 (content chunk and abort event as separate \"\\n\\n\"-delimited segments)\noutput: %q", len(segments), body)
+	}
+	if !strings.Contains(segments[0], `"content":"a"`) || strings.Contains(segments[0], "stream_incomplete") {
+		t.Errorf("first segment = %q, want only the content chunk", segments[0])
+	}
+	if !strings.Contains(segments[1], "stream_incomplete") || strings.Contains(segments[1], `"content":"a"`) {
+		t.Errorf("second segment = %q, want only the abort event", segments[1])
 	}
 	assertWellFormedSSEFraming(t, body)
 

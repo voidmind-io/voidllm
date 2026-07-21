@@ -1451,6 +1451,28 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 					}
 					continue plainScanLoop
 				}
+				// Raw passthrough (no adapter transform): vLLM/OpenAI/custom
+				// upstreams already emit OpenAI-shaped SSE. Each output line is
+				// written as a self-contained SSE event, exactly like the
+				// adapter branch above: the line itself followed by "\n\n" (the
+				// SSE event terminator). Forwarded upstream blank lines (event
+				// separators) are skipped — they are now redundant because
+				// every event self-terminates.
+				//
+				// This is byte-identical for the normal single-line case:
+				//   upstream: "data:{a}\n" + "\n"
+				//   old:      write "data:{a}\n" then forward blank as "\n" → "data:{a}\n\n"
+				//   new:      write "data:{a}\n\n", skip blank              → "data:{a}\n\n"
+				//
+				// This also makes the framing invariant below (case 4) hold on
+				// this path: without it, injecting our own [DONE]/abort events
+				// into a stream that relies on the upstream's own trailing
+				// blank line to close the previous event could leave an event
+				// un-terminated or merge two data: lines into one.
+				if len(line) == 0 {
+					continue plainScanLoop
+				}
+
 				// Always observe the (possibly transformed) line. Transformed
 				// lines are OpenAI-shaped (Azure passthrough, Anthropic → OpenAI),
 				// and raw passthrough lines are already OpenAI-shaped, so the
@@ -1461,7 +1483,7 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 					clientDisconnected = true
 					break plainScanLoop // client disconnected
 				}
-				if err := w.WriteByte('\n'); err != nil {
+				if _, err := w.WriteString("\n\n"); err != nil {
 					clientDisconnected = true
 					break plainScanLoop // client disconnected
 				}
@@ -1469,10 +1491,10 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 					clientDisconnected = true
 					break plainScanLoop // client disconnected
 				}
-				// The line was fully written and flushed — only now is it
-				// safe to record the terminal (see clientDisconnected above).
-				// Nothing after [DONE] may be processed or written, so stop
-				// scanning immediately.
+				// The line and its "\n\n" event terminator were fully written
+				// and flushed — only now is it safe to record the terminal
+				// (see clientDisconnected above). Nothing after [DONE] may be
+				// processed or written, so stop scanning immediately.
 				if bytes.Equal(line, doneLine) {
 					terminalSeen = true
 					break plainScanLoop
