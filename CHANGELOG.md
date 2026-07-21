@@ -2,6 +2,24 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.23] - 2026-07-21
+
+### Fixes
+- The Playground keeps the model you picked when you switch to another tab and back, instead of resetting it to the first model of that tab (#170)
+
+### Security
+- Fixed a dependency advisory affecting the frontend build toolchain (#163)
+- Fixed a further build-toolchain advisory that required moving to Vite 8 (#165)
+- Workflow tokens are scoped more tightly: two redundant top-level `permissions` grants were removed, so every job now runs with only the permissions it declares for itself (#168)
+
+### Dependencies
+- Go: fiber 3.2.0 -> 3.3.0, grpc 1.81.0 -> 1.81.1, modernc.org/sqlite 1.50.1 -> 1.52.0, pgx 5.9.2 -> 5.10.0, otel 1.43.0 -> 1.44.0, x/net 0.53.0 -> 0.55.0, x/crypto 0.50.0 -> 0.52.0 (#161)
+- Base images: alpine 3.21 -> 3.24, node 20 -> 24 LTS. The CI toolchain moves to node 24 alongside the release image so both build on the same runtime (#164)
+- GitHub Actions: checkout v7, codecov-action v7, setup-go v7, setup-qemu-action v4.1.0, and codeql-action v4 across init, analyze and upload-sarif (#162, #167)
+- UI: react 19.2.7, @tanstack/react-query 5.101.4, vite 8.1.5, @vitejs/plugin-react 6.0.3, eslint 10.7.0 (#163, #165, #170)
+
+---
+
 ## [0.0.22] - 2026-07-21
 
 ### Features
