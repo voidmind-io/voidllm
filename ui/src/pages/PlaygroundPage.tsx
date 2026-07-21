@@ -220,29 +220,16 @@ export default function PlaygroundPage() {
       .map((type) => ({ key: type, label: typeLabels[type] || type }))
   }, [modelsData])
 
-  // Set default tab when tabs first become available
-  useEffect(() => {
-    if (availableTabs.length > 0) {
-      setActiveTab((prev) => (prev === '' ? availableTabs[0].key : prev))
-    }
-  }, [availableTabs])
-
-  // Auto-select the first model of the active tab type
-  useEffect(() => {
-    if (!modelsData?.models || activeTab === '') return
-    const tabModels = modelsData.models.filter((m) => m.type === activeTab)
-    setModel((prev) => {
-      if (tabModels.some((m) => m.name === prev)) return prev
-      return tabModels[0]?.name ?? ''
-    })
-  }, [activeTab, modelsData])
-
   // Scroll to bottom when new messages arrive
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chatHistory, loading])
 
-  const tabModels = (modelsData?.models ?? []).filter((m) => m.type === activeTab)
+  const effectiveTab = activeTab !== '' ? activeTab : (availableTabs[0]?.key ?? '')
+
+  const tabModels = (modelsData?.models ?? []).filter((m) => m.type === effectiveTab)
+
+  const effectiveModel = tabModels.some((m) => m.name === model) ? model : (tabModels[0]?.name ?? '')
 
   const modelOptions: SelectOption[] = tabModels.map((m) => ({
     value: m.name,
@@ -256,7 +243,7 @@ export default function PlaygroundPage() {
 
   function handleClear() {
     setError(null)
-    if (activeTab === 'embedding') {
+    if (effectiveTab === 'embedding') {
       setEmbedResult(null)
       setSimilarity(null)
       setEmbedInput('')
@@ -269,7 +256,7 @@ export default function PlaygroundPage() {
   }
 
   async function handleSend() {
-    if (!model || !message.trim() || loading) return
+    if (!effectiveModel || !message.trim() || loading) return
 
     // Cancel any previous in-flight request
     abortRef.current?.abort()
@@ -310,7 +297,7 @@ export default function PlaygroundPage() {
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          model,
+          model: effectiveModel,
           messages,
           stream: streaming,
           temperature,
@@ -458,7 +445,7 @@ export default function PlaygroundPage() {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({ model, input }),
+      body: JSON.stringify({ model: effectiveModel, input }),
     })
     if (!res.ok) {
       throw new Error(await errorMessageFromResponse(res))
@@ -468,7 +455,7 @@ export default function PlaygroundPage() {
   }
 
   async function handleEmbed() {
-    if (!model || !embedInput.trim() || embedLoading) return
+    if (!effectiveModel || !embedInput.trim() || embedLoading) return
     setEmbedLoading(true)
     setError(null)
     try {
@@ -483,7 +470,7 @@ export default function PlaygroundPage() {
   }
 
   async function handleCompare() {
-    if (!model || !simTextA.trim() || !simTextB.trim() || simLoading) return
+    if (!effectiveModel || !simTextA.trim() || !simTextB.trim() || simLoading) return
     setSimLoading(true)
     setError(null)
     try {
@@ -502,8 +489,8 @@ export default function PlaygroundPage() {
     }
   }
 
-  const canSend = !!model && !!message.trim() && !loading
-  const isEmbedding = activeTab === 'embedding'
+  const canSend = !!effectiveModel && !!message.trim() && !loading
+  const isEmbedding = effectiveTab === 'embedding'
 
   return (
     <div className="flex flex-col overflow-hidden" style={{ height: 'calc(100vh - 4rem)' }}>
@@ -513,7 +500,7 @@ export default function PlaygroundPage() {
           <div className="mt-3">
             <TabSwitcher
               tabs={availableTabs}
-              activeKey={activeTab}
+              activeKey={effectiveTab}
               onChange={handleTabChange}
             />
           </div>
@@ -558,7 +545,7 @@ export default function PlaygroundPage() {
               <ConfigLabel>Model</ConfigLabel>
               <Select
                 options={modelOptions}
-                value={model}
+                value={effectiveModel}
                 onChange={setModel}
                 placeholder={
                   modelsData
@@ -712,9 +699,9 @@ export default function PlaygroundPage() {
           {/* Top bar */}
           <div className="shrink-0 flex items-center justify-between px-5 py-3.5 border-b border-border">
             <div className="flex items-center gap-3">
-              {model ? (
+              {effectiveModel ? (
                 <span className="px-2.5 py-1 rounded-full bg-accent/15 border border-accent/20 text-accent text-xs font-medium truncate max-w-[220px]">
-                  {model}
+                  {effectiveModel}
                 </span>
               ) : (
                 <span className="px-2.5 py-1 rounded-full bg-bg-tertiary border border-border text-text-tertiary text-xs">
@@ -970,7 +957,7 @@ export default function PlaygroundPage() {
                   variant="primary"
                   size="sm"
                   onClick={() => void handleEmbed()}
-                  disabled={!model || !embedInput.trim() || embedLoading}
+                  disabled={!effectiveModel || !embedInput.trim() || embedLoading}
                   loading={embedLoading}
                 >
                   Generate Embedding
@@ -1015,7 +1002,7 @@ export default function PlaygroundPage() {
                   variant="primary"
                   size="sm"
                   onClick={() => void handleCompare()}
-                  disabled={!model || !simTextA.trim() || !simTextB.trim() || simLoading}
+                  disabled={!effectiveModel || !simTextA.trim() || !simTextB.trim() || simLoading}
                   loading={simLoading}
                 >
                   Compare

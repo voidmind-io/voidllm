@@ -19,6 +19,8 @@ export default function AcceptInvitePage() {
   const [pageState, setPageState] = useState<PageState>('loading')
   const [invite, setInvite] = useState<InvitePeek | null>(null)
 
+  const effectivePageState: PageState = token ? pageState : 'invalid'
+
   const [displayName, setDisplayName] = useState('')
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
@@ -30,10 +32,7 @@ export default function AcceptInvitePage() {
   const [submitting, setSubmitting] = useState(false)
 
   useEffect(() => {
-    if (!token) {
-      setPageState('invalid')
-      return
-    }
+    if (!token) return
 
     fetch(`/api/v1/invites/peek?token=${encodeURIComponent(token)}`)
       .then((res) => {
@@ -53,12 +52,12 @@ export default function AcceptInvitePage() {
   }, [token])
 
   useEffect(() => {
-    if (pageState !== 'success') return
+    if (effectivePageState !== 'success') return
     const timer = setTimeout(() => {
       void navigate('/login')
     }, 2000)
     return () => clearTimeout(timer)
-  }, [pageState, navigate])
+  }, [effectivePageState, navigate])
 
   function validate(): boolean {
     let valid = true
@@ -128,7 +127,7 @@ export default function AcceptInvitePage() {
           <h1 className="text-3xl font-bold gradient-text">VoidLLM</h1>
         </div>
 
-        {pageState === 'loading' && (
+        {effectivePageState === 'loading' && (
           <div className="space-y-3">
             <div className="h-4 rounded bg-bg-tertiary animate-pulse" />
             <div className="h-4 w-2/3 rounded bg-bg-tertiary animate-pulse" />
@@ -136,11 +135,11 @@ export default function AcceptInvitePage() {
           </div>
         )}
 
-        {(pageState === 'invalid' || pageState === 'expired') && (
+        {(effectivePageState === 'invalid' || effectivePageState === 'expired') && (
           <div className="text-center space-y-4">
             <div className="rounded-lg bg-error/10 border border-error/20 px-4 py-3">
               <p className="text-sm font-medium text-error">
-                {pageState === 'expired'
+                {effectivePageState === 'expired'
                   ? 'This invite link has expired.'
                   : 'This invite link is invalid or has already been used.'}
               </p>
@@ -157,7 +156,7 @@ export default function AcceptInvitePage() {
           </div>
         )}
 
-        {pageState === 'success' && (
+        {effectivePageState === 'success' && (
           <div className="text-center space-y-4">
             <div className="rounded-lg bg-success/10 border border-success/20 px-4 py-3">
               <p className="text-sm font-medium text-success">
@@ -170,7 +169,7 @@ export default function AcceptInvitePage() {
           </div>
         )}
 
-        {pageState === 'form' && invite !== null && (
+        {effectivePageState === 'form' && invite !== null && (
           <>
             <div className="mb-6">
               <p className="text-sm text-text-secondary text-center">

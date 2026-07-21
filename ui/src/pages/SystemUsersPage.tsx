@@ -90,19 +90,14 @@ function CreateUserDialog({ open, onClose }: CreateUserDialogProps) {
     [orgsData?.data],
   )
 
-  // Auto-select first org when list loads and nothing is selected yet
-  React.useEffect(() => {
-    if (orgOptions.length > 0 && orgId === '') {
-      setOrgId(orgOptions[0].value)
-    }
-  }, [orgOptions, orgId])
+  const effectiveOrgId = orgId !== '' ? orgId : (orgOptions[0]?.value ?? '')
 
   function handleClose() {
     setEmail('')
     setDisplayName('')
     setPassword('')
     setIsSystemAdmin(false)
-    setOrgId(orgOptions.length > 0 ? orgOptions[0].value : '')
+    setOrgId('')
     setEmailError(undefined)
     setDisplayNameError(undefined)
     setPasswordError(undefined)
@@ -148,7 +143,7 @@ function CreateUserDialog({ open, onClose }: CreateUserDialogProps) {
       setPasswordError(undefined)
     }
 
-    if (!orgId) {
+    if (!effectiveOrgId) {
       setOrgError('Organization is required')
       valid = false
     } else {
@@ -162,7 +157,7 @@ function CreateUserDialog({ open, onClose }: CreateUserDialogProps) {
       display_name: trimmedName,
       password,
       is_system_admin: isSystemAdmin,
-      org_id: orgId,
+      org_id: effectiveOrgId,
       role: 'member',
     }
 
@@ -220,7 +215,7 @@ function CreateUserDialog({ open, onClose }: CreateUserDialogProps) {
         <Select
           label="Organization"
           options={orgOptions}
-          value={orgId}
+          value={effectiveOrgId}
           onChange={(v) => {
             setOrgId(v)
             if (v) setOrgError(undefined)
