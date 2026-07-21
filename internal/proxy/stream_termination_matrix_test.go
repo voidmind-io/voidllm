@@ -310,6 +310,54 @@ func terminationKeyInfo(orgID string) auth.KeyInfo {
 
 // ── row: clean EOF after [DONE] — success, no abort, no downgrade ─────────
 
+func TestStreamTermination_RawPassthrough_PreservesCompleteEvents(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		event string
+	}{
+		{
+			name:  "multiple data fields",
+			event: "data: {\"a\":\ndata: 1}\n\n",
+		},
+		{
+			name:  "event metadata and comment",
+			event: ": upstream comment\nevent: completion\nid: response-7\nretry: 2500\ndata: {\"choices\":[]}\n\n",
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wire := tc.event + "data: [DONE]\n\n"
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				if _, err := fmt.Fprint(w, wire); err != nil {
+					t.Errorf("write upstream stream: %v", err)
+					return
+				}
+				w.(http.Flusher).Flush()
+			}))
+			t.Cleanup(upstream.Close)
+
+			model := fmt.Sprintf("raw-event-%d", i)
+			reg := terminationRegistry(t, model, upstream.URL)
+			h, _, d := newTerminationTestHandler(t, reg)
+
+			baseURL, rawKey := startAuthedTestServer(t, h, terminationKeyInfo("org-"+model))
+			body := doStreamRequest(t, baseURL, rawKey, model)
+
+			if body != wire {
+				t.Errorf("raw stream changed in transit\n got: %q\nwant: %q", body, wire)
+			}
+			if status := waitForLoggedStatusCode(t, d); status != http.StatusOK {
+				t.Errorf("usage status_code = %d, want 200", status)
+			}
+		})
+	}
+}
+
 func TestStreamTermination_CleanEOFAfterDone_IsSuccess(t *testing.T) {
 	t.Parallel()
 
@@ -339,10 +387,8 @@ func TestStreamTermination_CleanEOFAfterDone_IsSuccess(t *testing.T) {
 	if n := countSegmentsContaining(body, `"error"`); n != 0 {
 		t.Errorf("unexpected abort event(s): %d\noutput: %s", n, body)
 	}
-	// The raw passthrough branch self-terminates every line with "\n\n"
-	// rather than relying on the upstream's own trailing blank line, so
-	// [DONE] must reach the wire blank-terminated regardless of what the
-	// upstream sends after it.
+	// The terminal is acted upon only once its blank event separator has
+	// reached the client.
 	if !strings.Contains(body, "data: [DONE]\n\n") {
 		t.Errorf("wire output missing blank-terminated \"data: [DONE]\\n\\n\"\noutput: %q", body)
 	}
@@ -474,10 +520,9 @@ func TestStreamTermination_ScannerErrorBeforeDone_IsIncompleteAndWellFormed(t *t
 // and relied on that upstream blank to close the event — without it, the
 // injected abort event landed in the SAME still-open SSE event as the
 // preceding content chunk ("data: <chunk>\ndata: <abort>\n\n"), which a real
-// SSE client merges into a single malformed field. The fixed branch
-// self-terminates every line with "\n\n" the instant it is written, so the
-// content chunk and the abort event must always land in two separate,
-// individually parseable "\n\n"-delimited segments.
+// SSE client merges into a single malformed field. The fixed branch closes
+// the open event when scanning ends, so the content chunk and the abort event
+// land in two separate, individually parseable "\n\n"-delimited segments.
 func TestStreamTermination_RawPassthrough_AbortAfterNonBlankLine_IsSeparateEvent(t *testing.T) {
 	t.Parallel()
 

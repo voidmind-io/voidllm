@@ -1360,17 +1360,19 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			// already gone, so it is reclassified as a disconnect rather than
 			// left as an "incomplete stream the client was notified about."
 			//
-			// terminalSeen mirrors the PII path's field of the same name: it
-			// becomes true once a clean "data: [DONE]" line has actually been
-			// WRITTEN to the client (never before a successful write — a
-			// write failure on the [DONE] line itself is a disconnect, not a
-			// completion). Like the PII path, this loop breaks out of the scan
-			// immediately once terminalSeen becomes true: nothing observed
-			// after a fully-delivered [DONE] may downgrade an
-			// already-completed stream, so scanning simply stops there.
+			// terminalSeen mirrors the PII path's field of the same name. In the
+			// adapter branch it becomes true after a synthesized [DONE] event is
+			// written; in raw passthrough it becomes true only after the complete
+			// event containing the sole "data: [DONE]" field and its separator are
+			// flushed. A write failure while delivering either is a disconnect,
+			// not a completion. The loop then stops so later upstream activity
+			// cannot downgrade an already-completed stream.
 			plainAborted := false
 			clientDisconnected := false
 			terminalSeen := false
+			rawEventOpen := false
+			rawEventDataLines := 0
+			rawEventHasDoneLine := false
 
 		plainScanLoop:
 			for scanner.Scan() {
@@ -1451,53 +1453,57 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 					}
 					continue plainScanLoop
 				}
-				// Raw passthrough (no adapter transform): vLLM/OpenAI/custom
-				// upstreams already emit OpenAI-shaped SSE. Each output line is
-				// written as a self-contained SSE event, exactly like the
-				// adapter branch above: the line itself followed by "\n\n" (the
-				// SSE event terminator). Forwarded upstream blank lines (event
-				// separators) are skipped — they are now redundant because
-				// every event self-terminates.
-				//
-				// This is byte-identical for the normal single-line case:
-				//   upstream: "data:{a}\n" + "\n"
-				//   old:      write "data:{a}\n" then forward blank as "\n" → "data:{a}\n\n"
-				//   new:      write "data:{a}\n\n", skip blank              → "data:{a}\n\n"
-				//
-				// This also makes the framing invariant below (case 4) hold on
-				// this path: without it, injecting our own [DONE]/abort events
-				// into a stream that relies on the upstream's own trailing
-				// blank line to close the previous event could leave an event
-				// un-terminated or merge two data: lines into one.
-				if len(line) == 0 {
-					continue plainScanLoop
+				// Raw passthrough (no adapter transform): preserve the upstream
+				// event structure line-for-line. In particular, several data fields,
+				// metadata fields, and comments may all belong to one event and must
+				// not be separated by proxy-inserted blank lines.
+				if len(line) > 0 {
+					rawEventOpen = true
+					if bytes.HasPrefix(line, []byte("data:")) {
+						rawEventDataLines++
+						if bytes.Equal(line, doneLine) {
+							rawEventHasDoneLine = true
+						}
+					}
+					extractor.observe(line)
 				}
-
-				// Always observe the (possibly transformed) line. Transformed
-				// lines are OpenAI-shaped (Azure passthrough, Anthropic → OpenAI),
-				// and raw passthrough lines are already OpenAI-shaped, so the
-				// extractor can parse usage from all of them.
-				extractor.observe(line)
 
 				if _, err := w.Write(line); err != nil {
 					clientDisconnected = true
-					break plainScanLoop // client disconnected
+					break plainScanLoop
 				}
-				if _, err := w.WriteString("\n\n"); err != nil {
+				if err := w.WriteByte('\n'); err != nil {
 					clientDisconnected = true
-					break plainScanLoop // client disconnected
+					break plainScanLoop
 				}
 				if err := w.Flush(); err != nil {
 					clientDisconnected = true
-					break plainScanLoop // client disconnected
-				}
-				// The line and its "\n\n" event terminator were fully written
-				// and flushed — only now is it safe to record the terminal
-				// (see clientDisconnected above). Nothing after [DONE] may be
-				// processed or written, so stop scanning immediately.
-				if bytes.Equal(line, doneLine) {
-					terminalSeen = true
 					break plainScanLoop
+				}
+
+				if len(line) == 0 {
+					isTerminalEvent := rawEventOpen && rawEventDataLines == 1 && rawEventHasDoneLine
+					rawEventOpen = false
+					rawEventDataLines = 0
+					rawEventHasDoneLine = false
+					if isTerminalEvent {
+						terminalSeen = true
+						break plainScanLoop
+					}
+				}
+			}
+
+			// EOF or a scanner error can arrive after a non-blank line. Close
+			// that event before classification so any injected abort event starts
+			// at a fresh boundary. A lone [DONE] event becomes terminal only after
+			// this successfully writes and flushes its missing separator.
+			if adapter == nil && !clientDisconnected && !terminalSeen && rawEventOpen {
+				if err := w.WriteByte('\n'); err != nil {
+					clientDisconnected = true
+				} else if err := w.Flush(); err != nil {
+					clientDisconnected = true
+				} else if rawEventDataLines == 1 && rawEventHasDoneLine {
+					terminalSeen = true
 				}
 			}
 
@@ -1553,12 +1559,9 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				// attempt to deliver the same content-free abort event the
 				// PII path already emits for this failure class.
 				//
-				// Framing invariant: this branch is reached only when the
-				// loop exited via scanner.Scan() returning false — never via
-				// a write/flush failure, which is case 1 above — so the last
-				// bytes written to the client always ended with a complete
-				// "\n\n" event terminator. The abort event below therefore
-				// always lands on a clean SSE event boundary, never mid-event.
+				// Framing invariant: upstream blank separators are forwarded, and
+				// an event still open at EOF/error is explicitly closed above. The
+				// abort event therefore always starts at a fresh SSE event boundary.
 				if writeStreamAbortEvent(w, "stream_incomplete") {
 					streamIncomplete = true
 				} else {
