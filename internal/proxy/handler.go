@@ -1456,10 +1456,13 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				// Raw passthrough (no adapter transform): preserve the upstream
 				// event structure line-for-line. In particular, several data fields,
 				// metadata fields, and comments may all belong to one event and must
-				// not be separated by proxy-inserted blank lines.
+				// not be separated by proxy-inserted blank lines. With ScanLines,
+				// LF-framed streams are forwarded byte-for-byte, CRLF is normalized
+				// to LF, and lone-CR framing is not supported.
 				if len(line) > 0 {
 					rawEventOpen = true
-					if bytes.HasPrefix(line, []byte("data:")) {
+					fieldName, _, _ := bytes.Cut(line, []byte(":"))
+					if bytes.Equal(fieldName, []byte("data")) {
 						rawEventDataLines++
 						if bytes.Equal(line, doneLine) {
 							rawEventHasDoneLine = true

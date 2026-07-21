@@ -358,6 +358,68 @@ func TestStreamTermination_RawPassthrough_PreservesCompleteEvents(t *testing.T) 
 	}
 }
 
+func TestStreamTermination_RawPassthrough_DataFieldGrammar(t *testing.T) {
+	t.Parallel()
+
+	const laterEvent = "data: {\"later\":true}\n\n"
+	const terminalEvent = "data: [DONE]\n\n"
+	tests := []struct {
+		name     string
+		upstream string
+		want     string
+	}{
+		{
+			name:     "bare data before terminal field makes event non-terminal",
+			upstream: "data\ndata: [DONE]\n\n" + laterEvent + terminalEvent,
+			want:     "data\ndata: [DONE]\n\n" + laterEvent + terminalEvent,
+		},
+		{
+			name:     "bare data after terminal field makes event non-terminal",
+			upstream: "data: [DONE]\ndata\n\n" + laterEvent + terminalEvent,
+			want:     "data: [DONE]\ndata\n\n" + laterEvent + terminalEvent,
+		},
+		{
+			name:     "bare data in ordinary event",
+			upstream: "data\n\n" + laterEvent + terminalEvent,
+			want:     "data\n\n" + laterEvent + terminalEvent,
+		},
+		{
+			name:     "comment does not add a data field to terminal event",
+			upstream: ": upstream comment\n" + terminalEvent + laterEvent,
+			want:     ": upstream comment\n" + terminalEvent,
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				if _, err := fmt.Fprint(w, tc.upstream); err != nil {
+					t.Errorf("write upstream stream: %v", err)
+					return
+				}
+				w.(http.Flusher).Flush()
+			}))
+			t.Cleanup(upstream.Close)
+
+			model := fmt.Sprintf("raw-data-field-%d", i)
+			reg := terminationRegistry(t, model, upstream.URL)
+			h, _, d := newTerminationTestHandler(t, reg)
+
+			baseURL, rawKey := startAuthedTestServer(t, h, terminationKeyInfo("org-"+model))
+			body := doStreamRequest(t, baseURL, rawKey, model)
+
+			if body != tc.want {
+				t.Errorf("raw stream output mismatch\n got: %q\nwant: %q", body, tc.want)
+			}
+			if status := waitForLoggedStatusCode(t, d); status != http.StatusOK {
+				t.Errorf("usage status_code = %d, want 200", status)
+			}
+		})
+	}
+}
+
 func TestStreamTermination_CleanEOFAfterDone_IsSuccess(t *testing.T) {
 	t.Parallel()
 
