@@ -151,7 +151,13 @@ type UpdateModelParams struct {
 
 // CreateModel inserts a new model and returns the persisted record.
 // It returns ErrConflict if a model with the same name already exists.
+// It returns ErrReservedValue if the name contains the reserved soft-delete
+// tombstone marker (see tombstone.go).
 func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model, error) {
+	if ContainsTombstoneMarker(params.Name) {
+		return nil, fmt.Errorf("create model: %w", ErrReservedValue)
+	}
+
 	id, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("create model: generate id: %w", err)
@@ -309,8 +315,14 @@ func (d *DB) ListModels(ctx context.Context, cursor string, limit int, includeIn
 // Only non-nil fields in params are written. If all fields are nil the record
 // is returned unchanged without issuing an UPDATE.
 // It returns ErrNotFound if the model does not exist or has been soft-deleted,
-// and ErrConflict if the new name collides with an existing model name.
+// ErrConflict if the new name collides with an existing model name, and
+// ErrReservedValue if the new name contains the reserved soft-delete
+// tombstone marker (see tombstone.go).
 func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParams) (*Model, error) {
+	if params.Name != nil && ContainsTombstoneMarker(*params.Name) {
+		return nil, fmt.Errorf("update model %s: %w", id, ErrReservedValue)
+	}
+
 	p := d.dialect.Placeholder
 	argN := 1
 	var setClauses []string
@@ -452,16 +464,24 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 	return model, nil
 }
 
-// DeleteModel soft-deletes an active model by setting deleted_at.
+// DeleteModel soft-deletes an active model by setting deleted_at. The name
+// column is mangled with a tombstone suffix so its value is freed for reuse
+// immediately; see StripTombstone and #172.
 // It returns ErrNotFound if the model does not exist or is already deleted.
+// It returns ErrConflict when a legacy row occupies the tombstone value; rename that row to resolve.
 func (d *DB) DeleteModel(ctx context.Context, id string) error {
 	p := d.dialect.Placeholder
-	query := "UPDATE models SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
+	query := "UPDATE models SET name = name || ':deleted:' || id, " +
+		"deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
 		"WHERE id = " + p(1) + " AND deleted_at IS NULL"
 
 	result, err := d.sql.ExecContext(ctx, query, id)
 	if err != nil {
-		return fmt.Errorf("delete model %s: %w", id, translateError(err))
+		translated := translateError(err)
+		if errors.Is(translated, ErrConflict) {
+			return fmt.Errorf("delete model %s: legacy row occupies tombstone value: %w", id, ErrConflict)
+		}
+		return fmt.Errorf("delete model %s: %w", id, translated)
 	}
 
 	n, err := result.RowsAffected()

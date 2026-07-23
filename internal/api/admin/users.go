@@ -57,11 +57,18 @@ type paginatedUsersResponse struct {
 	Cursor  string         `json:"next_cursor,omitempty"`
 }
 
-// userToResponse converts a db.User to its API wire representation.
+// userToResponse converts a db.User to its API wire representation. For
+// soft-deleted users the email column is stripped of its tombstone suffix
+// (see db.StripTombstone) so admins viewing include_deleted listings see the
+// original email rather than the mangled one used to free it for reuse.
 func userToResponse(u *db.User) userResponse {
+	email := u.Email
+	if u.DeletedAt != nil {
+		email = db.StripTombstone(email, u.ID)
+	}
 	return userResponse{
 		ID:            u.ID,
-		Email:         u.Email,
+		Email:         email,
 		DisplayName:   u.DisplayName,
 		AuthProvider:  u.AuthProvider,
 		IsSystemAdmin: u.IsSystemAdmin,
@@ -110,6 +117,9 @@ func (h *Handler) CreateUser(c fiber.Ctx) error {
 	}
 	if !strings.Contains(req.Email, "@") {
 		return apierror.BadRequest(c, "invalid email format")
+	}
+	if db.ContainsTombstoneMarker(req.Email) {
+		return apierror.BadRequest(c, `email must not contain ":deleted:"`)
 	}
 	if req.DisplayName == "" {
 		return apierror.BadRequest(c, "display_name is required")
@@ -176,6 +186,9 @@ func (h *Handler) CreateUser(c fiber.Ctx) error {
 		}
 		if errors.Is(err, db.ErrForeignKey) {
 			return apierror.BadRequest(c, "organization not found")
+		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `email must not contain ":deleted:"`)
 		}
 		h.Log.ErrorContext(c.Context(), "create user", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to create user")
@@ -370,6 +383,9 @@ func (h *Handler) UpdateUser(c fiber.Ctx) error {
 		if !strings.Contains(trimmed, "@") {
 			return apierror.BadRequest(c, "invalid email format")
 		}
+		if db.ContainsTombstoneMarker(trimmed) {
+			return apierror.BadRequest(c, `email must not contain ":deleted:"`)
+		}
 		req.Email = &trimmed
 	}
 
@@ -414,6 +430,9 @@ func (h *Handler) UpdateUser(c fiber.Ctx) error {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "email already in use")
 		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `email must not contain ":deleted:"`)
+		}
 		h.Log.ErrorContext(c.Context(), "update user", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to update user")
 	}
@@ -449,6 +468,9 @@ func (h *Handler) DeleteUser(c fiber.Ctx) error {
 	if err := h.DB.DeleteUser(c.Context(), id); err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "user not found")
+		}
+		if errors.Is(err, db.ErrConflict) {
+			return apierror.Conflict(c, "delete blocked: another row occupies the reserved deleted-name for this record; rename it and retry")
 		}
 		h.Log.ErrorContext(c.Context(), "delete user", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to delete user")

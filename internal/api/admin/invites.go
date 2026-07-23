@@ -141,6 +141,9 @@ func (h *Handler) CreateInvite(c fiber.Ctx) error {
 	if req.Email == "" || !strings.Contains(req.Email, "@") {
 		return apierror.BadRequest(c, "email is required and must be a valid email address")
 	}
+	if db.ContainsTombstoneMarker(req.Email) {
+		return apierror.BadRequest(c, `email must not contain ":deleted:"`)
+	}
 	if req.Role == "" {
 		req.Role = "member"
 	}
@@ -443,6 +446,9 @@ func (h *Handler) RedeemInvite(c fiber.Ctx) error {
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "email already registered")
+		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, inviteInvalidMsg)
 		}
 		h.Log.ErrorContext(ctx, "redeem invite: create user", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to redeem invite")

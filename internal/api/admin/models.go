@@ -461,6 +461,9 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 	if req.Name == "" {
 		return apierror.BadRequest(c, "name is required")
 	}
+	if db.ContainsTombstoneMarker(req.Name) {
+		return apierror.BadRequest(c, `name must not contain ":deleted:"`)
+	}
 	// provider and base_url are required only in single-endpoint mode (no strategy).
 	// When a strategy is set the endpoints live on the model's deployments.
 	if req.Strategy == "" {
@@ -570,6 +573,9 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "a model with this name already exists")
+		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `name must not contain ":deleted:"`)
 		}
 		h.Log.ErrorContext(ctx, "create model: db insert", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to create model")
@@ -780,6 +786,9 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		effectiveStrategy = *req.Strategy
 	}
 
+	if req.Name != nil && db.ContainsTombstoneMarker(*req.Name) {
+		return apierror.BadRequest(c, `name must not contain ":deleted:"`)
+	}
 	if req.Provider != nil && *req.Provider != "" && !provider.ValidProviders[*req.Provider] {
 		return apierror.BadRequest(c, "provider must be one of: "+strings.Join(provider.Names(), ", "))
 	}
@@ -936,6 +945,9 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "a model with this name already exists")
 		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `name must not contain ":deleted:"`)
+		}
 		h.Log.ErrorContext(ctx, "update model", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to update model")
 	}
@@ -1003,6 +1015,9 @@ func (h *Handler) DeleteModel(c fiber.Ctx) error {
 	if err := h.DB.DeleteModel(ctx, m.ID); err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "model not found")
+		}
+		if errors.Is(err, db.ErrConflict) {
+			return apierror.Conflict(c, "delete blocked: another row occupies the reserved deleted-name for this record; rename it and retry")
 		}
 		h.Log.ErrorContext(ctx, "delete model", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to delete model")

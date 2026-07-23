@@ -162,6 +162,9 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 	if req.Name == "" {
 		return apierror.BadRequest(c, "name is required")
 	}
+	if db.ContainsTombstoneMarker(req.Name) {
+		return apierror.BadRequest(c, `name must not contain ":deleted:"`)
+	}
 	if req.Provider == "" {
 		return apierror.BadRequest(c, "provider is required")
 	}
@@ -190,6 +193,9 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "a deployment with this name already exists for this model")
+		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `name must not contain ":deleted:"`)
 		}
 		h.Log.ErrorContext(ctx, "create deployment: db insert", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to create deployment")
@@ -309,6 +315,9 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 	rawBody := append([]byte(nil), c.Body()...)
 	piiPresent, piiIsNull := parsePIIFilterField(rawBody)
 
+	if req.Name != nil && db.ContainsTombstoneMarker(*req.Name) {
+		return apierror.BadRequest(c, `name must not contain ":deleted:"`)
+	}
 	if req.Provider != nil && !provider.ValidProviders[*req.Provider] {
 		return apierror.BadRequest(c, "provider must be one of: "+strings.Join(provider.Names(), ", "))
 	}
@@ -375,6 +384,9 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "a deployment with this name already exists for this model")
 		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `name must not contain ":deleted:"`)
+		}
 		h.Log.ErrorContext(ctx, "update deployment", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to update deployment")
 	}
@@ -439,6 +451,9 @@ func (h *Handler) deleteDeployment(c fiber.Ctx) error {
 	if err := h.DB.DeleteDeployment(ctx, deploymentID); err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "deployment not found")
+		}
+		if errors.Is(err, db.ErrConflict) {
+			return apierror.Conflict(c, "delete blocked: another row occupies the reserved deleted-name for this record; rename it and retry")
 		}
 		h.Log.ErrorContext(ctx, "delete deployment", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to delete deployment")

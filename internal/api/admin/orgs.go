@@ -65,12 +65,19 @@ type paginatedOrgsResponse struct {
 }
 
 // orgToResponse converts a db.OrgWithCounts to its API wire representation,
-// including the computed member_count and team_count fields.
+// including the computed member_count and team_count fields. For
+// soft-deleted organizations the slug is stripped of its tombstone suffix
+// (see db.StripTombstone) so admins viewing include_deleted listings see the
+// original slug rather than the mangled one used to free it for reuse.
 func orgToResponse(o *db.OrgWithCounts) orgResponse {
+	slug := o.Slug
+	if o.DeletedAt != nil {
+		slug = db.StripTombstone(slug, o.ID)
+	}
 	return orgResponse{
 		ID:                o.ID,
 		Name:              o.Name,
-		Slug:              o.Slug,
+		Slug:              slug,
 		Timezone:          o.Timezone,
 		DailyTokenLimit:   o.DailyTokenLimit,
 		MonthlyTokenLimit: o.MonthlyTokenLimit,
@@ -141,6 +148,9 @@ func (h *Handler) CreateOrg(c fiber.Ctx) error {
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "organization slug already exists")
+		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `slug must not contain ":deleted:"`)
 		}
 		h.Log.ErrorContext(c.Context(), "create org", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to create organization")
@@ -316,6 +326,9 @@ func (h *Handler) UpdateOrg(c fiber.Ctx) error {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "organization slug already exists")
 		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `slug must not contain ":deleted:"`)
+		}
 		h.Log.ErrorContext(c.Context(), "update org", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to update organization")
 	}
@@ -365,6 +378,9 @@ func (h *Handler) DeleteOrg(c fiber.Ctx) error {
 	if err := h.DB.DeleteOrg(c.Context(), id); err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "organization not found")
+		}
+		if errors.Is(err, db.ErrConflict) {
+			return apierror.Conflict(c, "delete blocked: another row occupies the reserved deleted-name for this record; rename it and retry")
 		}
 		h.Log.ErrorContext(c.Context(), "delete org", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to delete organization")

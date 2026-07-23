@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -94,7 +95,13 @@ type UpdateDeploymentParams struct {
 
 // CreateDeployment inserts a new deployment and returns the persisted record.
 // It returns ErrConflict if a deployment with the same (model_id, name) pair already exists.
+// It returns ErrReservedValue if the name contains the reserved soft-delete
+// tombstone marker (see tombstone.go).
 func (d *DB) CreateDeployment(ctx context.Context, params CreateDeploymentParams) (*Deployment, error) {
+	if ContainsTombstoneMarker(params.Name) {
+		return nil, fmt.Errorf("create deployment: %w", ErrReservedValue)
+	}
+
 	id, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("create deployment: generate id: %w", err)
@@ -230,8 +237,14 @@ func (d *DB) ListActiveDeployments(ctx context.Context, modelID string) ([]Deplo
 // Only non-nil fields in params are written. If all fields are nil the record
 // is returned unchanged without issuing an UPDATE.
 // It returns ErrNotFound if the deployment does not exist or has been soft-deleted,
-// and ErrConflict if the new name collides with an existing deployment on the same model.
+// ErrConflict if the new name collides with an existing deployment on the same
+// model, and ErrReservedValue if the new name contains the reserved
+// soft-delete tombstone marker (see tombstone.go).
 func (d *DB) UpdateDeployment(ctx context.Context, id string, params UpdateDeploymentParams) (*Deployment, error) {
+	if params.Name != nil && ContainsTombstoneMarker(*params.Name) {
+		return nil, fmt.Errorf("update deployment %s: %w", id, ErrReservedValue)
+	}
+
 	p := d.dialect.Placeholder
 	argN := 1
 	var setClauses []string
@@ -335,15 +348,23 @@ func (d *DB) UpdateDeployment(ctx context.Context, id string, params UpdateDeplo
 }
 
 // DeleteDeployment soft-deletes an active deployment by setting deleted_at.
+// The name column is mangled with a tombstone suffix so its value is freed
+// for reuse immediately; see StripTombstone and #172.
 // It returns ErrNotFound if the deployment does not exist or is already deleted.
+// It returns ErrConflict when a legacy row occupies the tombstone value; rename that row to resolve.
 func (d *DB) DeleteDeployment(ctx context.Context, id string) error {
 	p := d.dialect.Placeholder
-	query := "UPDATE model_deployments SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
+	query := "UPDATE model_deployments SET name = name || ':deleted:' || id, " +
+		"deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
 		"WHERE id = " + p(1) + " AND deleted_at IS NULL"
 
 	result, err := d.sql.ExecContext(ctx, query, id)
 	if err != nil {
-		return fmt.Errorf("delete deployment %s: %w", id, translateError(err))
+		translated := translateError(err)
+		if errors.Is(translated, ErrConflict) {
+			return fmt.Errorf("delete deployment %s: legacy row occupies tombstone value: %w", id, ErrConflict)
+		}
+		return fmt.Errorf("delete deployment %s: %w", id, translated)
 	}
 
 	n, err := result.RowsAffected()

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -54,7 +55,13 @@ type UpdateTeamParams struct {
 
 // CreateTeam inserts a new team and returns the persisted record.
 // It returns ErrConflict if the (org_id, slug) pair is already taken.
+// It returns ErrReservedValue if the slug contains the reserved soft-delete
+// tombstone marker (see tombstone.go).
 func (d *DB) CreateTeam(ctx context.Context, params CreateTeamParams) (*Team, error) {
+	if ContainsTombstoneMarker(params.Slug) {
+		return nil, fmt.Errorf("create team: %w", ErrReservedValue)
+	}
+
 	id, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("create team: generate id: %w", err)
@@ -188,8 +195,14 @@ func (d *DB) ListTeams(ctx context.Context, orgID string, cursor string, limit i
 // Only non-nil fields in params are written. If all fields are nil the record
 // is returned unchanged without issuing an UPDATE.
 // It returns ErrNotFound if the team does not exist or has been soft-deleted,
-// and ErrConflict if the new slug collides with an existing one in the same org.
+// ErrConflict if the new slug collides with an existing one in the same org,
+// and ErrReservedValue if the new slug contains the reserved soft-delete
+// tombstone marker (see tombstone.go).
 func (d *DB) UpdateTeam(ctx context.Context, id string, params UpdateTeamParams) (*Team, error) {
+	if params.Slug != nil && ContainsTombstoneMarker(*params.Slug) {
+		return nil, fmt.Errorf("UpdateTeam %s: %w", id, ErrReservedValue)
+	}
+
 	p := d.dialect.Placeholder
 	argN := 1
 	var setClauses []string
@@ -265,16 +278,24 @@ func (d *DB) UpdateTeam(ctx context.Context, id string, params UpdateTeamParams)
 	return team, nil
 }
 
-// DeleteTeam soft-deletes an active team by setting deleted_at.
+// DeleteTeam soft-deletes an active team by setting deleted_at. The slug
+// column is mangled with a tombstone suffix so its value is freed for reuse
+// immediately; see StripTombstone and #172.
 // It returns ErrNotFound if the team does not exist or is already deleted.
+// It returns ErrConflict when a legacy row occupies the tombstone value; rename that row to resolve.
 func (d *DB) DeleteTeam(ctx context.Context, id string) error {
 	p := d.dialect.Placeholder
-	query := "UPDATE teams SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
+	query := "UPDATE teams SET slug = slug || ':deleted:' || id, " +
+		"deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
 		"WHERE id = " + p(1) + " AND deleted_at IS NULL"
 
 	result, err := d.sql.ExecContext(ctx, query, id)
 	if err != nil {
-		return fmt.Errorf("DeleteTeam %s: %w", id, translateError(err))
+		translated := translateError(err)
+		if errors.Is(translated, ErrConflict) {
+			return fmt.Errorf("DeleteTeam %s: legacy row occupies tombstone value: %w", id, ErrConflict)
+		}
+		return fmt.Errorf("DeleteTeam %s: %w", id, translated)
 	}
 
 	n, err := result.RowsAffected()

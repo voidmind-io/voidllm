@@ -576,6 +576,27 @@ models:
 			errContains: "models[1].name",
 		},
 		{
+			name: "model name containing reserved tombstone marker error",
+			yaml: `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: voidllm.db
+settings:
+  encryption_key: key
+  usage:
+    buffer_size: 100
+models:
+  - name: "gpt-4:deleted:0198c9a2-1111-7000-8000-000000000001"
+    provider: openai
+    base_url: https://api.openai.com
+`,
+			wantErr:     true,
+			errContains: "models[0].name",
+		},
+		{
 			name: "duplicate aliases across models error",
 			yaml: `
 server:

@@ -213,6 +213,15 @@ func (h *Handler) OIDCCallback(c fiber.Ctx) error {
 			ExternalID:   &externalID,
 		})
 		if createErr != nil {
+			if errors.Is(createErr, db.ErrReservedValue) {
+				// The IdP-supplied email contains the reserved soft-delete
+				// tombstone marker (see db.ContainsTombstoneMarker). This is an
+				// expected input-validation failure, not an internal error, so
+				// it is logged at warn level and surfaces as a distinct,
+				// non-500 auth failure rather than the generic provisioning error.
+				h.Log.LogAttrs(ctx, slog.LevelWarn, "oidc callback: create user: email rejected")
+				return c.Redirect().To("/login?error=invalid_email")
+			}
 			h.Log.ErrorContext(ctx, "oidc callback: create user", slog.String("error", createErr.Error()))
 			return c.Redirect().To("/login?error=provision_failed")
 		}
