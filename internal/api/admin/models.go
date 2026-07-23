@@ -1010,6 +1010,9 @@ func (h *Handler) DeleteModel(c fiber.Ctx) error {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "model not found")
 		}
+		if errors.Is(err, db.ErrConflict) {
+			return apierror.Conflict(c, "delete blocked: another row occupies the reserved deleted-name for this record; rename it and retry")
+		}
 		h.Log.ErrorContext(ctx, "delete model", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to delete model")
 	}

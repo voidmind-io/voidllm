@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -268,6 +269,7 @@ func (d *DB) UpdateOrg(ctx context.Context, id string, params UpdateOrgParams) (
 // slug column is mangled with a tombstone suffix so its value is freed for
 // reuse immediately; see StripTombstone and #172.
 // It returns ErrNotFound if the organization does not exist or is already deleted.
+// It returns ErrConflict when a legacy row occupies the tombstone value; rename that row to resolve.
 func (d *DB) DeleteOrg(ctx context.Context, id string) error {
 	p := d.dialect.Placeholder
 	query := "UPDATE organizations SET slug = slug || ':deleted:' || id, " +
@@ -276,7 +278,11 @@ func (d *DB) DeleteOrg(ctx context.Context, id string) error {
 
 	result, err := d.sql.ExecContext(ctx, query, id)
 	if err != nil {
-		return fmt.Errorf("DeleteOrg %s: %w", id, translateError(err))
+		translated := translateError(err)
+		if errors.Is(translated, ErrConflict) {
+			return fmt.Errorf("DeleteOrg %s: legacy row occupies tombstone value: %w", id, ErrConflict)
+		}
+		return fmt.Errorf("DeleteOrg %s: %w", id, translated)
 	}
 
 	n, err := result.RowsAffected()

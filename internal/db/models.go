@@ -456,6 +456,7 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 // column is mangled with a tombstone suffix so its value is freed for reuse
 // immediately; see StripTombstone and #172.
 // It returns ErrNotFound if the model does not exist or is already deleted.
+// It returns ErrConflict when a legacy row occupies the tombstone value; rename that row to resolve.
 func (d *DB) DeleteModel(ctx context.Context, id string) error {
 	p := d.dialect.Placeholder
 	query := "UPDATE models SET name = name || ':deleted:' || id, " +
@@ -464,7 +465,11 @@ func (d *DB) DeleteModel(ctx context.Context, id string) error {
 
 	result, err := d.sql.ExecContext(ctx, query, id)
 	if err != nil {
-		return fmt.Errorf("delete model %s: %w", id, translateError(err))
+		translated := translateError(err)
+		if errors.Is(translated, ErrConflict) {
+			return fmt.Errorf("delete model %s: legacy row occupies tombstone value: %w", id, ErrConflict)
+		}
+		return fmt.Errorf("delete model %s: %w", id, translated)
 	}
 
 	n, err := result.RowsAffected()

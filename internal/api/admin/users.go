@@ -463,6 +463,9 @@ func (h *Handler) DeleteUser(c fiber.Ctx) error {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "user not found")
 		}
+		if errors.Is(err, db.ErrConflict) {
+			return apierror.Conflict(c, "delete blocked: another row occupies the reserved deleted-name for this record; rename it and retry")
+		}
 		h.Log.ErrorContext(c.Context(), "delete user", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to delete user")
 	}
