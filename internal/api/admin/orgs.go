@@ -149,6 +149,9 @@ func (h *Handler) CreateOrg(c fiber.Ctx) error {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "organization slug already exists")
 		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `slug must not contain ":deleted:"`)
+		}
 		h.Log.ErrorContext(c.Context(), "create org", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to create organization")
 	}
@@ -322,6 +325,9 @@ func (h *Handler) UpdateOrg(c fiber.Ctx) error {
 		}
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "organization slug already exists")
+		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `slug must not contain ":deleted:"`)
 		}
 		h.Log.ErrorContext(c.Context(), "update org", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to update organization")

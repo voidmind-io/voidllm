@@ -55,7 +55,13 @@ type UpdateTeamParams struct {
 
 // CreateTeam inserts a new team and returns the persisted record.
 // It returns ErrConflict if the (org_id, slug) pair is already taken.
+// It returns ErrReservedValue if the slug contains the reserved soft-delete
+// tombstone marker (see tombstone.go).
 func (d *DB) CreateTeam(ctx context.Context, params CreateTeamParams) (*Team, error) {
+	if ContainsTombstoneMarker(params.Slug) {
+		return nil, fmt.Errorf("create team: %w", ErrReservedValue)
+	}
+
 	id, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("create team: generate id: %w", err)
@@ -189,8 +195,14 @@ func (d *DB) ListTeams(ctx context.Context, orgID string, cursor string, limit i
 // Only non-nil fields in params are written. If all fields are nil the record
 // is returned unchanged without issuing an UPDATE.
 // It returns ErrNotFound if the team does not exist or has been soft-deleted,
-// and ErrConflict if the new slug collides with an existing one in the same org.
+// ErrConflict if the new slug collides with an existing one in the same org,
+// and ErrReservedValue if the new slug contains the reserved soft-delete
+// tombstone marker (see tombstone.go).
 func (d *DB) UpdateTeam(ctx context.Context, id string, params UpdateTeamParams) (*Team, error) {
+	if params.Slug != nil && ContainsTombstoneMarker(*params.Slug) {
+		return nil, fmt.Errorf("UpdateTeam %s: %w", id, ErrReservedValue)
+	}
+
 	p := d.dialect.Placeholder
 	argN := 1
 	var setClauses []string

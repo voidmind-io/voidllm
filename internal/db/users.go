@@ -55,8 +55,14 @@ type UpdateUserParams struct {
 
 // CreateUser inserts a new user and returns the persisted record.
 // It returns ErrConflict if the email is already taken.
+// It returns ErrReservedValue if the email contains the reserved soft-delete
+// tombstone marker (see tombstone.go).
 // If params.AuthProvider is empty, "local" is used.
 func (d *DB) CreateUser(ctx context.Context, params CreateUserParams) (*User, error) {
+	if ContainsTombstoneMarker(params.Email) {
+		return nil, fmt.Errorf("create user: %w", ErrReservedValue)
+	}
+
 	id, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("create user: generate id: %w", err)
@@ -118,7 +124,13 @@ func (d *DB) CreateUser(ctx context.Context, params CreateUserParams) (*User, er
 // Returns ErrForeignKey if orgID does not reference an existing organization,
 // allowing callers to map this to a 400 "organization not found" response
 // without an additional pre-flight SELECT.
+// Returns ErrReservedValue if the email contains the reserved soft-delete
+// tombstone marker (see tombstone.go).
 func (d *DB) CreateUserWithMembership(ctx context.Context, userParams CreateUserParams, orgID, role string) (*User, error) {
+	if ContainsTombstoneMarker(userParams.Email) {
+		return nil, fmt.Errorf("create user with membership: %w", ErrReservedValue)
+	}
+
 	userID, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("create user with membership: generate user id: %w", err)
@@ -293,8 +305,14 @@ func (d *DB) ListUsers(ctx context.Context, cursor string, limit int, includeDel
 // Only non-nil fields in params are written. If all fields are nil the record
 // is returned unchanged without issuing an UPDATE.
 // It returns ErrNotFound if the user does not exist or has been soft-deleted,
-// and ErrConflict if the new email collides with an existing one.
+// ErrConflict if the new email collides with an existing one, and
+// ErrReservedValue if the new email contains the reserved soft-delete
+// tombstone marker (see tombstone.go).
 func (d *DB) UpdateUser(ctx context.Context, id string, params UpdateUserParams) (*User, error) {
+	if params.Email != nil && ContainsTombstoneMarker(*params.Email) {
+		return nil, fmt.Errorf("UpdateUser %s: %w", id, ErrReservedValue)
+	}
+
 	p := d.dialect.Placeholder
 	argN := 1
 	var setClauses []string

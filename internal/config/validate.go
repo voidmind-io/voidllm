@@ -15,6 +15,14 @@ import (
 // characters and hyphens, starting with an alphanumeric character.
 var mcpAliasRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
+// reservedTombstoneMarker mirrors db.tombstoneMarker (internal/db/tombstone.go).
+// It cannot be imported directly — internal/db imports internal/config, so the
+// reverse import would create a cycle. Model and deployment names configured
+// in voidllm.yaml are rejected here if they contain this marker so an
+// operator typo fails fast at startup instead of failing later inside
+// SyncYAMLModels, which enforces the same rule at the DB layer. See #172.
+const reservedTombstoneMarker = ":deleted:"
+
 // validMCPAuthTypes is the set of accepted MCP server auth type values.
 var validMCPAuthTypes = map[string]bool{
 	"none":   true,
@@ -136,6 +144,9 @@ func (c *Config) validate() error {
 			if seenNames[m.Name] {
 				errs = append(errs, fmt.Errorf("%s.name: duplicate model name %q", prefix, m.Name))
 			}
+			if strings.Contains(m.Name, reservedTombstoneMarker) {
+				errs = append(errs, fmt.Errorf("%s.name: must not contain %q", prefix, reservedTombstoneMarker))
+			}
 			seenNames[m.Name] = true
 		}
 
@@ -190,6 +201,9 @@ func (c *Config) validate() error {
 				} else {
 					if seenDeploymentNames[d.Name] {
 						errs = append(errs, fmt.Errorf("%s.name: duplicate deployment name %q within model %q", dprefix, d.Name, m.Name))
+					}
+					if strings.Contains(d.Name, reservedTombstoneMarker) {
+						errs = append(errs, fmt.Errorf("%s.name: must not contain %q", dprefix, reservedTombstoneMarker))
 					}
 					seenDeploymentNames[d.Name] = true
 				}

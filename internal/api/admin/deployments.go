@@ -194,6 +194,9 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "a deployment with this name already exists for this model")
 		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `name must not contain ":deleted:"`)
+		}
 		h.Log.ErrorContext(ctx, "create deployment: db insert", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to create deployment")
 	}
@@ -380,6 +383,9 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 		}
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "a deployment with this name already exists for this model")
+		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `name must not contain ":deleted:"`)
 		}
 		h.Log.ErrorContext(ctx, "update deployment", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to update deployment")

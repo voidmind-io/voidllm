@@ -574,6 +574,9 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "a model with this name already exists")
 		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `name must not contain ":deleted:"`)
+		}
 		h.Log.ErrorContext(ctx, "create model: db insert", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to create model")
 	}
@@ -941,6 +944,9 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		}
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "a model with this name already exists")
+		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `name must not contain ":deleted:"`)
 		}
 		h.Log.ErrorContext(ctx, "update model", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to update model")

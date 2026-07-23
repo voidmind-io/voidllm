@@ -153,6 +153,9 @@ func (h *Handler) CreateTeam(c fiber.Ctx) error {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "team slug already exists in this organization")
 		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `slug must not contain ":deleted:"`)
+		}
 		h.Log.ErrorContext(c.Context(), "create team", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to create team")
 	}
@@ -338,6 +341,9 @@ func (h *Handler) UpdateTeam(c fiber.Ctx) error {
 		}
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "team slug already exists in this organization")
+		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `slug must not contain ":deleted:"`)
 		}
 		h.Log.ErrorContext(c.Context(), "update team", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to update team")

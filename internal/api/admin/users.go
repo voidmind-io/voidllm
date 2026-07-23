@@ -187,6 +187,9 @@ func (h *Handler) CreateUser(c fiber.Ctx) error {
 		if errors.Is(err, db.ErrForeignKey) {
 			return apierror.BadRequest(c, "organization not found")
 		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `email must not contain ":deleted:"`)
+		}
 		h.Log.ErrorContext(c.Context(), "create user", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to create user")
 	}
@@ -426,6 +429,9 @@ func (h *Handler) UpdateUser(c fiber.Ctx) error {
 		}
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "email already in use")
+		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, `email must not contain ":deleted:"`)
 		}
 		h.Log.ErrorContext(c.Context(), "update user", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to update user")

@@ -22,6 +22,13 @@ var ErrNoPassword = errors.New("no password")
 // It indicates that a referenced record (e.g. organization) does not exist.
 var ErrForeignKey = errors.New("foreign key violation")
 
+// ErrReservedValue is returned when a caller-supplied value for a unique
+// column (model/deployment name, user email, organization/team slug) contains
+// the reserved soft-delete tombstone marker. Such values are rejected before
+// any SQL is executed so a live row can never collide with, or be mistaken
+// for, a tombstoned one. See tombstone.go and #172.
+var ErrReservedValue = errors.New("reserved value")
+
 // translateError maps low-level driver errors to domain sentinels.
 // sql.ErrNoRows becomes ErrNotFound, UNIQUE constraint violations become ErrConflict,
 // FOREIGN KEY constraint violations become ErrForeignKey,

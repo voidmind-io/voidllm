@@ -447,6 +447,9 @@ func (h *Handler) RedeemInvite(c fiber.Ctx) error {
 		if errors.Is(err, db.ErrConflict) {
 			return apierror.Conflict(c, "email already registered")
 		}
+		if errors.Is(err, db.ErrReservedValue) {
+			return apierror.BadRequest(c, inviteInvalidMsg)
+		}
 		h.Log.ErrorContext(ctx, "redeem invite: create user", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to redeem invite")
 	}
