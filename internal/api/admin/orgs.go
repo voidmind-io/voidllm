@@ -65,12 +65,19 @@ type paginatedOrgsResponse struct {
 }
 
 // orgToResponse converts a db.OrgWithCounts to its API wire representation,
-// including the computed member_count and team_count fields.
+// including the computed member_count and team_count fields. For
+// soft-deleted organizations the slug is stripped of its tombstone suffix
+// (see db.StripTombstone) so admins viewing include_deleted listings see the
+// original slug rather than the mangled one used to free it for reuse.
 func orgToResponse(o *db.OrgWithCounts) orgResponse {
+	slug := o.Slug
+	if o.DeletedAt != nil {
+		slug = db.StripTombstone(slug, o.ID)
+	}
 	return orgResponse{
 		ID:                o.ID,
 		Name:              o.Name,
-		Slug:              o.Slug,
+		Slug:              slug,
 		Timezone:          o.Timezone,
 		DailyTokenLimit:   o.DailyTokenLimit,
 		MonthlyTokenLimit: o.MonthlyTokenLimit,

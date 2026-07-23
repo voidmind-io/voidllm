@@ -364,11 +364,14 @@ func (d *DB) UpdateUser(ctx context.Context, id string, params UpdateUserParams)
 	return user, nil
 }
 
-// DeleteUser soft-deletes an active user by setting deleted_at.
+// DeleteUser soft-deletes an active user by setting deleted_at. The email
+// column is mangled with a tombstone suffix so its value is freed for reuse
+// immediately; see StripTombstone and #172.
 // It returns ErrNotFound if the user does not exist or is already deleted.
 func (d *DB) DeleteUser(ctx context.Context, id string) error {
 	p := d.dialect.Placeholder
-	query := "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
+	query := "UPDATE users SET email = email || ':deleted:' || id, " +
+		"deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
 		"WHERE id = " + p(1) + " AND deleted_at IS NULL"
 
 	result, err := d.sql.ExecContext(ctx, query, id)

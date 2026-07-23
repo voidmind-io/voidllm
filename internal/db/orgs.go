@@ -264,11 +264,14 @@ func (d *DB) UpdateOrg(ctx context.Context, id string, params UpdateOrgParams) (
 	return org, nil
 }
 
-// DeleteOrg soft-deletes an active organization by setting deleted_at.
+// DeleteOrg soft-deletes an active organization by setting deleted_at. The
+// slug column is mangled with a tombstone suffix so its value is freed for
+// reuse immediately; see StripTombstone and #172.
 // It returns ErrNotFound if the organization does not exist or is already deleted.
 func (d *DB) DeleteOrg(ctx context.Context, id string) error {
 	p := d.dialect.Placeholder
-	query := "UPDATE organizations SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
+	query := "UPDATE organizations SET slug = slug || ':deleted:' || id, " +
+		"deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
 		"WHERE id = " + p(1) + " AND deleted_at IS NULL"
 
 	result, err := d.sql.ExecContext(ctx, query, id)

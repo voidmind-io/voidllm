@@ -162,6 +162,9 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 	if req.Name == "" {
 		return apierror.BadRequest(c, "name is required")
 	}
+	if db.ContainsTombstoneMarker(req.Name) {
+		return apierror.BadRequest(c, `name must not contain ":deleted:"`)
+	}
 	if req.Provider == "" {
 		return apierror.BadRequest(c, "provider is required")
 	}
@@ -309,6 +312,9 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 	rawBody := append([]byte(nil), c.Body()...)
 	piiPresent, piiIsNull := parsePIIFilterField(rawBody)
 
+	if req.Name != nil && db.ContainsTombstoneMarker(*req.Name) {
+		return apierror.BadRequest(c, `name must not contain ":deleted:"`)
+	}
 	if req.Provider != nil && !provider.ValidProviders[*req.Provider] {
 		return apierror.BadRequest(c, "provider must be one of: "+strings.Join(provider.Names(), ", "))
 	}

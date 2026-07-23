@@ -58,12 +58,19 @@ type paginatedTeamsResponse struct {
 
 // teamToResponse converts a db.Team to its API wire representation.
 // memberCount and keyCount are provided by the caller and included as-is.
+// For soft-deleted teams the slug is stripped of its tombstone suffix (see
+// db.StripTombstone) so admins viewing include_deleted listings see the
+// original slug rather than the mangled one used to free it for reuse.
 func teamToResponse(t *db.Team, memberCount, keyCount int) teamResponse {
+	slug := t.Slug
+	if t.DeletedAt != nil {
+		slug = db.StripTombstone(slug, t.ID)
+	}
 	return teamResponse{
 		ID:                t.ID,
 		OrgID:             t.OrgID,
 		Name:              t.Name,
-		Slug:              t.Slug,
+		Slug:              slug,
 		DailyTokenLimit:   t.DailyTokenLimit,
 		MonthlyTokenLimit: t.MonthlyTokenLimit,
 		RequestsPerMinute: t.RequestsPerMinute,

@@ -335,10 +335,13 @@ func (d *DB) UpdateDeployment(ctx context.Context, id string, params UpdateDeplo
 }
 
 // DeleteDeployment soft-deletes an active deployment by setting deleted_at.
+// The name column is mangled with a tombstone suffix so its value is freed
+// for reuse immediately; see StripTombstone and #172.
 // It returns ErrNotFound if the deployment does not exist or is already deleted.
 func (d *DB) DeleteDeployment(ctx context.Context, id string) error {
 	p := d.dialect.Placeholder
-	query := "UPDATE model_deployments SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
+	query := "UPDATE model_deployments SET name = name || ':deleted:' || id, " +
+		"deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
 		"WHERE id = " + p(1) + " AND deleted_at IS NULL"
 
 	result, err := d.sql.ExecContext(ctx, query, id)

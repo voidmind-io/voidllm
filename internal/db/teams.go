@@ -265,11 +265,14 @@ func (d *DB) UpdateTeam(ctx context.Context, id string, params UpdateTeamParams)
 	return team, nil
 }
 
-// DeleteTeam soft-deletes an active team by setting deleted_at.
+// DeleteTeam soft-deletes an active team by setting deleted_at. The slug
+// column is mangled with a tombstone suffix so its value is freed for reuse
+// immediately; see StripTombstone and #172.
 // It returns ErrNotFound if the team does not exist or is already deleted.
 func (d *DB) DeleteTeam(ctx context.Context, id string) error {
 	p := d.dialect.Placeholder
-	query := "UPDATE teams SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
+	query := "UPDATE teams SET slug = slug || ':deleted:' || id, " +
+		"deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
 		"WHERE id = " + p(1) + " AND deleted_at IS NULL"
 
 	result, err := d.sql.ExecContext(ctx, query, id)

@@ -461,6 +461,9 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 	if req.Name == "" {
 		return apierror.BadRequest(c, "name is required")
 	}
+	if db.ContainsTombstoneMarker(req.Name) {
+		return apierror.BadRequest(c, `name must not contain ":deleted:"`)
+	}
 	// provider and base_url are required only in single-endpoint mode (no strategy).
 	// When a strategy is set the endpoints live on the model's deployments.
 	if req.Strategy == "" {
@@ -780,6 +783,9 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		effectiveStrategy = *req.Strategy
 	}
 
+	if req.Name != nil && db.ContainsTombstoneMarker(*req.Name) {
+		return apierror.BadRequest(c, `name must not contain ":deleted:"`)
+	}
 	if req.Provider != nil && *req.Provider != "" && !provider.ValidProviders[*req.Provider] {
 		return apierror.BadRequest(c, "provider must be one of: "+strings.Join(provider.Names(), ", "))
 	}

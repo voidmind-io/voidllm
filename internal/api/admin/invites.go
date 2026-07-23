@@ -141,6 +141,9 @@ func (h *Handler) CreateInvite(c fiber.Ctx) error {
 	if req.Email == "" || !strings.Contains(req.Email, "@") {
 		return apierror.BadRequest(c, "email is required and must be a valid email address")
 	}
+	if db.ContainsTombstoneMarker(req.Email) {
+		return apierror.BadRequest(c, `email must not contain ":deleted:"`)
+	}
 	if req.Role == "" {
 		req.Role = "member"
 	}

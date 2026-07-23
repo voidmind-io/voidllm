@@ -452,11 +452,14 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 	return model, nil
 }
 
-// DeleteModel soft-deletes an active model by setting deleted_at.
+// DeleteModel soft-deletes an active model by setting deleted_at. The name
+// column is mangled with a tombstone suffix so its value is freed for reuse
+// immediately; see StripTombstone and #172.
 // It returns ErrNotFound if the model does not exist or is already deleted.
 func (d *DB) DeleteModel(ctx context.Context, id string) error {
 	p := d.dialect.Placeholder
-	query := "UPDATE models SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
+	query := "UPDATE models SET name = name || ':deleted:' || id, " +
+		"deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +
 		"WHERE id = " + p(1) + " AND deleted_at IS NULL"
 
 	result, err := d.sql.ExecContext(ctx, query, id)
