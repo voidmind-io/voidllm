@@ -111,19 +111,49 @@ func (r *Router) Pick(model proxy.Model) []proxy.Deployment {
 	return ordered[:limit]
 }
 
-// applyCooldownOrder stable-sorts ordered in place so that deployments
+// applyCooldownOrder partitions ordered in place so that deployments
 // currently cooling down (see cooldown.Registry) are moved after all
 // non-cooling deployments, without disturbing the relative order within
 // either group. A nil cooldowns registry makes this a no-op.
+//
+// The cooldown registry is never nil in production (app.go always
+// constructs one), so this must stay cheap on the common case where nothing
+// is cooling: Cooling() is read exactly once per candidate into a local
+// slice, and if none of them are cooling the function returns before doing
+// any reordering work at all. When at least one candidate is cooling, the
+// partition is applied as an explicit two-pass copy rather than
+// sort.SliceStable: sort's Swap only rearranges ordered itself, so a
+// separately-cached per-index boolean slice would desync from ordered's
+// elements as soon as the sort swapped anything, whereas indexing the cache
+// by original position and consuming it in a single forward pass is both
+// correct and O(n) instead of O(n log n).
 func (r *Router) applyCooldownOrder(modelName string, ordered []proxy.Deployment) {
 	if r.cooldowns == nil {
 		return
 	}
-	sort.SliceStable(ordered, func(i, j int) bool {
-		iCooling := r.cooldowns.Cooling(DeploymentKey(modelName, ordered[i].Name))
-		jCooling := r.cooldowns.Cooling(DeploymentKey(modelName, ordered[j].Name))
-		return !iCooling && jCooling
-	})
+
+	cooling := make([]bool, len(ordered))
+	anyCooling := false
+	for i, d := range ordered {
+		cooling[i] = r.cooldowns.Cooling(DeploymentKey(modelName, d.Name))
+		anyCooling = anyCooling || cooling[i]
+	}
+	if !anyCooling {
+		return
+	}
+
+	partitioned := make([]proxy.Deployment, 0, len(ordered))
+	for i, d := range ordered {
+		if !cooling[i] {
+			partitioned = append(partitioned, d)
+		}
+	}
+	for i, d := range ordered {
+		if cooling[i] {
+			partitioned = append(partitioned, d)
+		}
+	}
+	copy(ordered, partitioned)
 }
 
 // filterAvailable returns the subset of deployments whose circuit breaker

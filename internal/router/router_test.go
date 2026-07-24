@@ -1281,9 +1281,12 @@ func TestPick_ConcurrentRoundRobin(t *testing.T) {
 // --- Benchmark -------------------------------------------------------------
 
 // BenchmarkPick_RoundRobin measures the hot-path cost of a round-robin Pick
-// with no health or circuit-breaker checks.
+// with no health or circuit-breaker checks, against a real (empty) cooldown
+// registry — the same shape the production Router is always constructed
+// with — so the benchmark exercises applyCooldownOrder's no-op fast path
+// instead of skipping it via a nil registry.
 func BenchmarkPick_RoundRobin(b *testing.B) {
-	r := router.NewRouter(nil, nil, nil)
+	r := router.NewRouter(nil, nil, cooldown.NewRegistry())
 	m := proxy.Model{
 		Name:     "bench-model",
 		Strategy: "round-robin",
@@ -1302,9 +1305,10 @@ func BenchmarkPick_RoundRobin(b *testing.B) {
 	})
 }
 
-// BenchmarkPick_Priority measures priority-sorted Pick overhead.
+// BenchmarkPick_Priority measures priority-sorted Pick overhead against a
+// real (empty) cooldown registry, matching the production Router shape.
 func BenchmarkPick_Priority(b *testing.B) {
-	r := router.NewRouter(nil, nil, nil)
+	r := router.NewRouter(nil, nil, cooldown.NewRegistry())
 	m := proxy.Model{
 		Name:     "bench-model",
 		Strategy: "priority",
@@ -1323,9 +1327,10 @@ func BenchmarkPick_Priority(b *testing.B) {
 	})
 }
 
-// BenchmarkPick_Weighted measures weighted-random Pick overhead.
+// BenchmarkPick_Weighted measures weighted-random Pick overhead against a
+// real (empty) cooldown registry, matching the production Router shape.
 func BenchmarkPick_Weighted(b *testing.B) {
-	r := router.NewRouter(nil, nil, nil)
+	r := router.NewRouter(nil, nil, cooldown.NewRegistry())
 	m := proxy.Model{
 		Name:     "bench-model",
 		Strategy: "weighted",
@@ -1333,6 +1338,34 @@ func BenchmarkPick_Weighted(b *testing.B) {
 			{Name: "a", Weight: 5},
 			{Name: "b", Weight: 3},
 			{Name: "c", Weight: 2},
+		},
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = r.Pick(m)
+		}
+	})
+}
+
+// BenchmarkPick_RoundRobin_OneCooling measures round-robin Pick when one of
+// the three deployments is marked cooling, so applyCooldownOrder must take
+// its partition path instead of the no-op fast path exercised by
+// BenchmarkPick_RoundRobin.
+func BenchmarkPick_RoundRobin_OneCooling(b *testing.B) {
+	const modelName = "bench-model-cooling"
+	cd := cooldown.NewRegistry()
+	cd.Mark(router.DeploymentKey(modelName, "b"), time.Minute)
+
+	r := router.NewRouter(nil, nil, cd)
+	m := proxy.Model{
+		Name:     modelName,
+		Strategy: "round-robin",
+		Deployments: []proxy.Deployment{
+			{Name: "a"},
+			{Name: "b"},
+			{Name: "c"},
 		},
 	}
 

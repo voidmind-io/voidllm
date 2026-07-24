@@ -391,16 +391,6 @@ func TestRetryAfterOrDefault(t *testing.T) {
 			want:    5 * time.Second,
 		},
 		{
-			name:    "Retry-After HTTP-date far in the future clamps to max",
-			headers: map[string]string{"Retry-After": time.Now().Add(24 * time.Hour).UTC().Format(http.TimeFormat)},
-			want:    maxRateLimitCooldown,
-		},
-		{
-			name:    "Retry-After HTTP-date in the past clamps to zero",
-			headers: map[string]string{"Retry-After": time.Now().Add(-24 * time.Hour).UTC().Format(http.TimeFormat)},
-			want:    0,
-		},
-		{
 			name:    "Retry-After unparseable garbage uses default",
 			headers: map[string]string{"Retry-After": "not-a-valid-value"},
 			want:    defaultRateLimitCooldown,
@@ -425,6 +415,56 @@ func TestRetryAfterOrDefault(t *testing.T) {
 			headers: map[string]string{"Retry-After": "-5"},
 			want:    defaultRateLimitCooldown,
 		},
+		{
+			// Regression guard for the int64-overflow bug the bounds check in
+			// retryAfterOrDefault exists to prevent: 9999999999 seconds,
+			// multiplied by time.Second, overflows int64 and wraps to a
+			// negative duration, which clampCooldown would then turn into 0 —
+			// no cooldown at all, the exact opposite of the intent of a large
+			// Retry-After value. The pre-multiplication bounds check against
+			// maxRateLimitCooldownSecs must catch this before the overflow
+			// happens.
+			name:    "Retry-After large enough to overflow int64 seconds clamps to max",
+			headers: map[string]string{"Retry-After": "9999999999"},
+			want:    maxRateLimitCooldown,
+		},
+		{
+			// The extreme case of the same overflow: math.MaxInt64 itself.
+			name:    "Retry-After math.MaxInt64 clamps to max",
+			headers: map[string]string{"Retry-After": "9223372036854775807"},
+			want:    maxRateLimitCooldown,
+		},
+		{
+			// Same overflow regression, but for the retry-after-ms branch:
+			// multiplying by time.Millisecond instead of time.Second.
+			name:    "retry-after-ms large enough to overflow int64 ms clamps to max",
+			headers: map[string]string{"retry-after-ms": "9999999999999999"},
+			want:    maxRateLimitCooldown,
+		},
+		{
+			// Pins the ordinary clamp boundary (a value just above the cap,
+			// far from the overflow range) as distinct from the overflow
+			// guard above: deleting the bounds check would not overflow here,
+			// so this case alone would not catch that mutation, but it
+			// verifies the "> max clamps" behavior holds independent of
+			// overflow.
+			name:    "Retry-After just above cap in seconds clamps to max",
+			headers: map[string]string{"Retry-After": fmt.Sprintf("%d", maxRateLimitCooldownSecs+1)},
+			want:    maxRateLimitCooldown,
+		},
+		{
+			// Exactly at the cap in seconds: secs > maxRateLimitCooldownSecs
+			// is false, so this falls through to clampCooldown(secs *
+			// time.Second), which multiplies out to exactly
+			// maxRateLimitCooldown and clampCooldown's d > maxRateLimitCooldown
+			// check leaves it unchanged. The boundary is inclusive on the
+			// non-clamping side of the pre-multiplication check, but the
+			// numeric result is the same maxRateLimitCooldown value either
+			// way.
+			name:    "Retry-After exactly at cap in seconds is honored",
+			headers: map[string]string{"Retry-After": fmt.Sprintf("%d", maxRateLimitCooldownSecs)},
+			want:    maxRateLimitCooldown,
+		},
 	}
 
 	for _, tc := range tests {
@@ -446,6 +486,71 @@ func TestRetryAfterOrDefault(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRetryAfterOrDefault_HTTPDate covers the RFC 7231 HTTP-date form of the
+// Retry-After header specifically: past date, near-future date (not
+// clamped), and far-future date (must clamp to maxRateLimitCooldown).
+//
+// Unlike the table-driven cases above, these deliberately do not assert
+// exact equality against a duration precomputed from time.Now(): parsing an
+// HTTP-date internally calls time.Until, which reads the wall clock again at
+// call time, so any expected value baked in at header-construction time
+// would be racing the clock. The past- and far-future cases stay exact
+// because their expected results are the two saturating clamp bounds (0 and
+// maxRateLimitCooldown) — values wide enough that ordinary test-execution
+// jitter can never cross the clamp boundary. The near-future case is the one
+// that actually carries an unclamped, clock-derived value, so it asserts a
+// bound instead of exact equality.
+func TestRetryAfterOrDefault_HTTPDate(t *testing.T) {
+	t.Parallel()
+
+	t.Run("past date clamps to zero", func(t *testing.T) {
+		t.Parallel()
+
+		h := make(http.Header)
+		h.Set("Retry-After", time.Now().Add(-24*time.Hour).UTC().Format(http.TimeFormat))
+		resp := &http.Response{Header: h}
+
+		got := retryAfterOrDefault(resp)
+		if got != 0 {
+			t.Errorf("retryAfterOrDefault() = %v, want 0 (date is in the past)", got)
+		}
+	})
+
+	t.Run("near-future date within cap is honored", func(t *testing.T) {
+		t.Parallel()
+
+		const target = 10 * time.Second
+		h := make(http.Header)
+		h.Set("Retry-After", time.Now().Add(target).UTC().Format(http.TimeFormat))
+		resp := &http.Response{Header: h}
+
+		got := retryAfterOrDefault(resp)
+
+		// The header only carries second resolution and some wall-clock time
+		// elapses between construction and parsing, so bound the result
+		// instead of asserting it equals target exactly: it must be positive,
+		// must not exceed target, and must not be more than a generous
+		// tolerance below it.
+		const tolerance = 3 * time.Second
+		if got <= 0 || got > target || target-got > tolerance {
+			t.Errorf("retryAfterOrDefault() = %v, want within (%v, %v]", got, target-tolerance, target)
+		}
+	})
+
+	t.Run("far-future date clamps to max", func(t *testing.T) {
+		t.Parallel()
+
+		h := make(http.Header)
+		h.Set("Retry-After", time.Now().Add(24*time.Hour).UTC().Format(http.TimeFormat))
+		resp := &http.Response{Header: h}
+
+		got := retryAfterOrDefault(resp)
+		if got != maxRateLimitCooldown {
+			t.Errorf("retryAfterOrDefault() = %v, want %v (must clamp)", got, maxRateLimitCooldown)
+		}
+	})
 }
 
 // ── Model-level fallback on 429 ──────────────────────────────────────────────

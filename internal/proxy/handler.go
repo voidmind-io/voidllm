@@ -1876,6 +1876,18 @@ const (
 	// minute is a generous upper bound that still meaningfully deprioritizes
 	// the deployment without contributing to an hour of reduced capacity.
 	maxRateLimitCooldown = 60 * time.Second
+
+	// maxRateLimitCooldownMs and maxRateLimitCooldownSecs are
+	// maxRateLimitCooldown expressed in the unit of the corresponding
+	// Retry-After header. Both are compile-time constant expressions (no
+	// runtime division), used by retryAfterOrDefault to bounds-check a
+	// parsed header value BEFORE multiplying it into a time.Duration —
+	// multiplying an attacker- or upstream-controlled integer first and
+	// clamping afterwards lets a large-enough value overflow int64 and wrap
+	// to a negative duration, which is exactly the failure clampCooldown
+	// cannot recover from.
+	maxRateLimitCooldownMs   = int64(maxRateLimitCooldown / time.Millisecond)
+	maxRateLimitCooldownSecs = int64(maxRateLimitCooldown / time.Second)
 )
 
 // retryAfterOrDefault returns the cooldown duration to apply for a 429
@@ -1884,15 +1896,25 @@ const (
 // 1999 23:59:59 GMT"), and the OpenAI-specific "retry-after-ms" header
 // (milliseconds) as a higher-resolution alternative, preferring the latter
 // when both are present. When neither header is present or parseable,
-// defaultRateLimitCooldown is used. The result is always clamped to
-// [0, maxRateLimitCooldown].
+// defaultRateLimitCooldown is used.
+//
+// The result is always within [0, maxRateLimitCooldown]. Header values are
+// parsed as 64-bit integers and bounds-checked against maxRateLimitCooldown
+// (expressed in the header's own unit) before the multiplication that
+// converts them into a time.Duration, so a value large enough to otherwise
+// overflow int64 — e.g. "Retry-After: 9999999999" or a comparably large
+// "retry-after-ms" — clamps to maxRateLimitCooldown directly instead of
+// silently wrapping to a negative duration.
 func retryAfterOrDefault(resp *http.Response) time.Duration {
 	if resp == nil {
 		return defaultRateLimitCooldown
 	}
 
 	if ms := resp.Header.Get("retry-after-ms"); ms != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(ms)); err == nil && n >= 0 {
+		if n, err := strconv.ParseInt(strings.TrimSpace(ms), 10, 64); err == nil && n >= 0 {
+			if n > maxRateLimitCooldownMs {
+				return maxRateLimitCooldown
+			}
 			return clampCooldown(time.Duration(n) * time.Millisecond)
 		}
 	}
@@ -1901,7 +1923,10 @@ func retryAfterOrDefault(resp *http.Response) time.Duration {
 	if ra == "" {
 		return defaultRateLimitCooldown
 	}
-	if secs, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && secs >= 0 {
+	if secs, err := strconv.ParseInt(strings.TrimSpace(ra), 10, 64); err == nil && secs >= 0 {
+		if secs > maxRateLimitCooldownSecs {
+			return maxRateLimitCooldown
+		}
 		return clampCooldown(time.Duration(secs) * time.Second)
 	}
 	if when, err := http.ParseTime(ra); err == nil {
