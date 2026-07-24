@@ -2,6 +2,19 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.24] - 2026-07-24
+
+### Fixes
+- Deleting a model, user, organization, team, or deployment frees its name, email, or slug for immediate re-use. Previously the soft-deleted row kept the unique value, so re-creating a model with a previously used name failed with 409 - and re-inviting a deleted user's email or re-provisioning a deleted SSO identity failed the same way. The migration also unblocks values held by rows deleted before the fix, so existing installations need no manual cleanup (#173)
+
+### Security
+- Dependency updates addressing security advisories in the Go standard library extensions, the gRPC client, and the frontend router (#174, #175, #176)
+
+### Documentation
+- The logging configuration (level and format) is now documented, including how to enable debug logs and what the debug level adds. The no-content-logging guarantee is stated precisely: LLM prompts, responses, and detected PII values never appear in logs at any level (#177)
+
+---
+
 ## [0.0.23] - 2026-07-21
 
 ### Fixes
