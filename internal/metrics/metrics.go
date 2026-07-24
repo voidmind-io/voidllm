@@ -119,6 +119,19 @@ var RoutingRetriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help:      "Number of upstream retry attempts during load-balanced routing.",
 }, []string{"model", "strategy"})
 
+// RateLimitFailoversTotal counts requests that failed over to the next
+// deployment candidate because the current one returned HTTP 429, partitioned
+// by model name and deployment key. Unlike RoutingRetriesTotal (which also
+// fires for 5xx retries), this metric isolates rate-limit-induced failover so
+// operators can distinguish "upstream is broken" from "upstream is
+// throttling us" without inspecting request content — only the model and
+// deployment identifiers are recorded.
+var RateLimitFailoversTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "voidllm",
+	Name:      "rate_limit_failovers_total",
+	Help:      "Number of requests that failed over to another deployment due to HTTP 429.",
+}, []string{"model", "deployment"})
+
 // RegisterDBCollectors registers database connection pool metrics against the
 // default Prometheus registry. The gauges are implemented as GaugeFuncs that
 // read live values from sql.DB.Stats() on each scrape, so they always reflect

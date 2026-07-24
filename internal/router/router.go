@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/voidmind-io/voidllm/internal/circuitbreaker"
+	"github.com/voidmind-io/voidllm/internal/cooldown"
 	"github.com/voidmind-io/voidllm/internal/health"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 )
@@ -20,14 +21,16 @@ import (
 type Router struct {
 	healthChecker   *health.Checker
 	circuitBreakers *circuitbreaker.Registry
+	cooldowns       *cooldown.Registry
 	counters        sync.Map // model name → *atomic.Uint64 (round-robin)
 }
 
-// NewRouter creates a Router. Both dependencies are optional (nil-safe).
-func NewRouter(hc *health.Checker, cb *circuitbreaker.Registry) *Router {
+// NewRouter creates a Router. All three dependencies are optional (nil-safe).
+func NewRouter(hc *health.Checker, cb *circuitbreaker.Registry, cd *cooldown.Registry) *Router {
 	return &Router{
 		healthChecker:   hc,
 		circuitBreakers: cb,
+		cooldowns:       cd,
 	}
 }
 
@@ -87,6 +90,18 @@ func (r *Router) Pick(model proxy.Model) []proxy.Deployment {
 		ordered = r.roundRobin(model.Name, candidates)
 	}
 
+	// Deprioritize deployments that are currently rate-limit-cooling: a
+	// stable partition (not a filter) moves cooling deployments to the end
+	// while preserving the strategy's relative order within each partition.
+	// This is deliberately not a filter: Pick reinstates the full candidate
+	// list whenever filterAvailable above returns empty, and the proxy
+	// handler skips Allow() entirely when a Router is configured — so a
+	// cooldown filter here would be defeated in exactly the situation it
+	// exists to handle. A stable sort instead guarantees that when every
+	// candidate is cooling, the full list still survives in order, and the
+	// MaxRetries cap below naturally trims cooling entries first.
+	r.applyCooldownOrder(model.Name, ordered)
+
 	// Limit result length to maxRetries+1 so the caller does not attempt more
 	// deployments than the model policy allows. Zero means try all candidates.
 	limit := len(ordered)
@@ -94,6 +109,21 @@ func (r *Router) Pick(model proxy.Model) []proxy.Deployment {
 		limit = model.MaxRetries + 1
 	}
 	return ordered[:limit]
+}
+
+// applyCooldownOrder stable-sorts ordered in place so that deployments
+// currently cooling down (see cooldown.Registry) are moved after all
+// non-cooling deployments, without disturbing the relative order within
+// either group. A nil cooldowns registry makes this a no-op.
+func (r *Router) applyCooldownOrder(modelName string, ordered []proxy.Deployment) {
+	if r.cooldowns == nil {
+		return
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		iCooling := r.cooldowns.Cooling(DeploymentKey(modelName, ordered[i].Name))
+		jCooling := r.cooldowns.Cooling(DeploymentKey(modelName, ordered[j].Name))
+		return !iCooling && jCooling
+	})
 }
 
 // filterAvailable returns the subset of deployments whose circuit breaker

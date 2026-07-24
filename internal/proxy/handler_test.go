@@ -1465,8 +1465,9 @@ func TestIsFallbackEligible(t *testing.T) {
 		{"401 not eligible", 401, nil, false},
 		{"403 not eligible", 403, nil, false},
 		{"404 not eligible", 404, nil, false},
-		// 429 is 4xx — not eligible per production code.
-		{"429 not eligible", 429, nil, false},
+		// 429 is rate limiting, not a broken deployment — a different model
+		// may have separate quota, so fallback is eligible per production code.
+		{"429 eligible", 429, nil, true},
 		// 200 success is not eligible.
 		{"200 not eligible", 200, nil, false},
 		// Network error with no status is eligible.

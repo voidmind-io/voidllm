@@ -31,6 +31,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/cache"
 	"github.com/voidmind-io/voidllm/internal/circuitbreaker"
 	"github.com/voidmind-io/voidllm/internal/config"
+	"github.com/voidmind-io/voidllm/internal/cooldown"
 	"github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/docs"
 	"github.com/voidmind-io/voidllm/internal/health"
@@ -609,6 +610,13 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		)
 	}
 
+	// cdRegistry tracks deployments that returned HTTP 429 so the router can
+	// deprioritize them for a short window. Unlike cbRegistry it has no
+	// enable/disable setting — it is always created; a 429 must never be
+	// treated as a circuit-breaker failure regardless of whether circuit
+	// breaking itself is enabled.
+	cdRegistry := cooldown.NewRegistry()
+
 	// OTel tracing: initialise only when the feature is licensed and enabled.
 	var otelShutdownFn func(context.Context) error
 	var tracer trace.Tracer
@@ -662,15 +670,16 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		)
 	}
 
-	// Create the deployment router for load balancing. Both dependencies are
-	// optional: healthChecker may be nil when health probes are disabled, and
-	// cbRegistry may be nil when circuit breaking is disabled.
-	modelRouter := router.NewRouter(healthChecker, cbRegistry)
+	// Create the deployment router for load balancing. healthChecker and
+	// cbRegistry are optional and may be nil when the corresponding feature is
+	// disabled; cdRegistry is always non-nil (see above).
+	modelRouter := router.NewRouter(healthChecker, cbRegistry, cdRegistry)
 
 	proxyHandler := proxy.NewProxyHandler(registry, log)
 	proxyHandler.AccessCache = accessCache
 	proxyHandler.AliasCache = aliasCache
 	proxyHandler.CircuitBreakers = cbRegistry
+	proxyHandler.Cooldowns = cdRegistry
 	proxyHandler.Router = modelRouter
 	proxyHandler.UsageLogger = usageLogger
 	proxyHandler.RateLimiter = rateLimiter

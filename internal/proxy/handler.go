@@ -25,6 +25,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/circuitbreaker"
+	"github.com/voidmind-io/voidllm/internal/cooldown"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	"github.com/voidmind-io/voidllm/internal/pii"
@@ -48,6 +49,7 @@ type ProxyHandler struct {
 	AccessCache       *ModelAccessCache        // in-memory model access control; nil disables access checks
 	AliasCache        *AliasCache              // in-memory scoped alias resolution; nil disables alias lookup
 	CircuitBreakers   *circuitbreaker.Registry // per-model circuit breaker registry; nil disables circuit breaking
+	Cooldowns         *cooldown.Registry       // per-deployment rate-limit cooldown tracker; nil disables cooldown tracking
 	Router            DeploymentPicker         // deployment selector; nil falls back to single-deployment behavior
 	HTTPClient        *http.Client
 	UsageLogger       *usage.Logger           // nil disables usage logging
@@ -633,24 +635,44 @@ func (p *ProxyHandler) tryModel(
 
 		metrics.UpstreamRequestsTotal.WithLabelValues(m.Name, m.Provider, strconv.Itoa(currentResp.StatusCode)).Inc()
 
-		if isRetryable(currentResp.StatusCode) && i < len(candidates)-1 {
-			// 5xx response from upstream — try the next deployment. Drain
-			// and close the body before moving on so the connection is
+		if (isRetryable(currentResp.StatusCode) || isRateLimited(currentResp.StatusCode)) && i < len(candidates)-1 {
+			// 5xx or 429 response from upstream — try the next deployment.
+			// Drain and close the body before moving on so the connection is
 			// returned to the pool.
+			rateLimited := isRateLimited(currentResp.StatusCode)
+			retryAfter := retryAfterOrDefault(currentResp)
 			_, _ = io.Copy(io.Discard, currentResp.Body)
 			_ = currentResp.Body.Close()
 			cancelUpstream()
-			if p.CircuitBreakers != nil {
-				p.CircuitBreakers.Get(depKey).RecordFailure()
+			if rateLimited {
+				// A rate-limited upstream is not broken — recording it as a
+				// circuit-breaker failure would erase real accumulated
+				// failures on RecordSuccess and mis-trip the breaker on
+				// RecordFailure. Instead, park the deployment in the
+				// cooldown registry so the router deprioritizes it for a
+				// short window.
+				p.Cooldowns.Mark(depKey, retryAfter)
+				metrics.RateLimitFailoversTotal.WithLabelValues(model.Name, depKey).Inc()
+				p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream rate limited, retrying next deployment",
+					slog.String("model", m.Name),
+					slog.String("deployment", d.Name),
+					slog.String("provider", m.Provider),
+					slog.Int("candidate", i),
+					slog.Duration("cooldown", retryAfter),
+				)
+			} else {
+				if p.CircuitBreakers != nil {
+					p.CircuitBreakers.Get(depKey).RecordFailure()
+				}
+				metrics.UpstreamErrorsTotal.WithLabelValues(m.Name, m.Provider).Inc()
+				p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream returned retryable error, retrying next deployment",
+					slog.String("model", m.Name),
+					slog.String("deployment", d.Name),
+					slog.String("provider", m.Provider),
+					slog.Int("candidate", i),
+					slog.Int("status", currentResp.StatusCode),
+				)
 			}
-			metrics.UpstreamErrorsTotal.WithLabelValues(m.Name, m.Provider).Inc()
-			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream returned retryable error, retrying next deployment",
-				slog.String("model", m.Name),
-				slog.String("deployment", d.Name),
-				slog.String("provider", m.Provider),
-				slog.Int("candidate", i),
-				slog.Int("status", currentResp.StatusCode),
-			)
 			lastErr = errors.New("upstream returned " + strconv.Itoa(currentResp.StatusCode))
 			req = nil
 			cancelUpstream = nil
@@ -659,11 +681,17 @@ func (p *ProxyHandler) tryModel(
 			continue
 		}
 
-		// Success or non-retryable status (4xx, or last retryable with no
-		// more candidates). Record circuit breaker outcome for non-streaming
-		// responses immediately; streaming outcome is recorded inside the
-		// goroutine once the stream completes.
-		if p.CircuitBreakers != nil && !isStreamingResponse(currentResp) {
+		// Success or non-retryable status (4xx, or last retryable/rate-limited
+		// with no more candidates). Record circuit breaker outcome for
+		// non-streaming responses immediately; streaming outcome is recorded
+		// inside the goroutine once the stream completes. A 429 is NEUTRAL —
+		// it is neither a success (RecordSuccess would erase real accumulated
+		// failures) nor a breaker failure (a rate-limited upstream is not
+		// broken) — but the deployment is still marked cooling so the next
+		// request does not try it first again.
+		if isRateLimited(currentResp.StatusCode) {
+			p.Cooldowns.Mark(depKey, retryAfterOrDefault(currentResp))
+		} else if p.CircuitBreakers != nil && !isStreamingResponse(currentResp) {
 			breaker := p.CircuitBreakers.Get(depKey)
 			if currentResp.StatusCode >= 500 {
 				breaker.RecordFailure()
@@ -1810,11 +1838,90 @@ func applyDeployment(model *Model, dep Deployment) {
 // indicate a server-side problem that a different backend may not share.
 // 4xx errors are client errors that will recur regardless of which deployment
 // is used, so they are not retried.
+//
+// isRetryable is deliberately kept separate from isRateLimited even though
+// callers usually OR the two together to decide whether to try the next
+// candidate: the two carry different circuit-breaker semantics. A 5xx means
+// the deployment itself is broken and must count as a circuit-breaker
+// failure; a 429 (see isRateLimited) means the deployment is healthy but
+// temporarily throttled and must never trip or reset the circuit breaker —
+// it is tracked separately via the cooldown registry instead.
 func isRetryable(statusCode int) bool {
 	return statusCode == http.StatusInternalServerError ||
 		statusCode == http.StatusBadGateway ||
 		statusCode == http.StatusServiceUnavailable ||
 		statusCode == http.StatusGatewayTimeout
+}
+
+// isRateLimited reports whether an HTTP status code from an upstream response
+// is a rate-limit rejection (429). See isRetryable's godoc for why this is a
+// distinct predicate rather than folded into isRetryable.
+func isRateLimited(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests
+}
+
+// defaultRateLimitCooldown and maxRateLimitCooldown govern how long a
+// deployment is parked in the cooldown registry after returning HTTP 429.
+// Neither is configurable in v1.
+const (
+	// defaultRateLimitCooldown is applied when the upstream response carries
+	// no usable Retry-After / retry-after-ms hint. A few seconds is enough to
+	// skip the deployment for the next handful of requests without assuming a
+	// specific rate-limit window when the upstream did not say one.
+	defaultRateLimitCooldown = 3 * time.Second
+
+	// maxRateLimitCooldown caps the cooldown even when the upstream requests
+	// a much longer wait (e.g. "Retry-After: 3600"). A single 429 response
+	// must never park a deployment for anywhere close to that long; one
+	// minute is a generous upper bound that still meaningfully deprioritizes
+	// the deployment without contributing to an hour of reduced capacity.
+	maxRateLimitCooldown = 60 * time.Second
+)
+
+// retryAfterOrDefault returns the cooldown duration to apply for a 429
+// response. It reads the standard Retry-After header (RFC 7231), supporting
+// both the delta-seconds form ("120") and the HTTP-date form ("Fri, 31 Dec
+// 1999 23:59:59 GMT"), and the OpenAI-specific "retry-after-ms" header
+// (milliseconds) as a higher-resolution alternative, preferring the latter
+// when both are present. When neither header is present or parseable,
+// defaultRateLimitCooldown is used. The result is always clamped to
+// [0, maxRateLimitCooldown].
+func retryAfterOrDefault(resp *http.Response) time.Duration {
+	if resp == nil {
+		return defaultRateLimitCooldown
+	}
+
+	if ms := resp.Header.Get("retry-after-ms"); ms != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(ms)); err == nil && n >= 0 {
+			return clampCooldown(time.Duration(n) * time.Millisecond)
+		}
+	}
+
+	ra := resp.Header.Get("Retry-After")
+	if ra == "" {
+		return defaultRateLimitCooldown
+	}
+	if secs, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && secs >= 0 {
+		return clampCooldown(time.Duration(secs) * time.Second)
+	}
+	if when, err := http.ParseTime(ra); err == nil {
+		return clampCooldown(time.Until(when))
+	}
+
+	return defaultRateLimitCooldown
+}
+
+// clampCooldown bounds d to [0, maxRateLimitCooldown]. A negative input
+// (e.g. an HTTP-date Retry-After value already in the past) clamps to zero,
+// which makes the subsequent Registry.Mark call a no-op.
+func clampCooldown(d time.Duration) time.Duration {
+	if d < 0 {
+		return 0
+	}
+	if d > maxRateLimitCooldown {
+		return maxRateLimitCooldown
+	}
+	return d
 }
 
 // extractUsage parses token counts from a non-streaming OpenAI-format response
@@ -1863,8 +1970,9 @@ func mutateRequestBody(body []byte, canonicalModel string, injectUsage bool) []b
 //
 // Network / DNS / dial / timeout errors are eligible. Context cancellation is
 // NOT eligible — the client went away and there is no point retrying. 5xx
-// responses are eligible; 4xx are not (bad request or auth failure will recur
-// on any backend).
+// responses are eligible, as is 429 (rate limited — a different model may
+// have separate quota); other 4xx are not (bad request or auth failure will
+// recur on any backend).
 func isFallbackEligible(statusCode int, err error) bool {
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -1872,7 +1980,7 @@ func isFallbackEligible(statusCode int, err error) bool {
 		}
 		return true
 	}
-	return statusCode >= 500 && statusCode < 600
+	return (statusCode >= 500 && statusCode < 600) || statusCode == http.StatusTooManyRequests
 }
 
 // rewriteModelInBody replaces the "model" field inside a JSON request body
