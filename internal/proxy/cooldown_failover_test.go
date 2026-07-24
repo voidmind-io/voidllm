@@ -8,6 +8,7 @@ package proxy
 // success nor a failure.
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log/slog"
@@ -264,6 +265,226 @@ func singleDeploymentRegistry(modelName, provider, upstreamURL string) *Registry
 	}
 }
 
+// ── Streaming 429 must not touch the breaker ─────────────────────────────────
+
+// TestHandle_StreamingSSE429_LeavesBreakerClosed verifies that when an
+// upstream returns HTTP 429 with Content-Type: text/event-stream, Handle
+// never resolves a circuit breaker for the streaming path — its neutral
+// outcome was already recorded once via RecordNeutral() inside tryModel, and
+// resolving a breaker for handleStreamingResponse as well would let the SSE
+// scan loop additionally record a success or failure once the stream
+// completes, defeating that neutrality.
+//
+// To make a would-be regression observable, the mock upstream's SSE body
+// ends WITHOUT a [DONE] sentinel: handleStreamingResponse's own
+// classification treats a stream that ends without [DONE] as incomplete and
+// calls breaker.RecordFailure() whenever a non-nil breaker was passed in.
+// With a Threshold=1 registry, a regression that still resolves a breaker
+// for a 429 SSE response would trip it Open; the fix (never resolving a
+// breaker for a rate-limited SSE response) leaves it Closed.
+func TestHandle_StreamingSSE429_LeavesBreakerClosed(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusTooManyRequests)
+		flusher := w.(http.Flusher)
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"a"}}]}`)
+		fmt.Fprintln(w)
+		flusher.Flush()
+		// No [DONE] is ever sent: the handler returns here, so the upstream
+		// connection closes and the client observes a truncated stream.
+	}))
+	t.Cleanup(srv.Close)
+
+	const modelName = "sse-429-model"
+	reg := singleDeploymentRegistry(modelName, "vllm", srv.URL)
+	handler := NewProxyHandler(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler.CircuitBreakers = newTestCircuitBreakers(1)
+	handler.Cooldowns = cooldown.NewRegistry()
+
+	baseURL, rawKey := startAuthedTestServer(t, handler, terminationKeyInfo("org-sse-429"))
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"`+modelName+`","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawKey)
+
+	client := &http.Client{Timeout: testTimeout.Timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", resp.StatusCode)
+	}
+
+	// Read the full body to EOF. handleStreamingResponse's SendStreamWriter
+	// goroutine performs any breaker recording before it returns, and that
+	// return closes the connection — so observing EOF here happens-after
+	// any such recording, making the subsequent CurrentState() check race-free.
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("read streamed body: %v", err)
+	}
+
+	depKey := deploymentKey(modelName, modelName)
+	if state := handler.CircuitBreakers.Get(depKey).CurrentState(); state != circuitbreaker.Closed {
+		t.Errorf("breaker for %q state = %v after a streaming 429, want Closed (the streaming path "+
+			"must never resolve a breaker for a rate-limited SSE response)", depKey, state)
+	}
+}
+
+// ── Bounded drain: byte cap ───────────────────────────────────────────────────
+
+// TestHandle_429_EndlessBody_FailsOverWithoutBlocking verifies that an
+// unbounded response body on a rate-limited candidate does not prevent
+// failover: tryModel's drain is capped by the effective response-body limit
+// via io.CopyN, so an upstream that keeps writing forever is cut off after
+// exactly that many bytes instead of blocking until EOF (which never
+// arrives).
+func TestHandle_429_EndlessBody_FailsOverWithoutBlocking(t *testing.T) {
+	t.Parallel()
+
+	var dep2Calls int32
+	chunk := bytes.Repeat([]byte("x"), 4096)
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		flusher := w.(http.Flusher)
+		// Bounded only as a hard safety net (409600 bytes @ 4096/write): the
+		// real termination path is the connection closing once the client
+		// (voidllm) has read its capped share and moved on, either observed
+		// via context cancellation or a failing Write.
+		for i := 0; i < 100_000; i++ {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}))
+	t.Cleanup(srv1.Close)
+	srv2 := okServer(t, &dep2Calls)
+
+	dep1 := Deployment{Name: "dep-1", Provider: "openai", BaseURL: srv1.URL, APIKey: "k1", Priority: 1}
+	dep2 := Deployment{Name: "dep-2", Provider: "openai", BaseURL: srv2.URL, APIKey: "k2", Priority: 2}
+
+	reg := twoDeploymentRegistry("endless-body-model", dep1, dep2)
+	handler := NewProxyHandler(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler.Router = &staticDeploymentPicker{deps: []Deployment{dep1, dep2}}
+	handler.CircuitBreakers = newTestCircuitBreakers(1)
+	handler.Cooldowns = cooldown.NewRegistry()
+	handler.MaxResponseBody = 4096 // small cap: proves the drain stops far short of "endless"
+	app := testApp(t, handler)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"endless-body-model","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	start := time.Now()
+	resp, err := app.Test(req, testTimeout)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	elapsed := time.Since(start)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+	if atomic.LoadInt32(&dep2Calls) == 0 {
+		t.Error("second deployment (dep-2) was never called")
+	}
+	// The byte cap (4096 bytes) is reached almost instantly, so failover
+	// must complete far faster than the drain time budget — if the drain
+	// were unbounded in size, this request would never return within the
+	// test's overall timeout at all.
+	if elapsed >= failoverDrainBudget {
+		t.Errorf("request took %v, want well under failoverDrainBudget (%v): the byte cap should stop "+
+			"the drain almost immediately regardless of how much more data the upstream has to send",
+			elapsed, failoverDrainBudget)
+	}
+}
+
+// ── Bounded drain: time budget ────────────────────────────────────────────────
+
+// TestHandle_429_StalledBody_FailsOverWithinDrainBudget verifies that a
+// rate-limited candidate whose response headers arrive but whose body never
+// does cannot block failover longer than failoverDrainBudget: the
+// time.AfterFunc armed around the drain cancels the upstream context, which
+// unblocks the stalled read.
+func TestHandle_429_StalledBody_FailsOverWithinDrainBudget(t *testing.T) {
+	t.Parallel()
+
+	var dep2Calls int32
+	stopCh := make(chan struct{})
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.(http.Flusher).Flush()
+		// Headers are sent; the body never arrives until the test unblocks
+		// this handler at teardown. Registered as a t.Cleanup (closed before
+		// the server itself is, see below) so this goroutine never leaks.
+		<-stopCh
+	}))
+	// Registered before the stopCh-closing cleanup below so it runs AFTER it
+	// (t.Cleanup runs LIFO): stopCh must be closed, unblocking the handler,
+	// before srv1.Close() waits for the in-flight request to finish.
+	t.Cleanup(srv1.Close)
+	t.Cleanup(func() { close(stopCh) })
+	srv2 := okServer(t, &dep2Calls)
+
+	dep1 := Deployment{Name: "dep-1", Provider: "openai", BaseURL: srv1.URL, APIKey: "k1", Priority: 1}
+	dep2 := Deployment{Name: "dep-2", Provider: "openai", BaseURL: srv2.URL, APIKey: "k2", Priority: 2}
+
+	reg := twoDeploymentRegistry("stalled-body-model", dep1, dep2)
+	handler := NewProxyHandler(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler.Router = &staticDeploymentPicker{deps: []Deployment{dep1, dep2}}
+	handler.CircuitBreakers = newTestCircuitBreakers(1)
+	handler.Cooldowns = cooldown.NewRegistry()
+	app := testApp(t, handler)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"stalled-body-model","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	start := time.Now()
+	resp, err := app.Test(req, testTimeout)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	elapsed := time.Since(start)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+	if atomic.LoadInt32(&dep2Calls) == 0 {
+		t.Error("second deployment (dep-2) was never called")
+	}
+
+	// The drain must unblock at failoverDrainBudget, not later. The bound is
+	// derived from the constant itself (rather than a hardcoded duration) so
+	// this assertion tracks failoverDrainBudget if it is ever retuned, while
+	// still catching a regression where the drain blocks indefinitely.
+	bound := 2 * failoverDrainBudget
+	if elapsed >= bound {
+		t.Errorf("request took %v, want < %v (2x failoverDrainBudget=%v): a stalled response body "+
+			"must not block failover longer than the drain budget", elapsed, bound, failoverDrainBudget)
+	}
+}
+
 // ── All candidates rate limited ──────────────────────────────────────────────
 
 // TestHandle_429_AllCandidatesRateLimited verifies that when every deployment
@@ -464,6 +685,45 @@ func TestRetryAfterOrDefault(t *testing.T) {
 			name:    "Retry-After exactly at cap in seconds is honored",
 			headers: map[string]string{"Retry-After": fmt.Sprintf("%d", maxRateLimitCooldownSecs)},
 			want:    maxRateLimitCooldown,
+		},
+		{
+			// Distinct from the math.MaxInt64 case above: this value is too
+			// large for strconv.ParseInt to represent AT ALL (25 digits, far
+			// beyond math.MaxInt64's 19 digits), so ParseInt itself returns
+			// strconv.ErrRange rather than a parsed (and then bounds-checked)
+			// int64. Without isPositiveRangeOverflow catching this via the
+			// "err == nil" check failing, the value would fall through to
+			// HTTP-date parsing (which fails on a bare number) and then
+			// silently return defaultRateLimitCooldown — ignoring an upstream
+			// that unambiguously asked for a very long cooldown, the opposite
+			// of a clamp.
+			name:    "Retry-After 25 digits (beyond math.MaxInt64 parse range) clamps to max",
+			headers: map[string]string{"Retry-After": "9999999999999999999999999"},
+			want:    maxRateLimitCooldown,
+		},
+		{
+			// Same ParseInt-range-overflow case, but for retry-after-ms.
+			name:    "retry-after-ms 25 digits (beyond math.MaxInt64 parse range) clamps to max",
+			headers: map[string]string{"retry-after-ms": "9999999999999999999999999"},
+			want:    maxRateLimitCooldown,
+		},
+		{
+			// The negative counterpart of the ParseInt-range-overflow case:
+			// isPositiveRangeOverflow must return false for a value below
+			// math.MinInt64 (this is nonsensical input, not "ask for a very
+			// long cooldown"), so it must NOT clamp to maxRateLimitCooldown —
+			// it keeps falling through the existing behavior (failed
+			// HTTP-date parse) to defaultRateLimitCooldown, exactly like the
+			// in-range negative cases above.
+			name:    "Retry-After negative 25 digits (beyond range) does not clamp",
+			headers: map[string]string{"Retry-After": "-9999999999999999999999999"},
+			want:    defaultRateLimitCooldown,
+		},
+		{
+			// Same negative-overflow case for retry-after-ms.
+			name:    "retry-after-ms negative 25 digits (beyond range) does not clamp",
+			headers: map[string]string{"retry-after-ms": "-9999999999999999999999999"},
+			want:    defaultRateLimitCooldown,
 		},
 	}
 

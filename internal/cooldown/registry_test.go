@@ -114,6 +114,88 @@ func TestNilRegistry_MethodsAreSafe(t *testing.T) {
 	}
 }
 
+// TestMark_EvictsExpiredEntries verifies that Mark opportunistically sweeps
+// out every entry whose deadline has already passed, keeping the map from
+// growing without bound in a long-running process. Cooling cannot observe
+// this directly (it only reports true/false for a single key, and an
+// expired-but-not-yet-evicted entry already reports false), so this test
+// reaches into the unexported until map directly — safe and intended here
+// since this file is already in-package (package cooldown, white-box).
+func TestMark_EvictsExpiredEntries(t *testing.T) {
+	t.Parallel()
+
+	cur := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	r := newRegistryWithClock(&cur)
+
+	r.Mark("dep-a", 5*time.Second)
+	r.Mark("dep-b", 5*time.Second)
+	r.Mark("dep-c", 5*time.Second)
+
+	if got := len(r.until); got != 3 {
+		t.Fatalf("setup: len(until) = %d, want 3", got)
+	}
+
+	// Advance the clock past all three deadlines.
+	cur = cur.Add(10 * time.Second)
+
+	// Marking a new key triggers Mark's opportunistic sweep of every expired
+	// entry, not just a lookup of "dep-d".
+	r.Mark("dep-d", 5*time.Second)
+
+	if _, ok := r.until["dep-a"]; ok {
+		t.Error("dep-a still present in the map after its deadline passed; want evicted")
+	}
+	if _, ok := r.until["dep-b"]; ok {
+		t.Error("dep-b still present in the map after its deadline passed; want evicted")
+	}
+	if _, ok := r.until["dep-c"]; ok {
+		t.Error("dep-c still present in the map after its deadline passed; want evicted")
+	}
+	if _, ok := r.until["dep-d"]; !ok {
+		t.Error("dep-d missing from the map; the entry just set by this very Mark call must never evict itself")
+	}
+	if got := len(r.until); got != 1 {
+		t.Errorf("len(until) = %d, want 1 (only the just-marked dep-d should remain)", got)
+	}
+
+	// Behavioral cross-check: Cooling agrees with the map contents.
+	if r.Cooling("dep-a") {
+		t.Error("Cooling(\"dep-a\") = true after eviction, want false")
+	}
+	if !r.Cooling("dep-d") {
+		t.Error("Cooling(\"dep-d\") = false right after Mark, want true")
+	}
+}
+
+// TestMark_NonExpiredEntry_SurvivesSweep verifies that Mark's opportunistic
+// eviction only removes entries whose deadline has actually passed, never a
+// still-cooling one — the sweep must not be overzealous.
+func TestMark_NonExpiredEntry_SurvivesSweep(t *testing.T) {
+	t.Parallel()
+
+	cur := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	r := newRegistryWithClock(&cur)
+
+	// dep-long is marked with a cooldown that outlives dep-short.
+	r.Mark("dep-long", time.Minute)
+	r.Mark("dep-short", time.Second)
+
+	// Advance the clock past dep-short's deadline but not dep-long's.
+	cur = cur.Add(5 * time.Second)
+
+	r.Mark("dep-new", time.Second)
+
+	if _, ok := r.until["dep-short"]; ok {
+		t.Error("dep-short still present after its deadline passed; want evicted")
+	}
+	if _, ok := r.until["dep-long"]; !ok {
+		t.Error("dep-long evicted even though its deadline has not passed; want it preserved")
+	}
+	if !r.Cooling("dep-long") {
+		t.Error("Cooling(\"dep-long\") = false, want true (its cooldown has not expired)")
+	}
+}
+
 // TestRegistry_ConcurrentAccess fires many concurrent Mark and Cooling calls
 // against both shared and per-goroutine keys and must be free of data races
 // (run with -race).

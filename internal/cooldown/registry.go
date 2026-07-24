@@ -16,6 +16,11 @@ import (
 // Registry instance is shared across all proxy handler and router goroutines.
 // All methods are nil-receiver safe so callers never need to nil-check a
 // *Registry before use.
+//
+// Entries do not stay forever: Mark opportunistically evicts keys whose
+// cooldown has already expired (see Mark's godoc), so a long-running process
+// that adds and removes deployments over time does not grow this map without
+// bound.
 type Registry struct {
 	mu    sync.RWMutex
 	until map[string]time.Time
@@ -36,15 +41,31 @@ func NewRegistry() *Registry {
 // non-positive d is a no-op — it never shortens or clears an existing
 // cooldown. Mark is safe for concurrent use and safe to call on a nil
 // Registry (no-op).
+//
+// While it holds the write lock, Mark also opportunistically evicts every
+// entry whose deadline has already passed. This is deliberately piggybacked
+// on Mark (rather than a background goroutine or timer) so cleanup only
+// costs anything on the already-infrequent 429 path, is bounded by the
+// number of currently-tracked keys (expected to stay small — one per
+// deployment), and never touches the read-only, allocation-free Cooling hot
+// path.
 func (r *Registry) Mark(key string, d time.Duration) {
 	if r == nil || d <= 0 {
 		return
 	}
-	until := r.now().Add(d)
+	now := r.now()
+	until := now.Add(d)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.until[key] = until
+	// now is strictly before the deadline we just set (d > 0), so this loop
+	// can never evict the entry for key on this call.
+	for k, deadline := range r.until {
+		if !now.Before(deadline) {
+			delete(r.until, k)
+		}
+	}
 }
 
 // Cooling reports whether the deployment identified by key is currently

@@ -172,6 +172,33 @@ func (b *Breaker) RecordFailure() {
 	}
 }
 
+// RecordNeutral records an outcome that is neither a success nor a failure —
+// for example an upstream HTTP 429 (rate limit), which means the deployment
+// is healthy but temporarily throttled and must not be treated as evidence
+// of either recovery or breakage. Recording it as a success would erase real
+// accumulated failures via RecordSuccess's counter reset; recording it as a
+// failure would mis-trip the breaker for an upstream that isn't actually
+// broken. Callers use this instead of RecordSuccess/RecordFailure whenever
+// they decide an outcome is circuit-breaker-neutral.
+//
+//   - HalfOpen: Allow already reserved one of the halfOpenMax probe slots for
+//     this request (see Allow). Since this call reports no verdict, that
+//     reservation must still be released so a future request can probe again
+//     — otherwise halfOpenActive would stay elevated forever and the breaker
+//     would lock itself out of ever leaving HalfOpen. The state, failure
+//     counter, and lastFailure timestamp are left untouched: the breaker
+//     stays HalfOpen awaiting a real success or failure.
+//   - Closed and Open: no-op. Closed has no probe reservation to release, and
+//     Open rejects requests before Allow ever admits one.
+func (b *Breaker) RecordNeutral() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.state == HalfOpen && b.halfOpenActive > 0 {
+		b.halfOpenActive--
+	}
+}
+
 // CurrentState returns the current circuit state. It is safe to call from
 // multiple goroutines.
 func (b *Breaker) CurrentState() State {

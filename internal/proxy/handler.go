@@ -122,6 +122,23 @@ const (
 	defaultMaxStreamDuration = 300 * time.Second // 5 minutes
 )
 
+// failoverDrainBudget bounds, in wall-clock time, how long tryModel will
+// block draining a discarded 5xx/429 response body before giving up on
+// connection reuse and moving on to the next candidate deployment.
+//
+// The byte cap (maxRespBody) alone does not bound a stalled upstream: an
+// upstream that sends response headers and then never sends another body
+// byte would block io.CopyN forever, and failover would never happen.
+// Draining exists purely as a courtesy so the underlying TCP connection can
+// be returned to the transport's pool for reuse — it has no effect on
+// correctness of the failover decision itself. Giving up quickly and
+// losing that connection (it gets closed instead of pooled) is strictly
+// better than blocking failover on a stalled upstream, so this budget is
+// kept short: two seconds is enough for a healthy, merely-slow upstream to
+// finish flushing a small discarded body, while still failing over fast
+// when the upstream is actually stuck.
+const failoverDrainBudget = 2 * time.Second
+
 // streamUsageExtractor observes OpenAI-format SSE lines and records the last
 // usage object seen. Passthrough providers (vllm, custom) emit usage only on
 // the final data chunk when stream_options.include_usage is set.
@@ -351,7 +368,7 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		// body variant per deployment, after applyDeployment has resolved the
 		// effective provider. This is the fix for VULN-001: the body selection
 		// must happen inside the deployment loop, not at the loop's call site.
-		resp, cancelUpstream, adapter, usedDep, lastErr, lastStatus, tryErr = p.tryModel(c, currentModel, pickBody, envelope)
+		resp, cancelUpstream, adapter, usedDep, lastErr, lastStatus, tryErr = p.tryModel(c, currentModel, pickBody, envelope, maxRespBody)
 		if tryErr != nil {
 			// tryModel wrote an error response to c (errResponseSent) or
 			// returned a framework error. Either way, stop immediately.
@@ -474,7 +491,14 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 
 	if isStreamingResponse(resp) {
 		var breaker *circuitbreaker.Breaker
-		if p.CircuitBreakers != nil {
+		// A 429 can carry Content-Type: text/event-stream and still be
+		// dispatched into handleStreamingResponse below. Its neutral outcome
+		// was already recorded via RecordNeutral() in tryModel; resolving a
+		// breaker here as well would let handleStreamingResponse additionally
+		// record success/failure when the stream ends, defeating that
+		// neutrality. isStreamingResponse itself is left untouched so the
+		// handling of other non-2xx SSE responses is unaffected.
+		if p.CircuitBreakers != nil && !isRateLimited(resp.StatusCode) {
 			breaker = p.CircuitBreakers.Get(deploymentKey(currentModel.Name, usedDep.Name))
 		}
 		return p.handleStreamingResponse(c, resp, cancelUpstream, currentModel,
@@ -500,6 +524,11 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 // model-level provider field. When PII anonymization is disabled, pickBody
 // always returns the original body.
 //
+// maxRespBody is the caller's resolved response-body limit (see
+// resolveEffectiveLimits) and bounds the drain of a retryable/rate-limited
+// response body before failing over to the next candidate, so a stalling or
+// endlessly streaming upstream cannot block failover indefinitely.
+//
 // Return values:
 //   - resp: the upstream response, or nil if all candidates failed.
 //   - cancel: the cancel func for the upstream request context. Non-nil only
@@ -515,6 +544,7 @@ func (p *ProxyHandler) tryModel(
 	model Model,
 	pickBody func(dep Deployment) []byte,
 	envelope requestEnvelope,
+	maxRespBody int,
 ) (*http.Response, context.CancelFunc, Adapter, Deployment, error, int, error) {
 	// Build the ordered list of deployment candidates. When Router is nil or
 	// the model has no multi-deployment configuration, synthesize a single
@@ -641,7 +671,21 @@ func (p *ProxyHandler) tryModel(
 			// returned to the pool.
 			rateLimited := isRateLimited(currentResp.StatusCode)
 			retryAfter := retryAfterOrDefault(currentResp)
-			_, _ = io.Copy(io.Discard, currentResp.Body)
+			// Bounded drain: an upstream that sends headers and then stalls or
+			// streams endlessly must never block failover. maxRespBody bounds
+			// the drain in size; failoverDrainBudget bounds it in time — a
+			// stalled upstream (headers sent, body never arrives) would
+			// otherwise block io.CopyN forever regardless of the byte cap. The
+			// timer cancels the upstream context, which unblocks the in-flight
+			// body read immediately; it is always stopped before this branch
+			// returns so no goroutine is left behind. Any drain error
+			// (including io.EOF, the normal case when the body is shorter than
+			// the cap, and context.Canceled from the timer firing) is ignored —
+			// this is a best-effort drain to return the connection to the pool
+			// cleanly, not a read whose outcome affects the response.
+			drainTimer := time.AfterFunc(failoverDrainBudget, cancelUpstream)
+			_, _ = io.CopyN(io.Discard, currentResp.Body, int64(maxRespBody))
+			drainTimer.Stop()
 			_ = currentResp.Body.Close()
 			cancelUpstream()
 			if rateLimited {
@@ -651,6 +695,12 @@ func (p *ProxyHandler) tryModel(
 				// RecordFailure. Instead, park the deployment in the
 				// cooldown registry so the router deprioritizes it for a
 				// short window.
+				if p.CircuitBreakers != nil {
+					// Neutral: releases the half-open probe reservation Allow()
+					// took for this request (if any) without treating the 429 as
+					// a success or a failure. See RecordNeutral's godoc.
+					p.CircuitBreakers.Get(depKey).RecordNeutral()
+				}
 				p.Cooldowns.Mark(depKey, retryAfter)
 				metrics.RateLimitFailoversTotal.WithLabelValues(model.Name, depKey).Inc()
 				p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream rate limited, retrying next deployment",
@@ -690,6 +740,12 @@ func (p *ProxyHandler) tryModel(
 		// broken) — but the deployment is still marked cooling so the next
 		// request does not try it first again.
 		if isRateLimited(currentResp.StatusCode) {
+			if p.CircuitBreakers != nil {
+				// Neutral: releases the half-open probe reservation Allow() took
+				// for this request (if any) without treating the 429 as a
+				// success or a failure. See RecordNeutral's godoc.
+				p.CircuitBreakers.Get(depKey).RecordNeutral()
+			}
 			p.Cooldowns.Mark(depKey, retryAfterOrDefault(currentResp))
 		} else if p.CircuitBreakers != nil && !isStreamingResponse(currentResp) {
 			breaker := p.CircuitBreakers.Get(depKey)
@@ -1905,17 +1961,30 @@ const (
 // overflow int64 — e.g. "Retry-After: 9999999999" or a comparably large
 // "retry-after-ms" — clamps to maxRateLimitCooldown directly instead of
 // silently wrapping to a negative duration.
+//
+// A positive decimal value too large for strconv.ParseInt to represent at
+// all (i.e. larger than math.MaxInt64) also clamps to maxRateLimitCooldown,
+// via isPositiveRangeOverflow, rather than falling through to HTTP-date
+// parsing (which would fail) and then the default cooldown — that fallback
+// would silently ignore an upstream that unambiguously asked for a very long
+// cooldown. A negative value that overflows (below math.MinInt64) is
+// nonsensical input and keeps falling through to the existing behavior.
 func retryAfterOrDefault(resp *http.Response) time.Duration {
 	if resp == nil {
 		return defaultRateLimitCooldown
 	}
 
 	if ms := resp.Header.Get("retry-after-ms"); ms != "" {
-		if n, err := strconv.ParseInt(strings.TrimSpace(ms), 10, 64); err == nil && n >= 0 {
-			if n > maxRateLimitCooldownMs {
-				return maxRateLimitCooldown
+		trimmed := strings.TrimSpace(ms)
+		if n, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+			if n >= 0 {
+				if n > maxRateLimitCooldownMs {
+					return maxRateLimitCooldown
+				}
+				return clampCooldown(time.Duration(n) * time.Millisecond)
 			}
-			return clampCooldown(time.Duration(n) * time.Millisecond)
+		} else if isPositiveRangeOverflow(trimmed, err) {
+			return maxRateLimitCooldown
 		}
 	}
 
@@ -1923,17 +1992,34 @@ func retryAfterOrDefault(resp *http.Response) time.Duration {
 	if ra == "" {
 		return defaultRateLimitCooldown
 	}
-	if secs, err := strconv.ParseInt(strings.TrimSpace(ra), 10, 64); err == nil && secs >= 0 {
-		if secs > maxRateLimitCooldownSecs {
-			return maxRateLimitCooldown
+	trimmedRA := strings.TrimSpace(ra)
+	if secs, err := strconv.ParseInt(trimmedRA, 10, 64); err == nil {
+		if secs >= 0 {
+			if secs > maxRateLimitCooldownSecs {
+				return maxRateLimitCooldown
+			}
+			return clampCooldown(time.Duration(secs) * time.Second)
 		}
-		return clampCooldown(time.Duration(secs) * time.Second)
+	} else if isPositiveRangeOverflow(trimmedRA, err) {
+		return maxRateLimitCooldown
 	}
 	if when, err := http.ParseTime(ra); err == nil {
 		return clampCooldown(time.Until(when))
 	}
 
 	return defaultRateLimitCooldown
+}
+
+// isPositiveRangeOverflow reports whether err is the strconv.ErrRange range
+// error produced by parsing s (already trimmed) as a positive decimal
+// integer literal that does not fit in an int64. strconv.ParseInt returns
+// ErrRange both for positive values above math.MaxInt64 and for negative
+// values below math.MinInt64; only the positive case unambiguously means
+// "the upstream asked for a cooldown longer than we will ever honor" and
+// should clamp to maxRateLimitCooldown instead of falling through to the
+// existing default-cooldown behavior.
+func isPositiveRangeOverflow(s string, err error) bool {
+	return errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(s, "-")
 }
 
 // clampCooldown bounds d to [0, maxRateLimitCooldown]. A negative input
