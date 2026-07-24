@@ -139,6 +139,34 @@ const (
 // when the upstream is actually stuck.
 const failoverDrainBudget = 2 * time.Second
 
+// boundedDrainAndClose drains up to maxRespBody bytes from body, then closes
+// it and cancels the upstream request context. It is used before every
+// failover hop (both across candidate deployments within a model, in
+// tryModel, and across models in the fallback chain, in Handle) so the
+// underlying TCP connection can be returned to the transport's pool for
+// reuse. The drain is a courtesy only — it has no effect on the failover
+// decision itself, and any error it returns is discarded.
+//
+// The byte cap alone does not bound a stalled upstream: an upstream that
+// sends response headers and then never sends another body byte would block
+// io.CopyN forever, and failover would never happen. A wall-clock timer
+// (failoverDrainBudget) cancels the upstream context to unblock the in-flight
+// read; the timer is always stopped before this function returns, so no
+// goroutine is left behind. The context cancellation this produces (like any
+// other drain error, e.g. the normal io.EOF when the body is shorter than
+// the cap) is ignored — this is a best-effort drain, not a read whose
+// outcome affects the response.
+func boundedDrainAndClose(body io.ReadCloser, cancel context.CancelFunc, maxRespBody int) {
+	drainTimer := time.AfterFunc(failoverDrainBudget, cancel)
+	// Discarded: best-effort drain only, see godoc above.
+	_, _ = io.CopyN(io.Discard, body, int64(maxRespBody))
+	drainTimer.Stop()
+	// Discarded: closing an already-failed-over connection cannot fail in a
+	// way that affects the caller.
+	_ = body.Close()
+	cancel()
+}
+
 // streamUsageExtractor observes OpenAI-format SSE lines and records the last
 // usage object seen. Passthrough providers (vllm, custom) emit usage only on
 // the final data chunk when stream_options.include_usage is set.
@@ -460,12 +488,13 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			slog.Int("depth", depth+1),
 		)
 
-		// Drain and discard the current 5xx response before moving on so
-		// the upstream connection is returned to the pool cleanly.
+		// Drain and discard the current 5xx/429 response before moving on so
+		// the upstream connection is returned to the pool cleanly. Bounded in
+		// both size (maxRespBody) and time (failoverDrainBudget) — see
+		// boundedDrainAndClose — so a stalled or endlessly streaming upstream
+		// cannot block this fallback hop indefinitely.
 		if resp != nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-			cancelUpstream()
+			boundedDrainAndClose(resp.Body, cancelUpstream, maxRespBody)
 			resp = nil
 			cancelUpstream = nil
 		}
@@ -672,22 +701,10 @@ func (p *ProxyHandler) tryModel(
 			rateLimited := isRateLimited(currentResp.StatusCode)
 			retryAfter := retryAfterOrDefault(currentResp)
 			// Bounded drain: an upstream that sends headers and then stalls or
-			// streams endlessly must never block failover. maxRespBody bounds
-			// the drain in size; failoverDrainBudget bounds it in time — a
-			// stalled upstream (headers sent, body never arrives) would
-			// otherwise block io.CopyN forever regardless of the byte cap. The
-			// timer cancels the upstream context, which unblocks the in-flight
-			// body read immediately; it is always stopped before this branch
-			// returns so no goroutine is left behind. Any drain error
-			// (including io.EOF, the normal case when the body is shorter than
-			// the cap, and context.Canceled from the timer firing) is ignored —
-			// this is a best-effort drain to return the connection to the pool
-			// cleanly, not a read whose outcome affects the response.
-			drainTimer := time.AfterFunc(failoverDrainBudget, cancelUpstream)
-			_, _ = io.CopyN(io.Discard, currentResp.Body, int64(maxRespBody))
-			drainTimer.Stop()
-			_ = currentResp.Body.Close()
-			cancelUpstream()
+			// streams endlessly must never block failover. See
+			// boundedDrainAndClose for the size/time bounds and why the
+			// resulting drain error is always ignored.
+			boundedDrainAndClose(currentResp.Body, cancelUpstream, maxRespBody)
 			if rateLimited {
 				// A rate-limited upstream is not broken — recording it as a
 				// circuit-breaker failure would erase real accumulated
