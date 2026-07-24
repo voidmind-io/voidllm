@@ -769,6 +769,60 @@ func TestPick_CircuitBreaker_NilRegistry(t *testing.T) {
 	}
 }
 
+// TestPick_CircuitBreaker_HalfOpen_DoesNotConsumeProbeSlot is the regression
+// case for the Allow()->Permits() fix in filterAvailable: building a
+// candidate list is a peek, not an attempt, so it must never reserve the
+// single HalfOpen probe slot a deployment with HalfOpenMax=1 has available.
+// Before the fix, filterAvailable called Allow() while scanning candidates,
+// which consumed the one free slot on every Pick — so by the time the proxy
+// handler actually tried to attempt the deployment, Allow() had nothing left
+// to grant and the deployment was locked out of ever probing again.
+func TestPick_CircuitBreaker_HalfOpen_DoesNotConsumeProbeSlot(t *testing.T) {
+	t.Parallel()
+
+	const modelName = "half-open-model"
+	depKey := modelName + "/dep"
+
+	cbReg := circuitbreaker.NewRegistry(circuitbreaker.Config{
+		Enabled:     true,
+		Threshold:   1,
+		Timeout:     10 * time.Millisecond,
+		HalfOpenMax: 1,
+	})
+	b := cbReg.Get(depKey)
+	b.RecordFailure() // trips Open
+	if b.CurrentState() != circuitbreaker.Open {
+		t.Fatalf("setup: breaker state = %v, want Open", b.CurrentState())
+	}
+	time.Sleep(25 * time.Millisecond) // past Timeout: Permits()/Allow() now see HalfOpen-eligible
+
+	r := router.NewRouter(nil, cbReg, nil)
+	m := proxy.Model{
+		Name:     modelName,
+		Strategy: "round-robin",
+		Deployments: []proxy.Deployment{
+			{Name: "dep"},
+		},
+	}
+
+	// Building the candidate list must not itself transition the breaker or
+	// consume its single probe slot, however many times it is called.
+	for i := range 5 {
+		got := r.Pick(m)
+		if !containsName(got, "dep") {
+			t.Fatalf("call %d: Pick() = %v, want [dep]", i, deploymentNames(got))
+		}
+	}
+
+	// The slot must still be available for a genuine attempt: Allow() is the
+	// real reservation call and must succeed exactly as if Pick had never
+	// been called.
+	if !b.Allow() {
+		t.Fatal("Allow() after repeated Pick() calls = false, want true — " +
+			"Pick()/filterAvailable must not have consumed the HalfOpen probe slot")
+	}
+}
+
 // --- Health filtering ------------------------------------------------------
 
 // TestPick_Health_UnhealthyFiltered verifies that a deployment whose health

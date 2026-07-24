@@ -325,6 +325,206 @@ func TestRecordNeutral_HalfOpen_NeverGoesNegative(t *testing.T) {
 	}
 }
 
+// ── Permits ───────────────────────────────────────────────────────────────
+
+// TestPermits_HalfOpen_DoesNotMutate is the regression case for the fix: a
+// candidate-selection caller (e.g. router.filterAvailable) must be able to
+// call Permits any number of times on a HalfOpen breaker with a free slot
+// without consuming it — a subsequent Allow() must still see that slot and
+// return true. Before Permits existed, the only way to peek was Allow()
+// itself, which reserved the slot as a side effect and starved the real
+// attempt.
+func TestPermits_HalfOpen_DoesNotMutate(t *testing.T) {
+	t.Parallel()
+
+	const timeout = 10 * time.Millisecond
+	b := circuitbreaker.NewBreaker(circuitbreaker.Config{
+		Threshold:   1,
+		Timeout:     timeout,
+		HalfOpenMax: 1,
+	})
+
+	b.RecordFailure()
+	time.Sleep(timeout + 15*time.Millisecond)
+
+	// Enter HalfOpen via the sole Allow() call that reserves the one slot,
+	// then immediately release it so the breaker is HalfOpen with one free
+	// slot for the rest of the test.
+	if !b.Allow() {
+		t.Fatal("setup: Allow() did not admit the HalfOpen probe")
+	}
+	b.RecordNeutral()
+	if state := b.CurrentState(); state != circuitbreaker.HalfOpen {
+		t.Fatalf("setup: CurrentState() = %v, want HalfOpen", state)
+	}
+
+	// Repeated Permits() calls on a HalfOpen breaker with a free slot must
+	// all report true and must never consume the slot.
+	for i := 0; i < 10; i++ {
+		if !b.Permits() {
+			t.Fatalf("Permits() call %d = false, want true (HalfOpen with a free slot)", i)
+		}
+	}
+	if state := b.CurrentState(); state != circuitbreaker.HalfOpen {
+		t.Errorf("CurrentState() after repeated Permits() = %v, want HalfOpen (unchanged)", state)
+	}
+
+	// The slot must still be available: Allow() must succeed exactly as if
+	// Permits() had never been called.
+	if !b.Allow() {
+		t.Fatal("Allow() after repeated Permits() calls = false, want true — " +
+			"Permits() must never reserve a probe slot")
+	}
+}
+
+// TestPermits_Open_BeforeTimeout_DoesNotTransition verifies that Permits on
+// an Open breaker before the recovery timeout has elapsed returns false and,
+// critically, does not transition the breaker to HalfOpen — unlike Allow,
+// which would perform that transition and reserve the first probe slot.
+// Repeated calls must leave the breaker Open and still blocked.
+func TestPermits_Open_BeforeTimeout_DoesNotTransition(t *testing.T) {
+	t.Parallel()
+
+	const timeout = time.Hour // never elapses during this test
+	b := circuitbreaker.NewBreaker(circuitbreaker.Config{
+		Threshold:   1,
+		Timeout:     timeout,
+		HalfOpenMax: 1,
+	})
+
+	b.RecordFailure() // trips at threshold 1
+	if state := b.CurrentState(); state != circuitbreaker.Open {
+		t.Fatalf("setup: CurrentState() = %v, want Open", state)
+	}
+
+	for i := 0; i < 5; i++ {
+		if b.Permits() {
+			t.Errorf("Permits() call %d = true, want false (Open, timeout not elapsed)", i)
+		}
+	}
+	if state := b.CurrentState(); state != circuitbreaker.Open {
+		t.Errorf("CurrentState() after repeated Permits() = %v, want Open (must not transition to HalfOpen)", state)
+	}
+
+	// Allow() must still behave exactly as if Permits() were never called:
+	// blocked, because the timeout genuinely has not elapsed.
+	if b.Allow() {
+		t.Error("Allow() after repeated Permits() calls = true, want false (timeout still not elapsed)")
+	}
+}
+
+// TestPermits_AgreesWithAllow exercises all three states and asserts that
+// Permits reports exactly what Allow would then do, for a breaker whose
+// prior state Permits itself is guaranteed not to have disturbed (each
+// subtest builds its own breaker to keep the two calls independent).
+func TestPermits_AgreesWithAllow(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Closed", func(t *testing.T) {
+		t.Parallel()
+		b := circuitbreaker.NewBreaker(circuitbreaker.Config{
+			Threshold:   3,
+			Timeout:     time.Minute,
+			HalfOpenMax: 1,
+		})
+		permits := b.Permits()
+		allow := b.Allow()
+		if permits != allow {
+			t.Errorf("Permits() = %v, Allow() = %v; want equal (Closed)", permits, allow)
+		}
+		if !permits {
+			t.Error("Closed breaker: Permits() = false, want true")
+		}
+	})
+
+	t.Run("Open before timeout", func(t *testing.T) {
+		t.Parallel()
+		b := circuitbreaker.NewBreaker(circuitbreaker.Config{
+			Threshold:   1,
+			Timeout:     time.Hour,
+			HalfOpenMax: 1,
+		})
+		b.RecordFailure()
+		permits := b.Permits()
+		allow := b.Allow()
+		if permits != allow {
+			t.Errorf("Permits() = %v, Allow() = %v; want equal (Open, before timeout)", permits, allow)
+		}
+		if permits {
+			t.Error("Open breaker before timeout: Permits() = true, want false")
+		}
+	})
+
+	t.Run("Open after timeout", func(t *testing.T) {
+		t.Parallel()
+		const timeout = 10 * time.Millisecond
+		b := circuitbreaker.NewBreaker(circuitbreaker.Config{
+			Threshold:   1,
+			Timeout:     timeout,
+			HalfOpenMax: 1,
+		})
+		b.RecordFailure()
+		time.Sleep(timeout + 15*time.Millisecond)
+
+		permits := b.Permits()
+		allow := b.Allow()
+		if permits != allow {
+			t.Errorf("Permits() = %v, Allow() = %v; want equal (Open, after timeout)", permits, allow)
+		}
+		if !permits {
+			t.Error("Open breaker after timeout: Permits() = false, want true")
+		}
+	})
+
+	t.Run("HalfOpen with free slot", func(t *testing.T) {
+		t.Parallel()
+		const timeout = 10 * time.Millisecond
+		b := circuitbreaker.NewBreaker(circuitbreaker.Config{
+			Threshold:   1,
+			Timeout:     timeout,
+			HalfOpenMax: 2,
+		})
+		b.RecordFailure()
+		time.Sleep(timeout + 15*time.Millisecond)
+		if !b.Allow() { // consumes 1 of 2 slots, enters HalfOpen
+			t.Fatal("setup: Allow() did not admit the HalfOpen probe")
+		}
+
+		permits := b.Permits()
+		allow := b.Allow()
+		if permits != allow {
+			t.Errorf("Permits() = %v, Allow() = %v; want equal (HalfOpen, free slot)", permits, allow)
+		}
+		if !permits {
+			t.Error("HalfOpen breaker with a free slot: Permits() = false, want true")
+		}
+	})
+
+	t.Run("HalfOpen with no free slot", func(t *testing.T) {
+		t.Parallel()
+		const timeout = 10 * time.Millisecond
+		b := circuitbreaker.NewBreaker(circuitbreaker.Config{
+			Threshold:   1,
+			Timeout:     timeout,
+			HalfOpenMax: 1,
+		})
+		b.RecordFailure()
+		time.Sleep(timeout + 15*time.Millisecond)
+		if !b.Allow() { // consumes the only slot, enters HalfOpen
+			t.Fatal("setup: Allow() did not admit the HalfOpen probe")
+		}
+
+		permits := b.Permits()
+		allow := b.Allow()
+		if permits != allow {
+			t.Errorf("Permits() = %v, Allow() = %v; want equal (HalfOpen, no free slot)", permits, allow)
+		}
+		if permits {
+			t.Error("HalfOpen breaker with no free slot: Permits() = true, want false")
+		}
+	})
+}
+
 // ── Concurrency ───────────────────────────────────────────────────────────
 
 // TestBreaker_ConcurrentAccess fires Allow, RecordSuccess, RecordFailure,

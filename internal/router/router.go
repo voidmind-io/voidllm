@@ -94,12 +94,11 @@ func (r *Router) Pick(model proxy.Model) []proxy.Deployment {
 	// stable partition (not a filter) moves cooling deployments to the end
 	// while preserving the strategy's relative order within each partition.
 	// This is deliberately not a filter: Pick reinstates the full candidate
-	// list whenever filterAvailable above returns empty, and the proxy
-	// handler skips Allow() entirely when a Router is configured — so a
-	// cooldown filter here would be defeated in exactly the situation it
-	// exists to handle. A stable sort instead guarantees that when every
-	// candidate is cooling, the full list still survives in order, and the
-	// MaxRetries cap below naturally trims cooling entries first.
+	// list whenever filterAvailable above returns empty, so a cooldown filter
+	// here would be defeated in exactly the situation it exists to handle. A
+	// stable sort instead guarantees that when every candidate is cooling,
+	// the full list still survives in order, and the MaxRetries cap below
+	// naturally trims cooling entries first.
 	r.applyCooldownOrder(model.Name, ordered)
 
 	// Limit result length to maxRetries+1 so the caller does not attempt more
@@ -157,7 +156,19 @@ func (r *Router) applyCooldownOrder(modelName string, ordered []proxy.Deployment
 }
 
 // filterAvailable returns the subset of deployments whose circuit breaker
-// allows requests AND whose health status (if known) is not "unhealthy".
+// currently permits requests AND whose health status (if known) is not
+// "unhealthy".
+//
+// This is candidate selection, not an attempt: it uses Breaker.Permits, the
+// non-reserving peek, rather than Allow. Allow reserves a HalfOpen probe slot
+// as a side effect, and filterAvailable is called once per Pick to build the
+// whole candidate list — most of these candidates are never actually
+// attempted (an earlier one succeeds, MaxRetries trims the tail, or cooldown
+// ordering moves them to the back). Calling Allow here would reserve probes
+// for deployments that are only ever considered, not tried, exhausting
+// halfOpenMax on candidates the proxy handler never sends a request to. The
+// real reservation happens once, per candidate actually attempted, in
+// tryModel's own Allow call at attempt time.
 func (r *Router) filterAvailable(model proxy.Model) []proxy.Deployment {
 	result := make([]proxy.Deployment, 0, len(model.Deployments))
 	for _, d := range model.Deployments {
@@ -165,7 +176,7 @@ func (r *Router) filterAvailable(model proxy.Model) []proxy.Deployment {
 
 		// Circuit breaker check — nil registry means feature is disabled.
 		if r.circuitBreakers != nil {
-			if !r.circuitBreakers.Get(key).Allow() {
+			if !r.circuitBreakers.Get(key).Permits() {
 				continue
 			}
 		}

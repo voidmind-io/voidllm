@@ -614,11 +614,16 @@ func (p *ProxyHandler) tryModel(
 	for i, d := range candidates {
 		depKey := deploymentKey(model.Name, d.Name)
 
-		// Per-deployment circuit breaker check. The router's filterAvailable
-		// already excludes open breakers when Router is non-nil, so we only
-		// guard the synthesized single-candidate ourselves when Router is nil.
-		if p.CircuitBreakers != nil && p.Router == nil {
-			breaker := p.CircuitBreakers.Get(depKey)
+		// Per-deployment circuit breaker check, consulted for EVERY candidate
+		// at the moment it is about to be attempted — regardless of whether a
+		// Router is configured. The router's filterAvailable only peeks with
+		// the non-reserving Permits() when building the candidate list (see
+		// its godoc); Allow() here is the sole place that actually reserves a
+		// probe slot, so it must run once per candidate actually attempted,
+		// not be skipped just because a Router already looked at it.
+		var breaker *circuitbreaker.Breaker
+		if p.CircuitBreakers != nil {
+			breaker = p.CircuitBreakers.Get(depKey)
 			if !breaker.Allow() {
 				metrics.CircuitBreakerRejectionsTotal.WithLabelValues(depKey).Inc()
 				// Continue to the next candidate; if this is the only one,
@@ -626,6 +631,31 @@ func (p *ProxyHandler) tryModel(
 				// below.
 				continue
 			}
+		}
+
+		// resolved and handedToCaller track whether the probe reservation
+		// breaker.Allow() just granted (if breaker != nil) has been accounted
+		// for by the time this iteration's control flow leaves the loop body.
+		// Allow's godoc requires every true return to be balanced by exactly
+		// one RecordSuccess/RecordFailure/RecordNeutral call; resolved is set
+		// at every point below that makes one. handedToCaller marks the sole
+		// legitimate exception: the streaming branch deliberately leaves the
+		// reservation open because handleStreamingResponse records the
+		// verdict once the stream completes — see the comment there.
+		//
+		// The defer is what makes this structural rather than a "remember to
+		// call it" convention: it fires no later than tryModel's return (in
+		// particular, immediately, on the buildUpstreamRequest failure path
+		// below) and releases the reservation whenever neither flag ended up
+		// set, so a future early return or continue added to this iteration
+		// cannot silently reintroduce a leaked reservation.
+		var resolved, handedToCaller bool
+		if breaker != nil {
+			defer func() {
+				if !resolved && !handedToCaller {
+					breaker.RecordNeutral()
+				}
+			}()
 		}
 
 		// Overlay the deployment's endpoint fields onto a copy of the resolved
@@ -673,8 +703,9 @@ func (p *ProxyHandler) tryModel(
 		if doErr != nil {
 			// Connection-level error: transport failure, DNS, timeout.
 			cancelUpstream()
-			if p.CircuitBreakers != nil {
-				p.CircuitBreakers.Get(depKey).RecordFailure()
+			if breaker != nil {
+				breaker.RecordFailure()
+				resolved = true
 			}
 			metrics.UpstreamErrorsTotal.WithLabelValues(m.Name, m.Provider).Inc()
 			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream request failed, retrying next deployment",
@@ -712,11 +743,12 @@ func (p *ProxyHandler) tryModel(
 				// RecordFailure. Instead, park the deployment in the
 				// cooldown registry so the router deprioritizes it for a
 				// short window.
-				if p.CircuitBreakers != nil {
+				if breaker != nil {
 					// Neutral: releases the half-open probe reservation Allow()
 					// took for this request (if any) without treating the 429 as
 					// a success or a failure. See RecordNeutral's godoc.
-					p.CircuitBreakers.Get(depKey).RecordNeutral()
+					breaker.RecordNeutral()
+					resolved = true
 				}
 				p.Cooldowns.Mark(depKey, retryAfter)
 				metrics.RateLimitFailoversTotal.WithLabelValues(model.Name, depKey).Inc()
@@ -728,8 +760,9 @@ func (p *ProxyHandler) tryModel(
 					slog.Duration("cooldown", retryAfter),
 				)
 			} else {
-				if p.CircuitBreakers != nil {
-					p.CircuitBreakers.Get(depKey).RecordFailure()
+				if breaker != nil {
+					breaker.RecordFailure()
+					resolved = true
 				}
 				metrics.UpstreamErrorsTotal.WithLabelValues(m.Name, m.Provider).Inc()
 				p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream returned retryable error, retrying next deployment",
@@ -757,20 +790,28 @@ func (p *ProxyHandler) tryModel(
 		// broken) — but the deployment is still marked cooling so the next
 		// request does not try it first again.
 		if isRateLimited(currentResp.StatusCode) {
-			if p.CircuitBreakers != nil {
+			if breaker != nil {
 				// Neutral: releases the half-open probe reservation Allow() took
 				// for this request (if any) without treating the 429 as a
 				// success or a failure. See RecordNeutral's godoc.
-				p.CircuitBreakers.Get(depKey).RecordNeutral()
+				breaker.RecordNeutral()
+				resolved = true
 			}
 			p.Cooldowns.Mark(depKey, retryAfterOrDefault(currentResp))
-		} else if p.CircuitBreakers != nil && !isStreamingResponse(currentResp) {
-			breaker := p.CircuitBreakers.Get(depKey)
+		} else if breaker != nil && !isStreamingResponse(currentResp) {
 			if currentResp.StatusCode >= 500 {
 				breaker.RecordFailure()
 			} else {
 				breaker.RecordSuccess()
 			}
+			resolved = true
+		} else if breaker != nil {
+			// Streaming response, not rate-limited: the reservation is
+			// deliberately left open. The response (and this reservation)
+			// are being handed back to the caller — handleStreamingResponse
+			// records the verdict once the stream completes, so recording
+			// one here would double-record against the same reservation.
+			handedToCaller = true
 		}
 
 		dep = d
@@ -1428,7 +1469,12 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				case streamAborted:
 					breaker.RecordFailure()
 				case clientDisconnected:
-					// Client hung up — neither success nor failure on the upstream side.
+					// Client hung up — neither success nor failure on the
+					// upstream side, but the reservation Allow() took for
+					// this request (if any) must still be released so a
+					// future request can probe again. See RecordNeutral's
+					// godoc.
+					breaker.RecordNeutral()
 				case !terminalSeen:
 					// Upstream closed the connection without sending [DONE].
 					// This is a truncated response — treat as upstream failure.
@@ -1695,7 +1741,11 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				switch {
 				case clientDisconnected:
 					// Client hung up — neither success nor failure on the
-					// upstream side.
+					// upstream side, but the reservation Allow() took for
+					// this request (if any) must still be released so a
+					// future request can probe again. See RecordNeutral's
+					// godoc.
+					breaker.RecordNeutral()
 				case terminalSeen:
 					breaker.RecordSuccess()
 				default:
