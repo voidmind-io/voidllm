@@ -112,6 +112,16 @@ VoidLLM does not support the pre-2025-03-26 SSE MCP transport. The upstream serv
 - Check for large request/response bodies (VoidLLM buffers bodies in memory during proxying)
 - If using Code Mode, reduce `pool_size` to limit WASM runtime memory
 
+## Logging
+
+### How do I enable debug logs?
+Set the log level in `voidllm.yaml`:
+```yaml
+logging:
+  level: debug
+```
+Debug also records the source file and line of each log call and is noticeably more verbose - switch back to `info` in production. LLM prompts, responses, and detected PII values never appear in logs at any level, including debug - by design, not configuration. Note that error messages returned by configured upstream services (for example an MCP server's error text) can appear in logs.
+
 ## Getting Help
 
 - [GitHub Issues](https://github.com/voidmind-io/voidllm/issues) - bug reports and feature requests
