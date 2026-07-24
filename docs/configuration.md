@@ -332,7 +332,7 @@ logging:
 
 - `level: debug` additionally records the source file and line of each log call.
 - `${ENV_VAR}` interpolation works here like everywhere in the config, e.g. `level: ${VOIDLLM_LOG_LEVEL:-info}`.
-- No log level, including `debug`, ever logs prompt or response content - VoidLLM never logs request or response bodies by design. Only metadata (token counts, durations, model names) appears in logs.
+- LLM prompts, responses, and detected PII values never appear in logs at any level, including `debug` - by design, not configuration. Only metadata (token counts, durations, model names) is logged. Error messages returned by configured upstream services (for example an MCP server's error text) can appear in logs.
 
 ---
 

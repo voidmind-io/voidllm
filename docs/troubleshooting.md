@@ -120,7 +120,7 @@ Set the log level in `voidllm.yaml`:
 logging:
   level: debug
 ```
-Debug also records the source file and line of each log call and is noticeably more verbose - switch back to `info` in production. No log level, including debug, ever includes prompt or response content.
+Debug also records the source file and line of each log call and is noticeably more verbose - switch back to `info` in production. LLM prompts, responses, and detected PII values never appear in logs at any level, including debug - by design, not configuration. Note that error messages returned by configured upstream services (for example an MCP server's error text) can appear in logs.
 
 ## Getting Help
 
