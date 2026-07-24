@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/voidmind-io/voidllm/internal/circuitbreaker"
+	"github.com/voidmind-io/voidllm/internal/cooldown"
 	"github.com/voidmind-io/voidllm/internal/health"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 )
@@ -20,14 +21,16 @@ import (
 type Router struct {
 	healthChecker   *health.Checker
 	circuitBreakers *circuitbreaker.Registry
+	cooldowns       *cooldown.Registry
 	counters        sync.Map // model name → *atomic.Uint64 (round-robin)
 }
 
-// NewRouter creates a Router. Both dependencies are optional (nil-safe).
-func NewRouter(hc *health.Checker, cb *circuitbreaker.Registry) *Router {
+// NewRouter creates a Router. All three dependencies are optional (nil-safe).
+func NewRouter(hc *health.Checker, cb *circuitbreaker.Registry, cd *cooldown.Registry) *Router {
 	return &Router{
 		healthChecker:   hc,
 		circuitBreakers: cb,
+		cooldowns:       cd,
 	}
 }
 
@@ -87,6 +90,17 @@ func (r *Router) Pick(model proxy.Model) []proxy.Deployment {
 		ordered = r.roundRobin(model.Name, candidates)
 	}
 
+	// Deprioritize deployments that are currently rate-limit-cooling: a
+	// stable partition (not a filter) moves cooling deployments to the end
+	// while preserving the strategy's relative order within each partition.
+	// This is deliberately not a filter: Pick reinstates the full candidate
+	// list whenever filterAvailable above returns empty, so a cooldown filter
+	// here would be defeated in exactly the situation it exists to handle. A
+	// stable sort instead guarantees that when every candidate is cooling,
+	// the full list still survives in order, and the MaxRetries cap below
+	// naturally trims cooling entries first.
+	r.applyCooldownOrder(model.Name, ordered)
+
 	// Limit result length to maxRetries+1 so the caller does not attempt more
 	// deployments than the model policy allows. Zero means try all candidates.
 	limit := len(ordered)
@@ -96,8 +110,65 @@ func (r *Router) Pick(model proxy.Model) []proxy.Deployment {
 	return ordered[:limit]
 }
 
+// applyCooldownOrder partitions ordered in place so that deployments
+// currently cooling down (see cooldown.Registry) are moved after all
+// non-cooling deployments, without disturbing the relative order within
+// either group. A nil cooldowns registry makes this a no-op.
+//
+// The cooldown registry is never nil in production (app.go always
+// constructs one), so this must stay cheap on the common case where nothing
+// is cooling: Cooling() is read exactly once per candidate into a local
+// slice, and if none of them are cooling the function returns before doing
+// any reordering work at all. When at least one candidate is cooling, the
+// partition is applied as an explicit two-pass copy rather than
+// sort.SliceStable: sort's Swap only rearranges ordered itself, so a
+// separately-cached per-index boolean slice would desync from ordered's
+// elements as soon as the sort swapped anything, whereas indexing the cache
+// by original position and consuming it in a single forward pass is both
+// correct and O(n) instead of O(n log n).
+func (r *Router) applyCooldownOrder(modelName string, ordered []proxy.Deployment) {
+	if r.cooldowns == nil {
+		return
+	}
+
+	cooling := make([]bool, len(ordered))
+	anyCooling := false
+	for i, d := range ordered {
+		cooling[i] = r.cooldowns.Cooling(DeploymentKey(modelName, d.Name))
+		anyCooling = anyCooling || cooling[i]
+	}
+	if !anyCooling {
+		return
+	}
+
+	partitioned := make([]proxy.Deployment, 0, len(ordered))
+	for i, d := range ordered {
+		if !cooling[i] {
+			partitioned = append(partitioned, d)
+		}
+	}
+	for i, d := range ordered {
+		if cooling[i] {
+			partitioned = append(partitioned, d)
+		}
+	}
+	copy(ordered, partitioned)
+}
+
 // filterAvailable returns the subset of deployments whose circuit breaker
-// allows requests AND whose health status (if known) is not "unhealthy".
+// currently permits requests AND whose health status (if known) is not
+// "unhealthy".
+//
+// This is candidate selection, not an attempt: it uses Breaker.Permits, the
+// non-reserving peek, rather than Allow. Allow reserves a HalfOpen probe slot
+// as a side effect, and filterAvailable is called once per Pick to build the
+// whole candidate list — most of these candidates are never actually
+// attempted (an earlier one succeeds, MaxRetries trims the tail, or cooldown
+// ordering moves them to the back). Calling Allow here would reserve probes
+// for deployments that are only ever considered, not tried, exhausting
+// halfOpenMax on candidates the proxy handler never sends a request to. The
+// real reservation happens once, per candidate actually attempted, in
+// tryModel's own Allow call at attempt time.
 func (r *Router) filterAvailable(model proxy.Model) []proxy.Deployment {
 	result := make([]proxy.Deployment, 0, len(model.Deployments))
 	for _, d := range model.Deployments {
@@ -105,7 +176,7 @@ func (r *Router) filterAvailable(model proxy.Model) []proxy.Deployment {
 
 		// Circuit breaker check — nil registry means feature is disabled.
 		if r.circuitBreakers != nil {
-			if !r.circuitBreakers.Get(key).Allow() {
+			if !r.circuitBreakers.Get(key).Permits() {
 				continue
 			}
 		}

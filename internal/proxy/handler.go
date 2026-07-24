@@ -25,6 +25,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/circuitbreaker"
+	"github.com/voidmind-io/voidllm/internal/cooldown"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	"github.com/voidmind-io/voidllm/internal/pii"
@@ -48,6 +49,7 @@ type ProxyHandler struct {
 	AccessCache       *ModelAccessCache        // in-memory model access control; nil disables access checks
 	AliasCache        *AliasCache              // in-memory scoped alias resolution; nil disables alias lookup
 	CircuitBreakers   *circuitbreaker.Registry // per-model circuit breaker registry; nil disables circuit breaking
+	Cooldowns         *cooldown.Registry       // per-deployment rate-limit cooldown tracker; nil disables cooldown tracking
 	Router            DeploymentPicker         // deployment selector; nil falls back to single-deployment behavior
 	HTTPClient        *http.Client
 	UsageLogger       *usage.Logger           // nil disables usage logging
@@ -119,6 +121,51 @@ const (
 	defaultMaxResponseBody   = 50 * 1024 * 1024  // 50 MB
 	defaultMaxStreamDuration = 300 * time.Second // 5 minutes
 )
+
+// failoverDrainBudget bounds, in wall-clock time, how long tryModel will
+// block draining a discarded 5xx/429 response body before giving up on
+// connection reuse and moving on to the next candidate deployment.
+//
+// The byte cap (maxRespBody) alone does not bound a stalled upstream: an
+// upstream that sends response headers and then never sends another body
+// byte would block io.CopyN forever, and failover would never happen.
+// Draining exists purely as a courtesy so the underlying TCP connection can
+// be returned to the transport's pool for reuse — it has no effect on
+// correctness of the failover decision itself. Giving up quickly and
+// losing that connection (it gets closed instead of pooled) is strictly
+// better than blocking failover on a stalled upstream, so this budget is
+// kept short: two seconds is enough for a healthy, merely-slow upstream to
+// finish flushing a small discarded body, while still failing over fast
+// when the upstream is actually stuck.
+const failoverDrainBudget = 2 * time.Second
+
+// boundedDrainAndClose drains up to maxRespBody bytes from body, then closes
+// it and cancels the upstream request context. It is used before every
+// failover hop (both across candidate deployments within a model, in
+// tryModel, and across models in the fallback chain, in Handle) so the
+// underlying TCP connection can be returned to the transport's pool for
+// reuse. The drain is a courtesy only — it has no effect on the failover
+// decision itself, and any error it returns is discarded.
+//
+// The byte cap alone does not bound a stalled upstream: an upstream that
+// sends response headers and then never sends another body byte would block
+// io.CopyN forever, and failover would never happen. A wall-clock timer
+// (failoverDrainBudget) cancels the upstream context to unblock the in-flight
+// read; the timer is always stopped before this function returns, so no
+// goroutine is left behind. The context cancellation this produces (like any
+// other drain error, e.g. the normal io.EOF when the body is shorter than
+// the cap) is ignored — this is a best-effort drain, not a read whose
+// outcome affects the response.
+func boundedDrainAndClose(body io.ReadCloser, cancel context.CancelFunc, maxRespBody int) {
+	drainTimer := time.AfterFunc(failoverDrainBudget, cancel)
+	// Discarded: best-effort drain only, see godoc above.
+	_, _ = io.CopyN(io.Discard, body, int64(maxRespBody))
+	drainTimer.Stop()
+	// Discarded: closing an already-failed-over connection cannot fail in a
+	// way that affects the caller.
+	_ = body.Close()
+	cancel()
+}
 
 // streamUsageExtractor observes OpenAI-format SSE lines and records the last
 // usage object seen. Passthrough providers (vllm, custom) emit usage only on
@@ -349,7 +396,7 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		// body variant per deployment, after applyDeployment has resolved the
 		// effective provider. This is the fix for VULN-001: the body selection
 		// must happen inside the deployment loop, not at the loop's call site.
-		resp, cancelUpstream, adapter, usedDep, lastErr, lastStatus, tryErr = p.tryModel(c, currentModel, pickBody, envelope)
+		resp, cancelUpstream, adapter, usedDep, lastErr, lastStatus, tryErr = p.tryModel(c, currentModel, pickBody, envelope, maxRespBody)
 		if tryErr != nil {
 			// tryModel wrote an error response to c (errResponseSent) or
 			// returned a framework error. Either way, stop immediately.
@@ -441,12 +488,13 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			slog.Int("depth", depth+1),
 		)
 
-		// Drain and discard the current 5xx response before moving on so
-		// the upstream connection is returned to the pool cleanly.
+		// Drain and discard the current 5xx/429 response before moving on so
+		// the upstream connection is returned to the pool cleanly. Bounded in
+		// both size (maxRespBody) and time (failoverDrainBudget) — see
+		// boundedDrainAndClose — so a stalled or endlessly streaming upstream
+		// cannot block this fallback hop indefinitely.
 		if resp != nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-			cancelUpstream()
+			boundedDrainAndClose(resp.Body, cancelUpstream, maxRespBody)
 			resp = nil
 			cancelUpstream = nil
 		}
@@ -472,7 +520,14 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 
 	if isStreamingResponse(resp) {
 		var breaker *circuitbreaker.Breaker
-		if p.CircuitBreakers != nil {
+		// A 429 can carry Content-Type: text/event-stream and still be
+		// dispatched into handleStreamingResponse below. Its neutral outcome
+		// was already recorded via RecordNeutral() in tryModel; resolving a
+		// breaker here as well would let handleStreamingResponse additionally
+		// record success/failure when the stream ends, defeating that
+		// neutrality. isStreamingResponse itself is left untouched so the
+		// handling of other non-2xx SSE responses is unaffected.
+		if p.CircuitBreakers != nil && !isRateLimited(resp.StatusCode) {
 			breaker = p.CircuitBreakers.Get(deploymentKey(currentModel.Name, usedDep.Name))
 		}
 		return p.handleStreamingResponse(c, resp, cancelUpstream, currentModel,
@@ -498,6 +553,11 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 // model-level provider field. When PII anonymization is disabled, pickBody
 // always returns the original body.
 //
+// maxRespBody is the caller's resolved response-body limit (see
+// resolveEffectiveLimits) and bounds the drain of a retryable/rate-limited
+// response body before failing over to the next candidate, so a stalling or
+// endlessly streaming upstream cannot block failover indefinitely.
+//
 // Return values:
 //   - resp: the upstream response, or nil if all candidates failed.
 //   - cancel: the cancel func for the upstream request context. Non-nil only
@@ -513,6 +573,7 @@ func (p *ProxyHandler) tryModel(
 	model Model,
 	pickBody func(dep Deployment) []byte,
 	envelope requestEnvelope,
+	maxRespBody int,
 ) (*http.Response, context.CancelFunc, Adapter, Deployment, error, int, error) {
 	// Build the ordered list of deployment candidates. When Router is nil or
 	// the model has no multi-deployment configuration, synthesize a single
@@ -553,11 +614,16 @@ func (p *ProxyHandler) tryModel(
 	for i, d := range candidates {
 		depKey := deploymentKey(model.Name, d.Name)
 
-		// Per-deployment circuit breaker check. The router's filterAvailable
-		// already excludes open breakers when Router is non-nil, so we only
-		// guard the synthesized single-candidate ourselves when Router is nil.
-		if p.CircuitBreakers != nil && p.Router == nil {
-			breaker := p.CircuitBreakers.Get(depKey)
+		// Per-deployment circuit breaker check, consulted for EVERY candidate
+		// at the moment it is about to be attempted — regardless of whether a
+		// Router is configured. The router's filterAvailable only peeks with
+		// the non-reserving Permits() when building the candidate list (see
+		// its godoc); Allow() here is the sole place that actually reserves a
+		// probe slot, so it must run once per candidate actually attempted,
+		// not be skipped just because a Router already looked at it.
+		var breaker *circuitbreaker.Breaker
+		if p.CircuitBreakers != nil {
+			breaker = p.CircuitBreakers.Get(depKey)
 			if !breaker.Allow() {
 				metrics.CircuitBreakerRejectionsTotal.WithLabelValues(depKey).Inc()
 				// Continue to the next candidate; if this is the only one,
@@ -565,6 +631,31 @@ func (p *ProxyHandler) tryModel(
 				// below.
 				continue
 			}
+		}
+
+		// resolved and handedToCaller track whether the probe reservation
+		// breaker.Allow() just granted (if breaker != nil) has been accounted
+		// for by the time this iteration's control flow leaves the loop body.
+		// Allow's godoc requires every true return to be balanced by exactly
+		// one RecordSuccess/RecordFailure/RecordNeutral call; resolved is set
+		// at every point below that makes one. handedToCaller marks the sole
+		// legitimate exception: the streaming branch deliberately leaves the
+		// reservation open because handleStreamingResponse records the
+		// verdict once the stream completes — see the comment there.
+		//
+		// The defer is what makes this structural rather than a "remember to
+		// call it" convention: it fires no later than tryModel's return (in
+		// particular, immediately, on the buildUpstreamRequest failure path
+		// below) and releases the reservation whenever neither flag ended up
+		// set, so a future early return or continue added to this iteration
+		// cannot silently reintroduce a leaked reservation.
+		var resolved, handedToCaller bool
+		if breaker != nil {
+			defer func() {
+				if !resolved && !handedToCaller {
+					breaker.RecordNeutral()
+				}
+			}()
 		}
 
 		// Overlay the deployment's endpoint fields onto a copy of the resolved
@@ -612,8 +703,9 @@ func (p *ProxyHandler) tryModel(
 		if doErr != nil {
 			// Connection-level error: transport failure, DNS, timeout.
 			cancelUpstream()
-			if p.CircuitBreakers != nil {
-				p.CircuitBreakers.Get(depKey).RecordFailure()
+			if breaker != nil {
+				breaker.RecordFailure()
+				resolved = true
 			}
 			metrics.UpstreamErrorsTotal.WithLabelValues(m.Name, m.Provider).Inc()
 			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream request failed, retrying next deployment",
@@ -633,24 +725,54 @@ func (p *ProxyHandler) tryModel(
 
 		metrics.UpstreamRequestsTotal.WithLabelValues(m.Name, m.Provider, strconv.Itoa(currentResp.StatusCode)).Inc()
 
-		if isRetryable(currentResp.StatusCode) && i < len(candidates)-1 {
-			// 5xx response from upstream — try the next deployment. Drain
-			// and close the body before moving on so the connection is
+		if (isRetryable(currentResp.StatusCode) || isRateLimited(currentResp.StatusCode)) && i < len(candidates)-1 {
+			// 5xx or 429 response from upstream — try the next deployment.
+			// Drain and close the body before moving on so the connection is
 			// returned to the pool.
-			_, _ = io.Copy(io.Discard, currentResp.Body)
-			_ = currentResp.Body.Close()
-			cancelUpstream()
-			if p.CircuitBreakers != nil {
-				p.CircuitBreakers.Get(depKey).RecordFailure()
+			rateLimited := isRateLimited(currentResp.StatusCode)
+			retryAfter := retryAfterOrDefault(currentResp)
+			// Bounded drain: an upstream that sends headers and then stalls or
+			// streams endlessly must never block failover. See
+			// boundedDrainAndClose for the size/time bounds and why the
+			// resulting drain error is always ignored.
+			boundedDrainAndClose(currentResp.Body, cancelUpstream, maxRespBody)
+			if rateLimited {
+				// A rate-limited upstream is not broken — recording it as a
+				// circuit-breaker failure would erase real accumulated
+				// failures on RecordSuccess and mis-trip the breaker on
+				// RecordFailure. Instead, park the deployment in the
+				// cooldown registry so the router deprioritizes it for a
+				// short window.
+				if breaker != nil {
+					// Neutral: releases the half-open probe reservation Allow()
+					// took for this request (if any) without treating the 429 as
+					// a success or a failure. See RecordNeutral's godoc.
+					breaker.RecordNeutral()
+					resolved = true
+				}
+				p.Cooldowns.Mark(depKey, retryAfter)
+				metrics.RateLimitFailoversTotal.WithLabelValues(model.Name, depKey).Inc()
+				p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream rate limited, retrying next deployment",
+					slog.String("model", m.Name),
+					slog.String("deployment", d.Name),
+					slog.String("provider", m.Provider),
+					slog.Int("candidate", i),
+					slog.Duration("cooldown", retryAfter),
+				)
+			} else {
+				if breaker != nil {
+					breaker.RecordFailure()
+					resolved = true
+				}
+				metrics.UpstreamErrorsTotal.WithLabelValues(m.Name, m.Provider).Inc()
+				p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream returned retryable error, retrying next deployment",
+					slog.String("model", m.Name),
+					slog.String("deployment", d.Name),
+					slog.String("provider", m.Provider),
+					slog.Int("candidate", i),
+					slog.Int("status", currentResp.StatusCode),
+				)
 			}
-			metrics.UpstreamErrorsTotal.WithLabelValues(m.Name, m.Provider).Inc()
-			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream returned retryable error, retrying next deployment",
-				slog.String("model", m.Name),
-				slog.String("deployment", d.Name),
-				slog.String("provider", m.Provider),
-				slog.Int("candidate", i),
-				slog.Int("status", currentResp.StatusCode),
-			)
 			lastErr = errors.New("upstream returned " + strconv.Itoa(currentResp.StatusCode))
 			req = nil
 			cancelUpstream = nil
@@ -659,17 +781,37 @@ func (p *ProxyHandler) tryModel(
 			continue
 		}
 
-		// Success or non-retryable status (4xx, or last retryable with no
-		// more candidates). Record circuit breaker outcome for non-streaming
-		// responses immediately; streaming outcome is recorded inside the
-		// goroutine once the stream completes.
-		if p.CircuitBreakers != nil && !isStreamingResponse(currentResp) {
-			breaker := p.CircuitBreakers.Get(depKey)
+		// Success or non-retryable status (4xx, or last retryable/rate-limited
+		// with no more candidates). Record circuit breaker outcome for
+		// non-streaming responses immediately; streaming outcome is recorded
+		// inside the goroutine once the stream completes. A 429 is NEUTRAL —
+		// it is neither a success (RecordSuccess would erase real accumulated
+		// failures) nor a breaker failure (a rate-limited upstream is not
+		// broken) — but the deployment is still marked cooling so the next
+		// request does not try it first again.
+		if isRateLimited(currentResp.StatusCode) {
+			if breaker != nil {
+				// Neutral: releases the half-open probe reservation Allow() took
+				// for this request (if any) without treating the 429 as a
+				// success or a failure. See RecordNeutral's godoc.
+				breaker.RecordNeutral()
+				resolved = true
+			}
+			p.Cooldowns.Mark(depKey, retryAfterOrDefault(currentResp))
+		} else if breaker != nil && !isStreamingResponse(currentResp) {
 			if currentResp.StatusCode >= 500 {
 				breaker.RecordFailure()
 			} else {
 				breaker.RecordSuccess()
 			}
+			resolved = true
+		} else if breaker != nil {
+			// Streaming response, not rate-limited: the reservation is
+			// deliberately left open. The response (and this reservation)
+			// are being handed back to the caller — handleStreamingResponse
+			// records the verdict once the stream completes, so recording
+			// one here would double-record against the same reservation.
+			handedToCaller = true
 		}
 
 		dep = d
@@ -1327,7 +1469,12 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				case streamAborted:
 					breaker.RecordFailure()
 				case clientDisconnected:
-					// Client hung up — neither success nor failure on the upstream side.
+					// Client hung up — neither success nor failure on the
+					// upstream side, but the reservation Allow() took for
+					// this request (if any) must still be released so a
+					// future request can probe again. See RecordNeutral's
+					// godoc.
+					breaker.RecordNeutral()
 				case !terminalSeen:
 					// Upstream closed the connection without sending [DONE].
 					// This is a truncated response — treat as upstream failure.
@@ -1594,7 +1741,11 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				switch {
 				case clientDisconnected:
 					// Client hung up — neither success nor failure on the
-					// upstream side.
+					// upstream side, but the reservation Allow() took for
+					// this request (if any) must still be released so a
+					// future request can probe again. See RecordNeutral's
+					// godoc.
+					breaker.RecordNeutral()
 				case terminalSeen:
 					breaker.RecordSuccess()
 				default:
@@ -1810,11 +1961,145 @@ func applyDeployment(model *Model, dep Deployment) {
 // indicate a server-side problem that a different backend may not share.
 // 4xx errors are client errors that will recur regardless of which deployment
 // is used, so they are not retried.
+//
+// isRetryable is deliberately kept separate from isRateLimited even though
+// callers usually OR the two together to decide whether to try the next
+// candidate: the two carry different circuit-breaker semantics. A 5xx means
+// the deployment itself is broken and must count as a circuit-breaker
+// failure; a 429 (see isRateLimited) means the deployment is healthy but
+// temporarily throttled and must never trip or reset the circuit breaker —
+// it is tracked separately via the cooldown registry instead.
 func isRetryable(statusCode int) bool {
 	return statusCode == http.StatusInternalServerError ||
 		statusCode == http.StatusBadGateway ||
 		statusCode == http.StatusServiceUnavailable ||
 		statusCode == http.StatusGatewayTimeout
+}
+
+// isRateLimited reports whether an HTTP status code from an upstream response
+// is a rate-limit rejection (429). See isRetryable's godoc for why this is a
+// distinct predicate rather than folded into isRetryable.
+func isRateLimited(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests
+}
+
+// defaultRateLimitCooldown and maxRateLimitCooldown govern how long a
+// deployment is parked in the cooldown registry after returning HTTP 429.
+// Neither is configurable in v1.
+const (
+	// defaultRateLimitCooldown is applied when the upstream response carries
+	// no usable Retry-After / retry-after-ms hint. A few seconds is enough to
+	// skip the deployment for the next handful of requests without assuming a
+	// specific rate-limit window when the upstream did not say one.
+	defaultRateLimitCooldown = 3 * time.Second
+
+	// maxRateLimitCooldown caps the cooldown even when the upstream requests
+	// a much longer wait (e.g. "Retry-After: 3600"). A single 429 response
+	// must never park a deployment for anywhere close to that long; one
+	// minute is a generous upper bound that still meaningfully deprioritizes
+	// the deployment without contributing to an hour of reduced capacity.
+	maxRateLimitCooldown = 60 * time.Second
+
+	// maxRateLimitCooldownMs and maxRateLimitCooldownSecs are
+	// maxRateLimitCooldown expressed in the unit of the corresponding
+	// Retry-After header. Both are compile-time constant expressions (no
+	// runtime division), used by retryAfterOrDefault to bounds-check a
+	// parsed header value BEFORE multiplying it into a time.Duration —
+	// multiplying an attacker- or upstream-controlled integer first and
+	// clamping afterwards lets a large-enough value overflow int64 and wrap
+	// to a negative duration, which is exactly the failure clampCooldown
+	// cannot recover from.
+	maxRateLimitCooldownMs   = int64(maxRateLimitCooldown / time.Millisecond)
+	maxRateLimitCooldownSecs = int64(maxRateLimitCooldown / time.Second)
+)
+
+// retryAfterOrDefault returns the cooldown duration to apply for a 429
+// response. It reads the standard Retry-After header (RFC 7231), supporting
+// both the delta-seconds form ("120") and the HTTP-date form ("Fri, 31 Dec
+// 1999 23:59:59 GMT"), and the OpenAI-specific "retry-after-ms" header
+// (milliseconds) as a higher-resolution alternative, preferring the latter
+// when both are present. When neither header is present or parseable,
+// defaultRateLimitCooldown is used.
+//
+// The result is always within [0, maxRateLimitCooldown]. Header values are
+// parsed as 64-bit integers and bounds-checked against maxRateLimitCooldown
+// (expressed in the header's own unit) before the multiplication that
+// converts them into a time.Duration, so a value large enough to otherwise
+// overflow int64 — e.g. "Retry-After: 9999999999" or a comparably large
+// "retry-after-ms" — clamps to maxRateLimitCooldown directly instead of
+// silently wrapping to a negative duration.
+//
+// A positive decimal value too large for strconv.ParseInt to represent at
+// all (i.e. larger than math.MaxInt64) also clamps to maxRateLimitCooldown,
+// via isPositiveRangeOverflow, rather than falling through to HTTP-date
+// parsing (which would fail) and then the default cooldown — that fallback
+// would silently ignore an upstream that unambiguously asked for a very long
+// cooldown. A negative value that overflows (below math.MinInt64) is
+// nonsensical input and keeps falling through to the existing behavior.
+func retryAfterOrDefault(resp *http.Response) time.Duration {
+	if resp == nil {
+		return defaultRateLimitCooldown
+	}
+
+	if ms := resp.Header.Get("retry-after-ms"); ms != "" {
+		trimmed := strings.TrimSpace(ms)
+		if n, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+			if n >= 0 {
+				if n > maxRateLimitCooldownMs {
+					return maxRateLimitCooldown
+				}
+				return clampCooldown(time.Duration(n) * time.Millisecond)
+			}
+		} else if isPositiveRangeOverflow(trimmed, err) {
+			return maxRateLimitCooldown
+		}
+	}
+
+	ra := resp.Header.Get("Retry-After")
+	if ra == "" {
+		return defaultRateLimitCooldown
+	}
+	trimmedRA := strings.TrimSpace(ra)
+	if secs, err := strconv.ParseInt(trimmedRA, 10, 64); err == nil {
+		if secs >= 0 {
+			if secs > maxRateLimitCooldownSecs {
+				return maxRateLimitCooldown
+			}
+			return clampCooldown(time.Duration(secs) * time.Second)
+		}
+	} else if isPositiveRangeOverflow(trimmedRA, err) {
+		return maxRateLimitCooldown
+	}
+	if when, err := http.ParseTime(ra); err == nil {
+		return clampCooldown(time.Until(when))
+	}
+
+	return defaultRateLimitCooldown
+}
+
+// isPositiveRangeOverflow reports whether err is the strconv.ErrRange range
+// error produced by parsing s (already trimmed) as a positive decimal
+// integer literal that does not fit in an int64. strconv.ParseInt returns
+// ErrRange both for positive values above math.MaxInt64 and for negative
+// values below math.MinInt64; only the positive case unambiguously means
+// "the upstream asked for a cooldown longer than we will ever honor" and
+// should clamp to maxRateLimitCooldown instead of falling through to the
+// existing default-cooldown behavior.
+func isPositiveRangeOverflow(s string, err error) bool {
+	return errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(s, "-")
+}
+
+// clampCooldown bounds d to [0, maxRateLimitCooldown]. A negative input
+// (e.g. an HTTP-date Retry-After value already in the past) clamps to zero,
+// which makes the subsequent Registry.Mark call a no-op.
+func clampCooldown(d time.Duration) time.Duration {
+	if d < 0 {
+		return 0
+	}
+	if d > maxRateLimitCooldown {
+		return maxRateLimitCooldown
+	}
+	return d
 }
 
 // extractUsage parses token counts from a non-streaming OpenAI-format response
@@ -1863,8 +2148,9 @@ func mutateRequestBody(body []byte, canonicalModel string, injectUsage bool) []b
 //
 // Network / DNS / dial / timeout errors are eligible. Context cancellation is
 // NOT eligible — the client went away and there is no point retrying. 5xx
-// responses are eligible; 4xx are not (bad request or auth failure will recur
-// on any backend).
+// responses are eligible, as is 429 (rate limited — a different model may
+// have separate quota); other 4xx are not (bad request or auth failure will
+// recur on any backend).
 func isFallbackEligible(statusCode int, err error) bool {
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -1872,7 +2158,7 @@ func isFallbackEligible(statusCode int, err error) bool {
 		}
 		return true
 	}
-	return statusCode >= 500 && statusCode < 600
+	return (statusCode >= 500 && statusCode < 600) || statusCode == http.StatusTooManyRequests
 }
 
 // rewriteModelInBody replaces the "model" field inside a JSON request body

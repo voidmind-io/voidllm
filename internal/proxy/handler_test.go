@@ -1106,6 +1106,79 @@ func TestHandle_FallbackOn500(t *testing.T) {
 	}
 }
 
+// TestHandle_ModelFallback_429StalledBody_FailsOverWithinDrainBudget verifies
+// that the model-level fallback hop in Handle (as opposed to tryModel's
+// per-deployment retry) is not blocked by a stalled 429 body: model-a's only
+// deployment sends 429 response headers and then never writes body bytes.
+// Handle must drain that response via boundedDrainAndClose — bounded by
+// failoverDrainBudget — before hopping to model-b, whose 200 response the
+// client must ultimately receive within a bound derived from
+// failoverDrainBudget itself.
+func TestHandle_ModelFallback_429StalledBody_FailsOverWithinDrainBudget(t *testing.T) {
+	t.Parallel()
+
+	var bCalls int32
+	stopCh := make(chan struct{})
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.(http.Flusher).Flush()
+		// Headers are sent; the body never arrives until the test unblocks
+		// this handler at teardown. Registered as a t.Cleanup (closed before
+		// the server itself is, see below) so this goroutine never leaks.
+		<-stopCh
+	}))
+	// Registered before the stopCh-closing cleanup below so it runs AFTER it
+	// (t.Cleanup runs LIFO): stopCh must be closed, unblocking the handler,
+	// before upstreamA.Close() waits for the in-flight request to finish.
+	t.Cleanup(upstreamA.Close)
+	t.Cleanup(func() { close(stopCh) })
+
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&bCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"cmp-3","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"hello from B"}}]}`)
+	}))
+	t.Cleanup(upstreamB.Close)
+
+	reg := testRegistryWithFallback(t, upstreamA.URL, upstreamB.URL)
+	handler := NewProxyHandler(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler.FallbackMaxDepth = 1
+	app := testApp(t, handler)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"model-a","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	start := time.Now()
+	resp, err := app.Test(req, testTimeout)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	elapsed := time.Since(start)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d; body: %s", resp.StatusCode, http.StatusOK, body)
+	}
+	if atomic.LoadInt32(&bCalls) == 0 {
+		t.Error("model-b was never called")
+	}
+
+	// The drain must unblock at failoverDrainBudget, not later. The bound is
+	// derived from the constant itself (rather than a hardcoded duration) so
+	// this assertion tracks failoverDrainBudget if it is ever retuned, while
+	// still catching a regression where the model-level fallback drain in
+	// Handle blocks indefinitely on a stalled body.
+	bound := 2 * failoverDrainBudget
+	if elapsed >= bound {
+		t.Errorf("request took %v, want < %v (2x failoverDrainBudget=%v): a stalled 429 body "+
+			"must not block model-level fallback longer than the drain budget", elapsed, bound, failoverDrainBudget)
+	}
+}
+
 // TestHandle_NoFallbackOn400 verifies that 4xx responses do not trigger
 // fallback — the client error is forwarded and model-b is never tried.
 func TestHandle_NoFallbackOn400(t *testing.T) {
@@ -1465,8 +1538,9 @@ func TestIsFallbackEligible(t *testing.T) {
 		{"401 not eligible", 401, nil, false},
 		{"403 not eligible", 403, nil, false},
 		{"404 not eligible", 404, nil, false},
-		// 429 is 4xx — not eligible per production code.
-		{"429 not eligible", 429, nil, false},
+		// 429 is rate limiting, not a broken deployment — a different model
+		// may have separate quota, so fallback is eligible per production code.
+		{"429 eligible", 429, nil, true},
 		// 200 success is not eligible.
 		{"200 not eligible", 200, nil, false},
 		// Network error with no status is eligible.

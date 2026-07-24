@@ -10,6 +10,7 @@ import (
 
 	"github.com/voidmind-io/voidllm/internal/circuitbreaker"
 	"github.com/voidmind-io/voidllm/internal/config"
+	"github.com/voidmind-io/voidllm/internal/cooldown"
 	"github.com/voidmind-io/voidllm/internal/health"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 	"github.com/voidmind-io/voidllm/internal/router"
@@ -192,7 +193,7 @@ func TestDeploymentKey(t *testing.T) {
 func TestPick_SingleDeployment(t *testing.T) {
 	t.Parallel()
 
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, nil)
 	m := proxy.Model{
 		Name:            "gpt-4o",
 		Provider:        "openai",
@@ -234,7 +235,7 @@ func TestPick_SingleDeployment(t *testing.T) {
 func TestPick_SingleDeployment_AzureFields(t *testing.T) {
 	t.Parallel()
 
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, nil)
 	m := proxy.Model{
 		Name:            "azure-gpt4",
 		Provider:        "azure",
@@ -266,7 +267,7 @@ func TestPick_SingleDeployment_AzureFields(t *testing.T) {
 func TestPick_RoundRobin(t *testing.T) {
 	t.Parallel()
 
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, nil)
 	m := proxy.Model{
 		Name:     "gpt-4o",
 		Strategy: "round-robin",
@@ -310,7 +311,7 @@ func TestPick_RoundRobin(t *testing.T) {
 func TestPick_RoundRobin_DefaultStrategy(t *testing.T) {
 	t.Parallel()
 
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, nil)
 	m := proxy.Model{
 		Name:     "gpt-4o",
 		Strategy: "", // empty → round-robin
@@ -333,7 +334,7 @@ func TestPick_RoundRobin_DefaultStrategy(t *testing.T) {
 func TestPick_RoundRobin_FullSliceIsRotated(t *testing.T) {
 	t.Parallel()
 
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, nil)
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "round-robin",
@@ -421,7 +422,7 @@ func TestPick_Priority(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			r := router.NewRouter(nil, nil)
+			r := router.NewRouter(nil, nil, nil)
 			m := proxy.Model{
 				Name:        "model",
 				Strategy:    "priority",
@@ -444,7 +445,7 @@ func TestPick_Priority(t *testing.T) {
 func TestPick_Priority_FullOrder(t *testing.T) {
 	t.Parallel()
 
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, nil)
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "priority",
@@ -478,7 +479,7 @@ func TestPick_Priority_FullOrder(t *testing.T) {
 func TestPick_Weighted_Distribution(t *testing.T) {
 	t.Parallel()
 
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, nil)
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "weighted",
@@ -510,7 +511,7 @@ func TestPick_Weighted_Distribution(t *testing.T) {
 func TestPick_Weighted_ZeroWeightTreatedAsOne(t *testing.T) {
 	t.Parallel()
 
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, nil)
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "weighted",
@@ -541,7 +542,7 @@ func TestPick_Weighted_ZeroWeightTreatedAsOne(t *testing.T) {
 func TestPick_Weighted_RestIsShuffled(t *testing.T) {
 	t.Parallel()
 
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, nil)
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "weighted",
@@ -603,7 +604,7 @@ func TestPick_LeastLatency_SortsByLatency(t *testing.T) {
 		}
 	}
 
-	r := router.NewRouter(checker, nil)
+	r := router.NewRouter(checker, nil, nil)
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "least-latency",
@@ -642,7 +643,7 @@ func TestPick_LeastLatency_FallsBackToRoundRobin(t *testing.T) {
 	stop := checker.Start()
 	t.Cleanup(stop)
 
-	r := router.NewRouter(checker, nil)
+	r := router.NewRouter(checker, nil, nil)
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "least-latency",
@@ -671,7 +672,7 @@ func TestPick_LeastLatency_FallsBackToRoundRobin(t *testing.T) {
 func TestPick_LeastLatency_NilChecker(t *testing.T) {
 	t.Parallel()
 
-	r := router.NewRouter(nil, nil) // nil health checker
+	r := router.NewRouter(nil, nil, nil) // nil health checker
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "least-latency",
@@ -697,7 +698,7 @@ func TestPick_CircuitBreaker_FiltersOpenBreaker(t *testing.T) {
 	// Open the breaker for "model/broken".
 	cbReg := openCircuitBreaker(t, "model/broken")
 
-	r := router.NewRouter(nil, cbReg)
+	r := router.NewRouter(nil, cbReg, nil)
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "round-robin",
@@ -732,7 +733,7 @@ func TestPick_CircuitBreaker_ClosedBreakerAllowed(t *testing.T) {
 	// Access the breaker to ensure it is created but leave it in Closed state.
 	_ = cbReg.Get("model/ok")
 
-	r := router.NewRouter(nil, cbReg)
+	r := router.NewRouter(nil, cbReg, nil)
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "round-robin",
@@ -752,7 +753,7 @@ func TestPick_CircuitBreaker_ClosedBreakerAllowed(t *testing.T) {
 func TestPick_CircuitBreaker_NilRegistry(t *testing.T) {
 	t.Parallel()
 
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, nil)
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "round-robin",
@@ -765,6 +766,60 @@ func TestPick_CircuitBreaker_NilRegistry(t *testing.T) {
 	got := r.Pick(m)
 	if len(got) != 2 {
 		t.Errorf("len(Pick) = %d, want 2 (nil CB registry must not filter)", len(got))
+	}
+}
+
+// TestPick_CircuitBreaker_HalfOpen_DoesNotConsumeProbeSlot is the regression
+// case for the Allow()->Permits() fix in filterAvailable: building a
+// candidate list is a peek, not an attempt, so it must never reserve the
+// single HalfOpen probe slot a deployment with HalfOpenMax=1 has available.
+// Before the fix, filterAvailable called Allow() while scanning candidates,
+// which consumed the one free slot on every Pick — so by the time the proxy
+// handler actually tried to attempt the deployment, Allow() had nothing left
+// to grant and the deployment was locked out of ever probing again.
+func TestPick_CircuitBreaker_HalfOpen_DoesNotConsumeProbeSlot(t *testing.T) {
+	t.Parallel()
+
+	const modelName = "half-open-model"
+	depKey := modelName + "/dep"
+
+	cbReg := circuitbreaker.NewRegistry(circuitbreaker.Config{
+		Enabled:     true,
+		Threshold:   1,
+		Timeout:     10 * time.Millisecond,
+		HalfOpenMax: 1,
+	})
+	b := cbReg.Get(depKey)
+	b.RecordFailure() // trips Open
+	if b.CurrentState() != circuitbreaker.Open {
+		t.Fatalf("setup: breaker state = %v, want Open", b.CurrentState())
+	}
+	time.Sleep(25 * time.Millisecond) // past Timeout: Permits()/Allow() now see HalfOpen-eligible
+
+	r := router.NewRouter(nil, cbReg, nil)
+	m := proxy.Model{
+		Name:     modelName,
+		Strategy: "round-robin",
+		Deployments: []proxy.Deployment{
+			{Name: "dep"},
+		},
+	}
+
+	// Building the candidate list must not itself transition the breaker or
+	// consume its single probe slot, however many times it is called.
+	for i := range 5 {
+		got := r.Pick(m)
+		if !containsName(got, "dep") {
+			t.Fatalf("call %d: Pick() = %v, want [dep]", i, deploymentNames(got))
+		}
+	}
+
+	// The slot must still be available for a genuine attempt: Allow() is the
+	// real reservation call and must succeed exactly as if Pick had never
+	// been called.
+	if !b.Allow() {
+		t.Fatal("Allow() after repeated Pick() calls = false, want true — " +
+			"Pick()/filterAvailable must not have consumed the HalfOpen probe slot")
 	}
 }
 
@@ -802,7 +857,7 @@ func TestPick_Health_UnhealthyFiltered(t *testing.T) {
 		}
 	}
 
-	r := router.NewRouter(checker, nil)
+	r := router.NewRouter(checker, nil, nil)
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "round-robin",
@@ -893,7 +948,7 @@ func TestPick_Health_DegradedNotFiltered(t *testing.T) {
 		t.Skipf("expected degraded status but got %q; skipping degraded-not-filtered assertion", mh.Status)
 	}
 
-	r := router.NewRouter(checker, nil)
+	r := router.NewRouter(checker, nil, nil)
 	m := proxy.Model{
 		Name:     "model",
 		Strategy: "round-robin",
@@ -936,7 +991,7 @@ func TestPick_AllFiltered_Fallback(t *testing.T) {
 	cbReg2.Get(modelName + "/a").RecordFailure()
 	cbReg2.Get(modelName + "/b").RecordFailure()
 
-	r := router.NewRouter(nil, cbReg2)
+	r := router.NewRouter(nil, cbReg2, nil)
 	m := proxy.Model{
 		Name:     modelName,
 		Strategy: "round-robin",
@@ -975,7 +1030,7 @@ func TestPick_AllFiltered_FallbackPreservesOriginalOrder(t *testing.T) {
 		cbReg.Get(modelName + "/" + dep).RecordFailure()
 	}
 
-	r := router.NewRouter(nil, cbReg)
+	r := router.NewRouter(nil, cbReg, nil)
 	m := proxy.Model{
 		Name:     modelName,
 		Strategy: "priority",
@@ -1044,7 +1099,7 @@ func TestPick_MaxRetries_LimitsLength(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			r := router.NewRouter(nil, nil)
+			r := router.NewRouter(nil, nil, nil)
 
 			deps := make([]proxy.Deployment, tc.deployments)
 			for i := range tc.deployments {
@@ -1066,6 +1121,147 @@ func TestPick_MaxRetries_LimitsLength(t *testing.T) {
 	}
 }
 
+// --- Cooldown ordering (429 failover) --------------------------------------
+
+// TestPick_Cooldown_CoolingDeploymentOrderedLast verifies that a deployment
+// currently marked as cooling in the cooldown.Registry is moved to the end of
+// the candidate list, while the relative order of the non-cooling deployments
+// is preserved. The "priority" strategy is used so the pre-cooldown order is
+// deterministic: a, b, c.
+func TestPick_Cooldown_CoolingDeploymentOrderedLast(t *testing.T) {
+	t.Parallel()
+
+	const modelName = "cooldown-order-model"
+	cd := cooldown.NewRegistry()
+	cd.Mark(router.DeploymentKey(modelName, "b"), time.Minute)
+
+	r := router.NewRouter(nil, nil, cd)
+	m := proxy.Model{
+		Name:     modelName,
+		Strategy: "priority",
+		Deployments: []proxy.Deployment{
+			{Name: "a", Priority: 1},
+			{Name: "b", Priority: 2},
+			{Name: "c", Priority: 3},
+		},
+	}
+
+	got := deploymentNames(r.Pick(m))
+	want := []string{"a", "c", "b"}
+	if len(got) != len(want) {
+		t.Fatalf("Pick order = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Pick order = %v, want %v (cooling deployment %q must be last)", got, want, "b")
+		}
+	}
+}
+
+// TestPick_Cooldown_AllCoolingReturnsFullListUnchanged verifies that when
+// every deployment is cooling, applyCooldownOrder's stable partition is a
+// no-op: the full candidate list survives (no drop), in the same order it
+// would have had without any cooldown registry at all.
+func TestPick_Cooldown_AllCoolingReturnsFullListUnchanged(t *testing.T) {
+	t.Parallel()
+
+	const modelName = "all-cooling-model"
+	deployments := []proxy.Deployment{
+		{Name: "x", Priority: 1},
+		{Name: "y", Priority: 2},
+		{Name: "z", Priority: 3},
+	}
+	m := proxy.Model{Name: modelName, Strategy: "priority", Deployments: deployments}
+
+	// Baseline: no cooldown registry at all.
+	baseline := router.NewRouter(nil, nil, nil)
+	want := deploymentNames(baseline.Pick(m))
+
+	// All three deployments marked cooling.
+	cd := cooldown.NewRegistry()
+	for _, d := range deployments {
+		cd.Mark(router.DeploymentKey(modelName, d.Name), time.Minute)
+	}
+	r := router.NewRouter(nil, nil, cd)
+	got := deploymentNames(r.Pick(m))
+
+	if len(got) != len(deployments) {
+		t.Fatalf("Pick with all deployments cooling returned %d, want %d (must not drop candidates)",
+			len(got), len(deployments))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Pick order with all cooling = %v, want unchanged order %v", got, want)
+		}
+	}
+}
+
+// TestPick_Cooldown_MaxRetriesTrimsCoolingFirst verifies that when MaxRetries
+// limits the result length, cooling deployments — having been moved to the
+// end by applyCooldownOrder — are the ones trimmed off, not the healthy ones.
+func TestPick_Cooldown_MaxRetriesTrimsCoolingFirst(t *testing.T) {
+	t.Parallel()
+
+	const modelName = "trim-cooling-model"
+	cd := cooldown.NewRegistry()
+	// "a" would normally be first (lowest Priority) but is cooling.
+	cd.Mark(router.DeploymentKey(modelName, "a"), time.Minute)
+
+	r := router.NewRouter(nil, nil, cd)
+	m := proxy.Model{
+		Name:       modelName,
+		Strategy:   "priority",
+		MaxRetries: 1, // limit to 2 candidates
+		Deployments: []proxy.Deployment{
+			{Name: "a", Priority: 1},
+			{Name: "b", Priority: 2},
+			{Name: "c", Priority: 3},
+		},
+	}
+
+	got := deploymentNames(r.Pick(m))
+	want := []string{"b", "c"}
+	if len(got) != len(want) {
+		t.Fatalf("Pick = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Pick = %v, want %v", got, want)
+		}
+	}
+	if containsName(r.Pick(m), "a") {
+		t.Error("cooling deployment 'a' should have been trimmed by MaxRetries, but is present")
+	}
+}
+
+// TestPick_Cooldown_NilRegistryChangesNothing verifies that a nil cooldown
+// registry produces the exact same order as the strategy alone, for both the
+// three-argument and explicit nil-cooldown NewRouter calls.
+func TestPick_Cooldown_NilRegistryChangesNothing(t *testing.T) {
+	t.Parallel()
+
+	const modelName = "nil-cooldown-model"
+	deployments := []proxy.Deployment{
+		{Name: "a", Priority: 1},
+		{Name: "b", Priority: 2},
+		{Name: "c", Priority: 3},
+	}
+	m := proxy.Model{Name: modelName, Strategy: "priority", Deployments: deployments}
+
+	rWithNilCooldown := router.NewRouter(nil, nil, nil)
+	got := deploymentNames(rWithNilCooldown.Pick(m))
+	want := []string{"a", "b", "c"}
+
+	if len(got) != len(want) {
+		t.Fatalf("Pick = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Pick with nil cooldown registry = %v, want %v (strategy order unchanged)", got, want)
+		}
+	}
+}
+
 // --- Nil dependencies ------------------------------------------------------
 
 // TestNewRouter_NilDependencies verifies that a Router created with nil health
@@ -1078,7 +1274,7 @@ func TestNewRouter_NilDependencies(t *testing.T) {
 	for _, strategy := range strategies {
 		t.Run("strategy="+strategy, func(t *testing.T) {
 			t.Parallel()
-			r := router.NewRouter(nil, nil)
+			r := router.NewRouter(nil, nil, nil)
 			m := proxy.Model{
 				Name:     "model",
 				Strategy: strategy,
@@ -1103,7 +1299,7 @@ func TestNewRouter_NilDependencies(t *testing.T) {
 func TestPick_ConcurrentRoundRobin(t *testing.T) {
 	t.Parallel()
 
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, nil)
 	m := proxy.Model{
 		Name:     "concurrent-model",
 		Strategy: "round-robin",
@@ -1139,9 +1335,12 @@ func TestPick_ConcurrentRoundRobin(t *testing.T) {
 // --- Benchmark -------------------------------------------------------------
 
 // BenchmarkPick_RoundRobin measures the hot-path cost of a round-robin Pick
-// with no health or circuit-breaker checks.
+// with no health or circuit-breaker checks, against a real (empty) cooldown
+// registry — the same shape the production Router is always constructed
+// with — so the benchmark exercises applyCooldownOrder's no-op fast path
+// instead of skipping it via a nil registry.
 func BenchmarkPick_RoundRobin(b *testing.B) {
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, cooldown.NewRegistry())
 	m := proxy.Model{
 		Name:     "bench-model",
 		Strategy: "round-robin",
@@ -1160,9 +1359,10 @@ func BenchmarkPick_RoundRobin(b *testing.B) {
 	})
 }
 
-// BenchmarkPick_Priority measures priority-sorted Pick overhead.
+// BenchmarkPick_Priority measures priority-sorted Pick overhead against a
+// real (empty) cooldown registry, matching the production Router shape.
 func BenchmarkPick_Priority(b *testing.B) {
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, cooldown.NewRegistry())
 	m := proxy.Model{
 		Name:     "bench-model",
 		Strategy: "priority",
@@ -1181,9 +1381,10 @@ func BenchmarkPick_Priority(b *testing.B) {
 	})
 }
 
-// BenchmarkPick_Weighted measures weighted-random Pick overhead.
+// BenchmarkPick_Weighted measures weighted-random Pick overhead against a
+// real (empty) cooldown registry, matching the production Router shape.
 func BenchmarkPick_Weighted(b *testing.B) {
-	r := router.NewRouter(nil, nil)
+	r := router.NewRouter(nil, nil, cooldown.NewRegistry())
 	m := proxy.Model{
 		Name:     "bench-model",
 		Strategy: "weighted",
@@ -1191,6 +1392,34 @@ func BenchmarkPick_Weighted(b *testing.B) {
 			{Name: "a", Weight: 5},
 			{Name: "b", Weight: 3},
 			{Name: "c", Weight: 2},
+		},
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = r.Pick(m)
+		}
+	})
+}
+
+// BenchmarkPick_RoundRobin_OneCooling measures round-robin Pick when one of
+// the three deployments is marked cooling, so applyCooldownOrder must take
+// its partition path instead of the no-op fast path exercised by
+// BenchmarkPick_RoundRobin.
+func BenchmarkPick_RoundRobin_OneCooling(b *testing.B) {
+	const modelName = "bench-model-cooling"
+	cd := cooldown.NewRegistry()
+	cd.Mark(router.DeploymentKey(modelName, "b"), time.Minute)
+
+	r := router.NewRouter(nil, nil, cd)
+	m := proxy.Model{
+		Name:     modelName,
+		Strategy: "round-robin",
+		Deployments: []proxy.Deployment{
+			{Name: "a"},
+			{Name: "b"},
+			{Name: "c"},
 		},
 	}
 

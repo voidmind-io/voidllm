@@ -83,6 +83,18 @@ func NewBreaker(cfg Config) *Breaker {
 
 // Allow reports whether a request should be allowed to proceed to the upstream.
 //
+// Allow is not a pure predicate: a true return always reserves something — a
+// HalfOpen probe slot, or (from Open) the transition into HalfOpen plus its
+// first probe slot — that only RecordSuccess, RecordFailure, or RecordNeutral
+// releases. Every call to Allow that returns true MUST be balanced by exactly
+// one call to one of those three methods, even if the caller ends up not
+// using the request for any reason (e.g. it fails to build, or the caller
+// decides not to send it). Failing to balance a reservation leaves it stuck
+// forever, which permanently starves the breaker of probes once
+// halfOpenActive reaches halfOpenMax — the circuit can then never leave
+// HalfOpen. Callers that only need to inspect whether Allow would currently
+// admit a request, without reserving anything, must use Permits instead.
+//
 //   - Closed: always returns true.
 //   - Open: checks if the recovery timeout has elapsed; if so, transitions to
 //     HalfOpen and counts this request against halfOpenMax, returning true.
@@ -114,6 +126,36 @@ func (b *Breaker) Allow() bool {
 		b.halfOpenActive++
 		return true
 
+	default:
+		return true
+	}
+}
+
+// Permits reports whether Allow would currently admit a request, WITHOUT
+// transitioning state or reserving a probe slot. It exists for candidate
+// *selection* — for example a router inspecting many deployments to decide
+// which ones are worth ordering into the retry list, when most of those
+// candidates will never actually be attempted. Because it reserves nothing,
+// Permits must never be used as the gate for actually issuing a request:
+// only Allow may do that (see Allow's godoc for the reservation-balance
+// contract that gate carries).
+//
+//   - Closed: always returns true.
+//   - Open: returns true only if the recovery timeout has elapsed — i.e. the
+//     same condition under which Allow would transition to HalfOpen.
+//   - HalfOpen: returns true only if fewer than halfOpenMax probes are
+//     currently active.
+func (b *Breaker) Permits() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	switch b.state {
+	case Closed:
+		return true
+	case Open:
+		return time.Since(b.lastFailure) >= b.timeout
+	case HalfOpen:
+		return b.halfOpenActive < b.halfOpenMax
 	default:
 		return true
 	}
@@ -169,6 +211,33 @@ func (b *Breaker) RecordFailure() {
 	case Open:
 		// No-op: let the original trip timestamp stand so the recovery timer
 		// is not pushed forward by late-arriving failures.
+	}
+}
+
+// RecordNeutral records an outcome that is neither a success nor a failure —
+// for example an upstream HTTP 429 (rate limit), which means the deployment
+// is healthy but temporarily throttled and must not be treated as evidence
+// of either recovery or breakage. Recording it as a success would erase real
+// accumulated failures via RecordSuccess's counter reset; recording it as a
+// failure would mis-trip the breaker for an upstream that isn't actually
+// broken. Callers use this instead of RecordSuccess/RecordFailure whenever
+// they decide an outcome is circuit-breaker-neutral.
+//
+//   - HalfOpen: Allow already reserved one of the halfOpenMax probe slots for
+//     this request (see Allow). Since this call reports no verdict, that
+//     reservation must still be released so a future request can probe again
+//     — otherwise halfOpenActive would stay elevated forever and the breaker
+//     would lock itself out of ever leaving HalfOpen. The state, failure
+//     counter, and lastFailure timestamp are left untouched: the breaker
+//     stays HalfOpen awaiting a real success or failure.
+//   - Closed and Open: no-op. Closed has no probe reservation to release, and
+//     Open rejects requests before Allow ever admits one.
+func (b *Breaker) RecordNeutral() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.state == HalfOpen && b.halfOpenActive > 0 {
+		b.halfOpenActive--
 	}
 }
 
