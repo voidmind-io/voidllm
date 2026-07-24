@@ -320,6 +320,20 @@ settings:
     half_open_max: 1         # Probe requests in half-open state
 ```
 
+## Logging
+
+Controls log output level and format.
+
+```yaml
+logging:
+  level: info               # debug, info, warn, error (default: info)
+  format: json              # json (default) or text (local dev)
+```
+
+- `level: debug` additionally records the source file and line of each log call.
+- `${ENV_VAR}` interpolation works here like everywhere in the config, e.g. `level: ${VOIDLLM_LOG_LEVEL:-info}`.
+- No log level, including `debug`, ever logs prompt or response content - VoidLLM never logs request or response bodies by design. Only metadata (token counts, durations, model names) appears in logs.
+
 ---
 
 ## Enterprise Features
