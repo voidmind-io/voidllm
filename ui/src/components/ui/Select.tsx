@@ -374,6 +374,16 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
         selectHighlighted()
         return
       }
+      // Tab closes the menu and then lets focus move on normally. Note the
+      // deliberate absence of preventDefault here: the searchable path has to
+      // trap Tab because its search input sits in the portal, outside an
+      // ancestor Dialog's focus trap. The trigger is inside that trap, so
+      // nothing needs intercepting - leaving the menu open behind a moved
+      // focus is the only thing to avoid.
+      if (e.key === 'Tab') {
+        closeDropdown()
+        return
+      }
       handleNavigationKeyDown(e)
     }
 

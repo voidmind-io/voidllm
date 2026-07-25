@@ -416,6 +416,25 @@ describe('Select', () => {
       fireEvent.keyDown(screen.getByRole('combobox'), { key: 'ArrowDown' })
       expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
     })
+
+    // Deliberate asymmetry with "Tab in searchable menu" below: the trigger
+    // is already inside an ancestor Dialog's focus trap, so this Tab handler
+    // only has to close the menu, not intercept the key — leaving
+    // preventDefault uncalled lets the browser move focus on as normal
+    // instead of stranding the menu open behind it. Contrast the searchable
+    // path, which does call preventDefault because its search input lives in
+    // the portal, outside the trap's reach.
+    it('Tab on the trigger closes the dropdown without preventing default', async () => {
+      renderSelect()
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
+      expect(screen.getByRole('listbox')).toBeInTheDocument()
+      // fireEvent.keyDown returns the result of dispatchEvent: true unless
+      // preventDefault() was called on the (cancelable) event.
+      const notPrevented = fireEvent.keyDown(trigger, { key: 'Tab' })
+      expect(screen.queryByRole('listbox')).toBeNull()
+      expect(notPrevented).toBe(true)
+    })
   })
 
   // ---------------------------------------------------------------------------
