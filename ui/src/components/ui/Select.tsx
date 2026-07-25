@@ -20,6 +20,13 @@ export interface SelectOption {
 // against the menu's real measured height once it is mounted.
 const ESTIMATED_MENU_HEIGHT = 240
 
+// Gap kept between the menu and the viewport edge when its height has to be
+// clamped, so the menu never sits flush against the window border.
+const VIEWPORT_MARGIN = 8
+
+// Distance between the trigger and the menu.
+const TRIGGER_GAP = 4
+
 interface MenuPosition {
   left: number
   width: number
@@ -27,6 +34,12 @@ interface MenuPosition {
   top: number | null
   /** Set when the menu renders above the trigger; null when it renders below. */
   bottom: number | null
+  /**
+   * Upper bound for the menu height, in pixels, derived from the space
+   * available on the chosen side. Caps the max-h-60 class so the menu scrolls
+   * internally instead of overflowing the viewport.
+   */
+  maxHeight: number
 }
 
 export interface SelectProps {
@@ -175,13 +188,22 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
       const el = internalRef.current
       if (!el) return
       const rect = el.getBoundingClientRect()
-      const spaceBelow = window.innerHeight - rect.bottom
-      const above = spaceBelow < menuHeight && rect.top > menuHeight
+      const spaceBelow = window.innerHeight - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN
+      const spaceAbove = rect.top - TRIGGER_GAP - VIEWPORT_MARGIN
+      // Prefer below. Flip above when the menu does not fit below but does
+      // fit above; when it fits on neither side, take whichever side has more
+      // room and clamp the height to it rather than overflowing the viewport.
+      let above = false
+      if (spaceBelow < menuHeight) {
+        above = spaceAbove >= menuHeight || spaceAbove > spaceBelow
+      }
+      const available = above ? spaceAbove : spaceBelow
       setMenuPosition({
         left: rect.left,
         width: rect.width,
-        top: above ? null : rect.bottom + 4,
-        bottom: above ? window.innerHeight - rect.top + 4 : null,
+        top: above ? null : rect.bottom + TRIGGER_GAP,
+        bottom: above ? window.innerHeight - rect.top + TRIGGER_GAP : null,
+        maxHeight: Math.max(available, 0),
       })
     }, [])
 
@@ -373,6 +395,7 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
                 width: menuPosition.width,
                 top: menuPosition.top ?? undefined,
                 bottom: menuPosition.bottom ?? undefined,
+                maxHeight: menuPosition.maxHeight,
               }}
               onKeyDown={handleDropdownKeyDown}
               tabIndex={-1}

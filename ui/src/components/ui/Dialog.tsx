@@ -76,6 +76,11 @@ export function Dialog({
 
   const handlePanelKeyDown = (e: React.KeyboardEvent) => {
     if (e.key !== 'Tab') return
+    // A descendant may already have handled Tab and moved focus deliberately -
+    // a portalled Select menu does exactly that, and its events still reach us
+    // by bubbling through the React tree. Re-running the trap afterwards would
+    // undo that focus move. The Escape handler above uses the same guard.
+    if (e.defaultPrevented) return
     const focusable = panelRef.current?.querySelectorAll<HTMLElement>(
       'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
     )

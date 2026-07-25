@@ -1,6 +1,6 @@
 import { createRef } from 'react'
 import type { ComponentProps } from 'react'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { Select } from './Select'
@@ -651,6 +651,112 @@ describe('Select', () => {
       expect(listbox.style.top).toBe('134px')
       expect(listbox.style.bottom).toBe('')
     })
+
+    // -------------------------------------------------------------------
+    // maxHeight clamp (the menu's height must never exceed the space
+    // actually available on whichever side it renders — previously it
+    // kept the fixed max-h-60 class (240px) regardless, which could
+    // overflow a viewport a Dialog's body-scroll-lock made unreachable).
+    //
+    // TRIGGER_GAP (4) and VIEWPORT_MARGIN (8) below mirror the
+    // module-private constants of the same name in Select.tsx (not
+    // exported). Expected values are derived from the stubbed rect and
+    // these constants rather than hardcoded, so a future change to the
+    // margins fails these tests loudly instead of leaving them silently
+    // out of sync.
+    // -------------------------------------------------------------------
+
+    it('clamps the below-placed menu maxHeight to the measured space below, not an unbounded value', async () => {
+      const TRIGGER_GAP = 4
+      const VIEWPORT_MARGIN = 8
+      const innerHeight = 800
+      const rect = { left: 40, top: 100, right: 240, bottom: 130, width: 200, height: 30 }
+      vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(innerHeight)
+      renderSelect()
+      const trigger = screen.getByRole('combobox')
+      stubRect(trigger, rect)
+      await userEvent.click(trigger)
+      const listbox = screen.getByRole('listbox')
+
+      const spaceBelow = innerHeight - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN
+      expect(listbox.style.top).toBe(`${rect.bottom + TRIGGER_GAP}px`)
+      expect(listbox.style.maxHeight).toBe(`${spaceBelow}px`)
+    })
+
+    it('clamps the above-flipped menu maxHeight to the measured space above', async () => {
+      const TRIGGER_GAP = 4
+      const VIEWPORT_MARGIN = 8
+      const innerHeight = 400
+      const rect = { left: 40, top: 350, right: 240, bottom: 380, width: 200, height: 30 }
+      vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(innerHeight)
+      renderSelect()
+      const trigger = screen.getByRole('combobox')
+      stubRect(trigger, rect)
+      await userEvent.click(trigger)
+      const listbox = screen.getByRole('listbox')
+
+      const spaceAbove = rect.top - TRIGGER_GAP - VIEWPORT_MARGIN
+      expect(listbox.style.top).toBe('')
+      expect(listbox.style.bottom).toBe(`${innerHeight - rect.top + TRIGGER_GAP}px`)
+      expect(listbox.style.maxHeight).toBe(`${spaceAbove}px`)
+    })
+
+    it('flips above and clamps to that side when the menu fits on neither side', async () => {
+      // Both sides are smaller than the pre-paint height estimate, so
+      // under the previous logic ("above" was only chosen when space
+      // fit above that estimate) this would have fallen through to
+      // "below" with no clamp at all — a fixed max-h-60 (240px) menu
+      // inside a 200px-tall viewport, overflowing it.
+      const TRIGGER_GAP = 4
+      const VIEWPORT_MARGIN = 8
+      const innerHeight = 200
+      const rect = { left: 40, top: 100, right: 240, bottom: 110, width: 200, height: 10 }
+      vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(innerHeight)
+      renderSelect()
+      const trigger = screen.getByRole('combobox')
+      stubRect(trigger, rect)
+      await userEvent.click(trigger)
+      const listbox = screen.getByRole('listbox')
+
+      const spaceBelow = innerHeight - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN
+      const spaceAbove = rect.top - TRIGGER_GAP - VIEWPORT_MARGIN
+      // Sanity check on the fixture itself: this test only pins down the
+      // "neither fits, pick the bigger side" branch if above truly has
+      // more room than below.
+      expect(spaceAbove).toBeGreaterThan(spaceBelow)
+
+      // Flipped above (bottom set, top unset) ...
+      expect(listbox.style.top).toBe('')
+      expect(listbox.style.bottom).toBe(`${innerHeight - rect.top + TRIGGER_GAP}px`)
+      // ...and clamped to the larger (above) side's space, not left
+      // unbounded at the old fixed 240px.
+      expect(listbox.style.maxHeight).toBe(`${spaceAbove}px`)
+    })
+
+    it('recomputes the maxHeight clamp on resize and shrinks it when the viewport shrinks', async () => {
+      const TRIGGER_GAP = 4
+      const VIEWPORT_MARGIN = 8
+      const rect = { left: 40, top: 100, right: 240, bottom: 130, width: 200, height: 30 }
+      const innerHeightSpy = vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(800)
+      renderSelect()
+      const trigger = screen.getByRole('combobox')
+      stubRect(trigger, rect)
+      await userEvent.click(trigger)
+      const listbox = screen.getByRole('listbox')
+      expect(listbox.style.maxHeight).toBe(
+        `${800 - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN}px`,
+      )
+
+      innerHeightSpy.mockReturnValue(300)
+      fireEvent.resize(window)
+      // The re-measure reads the menu's real (unstubbed) height from
+      // menuRef, which jsdom reports as 0 — still enough to exercise the
+      // same "clamp to available space" path, just recomputed against the
+      // shrunk viewport.
+      expect(listbox.style.maxHeight).toBe(
+        `${300 - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN}px`,
+      )
+    })
   })
 
   // ---------------------------------------------------------------------------
@@ -749,6 +855,71 @@ describe('Select', () => {
       fireEvent.keyDown(searchInput, { key: 'Tab', shiftKey: true })
       expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
       expect(document.activeElement).toBe(trigger)
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Dialog focus trap interaction (GitHub #183) — the searchable Select's
+  // Tab handler above closes the menu and focuses the trigger itself. Because
+  // the portalled search input is outside the Dialog panel's DOM subtree, the
+  // panel's own focusable-elements query never sees it — so when the menu is
+  // the last focusable thing in the panel, the trigger it hands focus back to
+  // *is* `last` from the panel's point of view. Dialog's own Tab trap must
+  // not then re-run and wrap that focus back to `first`. Covered here (not
+  // Dialog.test.tsx) because it needs both components wired together.
+  // ---------------------------------------------------------------------------
+
+  describe('Dialog focus trap interaction', () => {
+    it("Tab in a searchable Select as the last focusable element leaves focus on the Select trigger, not the dialog's first focusable", async () => {
+      render(
+        <Dialog open onClose={vi.fn()} title="Pick a fruit">
+          <button>First</button>
+          <Select options={options} value="" onChange={vi.fn()} searchable />
+        </Dialog>,
+      )
+      // Let the Dialog's own open-focus effect settle before we open the
+      // Select, so it isn't still pending when we make our assertions.
+      await act(async () => {
+        await new Promise((r) => requestAnimationFrame(r))
+      })
+
+      const trigger = screen.getByRole('combobox')
+      await userEvent.click(trigger)
+      const searchInput = screen.getByPlaceholderText('Search...')
+
+      fireEvent.keyDown(searchInput, { key: 'Tab' })
+
+      expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
+      expect(document.activeElement).toBe(trigger)
+      // The bug this guards against: without the defaultPrevented check,
+      // the Dialog's trap would see the Select's own focus move land on
+      // `last` (the trigger — the only Select-related element the panel's
+      // query can see) and wrap it straight back to `first`.
+      expect(document.activeElement).not.toBe(
+        screen.getByRole('button', { name: 'Close' }),
+      )
+    })
+
+    it('Tab still wraps from the last focusable to the first when a Select is present but closed (guard does not disable the trap in general)', async () => {
+      render(
+        <Dialog open onClose={vi.fn()} title="Pick a fruit">
+          <button>First</button>
+          <Select options={options} value="" onChange={vi.fn()} searchable />
+        </Dialog>,
+      )
+      await act(async () => {
+        await new Promise((r) => requestAnimationFrame(r))
+      })
+
+      const trigger = screen.getByRole('combobox')
+      trigger.focus()
+      expect(document.activeElement).toBe(trigger)
+
+      await userEvent.tab()
+
+      expect(document.activeElement).toBe(
+        screen.getByRole('button', { name: 'Close' }),
+      )
     })
   })
 })
