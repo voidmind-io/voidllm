@@ -126,8 +126,9 @@ type ModelHealth struct {
 // serialization one level's Store can silently overwrite a concurrent
 // update from another level (a lost update, not a data race — copying the
 // struct before mutating already prevents the latter). Readers never take
-// mu; they only ever observe a fully-formed *ModelHealth that runOne
-// published after releasing it.
+// mu: runOne stores a value only once it is fully populated, so whether a
+// reader loads before or after a concurrent write it always observes a
+// complete, internally consistent *ModelHealth.
 type Checker struct {
 	registry *proxy.Registry
 	results  sync.Map // map[string]*ModelHealth — keyed by probeTarget.key, replaced atomically
