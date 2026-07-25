@@ -80,8 +80,12 @@ type ModelHealth struct {
 	Status string `json:"status"`
 	// LastCheck is the UTC timestamp of the most recent probe cycle.
 	LastCheck time.Time `json:"last_check"`
-	// LastError holds the error message from the most recently failed probe,
-	// or is empty when all probes passed.
+	// LastError is derived from HealthError, ModelsError, and FunctionalError
+	// using the same health > models > functional priority as Status, for
+	// consumers that display a single error value. It is empty when every
+	// enabled and applicable probe is currently passing. Prefer HealthError,
+	// ModelsError, and FunctionalError when it matters which probe produced
+	// the message.
 	LastError string `json:"last_error,omitempty"`
 	// LatencyMs is the round-trip time of the most recent successful probe
 	// in milliseconds. Zero when no probe has succeeded yet.
@@ -96,6 +100,19 @@ type ModelHealth struct {
 	// reflects whether the last POST /chat/completions probe returned a 2xx
 	// response.
 	FunctionalOK *bool `json:"functional_ok"`
+	// HealthError holds the sanitized error from the most recent health
+	// probe. It is empty when the probe is disabled, has not yet run, or
+	// last succeeded.
+	HealthError string `json:"health_error,omitempty"`
+	// ModelsError holds the sanitized error from the most recent models
+	// probe. It is empty when the probe is disabled, not applicable to the
+	// target's provider, has not yet run, or last succeeded.
+	ModelsError string `json:"models_error,omitempty"`
+	// FunctionalError holds the sanitized error from the most recent
+	// functional probe. It is empty when the probe is disabled, not
+	// applicable to the target's model type, has not yet run, or last
+	// succeeded.
+	FunctionalError string `json:"functional_error,omitempty"`
 }
 
 // Checker periodically probes all models registered in the proxy.Registry at
@@ -270,7 +287,10 @@ func (c *Checker) runOne(t probeTarget, level probeLevel) {
 		// functional probe against an image model). Leave the level's field
 		// nil — deriveStatus already treats nil as "not checked" — rather
 		// than recording a success that never actually ran, or a failure
-		// that would wrongly drag the status to degraded/unhealthy.
+		// that would wrongly drag the status to degraded/unhealthy. Also
+		// clear the level's own error field: a probe that just became
+		// not-applicable (e.g. after a model type edit) must not keep
+		// displaying a stale failure from when it was still applicable.
 		//
 		// levelHealth never appears here: probeHealth pings the bare server
 		// root directly and never routes through BuildProbeRequest, so it
@@ -278,9 +298,12 @@ func (c *Checker) runOne(t probeTarget, level probeLevel) {
 		switch level {
 		case levelModels:
 			updated.ModelsOK = nil
+			updated.ModelsError = ""
 		case levelFunctional:
 			updated.FunctionalOK = nil
+			updated.FunctionalError = ""
 		}
+		updated.LastError = deriveLastError(&updated)
 		updated.Status = deriveStatus(&updated)
 		c.results.Store(t.key, &updated)
 		updateMetrics(t.key, &updated)
@@ -288,29 +311,34 @@ func (c *Checker) runOne(t probeTarget, level probeLevel) {
 	}
 
 	ok := err == nil
+	var sanitized string
 	if ok {
 		updated.LatencyMs = latencyMs
-		updated.LastError = ""
 	} else {
-		updated.LastError = sanitizeError(err)
+		sanitized = sanitizeError(err)
 		c.log.LogAttrs(ctx, slog.LevelDebug, "health probe failed",
 			slog.String("key", t.key),
-			slog.String("error", updated.LastError),
+			slog.String("error", sanitized),
 		)
 	}
 
+	// Each level owns its own error field. Assigning sanitized (empty on
+	// success) here, rather than sharing one field across levels, ensures a
+	// successful run of one probe never wipes a genuine failure recorded by
+	// another.
 	switch level {
 	case levelHealth:
 		updated.HealthOK = &ok
-		if ok {
-			updated.LatencyMs = latencyMs
-		}
+		updated.HealthError = sanitized
 	case levelModels:
 		updated.ModelsOK = &ok
+		updated.ModelsError = sanitized
 	case levelFunctional:
 		updated.FunctionalOK = &ok
+		updated.FunctionalError = sanitized
 	}
 
+	updated.LastError = deriveLastError(&updated)
 	updated.Status = deriveStatus(&updated)
 	c.results.Store(t.key, &updated)
 
@@ -474,6 +502,22 @@ func setAuthHeaders(req *http.Request, t probeTarget) {
 	} else {
 		req.Header.Set("Authorization", "Bearer "+t.apiKey)
 	}
+}
+
+// deriveLastError picks the single error message to expose as LastError for
+// consumers that show one value. It follows the same precedence as
+// deriveStatus: a failed reachability probe outranks a failed models probe,
+// which outranks a failed functional probe, so the reported message always
+// describes the most severe current failure. It returns an empty string when
+// every enabled and applicable probe is passing.
+func deriveLastError(h *ModelHealth) string {
+	if h.HealthError != "" {
+		return h.HealthError
+	}
+	if h.ModelsError != "" {
+		return h.ModelsError
+	}
+	return h.FunctionalError
 }
 
 // deriveStatus computes the overall status from the individual probe results.

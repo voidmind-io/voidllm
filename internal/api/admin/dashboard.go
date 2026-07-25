@@ -43,6 +43,10 @@ type dashboardStatsResponse struct {
 	// ModelsDegraded is the count of registered models whose current health
 	// status is "degraded". Zero when health monitoring is not enabled.
 	ModelsDegraded int `json:"models_degraded"`
+	// ModelsUnknown is the count of registered models whose current health
+	// status is "unknown" (e.g. no applicable probe ran yet for that
+	// provider/model type). Zero when health monitoring is not enabled.
+	ModelsUnknown int `json:"models_unknown"`
 }
 
 // DashboardStats handles GET /api/v1/dashboard/stats.
@@ -242,6 +246,8 @@ func (h *Handler) DashboardStats(c fiber.Ctx) error {
 				resp.ModelsUnhealthy++
 			case "degraded":
 				resp.ModelsDegraded++
+			case "unknown":
+				resp.ModelsUnknown++
 			}
 		}
 	}

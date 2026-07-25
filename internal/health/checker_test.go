@@ -704,6 +704,101 @@ func TestChecker_NotApplicableProbe_DoesNotBlockGenuineDegradation(t *testing.T)
 	}
 }
 
+// TestChecker_CrossLevelIsolation_SuccessDoesNotWipeFailure drives a real
+// Checker with the models and functional probes enabled against a server
+// where the models-list probe genuinely fails and the functional probe
+// genuinely succeeds. Start() runs levelModels before levelFunctional, so
+// this reproduces the exact ordering that triggered the old shared-LastError
+// bug: a later successful probe (functional) must not erase an earlier
+// genuine failure (models). Each level now owns its own error field, so the
+// failing level's error must survive and the passing level's error field
+// must be empty.
+func TestChecker_CrossLevelIsolation_SuccessDoesNotWipeFailure(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if r.URL.Path == "/chat/completions" && r.Method == http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi"}}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	reg := newRegistry(t, srv.URL)
+	// Models is enabled and fails; Functional is enabled and succeeds; Health
+	// is disabled so it cannot mask the scenario.
+	c := health.NewChecker(reg, cfg(false, true, true), newLogger())
+	stop := c.Start()
+	t.Cleanup(stop)
+
+	mh, ok := c.GetHealth("test-model")
+	if !ok {
+		t.Fatal("GetHealth returned false; probe cycle did not run")
+	}
+	if mh.ModelsOK == nil || *mh.ModelsOK {
+		t.Errorf("ModelsOK = %v, want false", mh.ModelsOK)
+	}
+	if mh.ModelsError == "" {
+		t.Error("ModelsError is empty, want the genuine models-probe failure to be recorded")
+	}
+	if mh.FunctionalOK == nil || !*mh.FunctionalOK {
+		t.Errorf("FunctionalOK = %v, want true", mh.FunctionalOK)
+	}
+	if mh.FunctionalError != "" {
+		t.Errorf("FunctionalError = %q, want empty — a later successful probe must not report an error", mh.FunctionalError)
+	}
+	// The models failure must still be the one surfaced by LastError, since
+	// FunctionalError being empty must not have wiped it.
+	if mh.LastError != mh.ModelsError {
+		t.Errorf("LastError = %q, want it to equal ModelsError (%q)", mh.LastError, mh.ModelsError)
+	}
+	if mh.LastError == "" {
+		t.Error("LastError is empty, want the surviving models-probe failure")
+	}
+}
+
+// TestChecker_LastError_PrecedenceEndToEnd drives a real Checker with all
+// three probes enabled against an unreachable host, so health, models, and
+// functional all genuinely fail at once. It verifies that LastError — the
+// single-value field kept for existing consumers — surfaces the
+// highest-priority failure (health) rather than whichever probe happened to
+// run last, confirming the JSON contract (LastError) still behaves as
+// existing consumers expect.
+func TestChecker_LastError_PrecedenceEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	allEnabled := config.HealthCheckConfig{
+		Health:     config.HealthProbeConfig{Enabled: true, Interval: 24 * time.Hour},
+		Models:     config.HealthProbeConfig{Enabled: true, Interval: 24 * time.Hour},
+		Functional: config.HealthProbeConfig{Enabled: true, Interval: 24 * time.Hour},
+	}
+	reg := newRegistry(t, "http://127.0.0.1:1")
+	c := health.NewChecker(reg, allEnabled, newLogger())
+	stop := c.Start()
+	t.Cleanup(stop)
+
+	mh, ok := c.GetHealth("test-model")
+	if !ok {
+		t.Fatal("GetHealth returned false; probe cycle did not run")
+	}
+	if mh.HealthError == "" {
+		t.Fatal("precondition failed: HealthError must be non-empty (unreachable host)")
+	}
+	if mh.LastError != mh.HealthError {
+		t.Errorf("LastError = %q, want it to equal HealthError (%q) — health outranks models and functional", mh.LastError, mh.HealthError)
+	}
+	if mh.Status != "unhealthy" {
+		t.Errorf("Status = %q, want %q", mh.Status, "unhealthy")
+	}
+}
+
 // TestChecker_MultiDeployment_KeepsPerDeploymentKey verifies that a
 // multi-deployment model produces one health result per deployment, each
 // keyed as "modelName/deploymentName".

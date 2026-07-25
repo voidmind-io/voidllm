@@ -21,6 +21,7 @@ export interface DashboardStats {
   models_healthy: number
   models_unhealthy: number
   models_degraded: number
+  models_unknown: number
 }
 
 export function useDashboardStats() {
