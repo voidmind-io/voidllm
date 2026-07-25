@@ -1578,6 +1578,258 @@ func TestTestConnection_NonAnthropicUsesBearerAuth(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Provider-aware probe tests (issue #182)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// TestTestConnection_AnthropicUsesModelsListIntent verifies that anthropic —
+// like openai — is probed via the models-list intent: a GET request to a
+// path ending "/models", authenticated with x-api-key.
+func TestTestConnection_AnthropicUsesModelsListIntent(t *testing.T) {
+	t.Parallel()
+
+	var capturedMethod, capturedPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMethod = r.Method
+		capturedPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	dsn := "file:TestTestConnection_AnthropicModelsList?mode=memory&cache=private"
+	app, _, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	req := httptest.NewRequest("POST", modelTestConnectionURL(), bodyJSON(t, map[string]any{
+		"provider": "anthropic",
+		"base_url": upstream.URL,
+		"api_key":  "sk-ant-test-key",
+	}))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if capturedMethod != http.MethodGet {
+		t.Errorf("upstream method = %q, want GET", capturedMethod)
+	}
+	if !strings.HasSuffix(capturedPath, "/models") {
+		t.Errorf("upstream path = %q, want suffix %q", capturedPath, "/models")
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+	if got["success"] != true {
+		t.Errorf("success = %v, want true", got["success"])
+	}
+}
+
+// TestTestConnection_AzureFallsBackToChatProbe verifies that azure — which
+// has no meaningful models-list probe — falls back to a chat probe: a POST
+// to a deployment-scoped URL carrying api-version, authenticated with
+// api-key (not Authorization).
+func TestTestConnection_AzureFallsBackToChatProbe(t *testing.T) {
+	t.Parallel()
+
+	var capturedMethod, capturedPath, capturedQuery string
+	var capturedHeaders http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMethod = r.Method
+		capturedPath = r.URL.Path
+		capturedQuery = r.URL.RawQuery
+		capturedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	dsn := "file:TestTestConnection_AzureChatFallback?mode=memory&cache=private"
+	app, _, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	req := httptest.NewRequest("POST", modelTestConnectionURL(), bodyJSON(t, map[string]any{
+		"provider":         "azure",
+		"base_url":         upstream.URL,
+		"api_key":          "azure-test-key",
+		"model_name":       "gpt-4o",
+		"azure_deployment": "gpt4-deployment",
+	}))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	if capturedMethod != http.MethodPost {
+		t.Errorf("upstream method = %q, want POST", capturedMethod)
+	}
+	if !strings.Contains(capturedPath, "/openai/deployments/gpt4-deployment/") {
+		t.Errorf("upstream path = %q, want to contain %q", capturedPath, "/openai/deployments/gpt4-deployment/")
+	}
+	if !strings.Contains(capturedQuery, "api-version=") {
+		t.Errorf("upstream query = %q, want to contain %q", capturedQuery, "api-version=")
+	}
+	if capturedHeaders.Get("api-key") != "azure-test-key" {
+		t.Errorf("api-key header = %q, want %q", capturedHeaders.Get("api-key"), "azure-test-key")
+	}
+	if capturedHeaders.Get("Authorization") != "" {
+		t.Error("Authorization header must not be set for azure provider")
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+	if got["success"] != true {
+		t.Errorf("success = %v, want true", got["success"])
+	}
+	// The chat-probe fallback response has no models-list envelope, so the
+	// message must not report a model count.
+	msg, _ := got["message"].(string)
+	if strings.Contains(msg, "models available") {
+		t.Errorf("message = %q, must not report a model count for a chat-probe fallback", msg)
+	}
+}
+
+// TestTestConnection_GeminiFallsBackToChatProbe verifies that gemini — which
+// has no meaningful models-list probe — falls back to a chat probe: a POST
+// to a v1beta generateContent URL, authenticated with x-goog-api-key.
+func TestTestConnection_GeminiFallsBackToChatProbe(t *testing.T) {
+	t.Parallel()
+
+	var capturedMethod, capturedPath string
+	var capturedHeaders http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMethod = r.Method
+		capturedPath = r.URL.Path
+		capturedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	dsn := "file:TestTestConnection_GeminiChatFallback?mode=memory&cache=private"
+	app, _, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	req := httptest.NewRequest("POST", modelTestConnectionURL(), bodyJSON(t, map[string]any{
+		"provider":   "gemini",
+		"base_url":   upstream.URL,
+		"api_key":    "goog-test-key",
+		"model_name": "gemini-1.5-pro",
+	}))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	if capturedMethod != http.MethodPost {
+		t.Errorf("upstream method = %q, want POST", capturedMethod)
+	}
+	if !strings.Contains(capturedPath, "/v1beta/models/") || !strings.HasSuffix(capturedPath, ":generateContent") {
+		t.Errorf("upstream path = %q, want to contain /v1beta/models/ and end with :generateContent", capturedPath)
+	}
+	if capturedHeaders.Get("x-goog-api-key") != "goog-test-key" {
+		t.Errorf("x-goog-api-key header = %q, want %q", capturedHeaders.Get("x-goog-api-key"), "goog-test-key")
+	}
+	if capturedHeaders.Get("Authorization") != "" {
+		t.Error("Authorization header must not be set for gemini provider")
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+	if got["success"] != true {
+		t.Errorf("success = %v, want true", got["success"])
+	}
+}
+
+// TestTestConnection_VertexFallsBackToChatProbe verifies that vertex — which
+// has no meaningful models-list probe — falls back to a chat probe against a
+// project/location-scoped URL, and that the default Bearer Authorization
+// header IS present (GeminiAdapter.SetHeaders deliberately leaves it
+// untouched for provider "vertex").
+func TestTestConnection_VertexFallsBackToChatProbe(t *testing.T) {
+	t.Parallel()
+
+	var capturedMethod, capturedPath string
+	var capturedHeaders http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMethod = r.Method
+		capturedPath = r.URL.Path
+		capturedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	dsn := "file:TestTestConnection_VertexChatFallback?mode=memory&cache=private"
+	app, _, keyCache := setupModelTestApp(t, dsn)
+	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+	req := httptest.NewRequest("POST", modelTestConnectionURL(), bodyJSON(t, map[string]any{
+		"provider":     "vertex",
+		"base_url":     upstream.URL,
+		"api_key":      "vertex-bearer-token",
+		"model_name":   "gemini-1.5-pro",
+		"gcp_project":  "proj-123",
+		"gcp_location": "us-central1",
+	}))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	if capturedMethod != http.MethodPost {
+		t.Errorf("upstream method = %q, want POST", capturedMethod)
+	}
+	wantPathParts := []string{"/v1/projects/proj-123/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent"}
+	for _, want := range wantPathParts {
+		if capturedPath != want {
+			t.Errorf("upstream path = %q, want %q", capturedPath, want)
+		}
+	}
+	// The trap: vertex authenticates via the default Bearer header, not a
+	// provider-specific header.
+	if capturedHeaders.Get("Authorization") != "Bearer vertex-bearer-token" {
+		t.Errorf("Authorization header = %q, want %q", capturedHeaders.Get("Authorization"), "Bearer vertex-bearer-token")
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+	if got["success"] != true {
+		t.Errorf("success = %v, want true", got["success"])
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Fallback model name tests
 // ──────────────────────────────────────────────────────────────────────────────
 

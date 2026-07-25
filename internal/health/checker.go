@@ -4,8 +4,8 @@
 package health
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/voidmind-io/voidllm/internal/config"
-	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 )
@@ -53,6 +52,23 @@ type probeTarget struct {
 	gcpProject string
 	// gcpLocation is the Google Cloud region. Non-empty only for provider "vertex".
 	gcpLocation string
+}
+
+// asProbeTarget converts t to the exported ProbeTarget shape that
+// BuildProbeRequest accepts. key and modelType are Checker-internal
+// dispatch/labelling fields with no bearing on request construction and are
+// intentionally not carried over.
+func (t probeTarget) asProbeTarget() ProbeTarget {
+	return ProbeTarget{
+		ModelName:       t.modelName,
+		Provider:        t.provider,
+		BaseURL:         t.baseURL,
+		APIKey:          t.apiKey,
+		AzureDeployment: t.azureDeployment,
+		AzureAPIVersion: t.azureAPIVersion,
+		GCPProject:      t.gcpProject,
+		GCPLocation:     t.gcpLocation,
+	}
 }
 
 // ModelHealth holds the most recent health state for a single upstream model.
@@ -248,6 +264,27 @@ func (c *Checker) runOne(t probeTarget, level probeLevel) {
 	updated := *old
 	updated.LastCheck = time.Now().UTC()
 
+	if errors.Is(err, ErrProbeNotApplicable) {
+		// This probe has no meaningful equivalent for the target's provider
+		// or model type (e.g. a models-list probe against Gemini, or a
+		// functional probe against an image model). Leave the level's field
+		// nil — deriveStatus already treats nil as "not checked" — rather
+		// than recording a success that never actually ran, or a failure
+		// that would wrongly drag the status to degraded/unhealthy.
+		switch level {
+		case levelHealth:
+			updated.HealthOK = nil
+		case levelModels:
+			updated.ModelsOK = nil
+		case levelFunctional:
+			updated.FunctionalOK = nil
+		}
+		updated.Status = deriveStatus(&updated)
+		c.results.Store(t.key, &updated)
+		updateMetrics(t.key, &updated)
+		return
+	}
+
 	ok := err == nil
 	if ok {
 		updated.LatencyMs = latencyMs
@@ -357,115 +394,50 @@ func probeHealth(ctx context.Context, client *http.Client, t probeTarget) (int64
 	return latencyMs, nil
 }
 
-// probeModels performs a GET to <base_url>/models and returns success on any
-// 2xx HTTP response.
+// probeModels performs a GET to the provider's model-listing endpoint (built
+// by BuildProbeRequest, provider-aware) and returns success on any 2xx HTTP
+// response. It returns ErrProbeNotApplicable for providers whose adapter has
+// no meaningful model-listing endpoint (azure, vertex, gemini) — see
+// BuildProbeRequest's doc for the full rationale.
 func probeModels(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
-	rawURL := strings.TrimRight(t.baseURL, "/") + "/models"
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return 0, fmt.Errorf("build request: %w", err)
-	}
-
-	setAuthHeaders(req, t)
-
-	start := time.Now()
-	resp, err := client.Do(req)
-	latencyMs := time.Since(start).Milliseconds()
-	if err != nil {
-		return 0, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	return latencyMs, nil
+	return probeWithIntent(ctx, client, IntentModelsList, t)
 }
 
 // probeFunctional dispatches to the appropriate functional probe based on the
 // target's model type. Image, audio_transcription, and tts models are skipped
-// because they are too expensive or require special binary input to probe
-// meaningfully.
+// (ErrProbeNotApplicable) because they are too expensive or require special
+// binary input to probe meaningfully.
 func probeFunctional(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
 	switch t.modelType {
 	case "embedding":
-		return probeEmbedding(ctx, client, t)
+		return probeWithIntent(ctx, client, IntentEmbeddings, t)
 	case "reranking", "image", "audio_transcription", "tts":
 		// Skip — incompatible endpoint or too expensive to probe.
-		return 0, nil
+		return 0, ErrProbeNotApplicable
 	default: // "chat", "completion", ""
-		return probeFunctionalChat(ctx, client, t)
+		return probeWithIntent(ctx, client, IntentChat, t)
 	}
 }
 
-// probeFunctionalChat performs a minimal POST /chat/completions request with a
-// single-token max to verify end-to-end functionality of the upstream model.
-// For Azure targets the deployment name is used as the model identifier.
-func probeFunctionalChat(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
-	rawURL := strings.TrimRight(t.baseURL, "/") + "/chat/completions"
-
-	upstreamModel := t.modelName
-	if t.provider == "azure" && t.azureDeployment != "" {
-		upstreamModel = t.azureDeployment
-	}
-
-	payload := map[string]any{
-		"model":      upstreamModel,
-		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
-		"max_tokens": 1,
-	}
-	body, err := jsonx.Marshal(payload)
+// probeWithIntent builds a provider-aware probe request for intent via
+// BuildProbeRequest and executes it, returning ErrProbeNotApplicable
+// unchanged so callers (probeFunctional, runOne) can distinguish "skipped"
+// from "failed".
+func probeWithIntent(ctx context.Context, client *http.Client, intent ProbeIntent, t probeTarget) (int64, error) {
+	req, err := BuildProbeRequest(ctx, intent, t.asProbeTarget())
 	if err != nil {
-		return 0, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
-	if err != nil {
+		if errors.Is(err, ErrProbeNotApplicable) {
+			return 0, err
+		}
 		return 0, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	setAuthHeaders(req, t)
-
-	start := time.Now()
-	resp, err := client.Do(req)
-	latencyMs := time.Since(start).Milliseconds()
-	if err != nil {
-		return 0, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	return latencyMs, nil
+	return doProbeRequest(client, req)
 }
 
-// probeEmbedding performs a minimal POST /embeddings request with a single
-// short input string to verify end-to-end functionality of an embedding model.
-func probeEmbedding(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
-	rawURL := strings.TrimRight(t.baseURL, "/") + "/embeddings"
-
-	payload := map[string]any{
-		"model": t.modelName,
-		"input": "test",
-	}
-	body, err := jsonx.Marshal(payload)
-	if err != nil {
-		return 0, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
-	if err != nil {
-		return 0, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	setAuthHeaders(req, t)
-
+// doProbeRequest executes req and returns success on any 2xx HTTP response.
+// It is shared by every probe that treats "2xx" as the pass/fail boundary
+// (models-list, functional chat, functional embeddings).
+func doProbeRequest(client *http.Client, req *http.Request) (int64, error) {
 	start := time.Now()
 	resp, err := client.Do(req)
 	latencyMs := time.Since(start).Milliseconds()
@@ -482,8 +454,14 @@ func probeEmbedding(ctx context.Context, client *http.Client, t probeTarget) (in
 }
 
 // setAuthHeaders adds the appropriate authentication headers to req based on
-// the target's provider. Anthropic uses the x-api-key header scheme; all other
-// providers use Bearer token authorization.
+// the target's provider. It is used only by probeHealth: probeModels and
+// probeFunctional build their requests via BuildProbeRequest, which sets
+// provider-correct headers through the same proxy.Adapter.SetHeaders logic
+// the real proxy hot path uses. probeHealth intentionally stays independent
+// of BuildProbeRequest because it hits the bare server root, not a
+// provider-shaped endpoint, and treats any HTTP response as success — the
+// exact header scheme used barely matters for that check, but Anthropic's
+// x-api-key scheme is still applied for parity with a normal request.
 func setAuthHeaders(req *http.Request, t probeTarget) {
 	if t.apiKey == "" {
 		return

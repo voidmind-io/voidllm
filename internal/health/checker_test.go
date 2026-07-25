@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +26,22 @@ func newRegistry(t *testing.T, baseURL string) *proxy.Registry {
 			BaseURL:  baseURL,
 		},
 	})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	return reg
+}
+
+// newRegistryWithConfig builds a one-model Registry from mc, defaulting Name
+// to "test-model" when unset. Unlike newRegistry (hardcoded to provider
+// "openai" with no deployments), this lets tests set Provider, Type, and the
+// Azure/GCP fields needed for provider-specific probe-applicability tests.
+func newRegistryWithConfig(t *testing.T, mc config.ModelConfig) *proxy.Registry {
+	t.Helper()
+	if mc.Name == "" {
+		mc.Name = "test-model"
+	}
+	reg, err := proxy.NewRegistry([]config.ModelConfig{mc})
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
@@ -479,5 +497,254 @@ func TestSanitizeError_ConnectionRefused(t *testing.T) {
 	}
 	if mh.LastError != "connection refused" {
 		t.Errorf("LastError = %q, want %q", mh.LastError, "connection refused")
+	}
+}
+
+// TestChecker_ModelsProbe_NotApplicable_LeavesNilNotDegraded verifies that
+// when the models-list probe has no meaningful equivalent for the target's
+// provider (azure, vertex, gemini), the Checker leaves ModelsOK nil and
+// derives status "unknown" rather than contacting the upstream at all or
+// recording a false failure.
+func TestChecker_ModelsProbe_NotApplicable_LeavesNilNotDegraded(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		provider string
+	}{
+		{name: "azure", provider: "azure"},
+		{name: "vertex", provider: "vertex"},
+		{name: "gemini", provider: "gemini"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var hits int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+
+			reg := newRegistryWithConfig(t, config.ModelConfig{
+				Provider:        tc.provider,
+				BaseURL:         srv.URL,
+				AzureDeployment: "dep",
+				GCPProject:      "proj",
+				GCPLocation:     "us-central1",
+			})
+			// Only the models probe is enabled.
+			c := health.NewChecker(reg, cfg(false, true, false), newLogger())
+			stop := c.Start()
+			t.Cleanup(stop)
+
+			mh, ok := c.GetHealth("test-model")
+			if !ok {
+				t.Fatal("GetHealth returned false; probe cycle did not run")
+			}
+			if mh.ModelsOK != nil {
+				t.Errorf("ModelsOK = %v, want nil (not applicable for provider %s)", mh.ModelsOK, tc.provider)
+			}
+			if mh.Status != "unknown" {
+				t.Errorf("Status = %q, want %q (not-applicable must not degrade)", mh.Status, "unknown")
+			}
+			if got := atomic.LoadInt32(&hits); got != 0 {
+				t.Errorf("upstream received %d requests, want 0 (models-list is not applicable for %s)", got, tc.provider)
+			}
+		})
+	}
+}
+
+// TestChecker_EmbeddingsProbe_NotApplicable_LeavesNilNotDegraded verifies
+// that a functional probe against an embedding model whose provider has no
+// OpenAI-compatible embeddings endpoint (anthropic, gemini, vertex) leaves
+// FunctionalOK nil and derives status "unknown".
+func TestChecker_EmbeddingsProbe_NotApplicable_LeavesNilNotDegraded(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		provider string
+	}{
+		{name: "anthropic", provider: "anthropic"},
+		{name: "gemini", provider: "gemini"},
+		{name: "vertex", provider: "vertex"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var hits int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+
+			reg := newRegistryWithConfig(t, config.ModelConfig{
+				Provider:    tc.provider,
+				BaseURL:     srv.URL,
+				Type:        "embedding",
+				GCPProject:  "proj",
+				GCPLocation: "us-central1",
+			})
+			c := health.NewChecker(reg, cfg(false, false, true), newLogger())
+			stop := c.Start()
+			t.Cleanup(stop)
+
+			mh, ok := c.GetHealth("test-model")
+			if !ok {
+				t.Fatal("GetHealth returned false; probe cycle did not run")
+			}
+			if mh.FunctionalOK != nil {
+				t.Errorf("FunctionalOK = %v, want nil (embeddings not applicable for provider %s)", mh.FunctionalOK, tc.provider)
+			}
+			if mh.Status != "unknown" {
+				t.Errorf("Status = %q, want %q (not-applicable must not degrade)", mh.Status, "unknown")
+			}
+			if got := atomic.LoadInt32(&hits); got != 0 {
+				t.Errorf("upstream received %d requests, want 0 (embeddings is not applicable for %s)", got, tc.provider)
+			}
+		})
+	}
+}
+
+// TestChecker_FunctionalProbe_ModelTypeSkip_LeavesNilNotSuccess verifies
+// that model types with no meaningful functional probe (reranking, image,
+// audio_transcription, tts) leave FunctionalOK nil rather than recording a
+// success that never actually ran. This is a behaviour change: previously
+// these types were skipped by recording an implicit success.
+func TestChecker_FunctionalProbe_ModelTypeSkip_LeavesNilNotSuccess(t *testing.T) {
+	t.Parallel()
+
+	types := []string{"reranking", "image", "audio_transcription", "tts"}
+
+	for _, mt := range types {
+		t.Run(mt, func(t *testing.T) {
+			t.Parallel()
+
+			var hits int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+
+			reg := newRegistryWithConfig(t, config.ModelConfig{
+				Provider: "openai",
+				BaseURL:  srv.URL,
+				Type:     mt,
+			})
+			c := health.NewChecker(reg, cfg(false, false, true), newLogger())
+			stop := c.Start()
+			t.Cleanup(stop)
+
+			mh, ok := c.GetHealth("test-model")
+			if !ok {
+				t.Fatal("GetHealth returned false; probe cycle did not run")
+			}
+			if mh.FunctionalOK != nil {
+				t.Errorf("FunctionalOK = %v, want nil (model type %q is skipped)", mh.FunctionalOK, mt)
+			}
+			if mh.Status != "unknown" {
+				t.Errorf("Status = %q, want %q (a skipped probe must not be recorded as healthy)", mh.Status, "unknown")
+			}
+			if got := atomic.LoadInt32(&hits); got != 0 {
+				t.Errorf("upstream received %d requests, want 0 (type %q must be skipped before any request is sent)", got, mt)
+			}
+		})
+	}
+}
+
+// TestChecker_NotApplicableProbe_DoesNotBlockGenuineDegradation drives a
+// combined scenario through the real Checker: the models probe is not
+// applicable for azure (stays nil, "not checked"), while the functional
+// probe is applicable and genuinely fails. The not-applicable probe must
+// not mask the genuine failure — status must still be "degraded".
+func TestChecker_NotApplicableProbe_DoesNotBlockGenuineDegradation(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Azure's chat probe path always contains "/chat/completions"; fail
+		// it so the functional probe genuinely degrades the status.
+		if strings.Contains(r.URL.Path, "/chat/completions") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	reg := newRegistryWithConfig(t, config.ModelConfig{
+		Provider:        "azure",
+		BaseURL:         srv.URL,
+		AzureDeployment: "dep",
+	})
+	// Models probe (not applicable for azure, stays nil) and functional
+	// probe (applicable, fails) are both enabled; health is off.
+	c := health.NewChecker(reg, cfg(false, true, true), newLogger())
+	stop := c.Start()
+	t.Cleanup(stop)
+
+	mh, ok := c.GetHealth("test-model")
+	if !ok {
+		t.Fatal("GetHealth returned false; probe cycle did not run")
+	}
+	if mh.ModelsOK != nil {
+		t.Errorf("ModelsOK = %v, want nil (not applicable for azure)", mh.ModelsOK)
+	}
+	if mh.FunctionalOK == nil || *mh.FunctionalOK {
+		t.Errorf("FunctionalOK = %v, want false (upstream returned 500)", mh.FunctionalOK)
+	}
+	if mh.Status != "degraded" {
+		t.Errorf("Status = %q, want %q — a not-applicable probe must not prevent a genuine failure from degrading status", mh.Status, "degraded")
+	}
+}
+
+// TestChecker_MultiDeployment_KeepsPerDeploymentKey verifies that a
+// multi-deployment model produces one health result per deployment, each
+// keyed as "modelName/deploymentName".
+func TestChecker_MultiDeployment_KeepsPerDeploymentKey(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	reg, err := proxy.NewRegistry([]config.ModelConfig{
+		{
+			Name:     "multi-model",
+			Strategy: "round-robin",
+			Deployments: []config.DeploymentConfig{
+				{Name: "dep-a", Provider: "openai", BaseURL: srv.URL},
+				{Name: "dep-b", Provider: "openai", BaseURL: srv.URL},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+
+	c := health.NewChecker(reg, cfg(true, false, false), newLogger())
+	stop := c.Start()
+	t.Cleanup(stop)
+
+	for _, key := range []string{"multi-model/dep-a", "multi-model/dep-b"} {
+		mh, ok := c.GetHealth(key)
+		if !ok {
+			t.Fatalf("GetHealth(%q) returned false; probe did not run", key)
+		}
+		if mh.HealthOK == nil || !*mh.HealthOK {
+			t.Errorf("key %q: HealthOK = %v, want true", key, mh.HealthOK)
+		}
+	}
+
+	all := c.GetAllHealth()
+	if len(all) != 2 {
+		t.Fatalf("GetAllHealth() len = %d, want 2", len(all))
 	}
 }

@@ -554,13 +554,19 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     setTesting(true)
     setTestResult(null)
     try {
+      const body: Record<string, string> = {
+        provider,
+        base_url: baseUrl.trim(),
+        api_key: apiKey.trim(),
+      }
+      if (name.trim()) body.model_name = name.trim()
+      if (isAzure) {
+        if (azureDeployment.trim()) body.azure_deployment = azureDeployment.trim()
+        if (azureApiVersion.trim()) body.azure_api_version = azureApiVersion.trim()
+      }
       const res = await apiClient<{ success: boolean; message: string }>('/models/test-connection', {
         method: 'POST',
-        body: JSON.stringify({
-          provider,
-          base_url: baseUrl.trim(),
-          api_key: apiKey.trim(),
-        }),
+        body: JSON.stringify(body),
       })
       setTestResult(res)
     } catch (err) {

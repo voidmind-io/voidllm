@@ -17,6 +17,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/config"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/health"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/license"
 	"github.com/voidmind-io/voidllm/internal/provider"
@@ -1190,6 +1191,24 @@ type testConnectionRequest struct {
 	Provider string `json:"provider"`
 	BaseURL  string `json:"base_url"`
 	APIKey   string `json:"api_key"`
+	// ModelName is the model identifier the probe request references. It is
+	// required to build a meaningful request for providers whose synthetic
+	// probe must name a model in the URL or body (anthropic, gemini,
+	// vertex); providers tested via a models-list probe (openai, vllm,
+	// ollama, custom) ignore it.
+	ModelName string `json:"model_name,omitempty"`
+	// AzureDeployment is the Azure OpenAI deployment name. Required to build
+	// a working probe URL when Provider is "azure".
+	AzureDeployment string `json:"azure_deployment,omitempty"`
+	// AzureAPIVersion overrides the default Azure OpenAI API version used by
+	// the probe. Only meaningful when Provider is "azure".
+	AzureAPIVersion string `json:"azure_api_version,omitempty"`
+	// GCPProject is the Google Cloud project ID. Required to build a working
+	// probe URL when Provider is "vertex".
+	GCPProject string `json:"gcp_project,omitempty"`
+	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required
+	// to build a working probe URL when Provider is "vertex".
+	GCPLocation string `json:"gcp_location,omitempty"`
 }
 
 // testConnectionResponse is the JSON response returned by TestModelConnection.
@@ -1242,14 +1261,31 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 		})
 	}
 
-	testURL := strings.TrimRight(req.BaseURL, "/") + "/models"
-
 	// Use a background context with an explicit timeout so the outbound request
 	// is not cancelled if the Fiber request context is recycled.
 	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, testURL, nil)
+	target := health.ProbeTarget{
+		ModelName:       req.ModelName,
+		Provider:        req.Provider,
+		BaseURL:         req.BaseURL,
+		APIKey:          req.APIKey,
+		AzureDeployment: req.AzureDeployment,
+		AzureAPIVersion: req.AzureAPIVersion,
+		GCPProject:      req.GCPProject,
+		GCPLocation:     req.GCPLocation,
+	}
+
+	// Probe the provider the same way the proxy hot path would actually talk
+	// to it. A models-list probe is preferred (it needs no model identity and
+	// mirrors the historical behaviour for OpenAI-compatible providers and
+	// Anthropic); providers with no meaningful models-list equivalent (azure,
+	// vertex, gemini) fall back to a minimal chat probe.
+	httpReq, err := health.BuildProbeRequest(reqCtx, health.IntentModelsList, target)
+	if errors.Is(err, health.ErrProbeNotApplicable) {
+		httpReq, err = health.BuildProbeRequest(reqCtx, health.IntentChat, target)
+	}
 	if err != nil {
 		h.Log.WarnContext(ctx, "test-connection: build request failed",
 			slog.String("url", req.BaseURL),
@@ -1259,16 +1295,6 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 			Success: false,
 			Message: "Invalid base URL format",
 		})
-	}
-
-	if req.APIKey != "" {
-		switch req.Provider {
-		case "anthropic":
-			httpReq.Header.Set("x-api-key", req.APIKey)
-			httpReq.Header.Set("anthropic-version", "2023-06-01")
-		default:
-			httpReq.Header.Set("Authorization", "Bearer "+req.APIKey)
-		}
 	}
 
 	resp, err := testClient.Do(httpReq)
@@ -1300,17 +1326,22 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 
-	var modelsResp struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
+	// Only a models-list probe response has the OpenAI models-list envelope;
+	// a chat-probe fallback response (issued for azure/vertex/gemini) has a
+	// different shape and is not parsed for a model count.
+	if httpReq.Method == http.MethodGet {
+		var modelsResp struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
 
-	if err := jsonx.Unmarshal(body, &modelsResp); err == nil && len(modelsResp.Data) > 0 {
-		return c.JSON(testConnectionResponse{
-			Success: true,
-			Message: fmt.Sprintf("connected successfully. %d models available.", len(modelsResp.Data)),
-		})
+		if err := jsonx.Unmarshal(body, &modelsResp); err == nil && len(modelsResp.Data) > 0 {
+			return c.JSON(testConnectionResponse{
+				Success: true,
+				Message: fmt.Sprintf("connected successfully. %d models available.", len(modelsResp.Data)),
+			})
+		}
 	}
 
 	return c.JSON(testConnectionResponse{
