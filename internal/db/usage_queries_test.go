@@ -43,9 +43,13 @@ type usageEventParams struct {
 	promptTokens int64
 	compTokens   int64
 	totalTokens  int64
-	costEstimate *float64 // nil → NULL
-	durationMS   *int64   // nil → NULL
-	createdAt    time.Time
+	// cachedReadTokens and cacheWriteTokens default to 0 (their DB column
+	// default) when left unset.
+	cachedReadTokens int64
+	cacheWriteTokens int64
+	costEstimate     *float64 // nil → NULL
+	durationMS       *int64   // nil → NULL
+	createdAt        time.Time
 }
 
 // insertUsageEvent inserts a fully-specified usage_events row for aggregate tests.
@@ -72,13 +76,16 @@ func insertUsageEvent(t *testing.T, d *DB, p usageEventParams) {
 		`INSERT INTO usage_events
 			(id, key_id, key_type, org_id, team_id, model_name,
 			 prompt_tokens, completion_tokens, total_tokens,
+			 cached_read_tokens, cache_write_tokens,
 			 cost_estimate, request_duration_ms, status_code, created_at)
 		 VALUES
 			('%s', '%s', 'user_key', '%s', %s, '%s',
 			 %d, %d, %d,
+			 %d, %d,
 			 %s, %s, 200, '%s')`,
 		p.id, p.keyID, p.orgID, teamVal, p.modelName,
 		p.promptTokens, p.compTokens, p.totalTokens,
+		p.cachedReadTokens, p.cacheWriteTokens,
 		costVal, durVal,
 		p.createdAt.UTC().Format(time.RFC3339),
 	)
@@ -842,5 +849,266 @@ func TestGetUsageAggregates_AvgDuration_Calculated(t *testing.T) {
 	const tolerance = 0.001
 	if math.Abs(rows[0].AvgDurationMS-wantAvg) > tolerance {
 		t.Errorf("AvgDurationMS = %f, want %f", rows[0].AvgDurationMS, wantAvg)
+	}
+}
+
+// ---- GetUsageAggregates: cached-token sums (#179) --------------------------
+
+// TestGetUsageAggregates_CachedTokens_UngroupedSum verifies that
+// cached_read_tokens and cache_write_tokens are summed correctly across
+// multiple events in the ungrouped (totals-only) query path.
+func TestGetUsageAggregates_CachedTokens_UngroupedSum(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	from := now.Add(-2 * time.Hour)
+	to := now.Add(time.Minute)
+
+	insertUsageEvent(t, d, usageEventParams{
+		id: "agg-cache-1", keyID: "key-cache", orgID: "org-agg-cache",
+		promptTokens: 100, compTokens: 20, totalTokens: 120,
+		cachedReadTokens: 40, cacheWriteTokens: 10,
+		createdAt: now.Add(-90 * time.Minute),
+	})
+	insertUsageEvent(t, d, usageEventParams{
+		id: "agg-cache-2", keyID: "key-cache", orgID: "org-agg-cache",
+		promptTokens: 200, compTokens: 30, totalTokens: 230,
+		cachedReadTokens: 70, cacheWriteTokens: 5,
+		createdAt: now.Add(-60 * time.Minute),
+	})
+
+	rows, err := d.GetUsageAggregates(ctx, "org-agg-cache", from, to, "")
+	if err != nil {
+		t.Fatalf("GetUsageAggregates() error = %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1", len(rows))
+	}
+	if rows[0].CachedReadTokens != 110 {
+		t.Errorf("CachedReadTokens = %d, want 110", rows[0].CachedReadTokens)
+	}
+	if rows[0].CacheWriteTokens != 15 {
+		t.Errorf("CacheWriteTokens = %d, want 15", rows[0].CacheWriteTokens)
+	}
+}
+
+// TestGetUsageAggregates_CachedTokens_GroupedByModel verifies that cached-token
+// sums are computed per group (not just globally) when group_by=model.
+func TestGetUsageAggregates_CachedTokens_GroupedByModel(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	from := now.Add(-2 * time.Hour)
+	to := now.Add(time.Minute)
+
+	insertUsageEvent(t, d, usageEventParams{
+		id: "agg-cache-m1", keyID: "key-cache-m", orgID: "org-agg-cache-m",
+		modelName: "gpt-4", promptTokens: 100, compTokens: 20, totalTokens: 120,
+		cachedReadTokens: 40, cacheWriteTokens: 0,
+		createdAt: now.Add(-90 * time.Minute),
+	})
+	insertUsageEvent(t, d, usageEventParams{
+		id: "agg-cache-m2", keyID: "key-cache-m", orgID: "org-agg-cache-m",
+		modelName: "claude-3-5-sonnet", promptTokens: 200, compTokens: 30, totalTokens: 230,
+		cachedReadTokens: 50, cacheWriteTokens: 25,
+		createdAt: now.Add(-60 * time.Minute),
+	})
+
+	rows, err := d.GetUsageAggregates(ctx, "org-agg-cache-m", from, to, "model")
+	if err != nil {
+		t.Fatalf("GetUsageAggregates() error = %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("len(rows) = %d, want 2", len(rows))
+	}
+
+	byGroup := make(map[string]UsageAggregate, len(rows))
+	for _, r := range rows {
+		byGroup[r.GroupKey] = r
+	}
+
+	gpt4, ok := byGroup["gpt-4"]
+	if !ok {
+		t.Fatal("missing group for gpt-4")
+	}
+	if gpt4.CachedReadTokens != 40 {
+		t.Errorf("gpt-4 CachedReadTokens = %d, want 40", gpt4.CachedReadTokens)
+	}
+	if gpt4.CacheWriteTokens != 0 {
+		t.Errorf("gpt-4 CacheWriteTokens = %d, want 0", gpt4.CacheWriteTokens)
+	}
+
+	claude, ok := byGroup["claude-3-5-sonnet"]
+	if !ok {
+		t.Fatal("missing group for claude-3-5-sonnet")
+	}
+	if claude.CachedReadTokens != 50 {
+		t.Errorf("claude-3-5-sonnet CachedReadTokens = %d, want 50", claude.CachedReadTokens)
+	}
+	if claude.CacheWriteTokens != 25 {
+		t.Errorf("claude-3-5-sonnet CacheWriteTokens = %d, want 25", claude.CacheWriteTokens)
+	}
+}
+
+// TestGetUsageAggregates_CachedTokens_EmptyResultIsZero verifies that an org
+// with no events in range returns zero (not NULL, not an error) for the two
+// new cached-token columns, matching the COALESCE(SUM(...), 0) pattern used
+// for the pre-existing token columns.
+func TestGetUsageAggregates_CachedTokens_EmptyResultIsZero(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	rows, err := d.GetUsageAggregates(ctx, "org-agg-cache-empty", now.Add(-time.Hour), now, "")
+	if err != nil {
+		t.Fatalf("GetUsageAggregates() error = %v", err)
+	}
+	if len(rows) == 0 {
+		return // acceptable — empty result is also valid, mirrors TestGetUsageAggregates_NoEvents_NoGrouping
+	}
+	if len(rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 0 or 1", len(rows))
+	}
+	if rows[0].CachedReadTokens != 0 {
+		t.Errorf("CachedReadTokens = %d, want 0", rows[0].CachedReadTokens)
+	}
+	if rows[0].CacheWriteTokens != 0 {
+		t.Errorf("CacheWriteTokens = %d, want 0", rows[0].CacheWriteTokens)
+	}
+}
+
+// ---- GetScopedUsageAggregates / GetCrossOrgUsageAggregates: cached tokens --
+//
+// These two functions had no test coverage at all prior to #179 (grouped and
+// ungrouped alike). The pair of smoke tests below exercises their cached-token
+// SQL literals specifically, since each function carries its own independent
+// COALESCE(SUM(cached_read_tokens/cache_write_tokens)) pair.
+
+// TestGetScopedUsageAggregates_CachedTokens_Summed verifies that
+// GetScopedUsageAggregates (used by MyUsage) sums the two new cache-token
+// columns correctly in both the ungrouped and grouped query paths.
+func TestGetScopedUsageAggregates_CachedTokens_Summed(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	from := now.Add(-2 * time.Hour)
+	to := now.Add(time.Minute)
+
+	insertUsageEvent(t, d, usageEventParams{
+		id: "scoped-cache-1", keyID: "key-scoped-cache", orgID: "org-scoped-cache",
+		promptTokens: 100, compTokens: 20, totalTokens: 120,
+		cachedReadTokens: 40, cacheWriteTokens: 10,
+		createdAt: now.Add(-90 * time.Minute),
+	})
+	insertUsageEvent(t, d, usageEventParams{
+		id: "scoped-cache-2", keyID: "key-scoped-cache", orgID: "org-scoped-cache",
+		promptTokens: 50, compTokens: 5, totalTokens: 55,
+		cachedReadTokens: 15, cacheWriteTokens: 0,
+		createdAt: now.Add(-60 * time.Minute),
+	})
+
+	filter := UsageFilter{OrgID: "org-scoped-cache", KeyID: "key-scoped-cache"}
+
+	ungrouped, err := d.GetScopedUsageAggregates(ctx, filter, from, to, "")
+	if err != nil {
+		t.Fatalf("GetScopedUsageAggregates(ungrouped) error = %v", err)
+	}
+	if len(ungrouped) != 1 {
+		t.Fatalf("len(ungrouped) = %d, want 1", len(ungrouped))
+	}
+	if ungrouped[0].CachedReadTokens != 55 {
+		t.Errorf("ungrouped CachedReadTokens = %d, want 55", ungrouped[0].CachedReadTokens)
+	}
+	if ungrouped[0].CacheWriteTokens != 10 {
+		t.Errorf("ungrouped CacheWriteTokens = %d, want 10", ungrouped[0].CacheWriteTokens)
+	}
+
+	grouped, err := d.GetScopedUsageAggregates(ctx, filter, from, to, "key")
+	if err != nil {
+		t.Fatalf("GetScopedUsageAggregates(grouped) error = %v", err)
+	}
+	if len(grouped) != 1 {
+		t.Fatalf("len(grouped) = %d, want 1", len(grouped))
+	}
+	if grouped[0].CachedReadTokens != 55 {
+		t.Errorf("grouped CachedReadTokens = %d, want 55", grouped[0].CachedReadTokens)
+	}
+	if grouped[0].CacheWriteTokens != 10 {
+		t.Errorf("grouped CacheWriteTokens = %d, want 10", grouped[0].CacheWriteTokens)
+	}
+}
+
+// TestGetCrossOrgUsageAggregates_CachedTokens_Summed verifies that
+// GetCrossOrgUsageAggregates (used by the system-admin usage endpoint) sums
+// the two new cache-token columns correctly in both the ungrouped and
+// grouped (by org) query paths, across events from multiple orgs.
+func TestGetCrossOrgUsageAggregates_CachedTokens_Summed(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	from := now.Add(-2 * time.Hour)
+	to := now.Add(time.Minute)
+
+	insertUsageEvent(t, d, usageEventParams{
+		id: "xorg-cache-1", keyID: "key-xorg-1", orgID: "org-xorg-a",
+		promptTokens: 100, compTokens: 20, totalTokens: 120,
+		cachedReadTokens: 30, cacheWriteTokens: 5,
+		createdAt: now.Add(-90 * time.Minute),
+	})
+	insertUsageEvent(t, d, usageEventParams{
+		id: "xorg-cache-2", keyID: "key-xorg-2", orgID: "org-xorg-b",
+		promptTokens: 200, compTokens: 40, totalTokens: 240,
+		cachedReadTokens: 60, cacheWriteTokens: 15,
+		createdAt: now.Add(-60 * time.Minute),
+	})
+
+	ungrouped, err := d.GetCrossOrgUsageAggregates(ctx, from, to, "")
+	if err != nil {
+		t.Fatalf("GetCrossOrgUsageAggregates(ungrouped) error = %v", err)
+	}
+	if len(ungrouped) != 1 {
+		t.Fatalf("len(ungrouped) = %d, want 1", len(ungrouped))
+	}
+	if ungrouped[0].CachedReadTokens != 90 {
+		t.Errorf("ungrouped CachedReadTokens = %d, want 90", ungrouped[0].CachedReadTokens)
+	}
+	if ungrouped[0].CacheWriteTokens != 20 {
+		t.Errorf("ungrouped CacheWriteTokens = %d, want 20", ungrouped[0].CacheWriteTokens)
+	}
+
+	grouped, err := d.GetCrossOrgUsageAggregates(ctx, from, to, "org")
+	if err != nil {
+		t.Fatalf("GetCrossOrgUsageAggregates(grouped) error = %v", err)
+	}
+	byGroup := make(map[string]UsageAggregate, len(grouped))
+	for _, r := range grouped {
+		byGroup[r.GroupKey] = r
+	}
+	a, ok := byGroup["org-xorg-a"]
+	if !ok {
+		t.Fatal("missing group for org-xorg-a")
+	}
+	if a.CachedReadTokens != 30 {
+		t.Errorf("org-xorg-a CachedReadTokens = %d, want 30", a.CachedReadTokens)
+	}
+	b, ok := byGroup["org-xorg-b"]
+	if !ok {
+		t.Fatal("missing group for org-xorg-b")
+	}
+	if b.CachedReadTokens != 60 {
+		t.Errorf("org-xorg-b CachedReadTokens = %d, want 60", b.CachedReadTokens)
+	}
+	if b.CacheWriteTokens != 15 {
+		t.Errorf("org-xorg-b CacheWriteTokens = %d, want 15", b.CacheWriteTokens)
 	}
 }

@@ -31,6 +31,14 @@ type Event struct {
 	CompletionTokens int
 	// TotalTokens is the sum of prompt and completion tokens.
 	TotalTokens int
+	// CachedReadTokens is the subset of PromptTokens served from an upstream
+	// prompt cache, billed below the normal input rate. Zero when the
+	// provider reports no cache read.
+	CachedReadTokens int
+	// CacheWriteTokens is the subset of PromptTokens written to an upstream
+	// prompt cache (Anthropic only), billed above the normal input rate.
+	// Zero for providers without a cache-write concept.
+	CacheWriteTokens int
 	// CostEstimate is the estimated cost in USD, or nil if pricing is not configured.
 	CostEstimate *float64
 	// DurationMS is the total request duration in milliseconds.

@@ -33,6 +33,12 @@ type UsageAggregate struct {
 	PromptTokens     int64
 	CompletionTokens int64
 	TotalTokens      int64
+	// CachedReadTokens is the subset of PromptTokens served from an upstream
+	// prompt cache, summed across the group.
+	CachedReadTokens int64
+	// CacheWriteTokens is the subset of PromptTokens written to an upstream
+	// prompt cache (Anthropic only), summed across the group.
+	CacheWriteTokens int64
 	CostEstimate     float64
 	AvgDurationMS    float64
 }
@@ -74,7 +80,9 @@ func (d *DB) GetUsageAggregates(ctx context.Context, orgID string, from, to time
 	if groupCol != "" {
 		query = "SELECT " + selectCol + ", COUNT(*), " +
 			"COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), " +
-			"COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_estimate), 0), " +
+			"COALESCE(SUM(total_tokens), 0), " +
+			"COALESCE(SUM(cached_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), " +
+			"COALESCE(SUM(cost_estimate), 0), " +
 			"COALESCE(AVG(request_duration_ms), 0) " +
 			"FROM usage_events " +
 			"WHERE org_id = " + d.dialect.Placeholder(1) +
@@ -85,7 +93,9 @@ func (d *DB) GetUsageAggregates(ctx context.Context, orgID string, from, to time
 	} else {
 		query = "SELECT '' AS group_key, COUNT(*), " +
 			"COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), " +
-			"COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_estimate), 0), " +
+			"COALESCE(SUM(total_tokens), 0), " +
+			"COALESCE(SUM(cached_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), " +
+			"COALESCE(SUM(cost_estimate), 0), " +
 			"COALESCE(AVG(request_duration_ms), 0) " +
 			"FROM usage_events " +
 			"WHERE org_id = " + d.dialect.Placeholder(1) +
@@ -108,6 +118,8 @@ func (d *DB) GetUsageAggregates(ctx context.Context, orgID string, from, to time
 			&a.PromptTokens,
 			&a.CompletionTokens,
 			&a.TotalTokens,
+			&a.CachedReadTokens,
+			&a.CacheWriteTokens,
 			&a.CostEstimate,
 			&a.AvgDurationMS,
 		); err != nil {
@@ -220,7 +232,9 @@ func (d *DB) GetScopedUsageAggregates(ctx context.Context, filter UsageFilter, f
 	if groupCol != "" {
 		query = "SELECT " + selectCol + ", COUNT(*), " +
 			"COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), " +
-			"COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_estimate), 0), " +
+			"COALESCE(SUM(total_tokens), 0), " +
+			"COALESCE(SUM(cached_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), " +
+			"COALESCE(SUM(cost_estimate), 0), " +
 			"COALESCE(AVG(request_duration_ms), 0) " +
 			"FROM usage_events " +
 			where +
@@ -229,7 +243,9 @@ func (d *DB) GetScopedUsageAggregates(ctx context.Context, filter UsageFilter, f
 	} else {
 		query = "SELECT '' AS group_key, COUNT(*), " +
 			"COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), " +
-			"COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_estimate), 0), " +
+			"COALESCE(SUM(total_tokens), 0), " +
+			"COALESCE(SUM(cached_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), " +
+			"COALESCE(SUM(cost_estimate), 0), " +
 			"COALESCE(AVG(request_duration_ms), 0) " +
 			"FROM usage_events " +
 			where
@@ -250,6 +266,8 @@ func (d *DB) GetScopedUsageAggregates(ctx context.Context, filter UsageFilter, f
 			&a.PromptTokens,
 			&a.CompletionTokens,
 			&a.TotalTokens,
+			&a.CachedReadTokens,
+			&a.CacheWriteTokens,
 			&a.CostEstimate,
 			&a.AvgDurationMS,
 		); err != nil {
@@ -301,7 +319,9 @@ func (d *DB) GetCrossOrgUsageAggregates(ctx context.Context, from, to time.Time,
 	if groupCol != "" {
 		query = "SELECT " + selectCol + ", COUNT(*), " +
 			"COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), " +
-			"COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_estimate), 0), " +
+			"COALESCE(SUM(total_tokens), 0), " +
+			"COALESCE(SUM(cached_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), " +
+			"COALESCE(SUM(cost_estimate), 0), " +
 			"COALESCE(AVG(request_duration_ms), 0) " +
 			"FROM usage_events " +
 			"WHERE created_at >= " + p(1) +
@@ -311,7 +331,9 @@ func (d *DB) GetCrossOrgUsageAggregates(ctx context.Context, from, to time.Time,
 	} else {
 		query = "SELECT '' AS group_key, COUNT(*), " +
 			"COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), " +
-			"COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_estimate), 0), " +
+			"COALESCE(SUM(total_tokens), 0), " +
+			"COALESCE(SUM(cached_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), " +
+			"COALESCE(SUM(cost_estimate), 0), " +
 			"COALESCE(AVG(request_duration_ms), 0) " +
 			"FROM usage_events " +
 			"WHERE created_at >= " + p(1) +
@@ -333,6 +355,8 @@ func (d *DB) GetCrossOrgUsageAggregates(ctx context.Context, from, to time.Time,
 			&a.PromptTokens,
 			&a.CompletionTokens,
 			&a.TotalTokens,
+			&a.CachedReadTokens,
+			&a.CacheWriteTokens,
 			&a.CostEstimate,
 			&a.AvgDurationMS,
 		); err != nil {

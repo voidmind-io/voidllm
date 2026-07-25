@@ -39,7 +39,12 @@ var ProxyTTFTSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 }, []string{"model"})
 
 // TokensTotal counts tokens processed by the proxy, partitioned by model name
-// and direction: "prompt" for input tokens and "completion" for output tokens.
+// and direction: "prompt" for input tokens, "completion" for output tokens,
+// "cached_read" for the subset of prompt tokens served from an upstream
+// prompt cache, and "cache_write" for prompt tokens written to an upstream
+// prompt cache (Anthropic only; always zero for other providers). The
+// cached_read and cache_write values are informational subsets already
+// included in "prompt" — they are not additional tokens.
 var TokensTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "voidllm_tokens_total",
 	Help: "Total tokens processed by the proxy.",

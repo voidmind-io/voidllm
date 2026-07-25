@@ -40,6 +40,36 @@ func insertUsageEventHTTP(t *testing.T, database *db.DB, id, keyID, teamID, orgI
 	}
 }
 
+// insertUsageEventWithCacheHTTP inserts a single usage_events row with
+// explicit cached_read_tokens/cache_write_tokens values, for tests that
+// verify the cache-token fields surface through the HTTP usage endpoints.
+func insertUsageEventWithCacheHTTP(t *testing.T, database *db.DB, id, keyID, teamID, orgID, modelName string,
+	promptTokens, compTokens, totalTokens, cachedReadTokens, cacheWriteTokens int64, createdAt time.Time) {
+	t.Helper()
+
+	teamVal := "NULL"
+	if teamID != "" {
+		teamVal = fmt.Sprintf("'%s'", teamID)
+	}
+	query := fmt.Sprintf(
+		`INSERT INTO usage_events
+			(id, key_id, key_type, org_id, team_id, model_name,
+			 prompt_tokens, completion_tokens, total_tokens,
+			 cached_read_tokens, cache_write_tokens, status_code, created_at)
+		 VALUES
+			('%s', '%s', 'user_key', '%s', %s, '%s',
+			 %d, %d, %d,
+			 %d, %d, 200, '%s')`,
+		id, keyID, orgID, teamVal, modelName,
+		promptTokens, compTokens, totalTokens,
+		cachedReadTokens, cacheWriteTokens,
+		createdAt.UTC().Format(time.RFC3339),
+	)
+	if _, err := database.SQL().ExecContext(context.Background(), query); err != nil {
+		t.Fatalf("insertUsageEventWithCacheHTTP id=%q: %v", id, err)
+	}
+}
+
 // usageURL constructs the GET /api/v1/orgs/:org_id/usage URL with the given query params.
 func usageURL(orgID, from, to, groupBy string) string {
 	params := []string{}
@@ -627,6 +657,65 @@ func TestGetOrgUsage_ResponseShape(t *testing.T) {
 	}
 	if row.TotalTokens != 150 {
 		t.Errorf("total_tokens = %d, want 150", row.TotalTokens)
+	}
+}
+
+// TestGetOrgUsage_ResponseShape_CachedTokens verifies that
+// cached_read_tokens and cache_write_tokens (added for #179) appear in the
+// GET /api/v1/orgs/:org_id/usage JSON response and carry the summed values
+// from the underlying usage_events rows.
+func TestGetOrgUsage_ResponseShape_CachedTokens(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestGetOrgUsage_ShapeCached?mode=memory&cache=private")
+	org := mustCreateOrg(t, database, "Shape Cached Org", "usage-org-shape-cached")
+	testKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+	now := time.Now().UTC()
+	from := now.Add(-time.Hour)
+	to := now.Add(time.Minute)
+
+	insertUsageEventWithCacheHTTP(t, database, "shape-cache-1", "key-shape-cache", "", org.ID, "claude-3-5-sonnet",
+		100, 50, 150, 40, 15, now.Add(-30*time.Minute))
+
+	req := httptest.NewRequest("GET", usageURL(org.ID, from.Format(time.RFC3339), to.Format(time.RFC3339), ""), nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	var envelope struct {
+		Data []struct {
+			TotalTokens      int64 `json:"total_tokens"`
+			CachedReadTokens int64 `json:"cached_read_tokens"`
+			CacheWriteTokens int64 `json:"cache_write_tokens"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(envelope.Data) == 0 {
+		t.Fatal("data is empty, want at least one row")
+	}
+
+	row := envelope.Data[0]
+	if row.TotalTokens != 150 {
+		t.Errorf("total_tokens = %d, want 150", row.TotalTokens)
+	}
+	if row.CachedReadTokens != 40 {
+		t.Errorf("cached_read_tokens = %d, want 40", row.CachedReadTokens)
+	}
+	if row.CacheWriteTokens != 15 {
+		t.Errorf("cache_write_tokens = %d, want 15", row.CacheWriteTokens)
 	}
 }
 

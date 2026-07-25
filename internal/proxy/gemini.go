@@ -28,6 +28,10 @@ type GeminiAdapter struct {
 	modelName        string // stored from TransformRequest for use in TransformResponse
 	promptTokens     int    // accumulated from usageMetadata during streaming
 	completionTokens int    // accumulated from usageMetadata during streaming
+	// cachedReadTokens is accumulated from usageMetadata.cachedContentTokenCount
+	// during streaming. Gemini reports this as a SUBSET of promptTokens (unlike
+	// Anthropic) — see UsageInfo's doc for the cross-provider reconciliation.
+	cachedReadTokens int
 	// doneSent is true after a terminal chunk (finishReason present) has been
 	// written. The blank SSE delimiter that follows is then converted to
 	// data: [DONE] and this flag is cleared.
@@ -136,9 +140,12 @@ type geminiResponse struct {
 		FinishReason string `json:"finishReason"`
 	} `json:"candidates"`
 	UsageMetadata struct {
-		PromptTokenCount     int `json:"promptTokenCount"`
-		CandidatesTokenCount int `json:"candidatesTokenCount"`
-		TotalTokenCount      int `json:"totalTokenCount"`
+		PromptTokenCount int `json:"promptTokenCount"`
+		// CachedContentTokenCount is a SUBSET of PromptTokenCount — see
+		// UsageInfo's doc for the cross-provider reconciliation.
+		CachedContentTokenCount int `json:"cachedContentTokenCount"`
+		CandidatesTokenCount    int `json:"candidatesTokenCount"`
+		TotalTokenCount         int `json:"totalTokenCount"`
 	} `json:"usageMetadata"`
 }
 
@@ -700,9 +707,10 @@ func (a *GeminiAdapter) TransformResponse(body []byte) ([]byte, error) {
 			},
 		},
 		Usage: openAIUsage{
-			PromptTokens:     gr.UsageMetadata.PromptTokenCount,
-			CompletionTokens: gr.UsageMetadata.CandidatesTokenCount,
-			TotalTokens:      gr.UsageMetadata.TotalTokenCount,
+			PromptTokens:        gr.UsageMetadata.PromptTokenCount,
+			CompletionTokens:    gr.UsageMetadata.CandidatesTokenCount,
+			TotalTokens:         gr.UsageMetadata.TotalTokenCount,
+			PromptTokensDetails: cacheUsageDetails(gr.UsageMetadata.CachedContentTokenCount, 0),
 		},
 	}
 
@@ -818,6 +826,9 @@ func (a *GeminiAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 	}
 	if gr.UsageMetadata.CandidatesTokenCount > 0 || hasFinish {
 		a.completionTokens = gr.UsageMetadata.CandidatesTokenCount
+	}
+	if gr.UsageMetadata.CachedContentTokenCount > 0 || hasFinish {
+		a.cachedReadTokens = gr.UsageMetadata.CachedContentTokenCount
 	}
 
 	// Drop content-free intermediate chunks that carry no delta text, no tool
@@ -967,13 +978,15 @@ func (a *GeminiAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 }
 
 // StreamUsage returns the token counts accumulated during the Gemini stream.
-// Both fields are zero until the final stream chunk (carrying usageMetadata)
-// has been processed by TransformStreamLine.
+// All fields are zero until the final stream chunk (carrying usageMetadata)
+// has been processed by TransformStreamLine. CachedReadTokens is a subset of
+// PromptTokens, not additive — see UsageInfo's doc.
 func (a *GeminiAdapter) StreamUsage() UsageInfo {
 	return UsageInfo{
 		PromptTokens:     a.promptTokens,
 		CompletionTokens: a.completionTokens,
 		TotalTokens:      a.promptTokens + a.completionTokens,
+		CachedReadTokens: a.cachedReadTokens,
 	}
 }
 

@@ -21,6 +21,12 @@ type HourlyRollup struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+	// CachedReadTokens is the subset of PromptTokens served from an upstream
+	// prompt cache, summed across the bucket.
+	CachedReadTokens int
+	// CacheWriteTokens is the subset of PromptTokens written to an upstream
+	// prompt cache (Anthropic only), summed across the bucket.
+	CacheWriteTokens int
 	CostSum          float64
 	DurationSumMS    float64
 	TTFTSumMS        float64
@@ -66,14 +72,17 @@ func (d *DB) GetHourlyUsageTotals(ctx context.Context, filter UsageFilter, since
 
 	query := "SELECT COALESCE(SUM(request_count), 0), " +
 		"COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), " +
-		"COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_sum), 0), " +
+		"COALESCE(SUM(total_tokens), 0), " +
+		"COALESCE(SUM(cached_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), " +
+		"COALESCE(SUM(cost_sum), 0), " +
 		"CASE WHEN SUM(request_count) > 0 THEN SUM(duration_sum_ms) * 1.0 / SUM(request_count) ELSE 0 END " +
 		"FROM usage_hourly WHERE " + strings.Join(conditions, " AND ")
 
 	var a UsageAggregate
 	err := d.sql.QueryRowContext(ctx, query, args...).Scan(
 		&a.TotalRequests, &a.PromptTokens, &a.CompletionTokens,
-		&a.TotalTokens, &a.CostEstimate, &a.AvgDurationMS,
+		&a.TotalTokens, &a.CachedReadTokens, &a.CacheWriteTokens,
+		&a.CostEstimate, &a.AvgDurationMS,
 	)
 	if err != nil {
 		return a, fmt.Errorf("get hourly usage totals: %w", err)
@@ -89,16 +98,20 @@ func (d *DB) UpsertUsageHourly(ctx context.Context, r HourlyRollup) error {
 	query := "INSERT INTO usage_hourly (" +
 		"org_id, team_id, user_id, key_id, model_name, bucket_hour, " +
 		"request_count, prompt_tokens, completion_tokens, total_tokens, " +
+		"cached_read_tokens, cache_write_tokens, " +
 		"cost_sum, duration_sum_ms, ttft_sum_ms, ttft_count" +
 		") VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
 		p(7) + ", " + p(8) + ", " + p(9) + ", " + p(10) + ", " +
-		p(11) + ", " + p(12) + ", " + p(13) + ", " + p(14) +
+		p(11) + ", " + p(12) + ", " +
+		p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) +
 		") ON CONFLICT (key_id, model_name, bucket_hour) DO UPDATE SET " +
 		"request_count = request_count + excluded.request_count, " +
 		"prompt_tokens = prompt_tokens + excluded.prompt_tokens, " +
 		"completion_tokens = completion_tokens + excluded.completion_tokens, " +
 		"total_tokens = total_tokens + excluded.total_tokens, " +
+		"cached_read_tokens = cached_read_tokens + excluded.cached_read_tokens, " +
+		"cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens, " +
 		"cost_sum = cost_sum + excluded.cost_sum, " +
 		"duration_sum_ms = duration_sum_ms + excluded.duration_sum_ms, " +
 		"ttft_sum_ms = ttft_sum_ms + excluded.ttft_sum_ms, " +
@@ -107,6 +120,7 @@ func (d *DB) UpsertUsageHourly(ctx context.Context, r HourlyRollup) error {
 	_, err := d.sql.ExecContext(ctx, query,
 		r.OrgID, r.TeamID, r.UserID, r.KeyID, r.ModelName, r.BucketHour,
 		r.RequestCount, r.PromptTokens, r.CompletionTokens, r.TotalTokens,
+		r.CachedReadTokens, r.CacheWriteTokens,
 		r.CostSum, r.DurationSumMS, r.TTFTSumMS, r.TTFTCount,
 	)
 	if err != nil {

@@ -193,14 +193,16 @@ func (l *Logger) flush(events []Event) error {
 	query := "INSERT INTO usage_events " +
 		"(id, key_id, key_type, org_id, team_id, user_id, service_account_id, " +
 		"model_name, prompt_tokens, completion_tokens, total_tokens, " +
+		"cached_read_tokens, cache_write_tokens, " +
 		"cost_estimate, request_duration_ms, ttft_ms, tokens_per_second, status_code, request_id, " +
 		"requested_model_name) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " +
 		p(5) + ", " + p(6) + ", " + p(7) + ", " + p(8) + ", " +
 		p(9) + ", " + p(10) + ", " + p(11) + ", " +
-		p(12) + ", " + p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " +
-		p(18) + ")"
+		p(12) + ", " + p(13) + ", " +
+		p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " + p(18) + ", " + p(19) + ", " +
+		p(20) + ")"
 
 	ctx := context.Background()
 
@@ -227,6 +229,8 @@ func (l *Logger) flush(events []Event) error {
 				ev.PromptTokens,
 				ev.CompletionTokens,
 				ev.TotalTokens,
+				ev.CachedReadTokens,
+				ev.CacheWriteTokens,
 				ev.CostEstimate,
 				ev.DurationMS,
 				ev.TTFT_MS,
@@ -270,6 +274,8 @@ func (l *Logger) flush(events []Event) error {
 		r.PromptTokens += ev.PromptTokens
 		r.CompletionTokens += ev.CompletionTokens
 		r.TotalTokens += ev.TotalTokens
+		r.CachedReadTokens += ev.CachedReadTokens
+		r.CacheWriteTokens += ev.CacheWriteTokens
 		if ev.CostEstimate != nil {
 			r.CostSum += *ev.CostEstimate
 		}

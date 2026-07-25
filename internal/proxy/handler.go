@@ -183,17 +183,23 @@ func (s *streamUsageExtractor) observe(line []byte) {
 	data := line[len("data: "):]
 	var chunk struct {
 		Usage *struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
+			PromptTokens        int               `json:"prompt_tokens"`
+			CompletionTokens    int               `json:"completion_tokens"`
+			TotalTokens         int               `json:"total_tokens"`
+			PromptTokensDetails *wireUsageDetails `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if jsonx.Unmarshal(data, &chunk) == nil && chunk.Usage != nil {
-		s.lastUsage = UsageInfo{
+		ui := UsageInfo{
 			PromptTokens:     chunk.Usage.PromptTokens,
 			CompletionTokens: chunk.Usage.CompletionTokens,
 			TotalTokens:      chunk.Usage.TotalTokens,
 		}
+		if chunk.Usage.PromptTokensDetails != nil {
+			ui.CachedReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+			ui.CacheWriteTokens = chunk.Usage.PromptTokensDetails.CacheCreationTokens
+		}
+		s.lastUsage = ui
 	}
 }
 
@@ -1896,9 +1902,32 @@ func (p *ProxyHandler) logUsageEvent(keyInfo *auth.KeyInfo, model Model, ui Usag
 	}
 
 	var cost *float64
-	if model.Pricing.InputPer1M > 0 || model.Pricing.OutputPer1M > 0 {
-		c := float64(ui.PromptTokens)/1_000_000*model.Pricing.InputPer1M +
-			float64(ui.CompletionTokens)/1_000_000*model.Pricing.OutputPer1M
+	pricing := model.Pricing
+	if pricing.InputPer1M > 0 || pricing.OutputPer1M > 0 || pricing.CachedInputPer1M > 0 || pricing.CacheWritePer1M > 0 {
+		// Fall back to the base input rate for either cache bucket when its
+		// dedicated price is unconfigured (zero). Pricing a configured bucket
+		// at zero just because the rate was never set would silently
+		// under-report cost, so the base input rate is the safe default
+		// rather than free.
+		cachedReadRate := pricing.CachedInputPer1M
+		if cachedReadRate == 0 {
+			cachedReadRate = pricing.InputPer1M
+		}
+		cacheWriteRate := pricing.CacheWritePer1M
+		if cacheWriteRate == 0 {
+			cacheWriteRate = pricing.InputPer1M
+		}
+		// fresh is the portion of PromptTokens that is neither a cache read
+		// nor a cache write. Clamped at zero in case an upstream reports
+		// cache buckets that add up to more than PromptTokens.
+		fresh := ui.PromptTokens - ui.CachedReadTokens - ui.CacheWriteTokens
+		if fresh < 0 {
+			fresh = 0
+		}
+		c := float64(fresh)/1_000_000*pricing.InputPer1M +
+			float64(ui.CachedReadTokens)/1_000_000*cachedReadRate +
+			float64(ui.CacheWriteTokens)/1_000_000*cacheWriteRate +
+			float64(ui.CompletionTokens)/1_000_000*pricing.OutputPer1M
 		cost = &c
 	}
 
@@ -1920,6 +1949,8 @@ func (p *ProxyHandler) logUsageEvent(keyInfo *auth.KeyInfo, model Model, ui Usag
 		PromptTokens:       ui.PromptTokens,
 		CompletionTokens:   ui.CompletionTokens,
 		TotalTokens:        ui.TotalTokens,
+		CachedReadTokens:   ui.CachedReadTokens,
+		CacheWriteTokens:   ui.CacheWriteTokens,
 		CostEstimate:       cost,
 		DurationMS:         durationMS,
 		TTFT_MS:            ttftMS,
@@ -1930,6 +1961,8 @@ func (p *ProxyHandler) logUsageEvent(keyInfo *auth.KeyInfo, model Model, ui Usag
 
 	metrics.TokensTotal.WithLabelValues(model.Name, "prompt").Add(float64(ui.PromptTokens))
 	metrics.TokensTotal.WithLabelValues(model.Name, "completion").Add(float64(ui.CompletionTokens))
+	metrics.TokensTotal.WithLabelValues(model.Name, "cached_read").Add(float64(ui.CachedReadTokens))
+	metrics.TokensTotal.WithLabelValues(model.Name, "cache_write").Add(float64(ui.CacheWriteTokens))
 }
 
 // deploymentKey returns the circuit breaker / health-checker lookup key for a
@@ -2102,25 +2135,47 @@ func clampCooldown(d time.Duration) time.Duration {
 	return d
 }
 
+// wireUsageDetails is the JSON shape of usage.prompt_tokens_details as
+// emitted by extractUsage's callers (the raw upstream body for passthrough
+// providers, or the adapter's OpenAI-shaped TransformResponse output for
+// Anthropic/Gemini). CachedTokens follows the real OpenAI/Gemini field
+// (usage.prompt_tokens_details.cached_tokens): a subset of prompt_tokens
+// served from cache. CacheCreationTokens is a proxy-internal extension with
+// no OpenAI equivalent, added alongside it so that Anthropic's cache-write
+// count (cache_creation_input_tokens) survives the adapter's response
+// transform and can be recovered here without inventing a second top-level
+// object.
+type wireUsageDetails struct {
+	CachedTokens        int `json:"cached_tokens"`
+	CacheCreationTokens int `json:"cache_creation_tokens"`
+}
+
 // extractUsage parses token counts from a non-streaming OpenAI-format response
 // body. Returns a zero UsageInfo when the body cannot be parsed or carries no
-// usage field.
+// usage field. See wireUsageDetails for how cached/cache-write counts are
+// recovered from the wire format.
 func extractUsage(body []byte) UsageInfo {
 	var resp struct {
 		Usage *struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
+			PromptTokens        int               `json:"prompt_tokens"`
+			CompletionTokens    int               `json:"completion_tokens"`
+			TotalTokens         int               `json:"total_tokens"`
+			PromptTokensDetails *wireUsageDetails `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if jsonx.Unmarshal(body, &resp) != nil || resp.Usage == nil {
 		return UsageInfo{}
 	}
-	return UsageInfo{
+	ui := UsageInfo{
 		PromptTokens:     resp.Usage.PromptTokens,
 		CompletionTokens: resp.Usage.CompletionTokens,
 		TotalTokens:      resp.Usage.TotalTokens,
 	}
+	if resp.Usage.PromptTokensDetails != nil {
+		ui.CachedReadTokens = resp.Usage.PromptTokensDetails.CachedTokens
+		ui.CacheWriteTokens = resp.Usage.PromptTokensDetails.CacheCreationTokens
+	}
+	return ui
 }
 
 // mutateRequestBody applies model name replacement and optional stream_options

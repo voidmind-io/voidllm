@@ -48,13 +48,43 @@ func isForwardedPseudonym(s string) bool {
 // For non-streaming responses the counts come from the response JSON; for
 // streaming responses they are accumulated by the adapter during
 // TransformStreamLine calls.
+//
+// PromptTokens always means ALL prompt tokens, inclusive of any cached ones,
+// for every provider — this is the one normalized meaning the proxy exposes
+// regardless of how the upstream itself counts. Providers do not agree on
+// how cached tokens relate to their own prompt-token total, and adapters are
+// responsible for reconciling that before returning UsageInfo:
+//
+//   - OpenAI: usage.prompt_tokens_details.cached_tokens is already a SUBSET
+//     of prompt_tokens. PromptTokens is used as reported; CachedReadTokens is
+//     the subset within it.
+//   - Gemini: usageMetadata.cachedContentTokenCount is likewise a SUBSET of
+//     promptTokenCount. Same handling as OpenAI.
+//   - Anthropic: cache_read_input_tokens and cache_creation_input_tokens are
+//     reported IN ADDITION TO input_tokens (not a subset). The Anthropic
+//     adapter adds both into PromptTokens (and TotalTokens) so that
+//     PromptTokens carries the same all-inclusive meaning as every other
+//     provider; CachedReadTokens and CacheWriteTokens still report the
+//     individual buckets for pricing.
 type UsageInfo struct {
-	// PromptTokens is the number of input tokens consumed.
+	// PromptTokens is the number of input tokens consumed, inclusive of any
+	// cached-read or cache-write tokens. See the type-level doc for the
+	// per-provider reconciliation this field represents.
 	PromptTokens int
 	// CompletionTokens is the number of output tokens produced.
 	CompletionTokens int
 	// TotalTokens is the sum of prompt and completion tokens.
 	TotalTokens int
+	// CachedReadTokens is the subset of PromptTokens that were served from an
+	// upstream prompt cache rather than freshly processed. Billed below the
+	// normal input rate. Zero when the provider reports no cache read or the
+	// adapter cannot extract it.
+	CachedReadTokens int
+	// CacheWriteTokens is the subset of PromptTokens that were written to an
+	// upstream prompt cache (Anthropic's cache_creation_input_tokens). Billed
+	// above the normal input rate. Always zero for providers without a
+	// cache-write concept (OpenAI, Gemini).
+	CacheWriteTokens int
 }
 
 // Adapter transforms requests and responses between the client's OpenAI-compatible

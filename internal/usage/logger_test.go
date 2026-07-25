@@ -262,6 +262,86 @@ func TestLog_AllFieldsStored(t *testing.T) {
 	}
 }
 
+// TestLog_CachedTokensStored verifies that CachedReadTokens and
+// CacheWriteTokens round-trip through flush() into the cached_read_tokens and
+// cache_write_tokens columns, extending the TestLog_AllFieldsStored precedent
+// (see also TestLog_RequestedModelNameStored) to the two columns added by
+// migration 0016 for #179.
+func TestLog_CachedTokensStored(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		cachedRead     int
+		cacheWrite     int
+		wantCachedRead int
+		wantCacheWrite int
+	}{
+		{
+			name:           "both zero (no cache activity) stored as zero, not NULL",
+			cachedRead:     0,
+			cacheWrite:     0,
+			wantCachedRead: 0,
+			wantCacheWrite: 0,
+		},
+		{
+			name:           "cached-read only (OpenAI/Gemini shape)",
+			cachedRead:     40,
+			cacheWrite:     0,
+			wantCachedRead: 40,
+			wantCacheWrite: 0,
+		},
+		{
+			name:           "cache-write only (Anthropic cache-creation shape)",
+			cachedRead:     0,
+			cacheWrite:     25,
+			wantCachedRead: 0,
+			wantCacheWrite: 25,
+		},
+		{
+			name:           "both cached-read and cache-write (Anthropic mixed shape)",
+			cachedRead:     40,
+			cacheWrite:     25,
+			wantCachedRead: 40,
+			wantCacheWrite: 25,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dsn := "file:TestLog_CachedTokensStored_" + sanitizeDSNName(tc.name) + "?mode=memory&cache=private"
+			d := openTestDB(t, dsn)
+			l := newTestLogger(d, defaultCfg())
+			l.Start()
+
+			ev := makeEvent()
+			ev.CachedReadTokens = tc.cachedRead
+			ev.CacheWriteTokens = tc.cacheWrite
+
+			l.Log(ev)
+			stopAndWait(t, l, d, 1)
+
+			ctx := context.Background()
+			row := d.SQL().QueryRowContext(ctx,
+				"SELECT cached_read_tokens, cache_write_tokens FROM usage_events LIMIT 1")
+
+			var cachedRead, cacheWrite int
+			if err := row.Scan(&cachedRead, &cacheWrite); err != nil {
+				t.Fatalf("Scan: %v", err)
+			}
+
+			if cachedRead != tc.wantCachedRead {
+				t.Errorf("cached_read_tokens = %d, want %d", cachedRead, tc.wantCachedRead)
+			}
+			if cacheWrite != tc.wantCacheWrite {
+				t.Errorf("cache_write_tokens = %d, want %d", cacheWrite, tc.wantCacheWrite)
+			}
+		})
+	}
+}
+
 // TestLog_NullableFields verifies NULL vs. non-NULL storage for the six
 // optional columns: team_id, user_id, service_account_id, cost_estimate,
 // ttft_ms, and tokens_per_second.
@@ -692,5 +772,62 @@ func TestLog_TokenCounterUpdatedBeforeFlush(t *testing.T) {
 	// Confirm the DB row is not yet written (flush has not fired).
 	if got := countRows(t, d); got != 0 {
 		t.Errorf("usage_events row count before flush = %d, want 0 (counter updated before DB write)", got)
+	}
+}
+
+// TestLog_TokenCounterConsumesFullAnthropicShapedTotal verifies that an
+// Anthropic-shaped event — where PromptTokens already includes the cache-read
+// tokens the adapter folded in (see AnthropicAdapter.TransformResponse /
+// StreamUsage) — is counted against the token budget by its full TotalTokens,
+// not just the "fresh" portion. Before the #179 fix, an Anthropic response
+// with heavy cache reads would have under-reported PromptTokens/TotalTokens
+// by exactly the cached amount, which would have under-consumed the budget
+// here (a caller could exceed their real token spend before CheckTokens
+// blocked them). This test uses realistic Anthropic-shaped numbers: 10 fresh
+// input tokens + 50 cache-read tokens + 40 completion tokens = 100 total.
+func TestLog_TokenCounterConsumesFullAnthropicShapedTotal(t *testing.T) {
+	t.Parallel()
+
+	d := openTestDB(t, "file:TestLog_TokenCounterConsumesFullAnthropicShapedTotal?mode=memory&cache=private")
+
+	counter := ratelimit.NewTokenCounter()
+	cfg := defaultCfg()
+	l := NewLogger(d, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), counter)
+	l.Start()
+	defer l.Stop()
+
+	// Mirrors what logUsageEvent builds for an Anthropic response with cache
+	// reads: PromptTokens (10 + 50 = 60) already has the cache tokens folded
+	// in, CachedReadTokens carries the individual bucket for pricing, and
+	// TotalTokens is PromptTokens + CompletionTokens.
+	ev := Event{
+		KeyID:            "anthropic-cache-key",
+		KeyType:          "user_key",
+		OrgID:            "anthropic-cache-org",
+		ModelName:        "claude-3-5-sonnet",
+		PromptTokens:     60,
+		CompletionTokens: 40,
+		TotalTokens:      100,
+		CachedReadTokens: 50,
+		StatusCode:       200,
+	}
+
+	l.Log(ev)
+
+	// A 99-token budget must already be considered exceeded: if the counter
+	// only tracked the "fresh" 10 input tokens (the pre-fix, under-reported
+	// figure) plus 40 completion tokens = 50, this budget would incorrectly
+	// still have headroom.
+	keyLimitsExceeded := ratelimit.Limits{DailyTokenLimit: 99}
+	noLimits := ratelimit.Limits{}
+	if err := counter.CheckTokens("anthropic-cache-key", "", "anthropic-cache-org", keyLimitsExceeded, noLimits, noLimits); err == nil {
+		t.Error("CheckTokens() = nil, want ErrTokenBudgetExceeded (full 100-token total, including cache reads, must be counted)")
+	}
+
+	// A budget of exactly 100 (the correct, fully-inclusive total) must not
+	// yet be exceeded — this distinguishes "counts the full total" from "over-counts".
+	keyLimitsExact := ratelimit.Limits{DailyTokenLimit: 101}
+	if err := counter.CheckTokens("anthropic-cache-key", "", "anthropic-cache-org", keyLimitsExact, noLimits, noLimits); err != nil {
+		t.Errorf("CheckTokens() with limit 101 = %v, want nil (100 tokens < limit 101)", err)
 	}
 }

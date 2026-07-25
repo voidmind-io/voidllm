@@ -194,6 +194,18 @@ func (m ModelConfig) LogValue() slog.Value {
 type PricingConfig struct {
 	InputPer1M  float64 `yaml:"input_per_1m"`
 	OutputPer1M float64 `yaml:"output_per_1m"`
+	// CachedInputPer1M is the price per million cached-read prompt tokens
+	// (tokens served from an upstream prompt cache). Zero means "not
+	// configured"; the cost formula falls back to InputPer1M for that bucket
+	// rather than pricing it at zero.
+	CachedInputPer1M float64 `yaml:"cached_input_per_1m"`
+	// CacheWritePer1M is the price per million cache-write prompt tokens
+	// (Anthropic's cache_creation_input_tokens — tokens spent populating the
+	// prompt cache, billed above the normal input rate). Zero means "not
+	// configured"; the cost formula falls back to InputPer1M for that bucket.
+	// Always zero-cost in practice for providers without a cache-write
+	// concept (OpenAI, Gemini), since they never report cache-write tokens.
+	CacheWritePer1M float64 `yaml:"cache_write_per_1m"`
 }
 
 // LoggingConfig controls log output level and format.

@@ -391,14 +391,19 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			}
 
 			registry.AddModel(proxy.Model{
-				Name:              m.Name,
-				Provider:          m.Provider,
-				Type:              modelType,
-				BaseURL:           m.BaseURL,
-				APIKey:            apiKey,
-				Aliases:           aliases,
-				MaxContextTokens:  m.MaxContextTokens,
-				Pricing:           config.PricingConfig{InputPer1M: m.InputPricePer1M, OutputPer1M: m.OutputPricePer1M},
+				Name:             m.Name,
+				Provider:         m.Provider,
+				Type:             modelType,
+				BaseURL:          m.BaseURL,
+				APIKey:           apiKey,
+				Aliases:          aliases,
+				MaxContextTokens: m.MaxContextTokens,
+				Pricing: config.PricingConfig{
+					InputPer1M:       m.InputPricePer1M,
+					OutputPer1M:      m.OutputPricePer1M,
+					CachedInputPer1M: db.Float64Value(m.CachedInputPricePer1M),
+					CacheWritePer1M:  db.Float64Value(m.CacheWritePricePer1M),
+				},
 				AzureDeployment:   m.AzureDeployment,
 				AzureAPIVersion:   m.AzureAPIVersion,
 				GCPProject:        m.GCPProject,

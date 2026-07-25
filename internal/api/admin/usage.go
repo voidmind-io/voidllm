@@ -22,12 +22,18 @@ type usageResponse struct {
 
 // usageDataPoint holds aggregated metrics for one group within a usage response.
 type usageDataPoint struct {
-	GroupKey         string  `json:"group_key,omitempty"`
-	GroupLabel       string  `json:"group_label,omitempty"`
-	TotalRequests    int64   `json:"total_requests"`
-	PromptTokens     int64   `json:"prompt_tokens"`
-	CompletionTokens int64   `json:"completion_tokens"`
-	TotalTokens      int64   `json:"total_tokens"`
+	GroupKey         string `json:"group_key,omitempty"`
+	GroupLabel       string `json:"group_label,omitempty"`
+	TotalRequests    int64  `json:"total_requests"`
+	PromptTokens     int64  `json:"prompt_tokens"`
+	CompletionTokens int64  `json:"completion_tokens"`
+	TotalTokens      int64  `json:"total_tokens"`
+	// CachedReadTokens is the subset of PromptTokens served from an upstream
+	// prompt cache.
+	CachedReadTokens int64 `json:"cached_read_tokens"`
+	// CacheWriteTokens is the subset of PromptTokens written to an upstream
+	// prompt cache (Anthropic only).
+	CacheWriteTokens int64   `json:"cache_write_tokens"`
 	CostEstimate     float64 `json:"cost_estimate"`
 	AvgDurationMS    float64 `json:"avg_duration_ms"`
 }
@@ -152,6 +158,8 @@ func aggregatesToDataPoints(aggs []db.UsageAggregate) []usageDataPoint {
 			PromptTokens:     a.PromptTokens,
 			CompletionTokens: a.CompletionTokens,
 			TotalTokens:      a.TotalTokens,
+			CachedReadTokens: a.CachedReadTokens,
+			CacheWriteTokens: a.CacheWriteTokens,
 			CostEstimate:     a.CostEstimate,
 			AvgDurationMS:    a.AvgDurationMS,
 		}

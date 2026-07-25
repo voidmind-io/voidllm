@@ -16,6 +16,7 @@ import (
 // It must match the scan order in scanModel exactly.
 const modelSelectColumns = "id, name, provider, model_type, base_url, api_key_encrypted, " +
 	"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
+	"cached_input_price_per_1m, cache_write_price_per_1m, " +
 	"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
 	"is_active, source, created_by, created_at, updated_at, deleted_at, aliases, timeout, " +
 	"strategy, max_retries, fallback_model_id, pii_filter"
@@ -33,8 +34,17 @@ type Model struct {
 	MaxContextTokens int
 	InputPricePer1M  float64
 	OutputPricePer1M float64
-	AzureDeployment  string
-	AzureAPIVersion  string
+	// CachedInputPricePer1M is the price per million cached-read prompt
+	// tokens. Nil means not configured (NULL in the DB) — this is genuinely
+	// nullable, unlike InputPricePer1M/OutputPricePer1M, because migration
+	// 0016 added this column without backfilling existing rows.
+	CachedInputPricePer1M *float64
+	// CacheWritePricePer1M is the price per million cache-write prompt
+	// tokens (Anthropic only). Nil means not configured (NULL in the DB);
+	// see CachedInputPricePer1M's doc for why this field is a pointer.
+	CacheWritePricePer1M *float64
+	AzureDeployment      string
+	AzureAPIVersion      string
 	// GCPProject is the Google Cloud project ID. Non-empty only for provider "vertex".
 	GCPProject string
 	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
@@ -77,8 +87,15 @@ type CreateModelParams struct {
 	MaxContextTokens int
 	InputPricePer1M  float64
 	OutputPricePer1M float64
-	AzureDeployment  string
-	AzureAPIVersion  string
+	// CachedInputPricePer1M is the price per million cached-read prompt
+	// tokens. Zero means "not configured"; new rows always store an explicit
+	// value here (never SQL NULL), matching InputPricePer1M/OutputPricePer1M.
+	CachedInputPricePer1M float64
+	// CacheWritePricePer1M is the price per million cache-write prompt
+	// tokens (Anthropic only). Zero means "not configured".
+	CacheWritePricePer1M float64
+	AzureDeployment      string
+	AzureAPIVersion      string
 	// GCPProject is the Google Cloud project ID. Required when Provider is "vertex".
 	GCPProject string
 	// GCPLocation is the Google Cloud region. Required when Provider is "vertex".
@@ -116,8 +133,15 @@ type UpdateModelParams struct {
 	MaxContextTokens *int
 	InputPricePer1M  *float64
 	OutputPricePer1M *float64
-	AzureDeployment  *string
-	AzureAPIVersion  *string
+	// CachedInputPricePer1M, when non-nil, replaces the stored cached-read
+	// price. Set to a pointer to 0 to explicitly configure "no cache
+	// discount"; there is no separate clear-to-NULL mechanism, matching
+	// InputPricePer1M/OutputPricePer1M.
+	CachedInputPricePer1M *float64
+	// CacheWritePricePer1M, when non-nil, replaces the stored cache-write price.
+	CacheWritePricePer1M *float64
+	AzureDeployment      *string
+	AzureAPIVersion      *string
 	// GCPProject, when non-nil, replaces the stored Google Cloud project ID.
 	GCPProject *string
 	// GCPLocation, when non-nil, replaces the stored Google Cloud region.
@@ -181,15 +205,17 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 	insertQuery := "INSERT INTO models " +
 		"(id, name, provider, model_type, base_url, api_key_encrypted, " +
 		"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
+		"cached_input_price_per_1m, cache_write_price_per_1m, " +
 		"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
 		"is_active, source, created_by, aliases, timeout, strategy, max_retries, " +
 		"fallback_model_id, pii_filter, created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
 		p(7) + ", " + p(8) + ", " + p(9) + ", " +
-		p(10) + ", " + p(11) + ", " + p(12) + ", " + p(13) + ", " +
-		"1, " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " + p(18) + ", " + p(19) + ", " +
-		p(20) + ", " + p(21) + ", " +
+		p(10) + ", " + p(11) + ", " +
+		p(12) + ", " + p(13) + ", " + p(14) + ", " + p(15) + ", " +
+		"1, " + p(16) + ", " + p(17) + ", " + p(18) + ", " + p(19) + ", " + p(20) + ", " + p(21) + ", " +
+		p(22) + ", " + p(23) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + modelSelectColumns +
@@ -207,6 +233,8 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 			params.MaxContextTokens,
 			params.InputPricePer1M,
 			params.OutputPricePer1M,
+			params.CachedInputPricePer1M,
+			params.CacheWritePricePer1M,
 			params.AzureDeployment,
 			params.AzureAPIVersion,
 			params.GCPProject,
@@ -366,6 +394,16 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 	if params.OutputPricePer1M != nil {
 		setClauses = append(setClauses, "output_price_per_1m = "+p(argN))
 		args = append(args, *params.OutputPricePer1M)
+		argN++
+	}
+	if params.CachedInputPricePer1M != nil {
+		setClauses = append(setClauses, "cached_input_price_per_1m = "+p(argN))
+		args = append(args, *params.CachedInputPricePer1M)
+		argN++
+	}
+	if params.CacheWritePricePer1M != nil {
+		setClauses = append(setClauses, "cache_write_price_per_1m = "+p(argN))
+		args = append(args, *params.CacheWritePricePer1M)
 		argN++
 	}
 	if params.AzureDeployment != nil {
@@ -583,6 +621,17 @@ func boolPtrToNullableInt(v *bool) any {
 	return 0
 }
 
+// Float64Value dereferences a nullable price pointer, returning 0 when v is
+// nil. It bridges a DB-nullable price column (NULL = not configured) into a
+// plain float64 consumer such as config.PricingConfig, which uses 0 as its
+// own "not configured" sentinel.
+func Float64Value(v *float64) float64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
 // nullableIntToBoolPtr converts a nullable integer column value (scanned as
 // *int64) back to a *bool. A nil pointer (NULL column) returns nil; 1 returns
 // a pointer to true; any other value returns a pointer to false.
@@ -603,6 +652,7 @@ func scanModel(scanner interface{ Scan(...any) error }) (*Model, error) {
 	err := scanner.Scan(
 		&m.ID, &m.Name, &m.Provider, &m.ModelType, &m.BaseURL, &m.APIKeyEncrypted,
 		&m.MaxContextTokens, &m.InputPricePer1M, &m.OutputPricePer1M,
+		&m.CachedInputPricePer1M, &m.CacheWritePricePer1M,
 		&m.AzureDeployment, &m.AzureAPIVersion, &m.GCPProject, &m.GCPLocation,
 		&isActiveInt, &m.Source, &m.CreatedBy,
 		&m.CreatedAt, &m.UpdatedAt, &m.DeletedAt, &m.Aliases, &m.Timeout,
@@ -672,23 +722,25 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 			strategy := m.Strategy
 			maxRetries := m.MaxRetries
 			created, createErr := d.CreateModel(ctx, CreateModelParams{
-				Name:             m.Name,
-				Provider:         m.Provider,
-				ModelType:        &modelType,
-				BaseURL:          m.BaseURL,
-				MaxContextTokens: m.MaxContextTokens,
-				InputPricePer1M:  m.Pricing.InputPer1M,
-				OutputPricePer1M: m.Pricing.OutputPer1M,
-				AzureDeployment:  m.AzureDeployment,
-				AzureAPIVersion:  m.AzureAPIVersion,
-				GCPProject:       m.GCPProject,
-				GCPLocation:      m.GCPLocation,
-				Source:           "yaml",
-				Aliases:          aliases,
-				Timeout:          m.Timeout,
-				Strategy:         &strategy,
-				MaxRetries:       &maxRetries,
-				PIIFilter:        m.PIIFilter,
+				Name:                  m.Name,
+				Provider:              m.Provider,
+				ModelType:             &modelType,
+				BaseURL:               m.BaseURL,
+				MaxContextTokens:      m.MaxContextTokens,
+				InputPricePer1M:       m.Pricing.InputPer1M,
+				OutputPricePer1M:      m.Pricing.OutputPer1M,
+				CachedInputPricePer1M: m.Pricing.CachedInputPer1M,
+				CacheWritePricePer1M:  m.Pricing.CacheWritePer1M,
+				AzureDeployment:       m.AzureDeployment,
+				AzureAPIVersion:       m.AzureAPIVersion,
+				GCPProject:            m.GCPProject,
+				GCPLocation:           m.GCPLocation,
+				Source:                "yaml",
+				Aliases:               aliases,
+				Timeout:               m.Timeout,
+				Strategy:              &strategy,
+				MaxRetries:            &maxRetries,
+				PIIFilter:             m.PIIFilter,
 			})
 			if createErr != nil {
 				return fmt.Errorf("sync yaml models: create %s: %w", m.Name, createErr)
@@ -732,6 +784,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 		maxCtx := m.MaxContextTokens
 		inputPrice := m.Pricing.InputPer1M
 		outputPrice := m.Pricing.OutputPer1M
+		cachedInputPrice := m.Pricing.CachedInputPer1M
+		cacheWritePrice := m.Pricing.CacheWritePer1M
 		azureDeploy := m.AzureDeployment
 		azureVersion := m.AzureAPIVersion
 		gcpProject := m.GCPProject
@@ -741,21 +795,23 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 		maxRetries := m.MaxRetries
 
 		params := UpdateModelParams{
-			Name:             &name,
-			Provider:         &provider,
-			ModelType:        &modelType,
-			BaseURL:          &baseURL,
-			MaxContextTokens: &maxCtx,
-			InputPricePer1M:  &inputPrice,
-			OutputPricePer1M: &outputPrice,
-			AzureDeployment:  &azureDeploy,
-			AzureAPIVersion:  &azureVersion,
-			GCPProject:       &gcpProject,
-			GCPLocation:      &gcpLocation,
-			Aliases:          &aliases,
-			Timeout:          &timeout,
-			Strategy:         &strategy,
-			MaxRetries:       &maxRetries,
+			Name:                  &name,
+			Provider:              &provider,
+			ModelType:             &modelType,
+			BaseURL:               &baseURL,
+			MaxContextTokens:      &maxCtx,
+			InputPricePer1M:       &inputPrice,
+			OutputPricePer1M:      &outputPrice,
+			CachedInputPricePer1M: &cachedInputPrice,
+			CacheWritePricePer1M:  &cacheWritePrice,
+			AzureDeployment:       &azureDeploy,
+			AzureAPIVersion:       &azureVersion,
+			GCPProject:            &gcpProject,
+			GCPLocation:           &gcpLocation,
+			Aliases:               &aliases,
+			Timeout:               &timeout,
+			Strategy:              &strategy,
+			MaxRetries:            &maxRetries,
 			// Sync the YAML pii_filter value. If the YAML does not set pii_filter
 			// (nil), we clear the column back to NULL so that a previously-set
 			// value does not persist after the YAML flag is removed.
