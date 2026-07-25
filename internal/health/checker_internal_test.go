@@ -1,10 +1,12 @@
 package health
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/voidmind-io/voidllm/internal/config"
@@ -150,5 +152,86 @@ func TestRunOne_NotApplicable_ClearsOnlyOwnError(t *testing.T) {
 	}
 	if mh.FunctionalError != wantFunctionalError {
 		t.Errorf("FunctionalError = %q, want %q (must be unchanged by the models-level transition)", mh.FunctionalError, wantFunctionalError)
+	}
+}
+
+// TestRunOne_ConcurrentLevels_NoLostUpdate drives all three probe levels for
+// the SAME key concurrently, many times, and asserts that every level's
+// result survives in the final stored ModelHealth.
+//
+// runOne's sequence — Load the existing snapshot, copy it, mutate only the
+// calling level's field, then Store — is safe against concurrent mutation of
+// the same struct (copy-on-write), but without Checker.mu it is not safe
+// against a lost update: two levels can both Load the same old snapshot
+// before either has Stored, and whichever Store lands second silently
+// discards the field the other level just wrote, because it was built from a
+// copy that predates that write. That is a lost update, not a data race, so
+// -race alone cannot catch it — only asserting on the resulting state can.
+//
+// A single httptest.Server gives each level a distinct, deterministic
+// outcome by request path: the health probe hits the server root and always
+// succeeds (any response counts as reachable), "/models" returns 500 so the
+// models-list probe fails, and "/chat/completions" returns 200 so the
+// functional probe succeeds. That lets the assertions check not merely that
+// each field is non-nil but that it holds the *correct* per-level outcome —
+// ruling out a bug where one level's result leaks into another's field, not
+// just a bug where a field goes missing.
+func TestRunOne_ConcurrentLevels_NoLostUpdate(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	reg, err := proxy.NewRegistry(nil)
+	if err != nil {
+		t.Fatalf("proxy.NewRegistry: %v", err)
+	}
+	c := NewChecker(reg, config.HealthCheckConfig{}, newDiscardLogger())
+
+	const iterations = 300
+	for i := 0; i < iterations; i++ {
+		key := fmt.Sprintf("concurrent-model-%d", i)
+		target := probeTarget{
+			key:       key,
+			modelName: key,
+			provider:  "openai",
+			baseURL:   srv.URL,
+			modelType: "chat",
+		}
+
+		// Start all three levels as close to simultaneously as possible so
+		// their runOne calls race to update the same key.
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for _, lvl := range []probeLevel{levelHealth, levelModels, levelFunctional} {
+			wg.Add(1)
+			go func(lvl probeLevel) {
+				defer wg.Done()
+				<-start
+				c.runOne(target, lvl)
+			}(lvl)
+		}
+		close(start)
+		wg.Wait()
+
+		mh, ok := c.GetHealth(key)
+		if !ok {
+			t.Fatalf("iteration %d: GetHealth(%q) returned false after all three levels ran", i, key)
+		}
+		if mh.HealthOK == nil || !*mh.HealthOK {
+			t.Errorf("iteration %d: HealthOK = %v, want non-nil true (lost update clobbered the health level's result)", i, mh.HealthOK)
+		}
+		if mh.ModelsOK == nil || *mh.ModelsOK {
+			t.Errorf("iteration %d: ModelsOK = %v, want non-nil false (lost update clobbered the models level's result)", i, mh.ModelsOK)
+		}
+		if mh.FunctionalOK == nil || !*mh.FunctionalOK {
+			t.Errorf("iteration %d: FunctionalOK = %v, want non-nil true (lost update clobbered the functional level's result)", i, mh.FunctionalOK)
+		}
 	}
 }

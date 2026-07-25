@@ -118,12 +118,27 @@ type ModelHealth struct {
 // Checker periodically probes all models registered in the proxy.Registry at
 // up to three configurable levels and stores the results in memory. All methods
 // are safe for concurrent use.
+//
+// results is a sync.Map so that GetHealth and GetAllHealth stay lock-free on
+// the request hot path. mu protects only the load-copy-mutate-store sequence
+// in runOne: up to three probe levels (health, models, functional) run on
+// independent tickers and can race to update the same key, and without
+// serialization one level's Store can silently overwrite a concurrent
+// update from another level (a lost update, not a data race — copying the
+// struct before mutating already prevents the latter). Readers never take
+// mu; they only ever observe a fully-formed *ModelHealth that runOne
+// published after releasing it.
 type Checker struct {
 	registry *proxy.Registry
 	results  sync.Map // map[string]*ModelHealth — keyed by probeTarget.key, replaced atomically
-	cfg      config.HealthCheckConfig
-	client   *http.Client
-	log      *slog.Logger
+	// mu serializes the read-modify-write sequence in runOne across
+	// concurrently running probe levels. It is never held during network
+	// I/O (execProbe) and is never taken by readers (GetHealth,
+	// GetAllHealth) — see the Checker doc comment.
+	mu     sync.Mutex
+	cfg    config.HealthCheckConfig
+	client *http.Client
+	log    *slog.Logger
 }
 
 // NewChecker constructs a Checker that will probe the models in registry
@@ -151,7 +166,9 @@ func NewChecker(registry *proxy.Registry, cfg config.HealthCheckConfig, log *slo
 // within a multi-deployment model key is "modelName/deploymentName". It
 // returns nil and false when the target has not yet been probed.
 // The returned pointer is safe to read without further synchronization —
-// stored values are never mutated after being placed in the map.
+// stored values are never mutated after being placed in the map. This holds
+// even though writers serialize on Checker.mu: GetHealth intentionally does
+// not acquire it, since the map only ever holds fully-formed snapshots.
 func (c *Checker) GetHealth(key string) (*ModelHealth, bool) {
 	v, ok := c.results.Load(key)
 	if !ok {
@@ -263,21 +280,31 @@ func (c *Checker) runAll(level probeLevel) {
 }
 
 // runOne executes a single probe for the given target at the given level and
-// atomically replaces the stored ModelHealth using copy-on-write to avoid data
-// races.
+// atomically replaces the stored ModelHealth using copy-on-write.
 func (c *Checker) runOne(t probeTarget, level probeLevel) {
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 
 	latencyMs, err := execProbe(ctx, c.client, t, level)
 
+	// From here on we only touch in-memory state — no network I/O — so hold
+	// mu for the remainder of the function. Health, models, and functional
+	// probes run on independent tickers and can reach this point for the
+	// same key concurrently; without the lock, two levels could both load
+	// the same old snapshot and the second Store would silently discard the
+	// first level's update (a lost update). Copy-on-write alone prevents a
+	// data race on the struct fields, but not this lost-update race between
+	// levels — mu is what serializes the load-copy-mutate-store sequence.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	// Load existing or create a zero value to copy from.
 	existing, _ := c.results.LoadOrStore(t.key, &ModelHealth{ModelName: t.key, Status: "unknown"})
 	old := existing.(*ModelHealth)
 
-	// Copy-on-write: mutate the copy, then store atomically. This eliminates
-	// the data race that would occur if multiple probe-level goroutines
-	// mutated the same *ModelHealth in place.
+	// Copy-on-write: mutate the copy, then store atomically, so a concurrent
+	// reader that already holds the old pointer (see GetHealth) never
+	// observes a partially-updated struct.
 	updated := *old
 	updated.LastCheck = time.Now().UTC()
 
