@@ -278,8 +278,13 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
           closeDropdownRef.current()
           return
         }
-        const menuHeight =
-          menuRef.current?.getBoundingClientRect().height ?? ESTIMATED_MENU_HEIGHT
+        // scrollHeight, not the rendered height: the rendered box is already
+        // capped by the maxHeight from the previous pass, so feeding it back
+        // in would make a menu that had been shortened to fit look as though
+        // it fits, and it would never flip to the roomier side. scrollHeight
+        // is the natural content height, which is what the flip decision
+        // needs.
+        const menuHeight = menuRef.current?.scrollHeight ?? ESTIMATED_MENU_HEIGHT
         positionMenu(menuHeight)
       }
 

@@ -973,6 +973,59 @@ describe('Select', () => {
         `${Math.min(spaceBelowShrunk, ESTIMATED_MENU_HEIGHT)}px`,
       )
     })
+
+    it("flips to the roomier side using the menu's natural content height, not the previously clamped rendered height", async () => {
+      // Regression test: the tracking effect must measure the menu's
+      // natural content height (scrollHeight) when deciding whether to
+      // flip sides on re-measure, not the CSS-clamped rendered height. A
+      // menu that was shortened to fit below on a previous pass would
+      // otherwise always look like it still fits below, and never flip to
+      // a side with genuinely more room.
+      const innerHeight = 200
+      vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(innerHeight)
+      renderSelect()
+      const trigger = screen.getByRole('combobox')
+
+      // Trigger sits near the top: below has plenty of room relative to
+      // the pre-paint ESTIMATED_MENU_HEIGHT estimate used for this first,
+      // synchronous placement (so the menu opens below, unflipped), but
+      // not enough to fit the larger natural content height stubbed below.
+      stubRect(trigger, { left: 40, top: 50, right: 240, bottom: 80, width: 200, height: 30 })
+      await userEvent.click(trigger)
+      const listbox = screen.getByRole('listbox')
+      // Opened below, with its maxHeight clamped to the (smaller than a
+      // full 240px menu) space actually available below — this is the
+      // "clamped rendered height" the old code would have fed straight
+      // back into the next measurement.
+      expect(listbox.style.top).toBe('84px')
+      expect(listbox.style.bottom).toBe('')
+      expect(listbox.style.maxHeight).toBe('108px')
+
+      // jsdom performs no layout, so scrollHeight is always 0 on any
+      // element unless explicitly stubbed. Define it on the rendered
+      // listbox to stand in for its real (natural, unclamped) content
+      // height, which is what the flip decision is supposed to use.
+      Object.defineProperty(listbox, 'scrollHeight', {
+        configurable: true,
+        value: 150,
+      })
+
+      // Move the trigger down: below now has almost no room (5px) while
+      // above has plenty (141px) — clearly the roomier side.
+      stubRect(trigger, { left: 40, top: 153, right: 240, bottom: 183, width: 200, height: 30 })
+      fireEvent.resize(window)
+
+      // With the natural content height (150) fed into the flip decision,
+      // spaceBelow (5) no longer fits it, and spaceAbove (141), while also
+      // short of 150, is far roomier — so the menu flips above. Under the
+      // old rendered-height measurement, an unstubbed element's rect height
+      // is 0 in jsdom, which would make the clamped menu look like it still
+      // fits below (5 >= 0) and never flip, even though above has 28x more
+      // room.
+      expect(listbox.style.top).toBe('')
+      expect(listbox.style.bottom).toBe('51px')
+      expect(listbox.style.maxHeight).toBe('141px')
+    })
   })
 
   // ---------------------------------------------------------------------------
