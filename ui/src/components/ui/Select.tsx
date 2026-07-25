@@ -20,14 +20,10 @@ export interface SelectOption {
 // against the menu's real measured height once it is mounted.
 const ESTIMATED_MENU_HEIGHT = 240
 
-// Gap kept between the menu and the viewport edge when its height has to be
-// clamped, so the menu never sits flush against the window border.
+// Gap kept between the menu and the viewport edge: the anchored edge is
+// shifted to stay at least this far from the border, and the free edge's
+// maxHeight is capped so it does not cross into this margin either.
 const VIEWPORT_MARGIN = 8
-
-// Floor for the clamped height. On a viewport too short for either side, a
-// small scrollable menu is still usable; zero would leave the menu open but
-// invisible.
-const MIN_MENU_HEIGHT = 96
 
 // Distance between the trigger and the menu.
 const TRIGGER_GAP = 4
@@ -41,7 +37,8 @@ interface MenuPosition {
   bottom: number | null
   /**
    * Upper bound for the menu height, in pixels, derived from the space
-   * available on the chosen side. Caps the max-h-60 class so the menu scrolls
+   * actually available at the final (shifted) anchor position, capped at
+   * ESTIMATED_MENU_HEIGHT. Caps the max-h-60 class so the menu scrolls
    * internally instead of overflowing the viewport.
    */
   maxHeight: number
@@ -186,9 +183,13 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
     }, [isOpen, searchable])
 
     // Fix 5: Compute the portalled menu's fixed-viewport position from the
-    // trigger's current bounding rect, flipping above the trigger when there
-    // is not enough room below. `menuHeight` is either ESTIMATED_MENU_HEIGHT
-    // (before the menu has painted) or its real measured height.
+    // trigger's current bounding rect. Runs the standard anchor-positioning
+    // pipeline: offset (TRIGGER_GAP) -> flip (prefer below, flip above when
+    // it does not fit) -> shift (pull the anchored edge back inside the
+    // viewport, keeping VIEWPORT_MARGIN from the border) -> size (cap the
+    // height to whatever room is left at that final, shifted position).
+    // `menuHeight` is either ESTIMATED_MENU_HEIGHT (before the menu has
+    // painted) or its real measured height.
     const positionMenu = useCallback((menuHeight: number) => {
       const el = internalRef.current
       if (!el) return
@@ -197,26 +198,54 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
       const spaceAbove = rect.top - TRIGGER_GAP - VIEWPORT_MARGIN
       // Prefer below. Flip above when the menu does not fit below but does
       // fit above; when it fits on neither side, take whichever side has more
-      // room and clamp the height to it rather than overflowing the viewport.
+      // room.
       let above = false
       if (spaceBelow < menuHeight) {
         above = spaceAbove >= menuHeight || spaceAbove > spaceBelow
       }
-      const available = above ? spaceAbove : spaceBelow
-      setMenuPosition({
-        left: rect.left,
-        width: rect.width,
-        top: above ? null : rect.bottom + TRIGGER_GAP,
-        bottom: above ? window.innerHeight - rect.top + TRIGGER_GAP : null,
-        // The inline value beats the max-h-60 class in the cascade in both
-        // directions, so ESTIMATED_MENU_HEIGHT has to be applied here as the
-        // upper bound or the menu would grow past it on tall viewports.
-        // MIN_MENU_HEIGHT keeps it usable when neither side has real room.
-        maxHeight: Math.min(
-          Math.max(available, MIN_MENU_HEIGHT),
-          ESTIMATED_MENU_HEIGHT,
-        ),
-      })
+
+      // Shift: clamp the anchored edge into [VIEWPORT_MARGIN, innerHeight -
+      // VIEWPORT_MARGIN] before sizing. This is a no-op whenever the trigger
+      // itself is comfortably on-screen (the normal case) - it only moves
+      // the anchor when the trigger sits close enough to an edge that a bare
+      // offset would place the menu past the window border.
+      //
+      // Size: cap maxHeight to whatever room remains between the shifted
+      // anchor and the opposite margin, capped at ESTIMATED_MENU_HEIGHT. No
+      // floor - since the anchor is already shifted into the viewport, this
+      // is always >= 0. A cramped viewport yields a small, fully visible,
+      // internally-scrollable menu instead of an overflowing one.
+      if (above) {
+        const bottom = Math.min(
+          Math.max(window.innerHeight - rect.top + TRIGGER_GAP, VIEWPORT_MARGIN),
+          window.innerHeight - VIEWPORT_MARGIN,
+        )
+        setMenuPosition({
+          left: rect.left,
+          width: rect.width,
+          top: null,
+          bottom,
+          maxHeight: Math.min(
+            window.innerHeight - VIEWPORT_MARGIN - bottom,
+            ESTIMATED_MENU_HEIGHT,
+          ),
+        })
+      } else {
+        const top = Math.min(
+          Math.max(rect.bottom + TRIGGER_GAP, VIEWPORT_MARGIN),
+          window.innerHeight - VIEWPORT_MARGIN,
+        )
+        setMenuPosition({
+          left: rect.left,
+          width: rect.width,
+          top,
+          bottom: null,
+          maxHeight: Math.min(
+            window.innerHeight - VIEWPORT_MARGIN - top,
+            ESTIMATED_MENU_HEIGHT,
+          ),
+        })
+      }
     }, [])
 
     // Keep the portalled menu anchored to the trigger while open. Refines
