@@ -24,6 +24,11 @@ const ESTIMATED_MENU_HEIGHT = 240
 // clamped, so the menu never sits flush against the window border.
 const VIEWPORT_MARGIN = 8
 
+// Floor for the clamped height. On a viewport too short for either side, a
+// small scrollable menu is still usable; zero would leave the menu open but
+// invisible.
+const MIN_MENU_HEIGHT = 96
+
 // Distance between the trigger and the menu.
 const TRIGGER_GAP = 4
 
@@ -203,7 +208,14 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
         width: rect.width,
         top: above ? null : rect.bottom + TRIGGER_GAP,
         bottom: above ? window.innerHeight - rect.top + TRIGGER_GAP : null,
-        maxHeight: Math.max(available, 0),
+        // The inline value beats the max-h-60 class in the cascade in both
+        // directions, so ESTIMATED_MENU_HEIGHT has to be applied here as the
+        // upper bound or the menu would grow past it on tall viewports.
+        // MIN_MENU_HEIGHT keeps it usable when neither side has real room.
+        maxHeight: Math.min(
+          Math.max(available, MIN_MENU_HEIGHT),
+          ESTIMATED_MENU_HEIGHT,
+        ),
       })
     }, [])
 

@@ -658,18 +658,29 @@ describe('Select', () => {
     // kept the fixed max-h-60 class (240px) regardless, which could
     // overflow a viewport a Dialog's body-scroll-lock made unreachable).
     //
-    // TRIGGER_GAP (4) and VIEWPORT_MARGIN (8) below mirror the
-    // module-private constants of the same name in Select.tsx (not
-    // exported). Expected values are derived from the stubbed rect and
-    // these constants rather than hardcoded, so a future change to the
-    // margins fails these tests loudly instead of leaving them silently
-    // out of sync.
+    // TRIGGER_GAP (4), VIEWPORT_MARGIN (8), MIN_MENU_HEIGHT (96) and
+    // ESTIMATED_MENU_HEIGHT (240) below mirror the module-private
+    // constants of the same names in Select.tsx (not exported). Expected
+    // values are derived from the stubbed rect and these constants rather
+    // than hardcoded, so a future change to the margins or the clamp band
+    // fails these tests loudly instead of leaving them silently out of
+    // sync. The inline maxHeight style is clamped into
+    // [MIN_MENU_HEIGHT, ESTIMATED_MENU_HEIGHT]: it tracks the measured
+    // available space only inside that band, floors at MIN_MENU_HEIGHT
+    // when there is little or no room on either side, and caps at
+    // ESTIMATED_MENU_HEIGHT (matching the max-h-60 class) when there is
+    // far more room than that.
     // -------------------------------------------------------------------
 
     it('clamps the below-placed menu maxHeight to the measured space below, not an unbounded value', async () => {
       const TRIGGER_GAP = 4
       const VIEWPORT_MARGIN = 8
-      const innerHeight = 800
+      const MIN_MENU_HEIGHT = 96
+      const ESTIMATED_MENU_HEIGHT = 240
+      // innerHeight is chosen so spaceBelow lands strictly inside the
+      // clamp band — proving the height tracks the measured space rather
+      // than just hitting the floor or the cap.
+      const innerHeight = 300
       const rect = { left: 40, top: 100, right: 240, bottom: 130, width: 200, height: 30 }
       vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(innerHeight)
       renderSelect()
@@ -679,15 +690,27 @@ describe('Select', () => {
       const listbox = screen.getByRole('listbox')
 
       const spaceBelow = innerHeight - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN
+      // Sanity check on the fixture: this only proves tracking (not just
+      // the floor or the cap) if spaceBelow is strictly inside the band.
+      expect(spaceBelow).toBeGreaterThan(MIN_MENU_HEIGHT)
+      expect(spaceBelow).toBeLessThan(ESTIMATED_MENU_HEIGHT)
       expect(listbox.style.top).toBe(`${rect.bottom + TRIGGER_GAP}px`)
-      expect(listbox.style.maxHeight).toBe(`${spaceBelow}px`)
+      expect(listbox.style.maxHeight).toBe(
+        `${Math.min(Math.max(spaceBelow, MIN_MENU_HEIGHT), ESTIMATED_MENU_HEIGHT)}px`,
+      )
     })
 
-    it('clamps the above-flipped menu maxHeight to the measured space above', async () => {
+    it('caps the maxHeight at ESTIMATED_MENU_HEIGHT when the viewport offers far more room than that', async () => {
+      // The inline maxHeight style would otherwise beat the max-h-60
+      // class in the cascade and let the menu grow past 240px on a tall
+      // viewport — this is what pins the cap back in place after the
+      // move from a class-only cap to an inline style.
       const TRIGGER_GAP = 4
       const VIEWPORT_MARGIN = 8
-      const innerHeight = 400
-      const rect = { left: 40, top: 350, right: 240, bottom: 380, width: 200, height: 30 }
+      const MIN_MENU_HEIGHT = 96
+      const ESTIMATED_MENU_HEIGHT = 240
+      const innerHeight = 1000
+      const rect = { left: 40, top: 100, right: 240, bottom: 130, width: 200, height: 30 }
       vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(innerHeight)
       renderSelect()
       const trigger = screen.getByRole('combobox')
@@ -695,10 +718,48 @@ describe('Select', () => {
       await userEvent.click(trigger)
       const listbox = screen.getByRole('listbox')
 
+      const spaceBelow = innerHeight - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN
+      // Sanity check on the fixture: this only proves the cap survived if
+      // the raw available space genuinely exceeds it.
+      expect(spaceBelow).toBeGreaterThan(ESTIMATED_MENU_HEIGHT)
+      expect(listbox.style.top).toBe(`${rect.bottom + TRIGGER_GAP}px`)
+      expect(listbox.style.maxHeight).toBe(
+        `${Math.min(Math.max(spaceBelow, MIN_MENU_HEIGHT), ESTIMATED_MENU_HEIGHT)}px`,
+      )
+    })
+
+    it('clamps the above-flipped menu maxHeight to the measured space above', async () => {
+      const TRIGGER_GAP = 4
+      const VIEWPORT_MARGIN = 8
+      const MIN_MENU_HEIGHT = 96
+      const ESTIMATED_MENU_HEIGHT = 240
+      // innerHeight/rect are chosen so spaceBelow doesn't fit the
+      // pre-paint estimate (triggering the flip to "above") while
+      // spaceAbove lands strictly inside the clamp band.
+      const innerHeight = 400
+      const rect = { left: 40, top: 200, right: 240, bottom: 230, width: 200, height: 30 }
+      vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(innerHeight)
+      renderSelect()
+      const trigger = screen.getByRole('combobox')
+      stubRect(trigger, rect)
+      await userEvent.click(trigger)
+      const listbox = screen.getByRole('listbox')
+
+      const spaceBelow = innerHeight - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN
       const spaceAbove = rect.top - TRIGGER_GAP - VIEWPORT_MARGIN
+      // Sanity check on the fixture: the flip only happens because below
+      // doesn't fit the pre-paint estimate and above has more room; the
+      // test only proves tracking if spaceAbove is strictly inside the
+      // clamp band.
+      expect(spaceBelow).toBeLessThan(ESTIMATED_MENU_HEIGHT)
+      expect(spaceAbove).toBeGreaterThan(spaceBelow)
+      expect(spaceAbove).toBeGreaterThan(MIN_MENU_HEIGHT)
+      expect(spaceAbove).toBeLessThan(ESTIMATED_MENU_HEIGHT)
       expect(listbox.style.top).toBe('')
       expect(listbox.style.bottom).toBe(`${innerHeight - rect.top + TRIGGER_GAP}px`)
-      expect(listbox.style.maxHeight).toBe(`${spaceAbove}px`)
+      expect(listbox.style.maxHeight).toBe(
+        `${Math.min(Math.max(spaceAbove, MIN_MENU_HEIGHT), ESTIMATED_MENU_HEIGHT)}px`,
+      )
     })
 
     it('flips above and clamps to that side when the menu fits on neither side', async () => {
@@ -706,11 +767,15 @@ describe('Select', () => {
       // under the previous logic ("above" was only chosen when space
       // fit above that estimate) this would have fallen through to
       // "below" with no clamp at all — a fixed max-h-60 (240px) menu
-      // inside a 200px-tall viewport, overflowing it.
+      // inside a short viewport, overflowing it. innerHeight/rect are
+      // chosen so spaceAbove (the side picked) still lands strictly
+      // inside the clamp band, proving it tracks rather than just floors.
       const TRIGGER_GAP = 4
       const VIEWPORT_MARGIN = 8
-      const innerHeight = 200
-      const rect = { left: 40, top: 100, right: 240, bottom: 110, width: 200, height: 10 }
+      const MIN_MENU_HEIGHT = 96
+      const ESTIMATED_MENU_HEIGHT = 240
+      const innerHeight = 300
+      const rect = { left: 40, top: 150, right: 240, bottom: 170, width: 200, height: 20 }
       vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(innerHeight)
       renderSelect()
       const trigger = screen.getByRole('combobox')
@@ -721,21 +786,65 @@ describe('Select', () => {
       const spaceBelow = innerHeight - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN
       const spaceAbove = rect.top - TRIGGER_GAP - VIEWPORT_MARGIN
       // Sanity check on the fixture itself: this test only pins down the
-      // "neither fits, pick the bigger side" branch if above truly has
-      // more room than below.
+      // "neither fits, pick the bigger side" branch if neither side fits
+      // the pre-paint estimate, above truly has more room than below, and
+      // above lands inside the clamp band (not just at its floor).
+      expect(spaceBelow).toBeLessThan(ESTIMATED_MENU_HEIGHT)
+      expect(spaceAbove).toBeLessThan(ESTIMATED_MENU_HEIGHT)
       expect(spaceAbove).toBeGreaterThan(spaceBelow)
+      expect(spaceAbove).toBeGreaterThan(MIN_MENU_HEIGHT)
 
       // Flipped above (bottom set, top unset) ...
       expect(listbox.style.top).toBe('')
       expect(listbox.style.bottom).toBe(`${innerHeight - rect.top + TRIGGER_GAP}px`)
       // ...and clamped to the larger (above) side's space, not left
       // unbounded at the old fixed 240px.
-      expect(listbox.style.maxHeight).toBe(`${spaceAbove}px`)
+      expect(listbox.style.maxHeight).toBe(
+        `${Math.min(Math.max(spaceAbove, MIN_MENU_HEIGHT), ESTIMATED_MENU_HEIGHT)}px`,
+      )
+    })
+
+    it('floors the maxHeight at MIN_MENU_HEIGHT when the available space on both sides is at or below zero', async () => {
+      // A very short viewport (or a trigger scrolled partly toward an
+      // edge but not far enough to count as fully out of view — see the
+      // "closes the dropdown when the trigger scrolls above/below the
+      // viewport" tests above for the fully-out-of-view case) can leave
+      // zero or negative space on both sides. The menu must still get a
+      // usable, visible height rather than staying open with maxHeight: 0.
+      const TRIGGER_GAP = 4
+      const VIEWPORT_MARGIN = 8
+      const MIN_MENU_HEIGHT = 96
+      const ESTIMATED_MENU_HEIGHT = 240
+      const innerHeight = 20
+      const rect = { left: 0, top: 10, right: 100, bottom: 15, width: 100, height: 5 }
+      vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(innerHeight)
+      renderSelect()
+      const trigger = screen.getByRole('combobox')
+      stubRect(trigger, rect)
+      await userEvent.click(trigger)
+      const listbox = screen.getByRole('listbox')
+
+      const spaceBelow = innerHeight - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN
+      const spaceAbove = rect.top - TRIGGER_GAP - VIEWPORT_MARGIN
+      // Sanity check on the fixture: both sides must be at or below zero
+      // for this to actually exercise the floor.
+      expect(spaceBelow).toBeLessThanOrEqual(0)
+      expect(spaceAbove).toBeLessThanOrEqual(0)
+      // Whichever side has (marginally) more room is the one the
+      // component picks and clamps — here that is "above", since
+      // spaceAbove > spaceBelow.
+      expect(listbox.style.top).toBe('')
+      expect(listbox.style.bottom).toBe(`${innerHeight - rect.top + TRIGGER_GAP}px`)
+      expect(listbox.style.maxHeight).toBe(
+        `${Math.min(Math.max(Math.max(spaceAbove, spaceBelow), MIN_MENU_HEIGHT), ESTIMATED_MENU_HEIGHT)}px`,
+      )
     })
 
     it('recomputes the maxHeight clamp on resize and shrinks it when the viewport shrinks', async () => {
       const TRIGGER_GAP = 4
       const VIEWPORT_MARGIN = 8
+      const MIN_MENU_HEIGHT = 96
+      const ESTIMATED_MENU_HEIGHT = 240
       const rect = { left: 40, top: 100, right: 240, bottom: 130, width: 200, height: 30 }
       const innerHeightSpy = vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(800)
       renderSelect()
@@ -743,8 +852,13 @@ describe('Select', () => {
       stubRect(trigger, rect)
       await userEvent.click(trigger)
       const listbox = screen.getByRole('listbox')
+      // At innerHeight 800 the raw available space is far past the cap,
+      // so this leg proves the cap holds at the module boundary rather
+      // than tracking an unbounded value.
+      const spaceBelowTall = 800 - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN
+      expect(spaceBelowTall).toBeGreaterThan(ESTIMATED_MENU_HEIGHT)
       expect(listbox.style.maxHeight).toBe(
-        `${800 - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN}px`,
+        `${Math.min(Math.max(spaceBelowTall, MIN_MENU_HEIGHT), ESTIMATED_MENU_HEIGHT)}px`,
       )
 
       innerHeightSpy.mockReturnValue(300)
@@ -752,9 +866,15 @@ describe('Select', () => {
       // The re-measure reads the menu's real (unstubbed) height from
       // menuRef, which jsdom reports as 0 — still enough to exercise the
       // same "clamp to available space" path, just recomputed against the
-      // shrunk viewport.
+      // shrunk viewport. At innerHeight 300 the raw available space now
+      // lands inside the clamp band, so this leg proves the height
+      // actually follows the shrunk viewport down instead of staying
+      // pinned at the earlier cap.
+      const spaceBelowShrunk = 300 - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN
+      expect(spaceBelowShrunk).toBeGreaterThan(MIN_MENU_HEIGHT)
+      expect(spaceBelowShrunk).toBeLessThan(ESTIMATED_MENU_HEIGHT)
       expect(listbox.style.maxHeight).toBe(
-        `${300 - rect.bottom - TRIGGER_GAP - VIEWPORT_MARGIN}px`,
+        `${Math.min(Math.max(spaceBelowShrunk, MIN_MENU_HEIGHT), ESTIMATED_MENU_HEIGHT)}px`,
       )
     })
   })
@@ -890,14 +1010,13 @@ describe('Select', () => {
       fireEvent.keyDown(searchInput, { key: 'Tab' })
 
       expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
-      expect(document.activeElement).toBe(trigger)
       // The bug this guards against: without the defaultPrevented check,
       // the Dialog's trap would see the Select's own focus move land on
       // `last` (the trigger — the only Select-related element the panel's
-      // query can see) and wrap it straight back to `first`.
-      expect(document.activeElement).not.toBe(
-        screen.getByRole('button', { name: 'Close' }),
-      )
+      // query can see) and wrap it straight back to `first` (the Close
+      // button). Asserting activeElement is the trigger already proves it
+      // isn't the Close button, since they are distinct elements.
+      expect(document.activeElement).toBe(trigger)
     })
 
     it('Tab still wraps from the last focusable to the first when a Select is present but closed (guard does not disable the trap in general)', async () => {
