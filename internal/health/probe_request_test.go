@@ -359,6 +359,30 @@ func TestBuildProbeRequest_ModelsList_Applicability(t *testing.T) {
 	}
 }
 
+// TestBuildProbeRequest_ModelsList_AnthropicUsesV1Prefix verifies that a
+// models-list probe against provider "anthropic" requests the documented
+// Anthropic endpoint /v1/models — not the OpenAI-style /models path that a
+// naive base+"/models" concatenation would produce. The real Anthropic base
+// URL (https://api.anthropic.com) carries no /v1 segment itself, so this
+// prefix only appears in the built request if AnthropicAdapter.TransformURL
+// maps the "models" path explicitly (see internal/proxy/anthropic.go).
+func TestBuildProbeRequest_ModelsList_AnthropicUsesV1Prefix(t *testing.T) {
+	t.Parallel()
+
+	target := health.ProbeTarget{
+		Provider: "anthropic",
+		BaseURL:  "https://api.anthropic.com",
+		APIKey:   "key",
+	}
+	req, err := health.BuildProbeRequest(context.Background(), health.IntentModelsList, target)
+	if err != nil {
+		t.Fatalf("BuildProbeRequest: %v", err)
+	}
+	if !strings.HasSuffix(req.URL.String(), "/v1/models") {
+		t.Errorf("URL = %q, want suffix %q", req.URL.String(), "/v1/models")
+	}
+}
+
 // TestBuildProbeRequest_Embeddings_Applicability verifies which providers
 // have a meaningful embeddings probe and, where applicable, that the built
 // request carries an embeddings-shaped body.

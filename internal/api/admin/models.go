@@ -1217,6 +1217,40 @@ type testConnectionResponse struct {
 	Message string `json:"message"`
 }
 
+// validateProviderIdentity checks that req carries the identity fields required
+// to build a meaningful probe request for req.Provider. Vertex, Gemini, and
+// Azure each embed an identifier (project/location, model name, or deployment
+// name) directly in the probe URL; if that identifier is missing the request
+// still gets built and sent, producing an unhelpful 404 from a URL with an
+// empty path segment instead of a clear explanation. It returns an empty
+// message and ok=true when req.Provider requires no additional identity
+// fields or all required fields are present; otherwise it returns a specific,
+// actionable message and ok=false.
+func validateProviderIdentity(req testConnectionRequest) (message string, ok bool) {
+	switch req.Provider {
+	case "vertex":
+		switch {
+		case req.GCPProject == "" && req.GCPLocation == "":
+			return "gcp_project and gcp_location are required for vertex", false
+		case req.GCPProject == "":
+			return "gcp_project is required for vertex", false
+		case req.GCPLocation == "":
+			return "gcp_location is required for vertex", false
+		case req.ModelName == "":
+			return "model_name is required for vertex", false
+		}
+	case "gemini":
+		if req.ModelName == "" {
+			return "model_name is required for gemini", false
+		}
+	case "azure":
+		if req.AzureDeployment == "" {
+			return "azure_deployment is required for azure", false
+		}
+	}
+	return "", true
+}
+
 // TestModelConnection handles POST /api/v1/models/test-connection.
 // It probes the upstream provider's GET /models endpoint to verify connectivity
 // and authentication without persisting any data.
@@ -1261,6 +1295,16 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 		})
 	}
 
+	// Reject providers whose probe URL requires an identity field (project,
+	// location, model name, or deployment name) that was not supplied, before
+	// issuing a doomed upstream call built from empty path segments.
+	if msg, ok := validateProviderIdentity(req); !ok {
+		return c.JSON(testConnectionResponse{
+			Success: false,
+			Message: msg,
+		})
+	}
+
 	// Use a background context with an explicit timeout so the outbound request
 	// is not cancelled if the Fiber request context is recycled.
 	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1281,9 +1325,16 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 	// to it. A models-list probe is preferred (it needs no model identity and
 	// mirrors the historical behaviour for OpenAI-compatible providers and
 	// Anthropic); providers with no meaningful models-list equivalent (azure,
-	// vertex, gemini) fall back to a minimal chat probe.
+	// vertex, gemini) fall back to a minimal chat probe. isModelsListProbe
+	// records which intent actually built the request, explicitly, at the
+	// point the choice is made — the response is later parsed for a model
+	// count only when this is true, rather than inferring probe intent from
+	// httpReq.Method (an implementation detail of BuildProbeRequest that a
+	// future GET-based intent could misparse).
+	isModelsListProbe := true
 	httpReq, err := health.BuildProbeRequest(reqCtx, health.IntentModelsList, target)
 	if errors.Is(err, health.ErrProbeNotApplicable) {
+		isModelsListProbe = false
 		httpReq, err = health.BuildProbeRequest(reqCtx, health.IntentChat, target)
 	}
 	if err != nil {
@@ -1329,7 +1380,7 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 	// Only a models-list probe response has the OpenAI models-list envelope;
 	// a chat-probe fallback response (issued for azure/vertex/gemini) has a
 	// different shape and is not parsed for a model count.
-	if httpReq.Method == http.MethodGet {
+	if isModelsListProbe {
 		var modelsResp struct {
 			Data []struct {
 				ID string `json:"id"`

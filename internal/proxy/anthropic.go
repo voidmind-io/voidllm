@@ -590,11 +590,20 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 }
 
 // TransformURL maps the OpenAI endpoint path to the equivalent Anthropic path.
-// chat/completions becomes /v1/messages; all other paths are forwarded as-is.
+// chat/completions becomes /v1/messages and models becomes /v1/models — both
+// are real Anthropic API endpoints. The models mapping is exercised by the
+// health-check / connection-test models-list probe (see
+// internal/health.BuildProbeRequest) and by any direct, non-GET /v1/models
+// request that reaches the proxy hot path (GET /v1/models is served locally
+// by ModelsHandler and never reaches this adapter). All other paths are
+// forwarded as-is under the configured base URL.
 func (a *AnthropicAdapter) TransformURL(baseURL, upstreamPath string, _ Model) string {
 	base := strings.TrimRight(baseURL, "/")
-	if upstreamPath == "chat/completions" {
+	switch upstreamPath {
+	case "chat/completions":
 		return base + "/v1/messages"
+	case "models":
+		return base + "/v1/models"
 	}
 	return base + "/" + upstreamPath
 }

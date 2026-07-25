@@ -2873,6 +2873,18 @@ func TestAnthropicTransformURL(t *testing.T) {
 			upstreamPath: "embeddings",
 			wantURL:      "https://api.anthropic.com/embeddings",
 		},
+		{
+			name:         "models maps to /v1/models",
+			baseURL:      "https://api.anthropic.com",
+			upstreamPath: "models",
+			wantURL:      "https://api.anthropic.com/v1/models",
+		},
+		{
+			name:         "trailing slash on base with models path does not produce double slash",
+			baseURL:      "https://api.anthropic.com/",
+			upstreamPath: "models",
+			wantURL:      "https://api.anthropic.com/v1/models",
+		},
 	}
 
 	for _, tc := range tests {

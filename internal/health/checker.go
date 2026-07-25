@@ -271,9 +271,11 @@ func (c *Checker) runOne(t probeTarget, level probeLevel) {
 		// nil — deriveStatus already treats nil as "not checked" — rather
 		// than recording a success that never actually ran, or a failure
 		// that would wrongly drag the status to degraded/unhealthy.
+		//
+		// levelHealth never appears here: probeHealth pings the bare server
+		// root directly and never routes through BuildProbeRequest, so it
+		// can never return ErrProbeNotApplicable.
 		switch level {
-		case levelHealth:
-			updated.HealthOK = nil
 		case levelModels:
 			updated.ModelsOK = nil
 		case levelFunctional:

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1826,6 +1827,217 @@ func TestTestConnection_VertexFallsBackToChatProbe(t *testing.T) {
 	decodeBody(t, resp.Body, &got)
 	if got["success"] != true {
 		t.Errorf("success = %v, want true", got["success"])
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Server-side identity validation tests (validateProviderIdentity)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// TestTestConnection_MissingProviderIdentity verifies that TestModelConnection
+// rejects vertex/gemini/azure requests missing a required identity field
+// (gcp_project, gcp_location, model_name, azure_deployment) with the normal
+// testConnectionResponse{Success:false} shape, a message naming the missing
+// field, and — critically — WITHOUT issuing any upstream request at all.
+func TestTestConnection_MissingProviderIdentity(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		body       map[string]any
+		wantMsgHas string
+	}{
+		{
+			name: "vertex missing gcp_project and gcp_location",
+			body: map[string]any{
+				"provider":   "vertex",
+				"model_name": "gemini-1.5-pro",
+			},
+			wantMsgHas: "gcp_project and gcp_location",
+		},
+		{
+			name: "vertex missing gcp_project only",
+			body: map[string]any{
+				"provider":     "vertex",
+				"gcp_location": "us-central1",
+				"model_name":   "gemini-1.5-pro",
+			},
+			wantMsgHas: "gcp_project",
+		},
+		{
+			name: "vertex missing gcp_location only",
+			body: map[string]any{
+				"provider":    "vertex",
+				"gcp_project": "proj-123",
+				"model_name":  "gemini-1.5-pro",
+			},
+			wantMsgHas: "gcp_location",
+		},
+		{
+			name: "vertex missing model_name",
+			body: map[string]any{
+				"provider":     "vertex",
+				"gcp_project":  "proj-123",
+				"gcp_location": "us-central1",
+			},
+			wantMsgHas: "model_name",
+		},
+		{
+			name: "gemini missing model_name",
+			body: map[string]any{
+				"provider": "gemini",
+			},
+			wantMsgHas: "model_name",
+		},
+		{
+			name: "azure missing azure_deployment",
+			body: map[string]any{
+				"provider":   "azure",
+				"model_name": "gpt-4o",
+			},
+			wantMsgHas: "azure_deployment",
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var hits int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			t.Cleanup(upstream.Close)
+
+			dsn := fmt.Sprintf("file:TestTestConnection_MissingIdentity_%d?mode=memory&cache=private", i)
+			app, _, keyCache := setupModelTestApp(t, dsn)
+			testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+			reqBody := map[string]any{"base_url": upstream.URL, "api_key": "test-key"}
+			for k, v := range tc.body {
+				reqBody[k] = v
+			}
+
+			req := httptest.NewRequest("POST", modelTestConnectionURL(), bodyJSON(t, reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+testKey)
+
+			resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != fiber.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+			}
+
+			var got map[string]any
+			decodeBody(t, resp.Body, &got)
+			if got["success"] != false {
+				t.Errorf("success = %v, want false", got["success"])
+			}
+			msg, _ := got["message"].(string)
+			if !strings.Contains(msg, tc.wantMsgHas) {
+				t.Errorf("message = %q, want to contain %q", msg, tc.wantMsgHas)
+			}
+
+			if n := atomic.LoadInt32(&hits); n != 0 {
+				t.Errorf("upstream hit count = %d, want 0 (no upstream call must be made when identity validation fails)", n)
+			}
+		})
+	}
+}
+
+// TestTestConnection_ProviderIdentitySuppliedReachesUpstream is the
+// complement of TestTestConnection_MissingProviderIdentity: when all
+// required identity fields ARE supplied, validateProviderIdentity must not
+// block the request and the upstream probe must still be issued and succeed.
+// This is a light-touch confirmation alongside the fuller happy-path coverage
+// in TestTestConnection_AzureFallsBackToChatProbe, _GeminiFallsBackToChatProbe,
+// and _VertexFallsBackToChatProbe.
+func TestTestConnection_ProviderIdentitySuppliedReachesUpstream(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body map[string]any
+	}{
+		{
+			name: "vertex with all identity fields",
+			body: map[string]any{
+				"provider":     "vertex",
+				"model_name":   "gemini-1.5-pro",
+				"gcp_project":  "proj-123",
+				"gcp_location": "us-central1",
+			},
+		},
+		{
+			name: "gemini with model_name",
+			body: map[string]any{
+				"provider":   "gemini",
+				"model_name": "gemini-1.5-pro",
+			},
+		},
+		{
+			name: "azure with azure_deployment",
+			body: map[string]any{
+				"provider":         "azure",
+				"model_name":       "gpt-4o",
+				"azure_deployment": "gpt4-deployment",
+			},
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var hits int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi"}}],"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}`))
+			}))
+			t.Cleanup(upstream.Close)
+
+			dsn := fmt.Sprintf("file:TestTestConnection_IdentitySupplied_%d?mode=memory&cache=private", i)
+			app, _, keyCache := setupModelTestApp(t, dsn)
+			testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
+
+			reqBody := map[string]any{"base_url": upstream.URL, "api_key": "test-key"}
+			for k, v := range tc.body {
+				reqBody[k] = v
+			}
+
+			req := httptest.NewRequest("POST", modelTestConnectionURL(), bodyJSON(t, reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+testKey)
+
+			resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != fiber.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+			}
+
+			var got map[string]any
+			decodeBody(t, resp.Body, &got)
+			if got["success"] != true {
+				t.Errorf("success = %v, want true; message = %v", got["success"], got["message"])
+			}
+
+			if n := atomic.LoadInt32(&hits); n != 1 {
+				t.Errorf("upstream hit count = %d, want 1 (upstream call must be made when identity is supplied)", n)
+			}
+		})
 	}
 }
 
