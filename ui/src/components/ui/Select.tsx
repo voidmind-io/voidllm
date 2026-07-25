@@ -335,13 +335,19 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
     // deliberately not handled here — see handleTriggerKeyDown.
     const handleNavigationKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
       switch (e.key) {
+        // Step from clampedHighlight, not from the raw state. The raw value can
+        // sit outside the valid range - ArrowDown against an empty list leaves
+        // it at -1 - and the display already reflects the clamped one, so
+        // stepping from the raw value would silently swallow the first press.
         case 'ArrowDown':
           e.preventDefault()
-          setHighlightIndex((i) => Math.min(i + 1, filteredOptions.length - 1))
+          setHighlightIndex(
+            Math.min(clampedHighlight + 1, filteredOptions.length - 1),
+          )
           break
         case 'ArrowUp':
           e.preventDefault()
-          setHighlightIndex((i) => Math.max(i - 1, 0))
+          setHighlightIndex(Math.max(clampedHighlight - 1, 0))
           break
         case 'Enter':
           e.preventDefault()

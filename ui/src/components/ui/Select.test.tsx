@@ -466,8 +466,18 @@ describe('Select', () => {
       expect(activeEl).not.toBeNull()
       expect(activeEl).toHaveTextContent('Apple')
 
+      // The step that was missing: a further ArrowDown must actually move
+      // the highlight, not silently no-op because it stepped from the raw
+      // (still -1) state instead of the clamped, on-screen one.
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      const secondActiveId = trigger.getAttribute('aria-activedescendant')
+      expect(secondActiveId).toBeTruthy()
+      const secondActiveEl = document.getElementById(secondActiveId!)
+      expect(secondActiveEl).not.toBeNull()
+      expect(secondActiveEl).toHaveTextContent('Banana')
+
       fireEvent.keyDown(trigger, { key: 'Enter' })
-      expect(onChange).toHaveBeenCalledWith('apple')
+      expect(onChange).toHaveBeenCalledWith('banana')
       expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
     })
   })
