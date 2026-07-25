@@ -298,18 +298,37 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
       }
     }, [isOpen, positionMenu])
 
-    const handleTriggerKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
-      if (disabled) return
-      if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault()
-        // Position synchronously so the portalled menu is placed correctly
-        // on its very first paint, before the tracking effect's rAF fires.
-        positionMenu(ESTIMATED_MENU_HEIGHT)
-        setIsOpen(true)
+    // Highlight the currently selected option when the menu opens, falling
+    // back to the first option when nothing is selected or the value is not
+    // in the list. Read from `options`, not `filteredOptions` — every path
+    // that opens the menu does so with `search` already reset to '' (either
+    // it was never touched, or the prior close reset it), so the two are
+    // equivalent at open time and `options` avoids depending on a value that
+    // is about to be recomputed.
+    const getInitialHighlightIndex = () => {
+      const idx = options.findIndex((o) => o.value === value)
+      return idx >= 0 ? idx : 0
+    }
+
+    // Commits the highlighted option, shared by Enter (trigger and listbox)
+    // and Space (trigger only, menu open).
+    const selectHighlighted = () => {
+      const opt = filteredOptions[clampedHighlight]
+      if (opt != null) {
+        onChange(opt.value)
+        closeDropdown()
+        // Fix 4: Return focus to trigger after selection via keyboard
+        internalRef.current?.focus()
       }
     }
 
-    const handleDropdownKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // Shared arrow/Home/End/Enter navigation, operating on filteredOptions
+    // and clampedHighlight. Used by the trigger while the menu is open (the
+    // WAI-ARIA combobox pattern — focus stays on the trigger) and by the
+    // listbox in searchable mode, where focus sits in the search input and
+    // these events reach the listbox's onKeyDown by bubbling. Space is
+    // deliberately not handled here — see handleTriggerKeyDown.
+    const handleNavigationKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
       switch (e.key) {
         case 'ArrowDown':
           e.preventDefault()
@@ -319,17 +338,10 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
           e.preventDefault()
           setHighlightIndex((i) => Math.max(i - 1, 0))
           break
-        case 'Enter': {
+        case 'Enter':
           e.preventDefault()
-          const opt = filteredOptions[clampedHighlight]
-          if (opt != null) {
-            onChange(opt.value)
-            closeDropdown()
-            // Fix 4: Return focus to trigger after selection via keyboard
-            internalRef.current?.focus()
-          }
+          selectHighlighted()
           break
-        }
         case 'Home':
           e.preventDefault()
           setHighlightIndex(0)
@@ -339,6 +351,34 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
           setHighlightIndex(Math.max(filteredOptions.length - 1, 0))
           break
       }
+    }
+
+    const handleTriggerKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+      if (disabled) return
+      if (!isOpen) {
+        if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          // Position synchronously so the portalled menu is placed correctly
+          // on its very first paint, before the tracking effect's rAF fires.
+          positionMenu(ESTIMATED_MENU_HEIGHT)
+          setHighlightIndex(getInitialHighlightIndex())
+          setIsOpen(true)
+        }
+        return
+      }
+      // Menu open: Space selects like a native <select>, everything else
+      // delegates to the shared navigation handler. Space stays trigger-only
+      // — in the listbox it is ordinary typing in the search input.
+      if (e.key === ' ') {
+        e.preventDefault()
+        selectHighlighted()
+        return
+      }
+      handleNavigationKeyDown(e)
+    }
+
+    const handleDropdownKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+      handleNavigationKeyDown(e)
     }
 
     const handleOptionClick = (optValue: string) => {
@@ -386,6 +426,7 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
               // Position synchronously so the portalled menu is placed
               // correctly on its very first paint.
               positionMenu(ESTIMATED_MENU_HEIGHT)
+              setHighlightIndex(getInitialHighlightIndex())
               setIsOpen(true)
             }
           }}
