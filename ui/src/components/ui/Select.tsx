@@ -6,12 +6,27 @@ import React, {
   useRef,
   useState,
 } from 'react'
+import ReactDOM from 'react-dom'
 import { cn } from '../../lib/utils'
 
 export interface SelectOption {
   value: string
   label: string
   description?: string
+}
+
+// Height used to decide whether the menu should render above or below the
+// trigger before it has painted (matches max-h-60 = 15rem = 240px). Refined
+// against the menu's real measured height once it is mounted.
+const ESTIMATED_MENU_HEIGHT = 240
+
+interface MenuPosition {
+  left: number
+  width: number
+  /** Set when the menu renders below the trigger; null when it renders above. */
+  top: number | null
+  /** Set when the menu renders above the trigger; null when it renders below. */
+  bottom: number | null
 }
 
 export interface SelectProps {
@@ -51,12 +66,15 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
     const [isOpen, setIsOpen] = useState(false)
     const [search, setSearch] = useState('')
     const [highlightIndex, setHighlightIndex] = useState(0)
-    const [dropAbove, setDropAbove] = useState(false)
+    const [menuPosition, setMenuPosition] = useState<MenuPosition | null>(null)
 
     const containerRef = useRef<HTMLDivElement>(null)
     const searchInputRef = useRef<HTMLInputElement>(null)
     // Internal ref for the trigger — needed for focus-return and viewport flip
     const internalRef = useRef<HTMLButtonElement>(null)
+    // Portalled menu ref — needed so outside-click detection treats the menu
+    // (rendered under document.body, outside containerRef) as "inside"
+    const menuRef = useRef<HTMLDivElement>(null)
 
     // Merge the forwarded ref with our internal ref
     const mergedRef = useMemo(
@@ -106,13 +124,16 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
       closeDropdownRef.current = closeDropdown
     }, [closeDropdown])
 
-    // Outside click closes dropdown (no focus return — user clicked elsewhere)
+    // Outside click closes dropdown (no focus return — user clicked elsewhere).
+    // The menu is portalled to document.body, so a click inside it would not
+    // be "inside" containerRef — menuRef is checked too so option clicks land.
     useEffect(() => {
       if (!isOpen) return
       const handleMouseDown = (e: MouseEvent) => {
-        if (!containerRef.current?.contains(e.target as Node)) {
-          closeDropdownRef.current()
-        }
+        const target = e.target as Node
+        if (containerRef.current?.contains(target)) return
+        if (menuRef.current?.contains(target)) return
+        closeDropdownRef.current()
       }
       document.addEventListener('mousedown', handleMouseDown)
       return () => document.removeEventListener('mousedown', handleMouseDown)
@@ -142,25 +163,76 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
       }
     }, [isOpen, searchable])
 
-    // Fix 5: Check viewport space and flip dropdown above if needed.
-    // The setState call is deferred via rAF to avoid calling setState
-    // synchronously inside an effect body (react-hooks/set-state-in-effect).
-    useEffect(() => {
-      if (!isOpen || !internalRef.current) return
+    // Fix 5: Compute the portalled menu's fixed-viewport position from the
+    // trigger's current bounding rect, flipping above the trigger when there
+    // is not enough room below. `menuHeight` is either ESTIMATED_MENU_HEIGHT
+    // (before the menu has painted) or its real measured height.
+    const positionMenu = useCallback((menuHeight: number) => {
       const el = internalRef.current
-      const rafId = requestAnimationFrame(() => {
-        const rect = el.getBoundingClientRect()
-        const spaceBelow = window.innerHeight - rect.bottom
-        const dropdownHeight = 240 // max-h-60 = 15rem = 240px
-        setDropAbove(spaceBelow < dropdownHeight && rect.top > dropdownHeight)
+      if (!el) return
+      const rect = el.getBoundingClientRect()
+      const spaceBelow = window.innerHeight - rect.bottom
+      const above = spaceBelow < menuHeight && rect.top > menuHeight
+      setMenuPosition({
+        left: rect.left,
+        width: rect.width,
+        top: above ? null : rect.bottom + 4,
+        bottom: above ? window.innerHeight - rect.top + 4 : null,
       })
-      return () => cancelAnimationFrame(rafId)
-    }, [isOpen])
+    }, [])
+
+    // Keep the portalled menu anchored to the trigger while open. Refines
+    // placement against the menu's real height once mounted (superseding the
+    // ESTIMATED_MENU_HEIGHT guess used to open it), then re-measures on any
+    // resize or ancestor scroll. The scroll listener is registered on the
+    // capture phase so it catches scrolling from any ancestor scroll
+    // container (e.g. Table's overflow-x-auto, Dialog's overflow-y-auto),
+    // not just window — 'scroll' does not bubble, but capture still reaches
+    // it as the event travels down to its target. Closes the menu if the
+    // trigger scrolls out of the viewport entirely.
+    // The setState calls are deferred via rAF/listener callbacks rather than
+    // called synchronously inside the effect body (react-hooks/set-state-in-effect).
+    useEffect(() => {
+      if (!isOpen) return
+      const el = internalRef.current
+      if (!el) return
+
+      const measure = () => {
+        const rect = el.getBoundingClientRect()
+        // Strict inequalities: a rect flush against an edge (bottom/top/left/
+        // right exactly 0) still has a sliver of overlap with the viewport
+        // and should not be treated as fully scrolled out of view.
+        const outOfView =
+          rect.bottom < 0 ||
+          rect.top > window.innerHeight ||
+          rect.right < 0 ||
+          rect.left > window.innerWidth
+        if (outOfView) {
+          closeDropdownRef.current()
+          return
+        }
+        const menuHeight =
+          menuRef.current?.getBoundingClientRect().height ?? ESTIMATED_MENU_HEIGHT
+        positionMenu(menuHeight)
+      }
+
+      const rafId = requestAnimationFrame(measure)
+      window.addEventListener('resize', measure)
+      window.addEventListener('scroll', measure, true)
+      return () => {
+        cancelAnimationFrame(rafId)
+        window.removeEventListener('resize', measure)
+        window.removeEventListener('scroll', measure, true)
+      }
+    }, [isOpen, positionMenu])
 
     const handleTriggerKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
       if (disabled) return
       if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
         e.preventDefault()
+        // Position synchronously so the portalled menu is placed correctly
+        // on its very first paint, before the tracking effect's rAF fires.
+        positionMenu(ESTIMATED_MENU_HEIGHT)
         setIsOpen(true)
       }
     }
@@ -239,6 +311,9 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
             if (isOpen) {
               closeDropdown()
             } else {
+              // Position synchronously so the portalled menu is placed
+              // correctly on its very first paint.
+              positionMenu(ESTIMATED_MENU_HEIGHT)
               setIsOpen(true)
             }
           }}
@@ -274,72 +349,90 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
           </svg>
         </button>
 
-        {isOpen && (
-          <div
-            id={listboxId}
-            role="listbox"
-            aria-label={label}
-            // Fix 5: aria-activedescendant on search input when searchable
-            aria-activedescendant={
-              searchable && filteredOptions.length > 0
-                ? optionId(clampedHighlight)
-                : undefined
-            }
-            className={cn(
-              'absolute left-0 w-full bg-bg-secondary border border-border rounded-md shadow-lg z-40 max-h-60 overflow-y-auto',
-              // Fix 5: position above or below based on viewport space
-              dropAbove ? 'bottom-full mb-1' : 'top-full mt-1',
-            )}
-            onKeyDown={handleDropdownKeyDown}
-            tabIndex={-1}
-          >
-            {searchable && (
-              <div className="sticky top-0 bg-bg-secondary">
-                <input
-                  ref={searchInputRef}
-                  type="text"
-                  value={search}
-                  onChange={(e) => {
-                    setSearch(e.target.value)
-                    setHighlightIndex(0)
-                  }}
-                  placeholder="Search..."
-                  className="w-full px-3 py-2 text-sm bg-transparent border-b border-border text-text-primary placeholder:text-text-tertiary focus:outline-none"
-                />
-              </div>
-            )}
-
-            {filteredOptions.length > 0 ? (
-              filteredOptions.map((opt, i) => (
-                <div
-                  key={opt.value}
-                  id={optionId(i)}
-                  role="option"
-                  aria-selected={opt.value === value}
-                  onClick={() => handleOptionClick(opt.value)}
-                  onMouseEnter={() => setHighlightIndex(i)}
-                  className={cn(
-                    'px-3 py-2 text-sm cursor-pointer transition-colors',
-                    i === clampedHighlight && 'bg-bg-tertiary',
-                    opt.value === value && 'text-accent bg-accent/5',
-                    opt.value !== value && 'text-text-primary',
-                  )}
-                >
-                  {opt.label}
-                  {opt.description != null && (
-                    <span className="block text-xs text-text-tertiary mt-0.5">
-                      {opt.description}
-                    </span>
-                  )}
+        {isOpen &&
+          menuPosition != null &&
+          ReactDOM.createPortal(
+            <div
+              ref={menuRef}
+              id={listboxId}
+              role="listbox"
+              aria-label={label}
+              // Fix 5: aria-activedescendant on search input when searchable
+              aria-activedescendant={
+                searchable && filteredOptions.length > 0
+                  ? optionId(clampedHighlight)
+                  : undefined
+              }
+              className="fixed bg-bg-secondary border border-border rounded-md shadow-lg z-50 max-h-60 overflow-y-auto"
+              style={{
+                left: menuPosition.left,
+                width: menuPosition.width,
+                top: menuPosition.top ?? undefined,
+                bottom: menuPosition.bottom ?? undefined,
+              }}
+              onKeyDown={handleDropdownKeyDown}
+              tabIndex={-1}
+            >
+              {searchable && (
+                <div className="sticky top-0 bg-bg-secondary">
+                  <input
+                    ref={searchInputRef}
+                    type="text"
+                    value={search}
+                    onChange={(e) => {
+                      setSearch(e.target.value)
+                      setHighlightIndex(0)
+                    }}
+                    onKeyDown={(e) => {
+                      // Trap 3: the portalled menu lives outside any ancestor
+                      // Dialog's focusable-elements query, so the Dialog's
+                      // Tab-trap cannot wrap focus back into it. Close and
+                      // return focus to the trigger (which the Dialog's trap
+                      // does track) instead of letting Tab escape the modal.
+                      if (e.key === 'Tab') {
+                        e.preventDefault()
+                        closeDropdown()
+                        internalRef.current?.focus()
+                      }
+                    }}
+                    placeholder="Search..."
+                    className="w-full px-3 py-2 text-sm bg-transparent border-b border-border text-text-primary placeholder:text-text-tertiary focus:outline-none"
+                  />
                 </div>
-              ))
-            ) : (
-              <div className="px-3 py-2 text-sm text-text-tertiary">
-                No results
-              </div>
-            )}
-          </div>
-        )}
+              )}
+
+              {filteredOptions.length > 0 ? (
+                filteredOptions.map((opt, i) => (
+                  <div
+                    key={opt.value}
+                    id={optionId(i)}
+                    role="option"
+                    aria-selected={opt.value === value}
+                    onClick={() => handleOptionClick(opt.value)}
+                    onMouseEnter={() => setHighlightIndex(i)}
+                    className={cn(
+                      'px-3 py-2 text-sm cursor-pointer transition-colors',
+                      i === clampedHighlight && 'bg-bg-tertiary',
+                      opt.value === value && 'text-accent bg-accent/5',
+                      opt.value !== value && 'text-text-primary',
+                    )}
+                  >
+                    {opt.label}
+                    {opt.description != null && (
+                      <span className="block text-xs text-text-tertiary mt-0.5">
+                        {opt.description}
+                      </span>
+                    )}
+                  </div>
+                ))
+              ) : (
+                <div className="px-3 py-2 text-sm text-text-tertiary">
+                  No results
+                </div>
+              )}
+            </div>,
+            document.body,
+          )}
 
         {error != null && (
           <p id={errorId} role="alert" className="mt-1.5 text-xs text-error">
