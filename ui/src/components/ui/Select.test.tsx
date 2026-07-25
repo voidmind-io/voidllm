@@ -435,6 +435,41 @@ describe('Select', () => {
       expect(screen.queryByRole('listbox')).toBeNull()
       expect(notPrevented).toBe(true)
     })
+
+    it('recovers when options arrive after ArrowDown was pressed against an empty list, keeping the trigger operable', async () => {
+      // Every Select in this app is fed from an in-flight query, so it
+      // routinely opens with an empty `options` array before results land.
+      // ArrowDown against that empty list drives highlightIndex to -1
+      // (Math.min(0 + 1, filteredOptions.length - 1) is Math.min(1, -1) with
+      // zero options) — clampedHighlight's lower bound is what stops that -1
+      // from surviving once options arrive on a rerender. Without it,
+      // aria-activedescendant would reference a nonexistent option id and
+      // Enter would index filteredOptions with -1, selecting nothing.
+      const onChange = vi.fn()
+      const { rerender } = render(
+        <Select options={[]} value="" onChange={onChange} />,
+      )
+      const trigger = screen.getByRole('combobox')
+
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+      expect(screen.getByRole('listbox')).toBeInTheDocument()
+      expect(screen.getByText('No results')).toBeInTheDocument()
+      fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+
+      // Options arrive — the menu stays open, highlightIndex is untouched by
+      // the rerender itself.
+      rerender(<Select options={options} value="" onChange={onChange} />)
+
+      const activeId = trigger.getAttribute('aria-activedescendant')
+      expect(activeId).toBeTruthy()
+      const activeEl = document.getElementById(activeId!)
+      expect(activeEl).not.toBeNull()
+      expect(activeEl).toHaveTextContent('Apple')
+
+      fireEvent.keyDown(trigger, { key: 'Enter' })
+      expect(onChange).toHaveBeenCalledWith('apple')
+      expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
+    })
   })
 
   // ---------------------------------------------------------------------------

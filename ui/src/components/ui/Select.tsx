@@ -117,9 +117,14 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
       [options, search, searchable],
     )
 
-    // Fix 2: Clamp highlightIndex so stale values never point out-of-bounds
+    // Clamp highlightIndex so stale values never point out of bounds. The
+    // lower bound matters: pressing ArrowDown against an empty list drives
+    // highlightIndex to -1, and options routinely arrive from an in-flight
+    // query, so without it a negative index survives into a populated list -
+    // aria-activedescendant would reference a nonexistent option and Enter
+    // would select nothing.
     const clampedHighlight = Math.min(
-      highlightIndex,
+      Math.max(highlightIndex, 0),
       Math.max(filteredOptions.length - 1, 0),
     )
 
