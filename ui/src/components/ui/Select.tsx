@@ -116,6 +116,10 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
       setIsOpen(false)
       setSearch('')
       setHighlightIndex(0)
+      // Drop the measured position too. Every open path measures before it
+      // opens, so a stale value is never rendered today - clearing it keeps
+      // that true if a future path ever opens without measuring first.
+      setMenuPosition(null)
     }, [])
 
     // Stable ref so document listeners always call the latest version
@@ -384,11 +388,17 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
                       setHighlightIndex(0)
                     }}
                     onKeyDown={(e) => {
-                      // Trap 3: the portalled menu lives outside any ancestor
-                      // Dialog's focusable-elements query, so the Dialog's
-                      // Tab-trap cannot wrap focus back into it. Close and
-                      // return focus to the trigger (which the Dialog's trap
-                      // does track) instead of letting Tab escape the modal.
+                      // The portalled menu lives outside any ancestor Dialog's
+                      // focusable-elements query, so the Dialog's Tab-trap
+                      // cannot wrap focus back into it. Close and return focus
+                      // to the trigger (which the trap does track) instead of
+                      // letting Tab escape the modal.
+                      //
+                      // This deliberately diverges from the WAI-ARIA combobox
+                      // pattern, which has Tab close the popup and advance to
+                      // the next element in one press; here it takes a second
+                      // press. Do not "fix" that without also solving the
+                      // Dialog focus-trap problem above.
                       if (e.key === 'Tab') {
                         e.preventDefault()
                         closeDropdown()
