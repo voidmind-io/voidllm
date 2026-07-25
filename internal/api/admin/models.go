@@ -82,10 +82,12 @@ type updateModelRequest struct {
 	InputPricePer1M  *float64 `json:"input_price_per_1m"`
 	OutputPricePer1M *float64 `json:"output_price_per_1m"`
 	// CachedInputPricePer1M, when non-nil, replaces the stored cached-read
-	// price. 0 explicitly configures "no cache discount" rather than
-	// falling back to InputPricePer1M.
+	// price. 0 means "no cache discount": cached reads are then billed at the
+	// base input rate, the same effective result as leaving the price unset.
 	CachedInputPricePer1M *float64 `json:"cached_input_price_per_1m"`
-	// CacheWritePricePer1M, when non-nil, replaces the stored cache-write price.
+	// CacheWritePricePer1M, when non-nil, replaces the stored cache-write
+	// price. 0 behaves like CachedInputPricePer1M: cache writes fall back to
+	// the base input rate.
 	CacheWritePricePer1M *float64 `json:"cache_write_price_per_1m"`
 	AzureDeployment      *string  `json:"azure_deployment"`
 	AzureAPIVersion      *string  `json:"azure_api_version"`
