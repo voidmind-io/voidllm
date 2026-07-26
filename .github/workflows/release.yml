@@ -107,6 +107,12 @@ jobs:
         uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
         with:
           charts_dir: chart
+          # Makes a rerun safe. Without it, re-running the workflow after a
+          # partial failure aborts here because the chart release already
+          # exists - including the case where the only thing that failed was
+          # the pre-release marking below, which the rerun would then never
+          # reach.
+          skip_existing: true
         env:
           CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
 
@@ -118,8 +124,8 @@ jobs:
           # Keeps the chart release out of the "Latest" slot, which belongs to
           # the application release. This was a manual step after every release
           # until now; a step that cannot be forgotten beats a checklist entry.
-          # chart-releaser skips a chart whose version was already released, so
-          # tolerate the release not existing.
+          # Idempotent: marking an already-marked release again is a no-op, and
+          # the guard covers a tag whose chart version was never published.
           if gh release view "voidllm-${VERSION}" >/dev/null 2>&1; then
             gh release edit "voidllm-${VERSION}" --prerelease
           else
