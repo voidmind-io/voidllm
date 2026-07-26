@@ -335,22 +335,23 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
     // deliberately not handled here — see handleTriggerKeyDown.
     const handleNavigationKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
       switch (e.key) {
-        // Clamp the previous value inside the updater rather than stepping
-        // from the render-scoped clampedHighlight. Two reasons, and both are
-        // needed: the raw state can sit outside the valid range (ArrowDown
-        // against an empty list leaves it at -1) while the display already
-        // shows the clamped one, so an unclamped base swallows a press; and
-        // the functional form keeps the base current when several key events
-        // land in the same batch, which a render-scoped value would not.
+        // Clamp inside the updater, on both the previous value and the result.
+        // The functional form keeps the base current when several key events
+        // land in the same batch, which a render-scoped value would not;
+        // clamping the base stops an out-of-range value from swallowing a
+        // press; and clamping the result keeps the stored index valid even for
+        // an empty list, where stepping down would otherwise land on -1 again.
         case 'ArrowDown':
           e.preventDefault()
           setHighlightIndex((i) =>
-            Math.min(clampIndex(i, filteredOptions.length) + 1, filteredOptions.length - 1),
+            clampIndex(clampIndex(i, filteredOptions.length) + 1, filteredOptions.length),
           )
           break
         case 'ArrowUp':
           e.preventDefault()
-          setHighlightIndex((i) => Math.max(clampIndex(i, filteredOptions.length) - 1, 0))
+          setHighlightIndex((i) =>
+            clampIndex(clampIndex(i, filteredOptions.length) - 1, filteredOptions.length),
+          )
           break
         case 'Enter':
           e.preventDefault()
