@@ -2,6 +2,28 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.25] - 2026-07-26
+
+### Features
+- Cached prompt tokens are tracked and priced. Every major provider bills tokens served from a prompt cache differently from fresh input, and cache writes differently again, so a single input rate drifted from the real bill the better a customer's cache hit rate was. Models gain optional cached-input and cache-write prices; when they are unset the cost is calculated exactly as before (#188)
+
+### Fixes
+- A `429` from an upstream deployment now fails over to the next one instead of being returned to the client. It is also no longer recorded as a circuit-breaker success, which previously reset the accumulated failure count for that deployment. The deployment enters a short cooldown derived from `Retry-After`, and model-level fallback treats a rate limit as a reason to fall back (#185)
+- Anthropic prompt and total token counts were under-reported whenever prompt caching was used, because the separate cache-read and cache-write counters were discarded. That also under-consumed token budgets, since those read the total (#188)
+- Health probes are built the way each provider expects. They were OpenAI-shaped for every upstream, so probes against Anthropic, Gemini, Azure and Vertex failed permanently, showing a wrong "degraded" status and spending a billable request on every interval. The same applied to the admin connection test, where an operator adding a correctly configured model was told it was broken (#190)
+- Probes with no equivalent for a provider, such as a model list on Azure, now report as not applicable rather than as a failure. Skipped model types previously reported success for a probe that never ran (#190)
+- Dropdowns opened from a table are no longer clipped by the table's scroll container, and they follow the trigger on scroll and resize (#192)
+- Dropdowns can be operated by keyboard. Arrow keys, Home, End and Enter did nothing unless the dropdown had a search box, which affects nearly every dropdown in the UI (#193)
+
+### Security
+- Dependency update addressing an advisory in the frontend build toolchain
+
+### Internal
+- The Helm chart is now published by the release workflow after the container image is built, so it can never reference an image that does not exist yet (#194)
+- CI caches Go and npm dependencies (#186)
+
+---
+
 ## [0.0.24] - 2026-07-24
 
 ### Fixes
