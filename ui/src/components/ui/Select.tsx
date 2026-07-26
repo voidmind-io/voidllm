@@ -117,16 +117,16 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
       [options, search, searchable],
     )
 
-    // Clamp highlightIndex so stale values never point out of bounds. The
-    // lower bound matters: pressing ArrowDown against an empty list drives
-    // highlightIndex to -1, and options routinely arrive from an in-flight
+    // Clamp an index into the valid range for a list of the given length. The
+    // lower bound matters: pressing ArrowDown against an empty list drives the
+    // stored index to -1, and options routinely arrive from an in-flight
     // query, so without it a negative index survives into a populated list -
     // aria-activedescendant would reference a nonexistent option and Enter
     // would select nothing.
-    const clampedHighlight = Math.min(
-      Math.max(highlightIndex, 0),
-      Math.max(filteredOptions.length - 1, 0),
-    )
+    const clampIndex = (index: number, length: number) =>
+      Math.min(Math.max(index, 0), Math.max(length - 1, 0))
+
+    const clampedHighlight = clampIndex(highlightIndex, filteredOptions.length)
 
     // Helper to generate stable option ids for aria-activedescendant (Fix 6)
     const optionId = (index: number) => `${generatedId}-option-${index}`
@@ -335,19 +335,22 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
     // deliberately not handled here — see handleTriggerKeyDown.
     const handleNavigationKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
       switch (e.key) {
-        // Step from clampedHighlight, not from the raw state. The raw value can
-        // sit outside the valid range - ArrowDown against an empty list leaves
-        // it at -1 - and the display already reflects the clamped one, so
-        // stepping from the raw value would silently swallow the first press.
+        // Clamp the previous value inside the updater rather than stepping
+        // from the render-scoped clampedHighlight. Two reasons, and both are
+        // needed: the raw state can sit outside the valid range (ArrowDown
+        // against an empty list leaves it at -1) while the display already
+        // shows the clamped one, so an unclamped base swallows a press; and
+        // the functional form keeps the base current when several key events
+        // land in the same batch, which a render-scoped value would not.
         case 'ArrowDown':
           e.preventDefault()
-          setHighlightIndex(
-            Math.min(clampedHighlight + 1, filteredOptions.length - 1),
+          setHighlightIndex((i) =>
+            Math.min(clampIndex(i, filteredOptions.length) + 1, filteredOptions.length - 1),
           )
           break
         case 'ArrowUp':
           e.preventDefault()
-          setHighlightIndex(Math.max(clampedHighlight - 1, 0))
+          setHighlightIndex((i) => Math.max(clampIndex(i, filteredOptions.length) - 1, 0))
           break
         case 'Enter':
           e.preventDefault()
