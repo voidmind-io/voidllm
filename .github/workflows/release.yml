@@ -16,6 +16,8 @@ jobs:
       id-token: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -78,6 +80,51 @@ jobs:
         run: |
           cosign sign --yes \
             ghcr.io/voidmind-io/voidllm@${{ steps.build.outputs.digest }}
+
+  # The chart defaults image.tag to its own appVersion, so it must never be
+  # published before that image exists on the registry. needs: [docker] makes
+  # that ordering a property of the workflow graph rather than of timing -
+  # previously the chart was released by a separate workflow the moment the
+  # release PR merged, which is well before the tag that builds the image.
+  chart:
+    needs: [docker]
+    if: needs.docker.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # chart-releaser inspects existing tags to decide what is new.
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Run chart-releaser
+        uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
+        with:
+          charts_dir: chart
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Mark the chart release as a pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.docker.outputs.version }}
+        run: |
+          # Keeps the chart release out of the "Latest" slot, which belongs to
+          # the application release. This was a manual step after every release
+          # until now; a step that cannot be forgotten beats a checklist entry.
+          # chart-releaser skips a chart whose version was already released, so
+          # tolerate the release not existing.
+          if gh release view "voidllm-${VERSION}" >/dev/null 2>&1; then
+            gh release edit "voidllm-${VERSION}" --prerelease
+          else
+            echo "No chart release voidllm-${VERSION} was produced; nothing to mark."
+          fi
 
   binaries:
     runs-on: ubuntu-latest
