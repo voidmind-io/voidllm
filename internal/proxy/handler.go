@@ -2273,7 +2273,7 @@ func isAzureAdapter(a Adapter) bool {
 // only for paths that have legitimate sub-routes (images/, audio/, models/).
 func isAllowedPath(p string) bool {
 	switch p {
-	case "chat/completions", "completions", "embeddings", "models":
+	case "chat/completions", "completions", "embeddings", "models", "rerank", "score":
 		return true
 	}
 	return strings.HasPrefix(p, "images/") ||
