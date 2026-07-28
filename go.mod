@@ -3,7 +3,7 @@ module github.com/voidmind-io/voidllm
 go 1.26.4
 
 require (
-	github.com/bytedance/sonic v1.15.1
+	github.com/bytedance/sonic v1.15.2
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/fastschema/qjs v0.0.6
 	github.com/gofiber/fiber/v3 v3.3.0
