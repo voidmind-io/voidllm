@@ -1,10 +1,12 @@
 package mcp_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -17,30 +19,31 @@ func newTestServer(name, version string) *mcp.Server {
 	return mcp.NewServer(name, version)
 }
 
-// callRaw sends raw JSON to the server and returns the parsed Response.
+// callRaw sends raw JSON to the server with no transport headers (the legacy
+// path: no MCP-Protocol-Version header) and returns the parsed Response.
 func callRaw(t *testing.T, s *mcp.Server, raw string) *mcp.Response {
 	t.Helper()
-	result := s.Handle(context.Background(), []byte(raw))
-	if result == nil {
-		return nil
-	}
-	var resp mcp.Response
-	if err := json.Unmarshal(result, &resp); err != nil {
-		t.Fatalf("unmarshal server response: %v\nraw: %s", err, result)
-	}
-	return &resp
+	return callRawHdr(t, s, context.Background(), raw, mcp.MapHeader{})
 }
 
-// callRawCtx sends raw JSON to the server with a given context.
+// callRawCtx sends raw JSON to the server with a given context and no
+// transport headers.
 func callRawCtx(t *testing.T, s *mcp.Server, ctx context.Context, raw string) *mcp.Response {
 	t.Helper()
-	result := s.Handle(ctx, []byte(raw))
-	if result == nil {
+	return callRawHdr(t, s, ctx, raw, mcp.MapHeader{})
+}
+
+// callRawHdr sends raw JSON to the server with the given context and
+// transport headers, and returns the parsed Response.
+func callRawHdr(t *testing.T, s *mcp.Server, ctx context.Context, raw string, hdr mcp.Header) *mcp.Response {
+	t.Helper()
+	result := s.Handle(ctx, []byte(raw), hdr)
+	if result.Body == nil {
 		return nil
 	}
 	var resp mcp.Response
-	if err := json.Unmarshal(result, &resp); err != nil {
-		t.Fatalf("unmarshal server response: %v\nraw: %s", err, result)
+	if err := json.Unmarshal(result.Body, &resp); err != nil {
+		t.Fatalf("unmarshal server response: %v\nraw: %s", err, result.Body)
 	}
 	return &resp
 }
@@ -157,14 +160,14 @@ func TestServer_ToolsList(t *testing.T) {
 	s.RegisterTool(mcp.Tool{
 		Name:        "greet",
 		Description: "Greets the user.",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		return mcp.TextResult("hello"), nil
 	})
 	s.RegisterTool(mcp.Tool{
 		Name:        "farewell",
 		Description: "Says goodbye.",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		return mcp.TextResult("bye"), nil
 	})
@@ -219,7 +222,7 @@ func TestServer_ToolsCall_Success(t *testing.T) {
 	s := newTestServer("voidllm", "0.1.0")
 	s.RegisterTool(mcp.Tool{
 		Name:        "echo",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		return mcp.TextResult("echoed"), nil
 	})
@@ -253,7 +256,7 @@ func TestServer_ToolsCall_WithArguments(t *testing.T) {
 	s := newTestServer("voidllm", "0.1.0")
 	s.RegisterTool(mcp.Tool{
 		Name:        "parrot",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, args json.RawMessage) (*mcp.ToolResult, error) {
 		var in input
 		if err := json.Unmarshal(args, &in); err != nil {
@@ -288,7 +291,7 @@ func TestServer_ToolsCall_HandlerReturnsGoError(t *testing.T) {
 	s := newTestServer("voidllm", "0.1.0")
 	s.RegisterTool(mcp.Tool{
 		Name:        "failing_tool",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		return nil, errors.New("internal failure")
 	})
@@ -320,7 +323,7 @@ func TestServer_ToolsCall_HandlerReturnsErrorResult(t *testing.T) {
 	s := newTestServer("voidllm", "0.1.0")
 	s.RegisterTool(mcp.Tool{
 		Name:        "strict_tool",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		return mcp.ErrorResult(errMsg), nil
 	})
@@ -378,10 +381,58 @@ func TestServer_Notification_NotificationsInitialized(t *testing.T) {
 
 	s := newTestServer("voidllm", "0.1.0")
 	result := s.Handle(context.Background(),
-		[]byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+		[]byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`), mcp.MapHeader{})
 
-	if result != nil {
-		t.Errorf("notifications/initialized returned non-nil: %s", result)
+	if result.Body != nil {
+		t.Errorf("notifications/initialized returned non-nil: %s", result.Body)
+	}
+	if result.Hint != mcp.HintNotification {
+		t.Errorf("Hint = %v, want HintNotification", result.Hint)
+	}
+}
+
+// TestServer_NotificationsInitialized_WithID_ReturnsValidJSONRPC is the exact
+// reproduction for FIX A: a client that mistakenly attaches an id to the
+// notifications/initialized notification must still get back a
+// JSON-RPC-2.0-valid response — one that carries exactly one of "result" or
+// "error", never neither. Before FIX A, dispatchLegacy returned (nil, nil)
+// for this method, and because the request carried an id (IsNotification is
+// false), Handle went on to call EncodeResult with a nil *Result: the
+// legacy dialect's encoder rendered that as {"jsonrpc":"2.0","id":7} — no
+// "result", no "error" — which is not a valid JSON-RPC 2.0 response.
+func TestServer_NotificationsInitialized_WithID_ReturnsValidJSONRPC(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	result := s.Handle(context.Background(),
+		[]byte(`{"jsonrpc":"2.0","id":7,"method":"notifications/initialized"}`), mcp.MapHeader{})
+
+	if result.Hint == mcp.HintNotification {
+		t.Fatal("Hint = HintNotification, but the request carried an id and therefore is NOT a " +
+			"notification per JSON-RPC 2.0 — it must receive a response")
+	}
+	if result.Body == nil {
+		t.Fatal("Body = nil, want a JSON-RPC-valid response body")
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(result.Body, &raw); err != nil {
+		t.Fatalf("response is not valid JSON: %v\nbody: %s", err, result.Body)
+	}
+
+	_, hasResult := raw["result"]
+	_, hasError := raw["error"]
+	if hasResult == hasError {
+		t.Fatalf("response must carry exactly one of \"result\"/\"error\", got result=%v error=%v: %s",
+			hasResult, hasError, result.Body)
+	}
+
+	var resp mcp.Response
+	if err := json.Unmarshal(result.Body, &resp); err != nil {
+		t.Fatalf("unmarshal response: %v\nbody: %s", err, result.Body)
+	}
+	if string(resp.ID) != "7" {
+		t.Errorf("ID = %q, want %q", string(resp.ID), "7")
 	}
 }
 
@@ -391,10 +442,10 @@ func TestServer_Notification_NullID(t *testing.T) {
 	// Any method with null ID (notification) returns nil.
 	s := newTestServer("voidllm", "0.1.0")
 	result := s.Handle(context.Background(),
-		[]byte(`{"jsonrpc":"2.0","id":null,"method":"tools/list"}`))
+		[]byte(`{"jsonrpc":"2.0","id":null,"method":"tools/list"}`), mcp.MapHeader{})
 
-	if result != nil {
-		t.Errorf("null-ID request returned non-nil: %s", result)
+	if result.Body != nil {
+		t.Errorf("null-ID request returned non-nil: %s", result.Body)
 	}
 }
 
@@ -404,10 +455,10 @@ func TestServer_Notification_AbsentID_UnknownMethod(t *testing.T) {
 	// An unknown method sent as a notification (no ID) should also return nil.
 	s := newTestServer("voidllm", "0.1.0")
 	result := s.Handle(context.Background(),
-		[]byte(`{"jsonrpc":"2.0","method":"custom/event"}`))
+		[]byte(`{"jsonrpc":"2.0","method":"custom/event"}`), mcp.MapHeader{})
 
-	if result != nil {
-		t.Errorf("notification with unknown method returned non-nil: %s", result)
+	if result.Body != nil {
+		t.Errorf("notification with unknown method returned non-nil: %s", result.Body)
 	}
 }
 
@@ -419,7 +470,7 @@ func TestServer_ConcurrentHandle(t *testing.T) {
 	s := newTestServer("voidllm", "0.1.0")
 	s.RegisterTool(mcp.Tool{
 		Name:        "counter",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		return mcp.TextResult("ok"), nil
 	})
@@ -436,13 +487,13 @@ func TestServer_ConcurrentHandle(t *testing.T) {
 			raw := fmt.Sprintf(
 				`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"counter","arguments":{}}}`,
 				id)
-			result := s.Handle(context.Background(), []byte(raw))
-			if result == nil {
+			result := s.Handle(context.Background(), []byte(raw), mcp.MapHeader{})
+			if result.Body == nil {
 				errs <- fmt.Sprintf("goroutine %d: got nil response", id)
 				return
 			}
 			var resp mcp.Response
-			if err := json.Unmarshal(result, &resp); err != nil {
+			if err := json.Unmarshal(result.Body, &resp); err != nil {
 				errs <- fmt.Sprintf("goroutine %d: unmarshal error: %v", id, err)
 				return
 			}
@@ -480,7 +531,7 @@ func TestServer_RegisterTool_AppearsInList(t *testing.T) {
 	s.RegisterTool(mcp.Tool{
 		Name:        "new_tool",
 		Description: "A newly registered tool.",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		return mcp.TextResult("ok"), nil
 	})
@@ -528,7 +579,7 @@ func TestServer_ToolsCall_EmptyArguments(t *testing.T) {
 			s := newTestServer("voidllm", "0.1.0")
 			s.RegisterTool(mcp.Tool{
 				Name:        "safe_tool",
-				InputSchema: mcp.InputSchema{Type: "object"},
+				InputSchema: mcp.ObjectSchema(nil),
 			}, func(_ context.Context, args json.RawMessage) (*mcp.ToolResult, error) {
 				// Tool must not crash on nil/empty args.
 				return mcp.TextResult("safe"), nil
@@ -558,7 +609,7 @@ func TestServer_ToolsCall_MissingName(t *testing.T) {
 	s := newTestServer("voidllm", "0.1.0")
 	s.RegisterTool(mcp.Tool{
 		Name:        "named_tool",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		return mcp.TextResult("ok"), nil
 	})
@@ -581,7 +632,7 @@ func TestServer_ToolsCall_ErrorSanitized(t *testing.T) {
 	s := newTestServer("voidllm", "0.1.0")
 	s.RegisterTool(mcp.Tool{
 		Name:        "leaky_tool",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		return nil, fmt.Errorf("database connection failed: postgres://user:pass@host/db")
 	})
@@ -625,7 +676,7 @@ func TestServer_ToolsCall_NotificationExecutes(t *testing.T) {
 	s := newTestServer("voidllm", "0.1.0")
 	s.RegisterTool(mcp.Tool{
 		Name:        "side_effect_tool",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		called++
 		return mcp.TextResult("executed"), nil
@@ -633,10 +684,10 @@ func TestServer_ToolsCall_NotificationExecutes(t *testing.T) {
 
 	// A notification has no "id" field at all.
 	result := s.Handle(context.Background(),
-		[]byte(`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"side_effect_tool","arguments":{}}}`))
+		[]byte(`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"side_effect_tool","arguments":{}}}`), mcp.MapHeader{})
 
-	if result != nil {
-		t.Errorf("expected nil response for notification, got: %s", result)
+	if result.Body != nil {
+		t.Errorf("expected nil response for notification, got: %s", result.Body)
 	}
 	if called != 1 {
 		t.Errorf("tool handler called %d times, want 1", called)
@@ -652,17 +703,17 @@ func TestServer_ToolsCall_NotificationNoResponse(t *testing.T) {
 	s := newTestServer("voidllm", "0.1.0")
 	s.RegisterTool(mcp.Tool{
 		Name:        "null_id_tool",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		return mcp.TextResult("ok"), nil
 	})
 
 	// Explicit null ID is treated as a notification by IsNotification().
 	result := s.Handle(context.Background(),
-		[]byte(`{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"null_id_tool","arguments":{}}}`))
+		[]byte(`{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"null_id_tool","arguments":{}}}`), mcp.MapHeader{})
 
-	if result != nil {
-		t.Errorf("expected nil response for null-ID request, got: %s", result)
+	if result.Body != nil {
+		t.Errorf("expected nil response for null-ID request, got: %s", result.Body)
 	}
 }
 
@@ -698,5 +749,513 @@ func TestServer_ResponseID_EchoesRequest(t *testing.T) {
 				t.Errorf("response ID = %q, want %q", string(resp.ID), tc.wantID)
 			}
 		})
+	}
+}
+
+// ---- server/discover (modern-era, SEP-2575 MUST) -----------------------------
+
+// TestServer_Discover verifies server/discover reports every revision VoidLLM
+// understands, its capabilities, human-readable instructions, and
+// self-identifies under _meta["io.modelcontextprotocol/serverInfo"] — the
+// modern-era replacement for the legacy initialize handshake.
+func TestServer_Discover(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.4.0")
+	resp := callRawHdr(t, s, context.Background(),
+		modernRequestBody(1, "server/discover", nil, nil), modernHeader())
+
+	assertNoError(t, resp)
+	m := resultMap(t, resp)
+
+	versionsRaw, ok := m["supportedVersions"].([]any)
+	if !ok {
+		t.Fatalf("supportedVersions type = %T, want []any", m["supportedVersions"])
+	}
+	got := make(map[string]bool, len(versionsRaw))
+	for _, v := range versionsRaw {
+		got[v.(string)] = true
+	}
+	for _, want := range []string{"2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"} {
+		if !got[want] {
+			t.Errorf("supportedVersions missing %q; got %v", want, versionsRaw)
+		}
+	}
+	if len(versionsRaw) != 4 {
+		t.Errorf("supportedVersions len = %d, want 4", len(versionsRaw))
+	}
+
+	caps, ok := m["capabilities"].(map[string]any)
+	if !ok {
+		t.Fatalf("capabilities type = %T, want map[string]any", m["capabilities"])
+	}
+	if _, ok := caps["tools"]; !ok {
+		t.Errorf("capabilities.tools missing")
+	}
+
+	instructions, _ := m["instructions"].(string)
+	if instructions == "" {
+		t.Errorf("instructions missing or empty")
+	}
+
+	meta, ok := m["_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("_meta type = %T, want map[string]any", m["_meta"])
+	}
+	serverInfo, ok := meta["io.modelcontextprotocol/serverInfo"].(map[string]any)
+	if !ok {
+		t.Fatalf("_meta[serverInfo] type = %T, want map[string]any", meta["io.modelcontextprotocol/serverInfo"])
+	}
+	if serverInfo["name"] != "voidllm" || serverInfo["version"] != "0.4.0" {
+		t.Errorf("serverInfo = %v, want {name:voidllm version:0.4.0}", serverInfo)
+	}
+}
+
+// ---- tools/list ordering (SHOULD, minor changes: deterministic order) --------
+
+// TestServer_ToolsList_DeterministicallySortedByName registers tools in
+// deliberately unsorted order and verifies tools/list returns them sorted by
+// name, so client-side caching and LLM prompt caches can rely on stable
+// ordering (docs/mcp-v2.md §8 minor changes).
+func TestServer_ToolsList_DeterministicallySortedByName(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	// Registered deliberately out of alphabetical order.
+	for _, name := range []string{"zebra_tool", "alpha_tool", "mango_tool", "beta_tool"} {
+		s.RegisterTool(mcp.Tool{Name: name, InputSchema: mcp.ObjectSchema(nil)},
+			func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
+				return mcp.TextResult("ok"), nil
+			})
+	}
+
+	resp := callRaw(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	assertNoError(t, resp)
+
+	m := resultMap(t, resp)
+	toolsRaw, _ := m["tools"].([]any)
+	if len(toolsRaw) != 4 {
+		t.Fatalf("tools count = %d, want 4", len(toolsRaw))
+	}
+
+	want := []string{"alpha_tool", "beta_tool", "mango_tool", "zebra_tool"}
+	for i, w := range want {
+		tool, _ := toolsRaw[i].(map[string]any)
+		if got := tool["name"]; got != w {
+			t.Errorf("tools[%d].name = %v, want %q (registration order was NOT alphabetical: "+
+				"zebra, alpha, mango, beta)", i, got, w)
+		}
+	}
+}
+
+// ---- Era-specific methods are rejected in the wrong era -----------------------
+
+// TestServer_EraMismatch_MethodNotFound verifies that a legacy-only method
+// sent under the modern era, and a modern-only method sent under the legacy
+// era, both resolve to CodeMethodNotFound rather than being accidentally
+// dispatched — the era-specific vocabularies are disjoint (docs/mcp-v2.md
+// §3.1-3.3).
+func TestServer_EraMismatch_MethodNotFound(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body string
+		hdr  mcp.Header
+	}{
+		{
+			// Modern-era requests now require params._meta's two MUST fields
+			// (docs/mcp-v2.md §3.2) to reach dispatch at all — modernRequestBody
+			// supplies them so this case exercises era-mismatch dispatch, not
+			// the separate missing-required-fields rejection.
+			name: "initialize under the modern era is not found",
+			body: modernRequestBody(1, "initialize", nil, nil),
+			hdr:  modernHeader(),
+		},
+		{
+			name: "notifications/initialized under the modern era is not found",
+			body: modernRequestBody(1, "notifications/initialized", nil, nil),
+			hdr:  modernHeader(),
+		},
+		{
+			name: "ping under the modern era is not found",
+			body: modernRequestBody(1, "ping", nil, nil),
+			hdr:  modernHeader(),
+		},
+		{
+			name: "server/discover under the legacy era is not found",
+			body: `{"jsonrpc":"2.0","id":1,"method":"server/discover"}`,
+			hdr:  mcp.MapHeader{},
+		},
+		{
+			name: "subscriptions/listen under the legacy era is not found",
+			body: `{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen"}`,
+			hdr:  mcp.MapHeader{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newTestServer("voidllm", "0.1.0")
+			resp := callRawHdr(t, s, context.Background(), tc.body, tc.hdr)
+			assertErrorCode(t, resp, mcp.CodeMethodNotFound)
+		})
+	}
+}
+
+// TestServer_SubscriptionsListen_NotYetSupportedInPhase1 documents and locks
+// in the CURRENT, INTENTIONAL Phase 1 behavior: subscriptions/listen resolves
+// to CodeMethodNotFound under the modern era. This is NOT a bug — VoidLLM's
+// Handle returns a single, immediately-final []byte per call, and a
+// spec-faithful subscriptions/listen requires a long-lived response stream
+// that delivers notifications/subscriptions/acknowledged first and then stays
+// open. That streaming passthrough is explicitly out of scope until Phase 4
+// (see the Phase 1 report and dispatchModern's doc comment in server.go). If
+// this test starts failing because subscriptions/listen now succeeds, update
+// this test — don't treat the failure as a regression to revert.
+func TestServer_SubscriptionsListen_NotYetSupportedInPhase1(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	resp := callRawHdr(t, s, context.Background(),
+		modernRequestBody(1, "subscriptions/listen", map[string]any{"toolsListChanged": true}, nil),
+		modernHeader())
+
+	assertErrorCode(t, resp, mcp.CodeMethodNotFound)
+	if resp.Error != nil && !strings.Contains(resp.Error.Message, "not yet supported") {
+		t.Errorf("error message = %q, want it to explain streaming is not yet supported (Phase 4)", resp.Error.Message)
+	}
+}
+
+// ---- hintForError / StatusHint mapping (FIX 2, MCP Streamable HTTP §4.5/§4.6) ---
+
+// TestHintForError exhaustively verifies the JSON-RPC error code → StatusHint
+// mapping HTTP-aware callers (internal/api/admin/mcp_handler.go) rely on to
+// choose a status code, for every code/era combination hintForError branches
+// on. The single highest-priority case here is the legacy CodeMethodNotFound
+// regression: HTTP callers MUST keep responding 200 for it, never 404 — a 404
+// on an endpoint a legacy client already knows exists would be misread as
+// "wrong URL" and misdirect the client to the deprecated HTTP+SSE transport
+// fallback (docs/mcp-v2.md §4.6).
+func TestHintForError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		code int
+		era  mcp.Era
+		want mcp.StatusHint
+	}{
+		{"UnsupportedProtocolVersion (-32022), legacy era", mcp.CodeUnsupportedProtocolVersion, mcp.EraLegacy, mcp.HintBadRequest},
+		{"UnsupportedProtocolVersion (-32022), modern era", mcp.CodeUnsupportedProtocolVersion, mcp.EraModern, mcp.HintBadRequest},
+		{"HeaderMismatch (-32020), legacy era", mcp.CodeHeaderMismatch, mcp.EraLegacy, mcp.HintBadRequest},
+		{"HeaderMismatch (-32020), modern era", mcp.CodeHeaderMismatch, mcp.EraModern, mcp.HintBadRequest},
+		{"MissingRequiredClientCapability (-32021), legacy era", mcp.CodeMissingRequiredClientCapability, mcp.EraLegacy, mcp.HintBadRequest},
+		{"MissingRequiredClientCapability (-32021), modern era", mcp.CodeMissingRequiredClientCapability, mcp.EraModern, mcp.HintBadRequest},
+		{"MethodNotFound (-32601), modern era → HintMethodNotFound (HTTP 404)", mcp.CodeMethodNotFound, mcp.EraModern, mcp.HintMethodNotFound},
+		{
+			name: "REGRESSION (highest priority): MethodNotFound (-32601), legacy era → HintOK (HTTP 200), NEVER HintMethodNotFound/404",
+			code: mcp.CodeMethodNotFound, era: mcp.EraLegacy, want: mcp.HintOK,
+		},
+		{"InvalidParams (-32602) is an ordinary protocol error, legacy era → HintOK", mcp.CodeInvalidParams, mcp.EraLegacy, mcp.HintOK},
+		{"InvalidParams (-32602) is an ordinary protocol error, modern era → HintOK", mcp.CodeInvalidParams, mcp.EraModern, mcp.HintOK},
+		{"InvalidRequest (-32600), legacy era → HintOK", mcp.CodeInvalidRequest, mcp.EraLegacy, mcp.HintOK},
+		{"ParseError (-32700), modern era → HintOK", mcp.CodeParseError, mcp.EraModern, mcp.HintOK},
+		{"InternalError (-32603), legacy era → HintOK", mcp.CodeInternalError, mcp.EraLegacy, mcp.HintOK},
+		{"InternalError (-32603), modern era → HintOK", mcp.CodeInternalError, mcp.EraModern, mcp.HintOK},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := mcp.HintForError(tc.code, tc.era)
+			if got != tc.want {
+				t.Errorf("hintForError(%d, %v) = %v, want %v", tc.code, tc.era, got, tc.want)
+			}
+		})
+	}
+}
+
+// ---- Era leak regression: dispatch is keyed on Negotiate's dialect, never --
+// ---- on the body-derived Envelope.Version (docs/mcp-v2.md §4.6) -----------
+
+// TestServer_EraLeak_LegacyInitializeWithModernBodyProtocolVersion_StaysLegacy
+// is the single most important regression test of the whole dual-era
+// rework. A legacy client sends a bare "initialize" handshake with NO
+// MCP-Protocol-Version header — but its params.protocolVersion happens to
+// name the modern 2026-07-28 revision (a dual-era-capable legacy client that
+// already knows about the new revision, or simply a coincidence). Before
+// dispatch was keyed on the dialect Negotiate resolved, a body-derived
+// Envelope.Version could leak the modern era into dispatch: dispatchModern
+// does not know "initialize" at all, so this would have incorrectly resolved
+// to CodeMethodNotFound (-32601). The fix is that legacyDialect.Decode only
+// ever refines Envelope.Version WITHIN the era Negotiate already chose (see
+// the Era guard in dialect_legacy.go's Decode) — so this request must still
+// receive a normal, valid legacy initialize response.
+func TestServer_EraLeak_LegacyInitializeWithModernBodyProtocolVersion_StaysLegacy(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	resp := callRaw(t, s,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28"}}`)
+
+	assertNoError(t, resp)
+
+	m := resultMap(t, resp)
+	pv, _ := m["protocolVersion"].(string)
+	if pv != string(mcp.V20250326) {
+		t.Errorf("protocolVersion = %q, want %q — a body-claimed modern version must NOT leak the era, "+
+			"since no MCP-Protocol-Version header was sent", pv, mcp.V20250326)
+	}
+	// A leaked-era response would carry the modern wire shape (resultType,
+	// _meta.serverInfo) instead of the legacy shape (bare protocolVersion at
+	// the top level) — assert the legacy shape explicitly.
+	if _, ok := m["resultType"]; ok {
+		t.Errorf("legacy result must not carry \"resultType\" (a modern-era field), got: %v", m)
+	}
+}
+
+// TestServer_WithinEraRefinement_LegacyBodyCanRefineVersion verifies the
+// companion, positive half of the era-leak guard: a legacy initialize body
+// MAY still refine the negotiated version to a more specific one, as long as
+// it stays within the same era (V20250326 → V20251125 here, both EraLegacy).
+// Losing this would be an over-correction of the era-leak fix.
+func TestServer_WithinEraRefinement_LegacyBodyCanRefineVersion(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	resp := callRaw(t, s,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`)
+
+	assertNoError(t, resp)
+
+	m := resultMap(t, resp)
+	pv, _ := m["protocolVersion"].(string)
+	if pv != string(mcp.V20251125) {
+		t.Errorf("protocolVersion = %q, want %q — a same-era body value must still be able to refine "+
+			"the negotiated version", pv, mcp.V20251125)
+	}
+}
+
+// ---- Tools() / OnToolsListHook: no aliasing with server-internal state (FIX 4) --
+
+// TestServer_Tools_MutatingReturnedSchemaDoesNotAffectServerState verifies
+// that mutating the InputSchema bytes of a Tool returned by Server.Tools()
+// in place can never corrupt the Server's own registered schema — Tools()
+// must return a byte-for-byte deep copy, not an aliased view.
+func TestServer_Tools_MutatingReturnedSchemaDoesNotAffectServerState(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.RegisterTool(mcp.Tool{
+		Name:        "t1",
+		InputSchema: mcp.ObjectSchema(nil),
+	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
+		return mcp.TextResult("ok"), nil
+	})
+
+	got := s.Tools()
+	if len(got) != 1 {
+		t.Fatalf("Tools() len = %d, want 1", len(got))
+	}
+	// Corrupt the returned schema bytes in place.
+	for i := range got[0].InputSchema {
+		got[0].InputSchema[i] = 'X'
+	}
+
+	resp := callRaw(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	assertNoError(t, resp)
+
+	m := resultMap(t, resp)
+	tools, _ := m["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools/list tools count = %d, want 1", len(tools))
+	}
+	tool, _ := tools[0].(map[string]any)
+	schema, _ := tool["inputSchema"].(map[string]any)
+	if schema["type"] != "object" {
+		t.Errorf("server-internal schema was corrupted by mutating Tools()'s returned bytes: tool = %v", tool)
+	}
+}
+
+// TestServer_OnToolsListHook_MutatingHookDoesNotCorruptServerState verifies
+// the same aliasing guarantee for the tools slice handed to an
+// OnToolsListHook: a hook that mutates the InputSchema bytes it was given in
+// place — a legitimate, if unusual, thing for a hook to do to its own working
+// copy — must never corrupt the Server's own registered schema for
+// subsequent, unrelated calls.
+func TestServer_OnToolsListHook_MutatingHookDoesNotCorruptServerState(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.RegisterTool(mcp.Tool{
+		Name:        "t1",
+		InputSchema: mcp.ObjectSchema(nil),
+	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
+		return mcp.TextResult("ok"), nil
+	})
+
+	var hookRan bool
+	s.SetOnToolsList(func(tools []mcp.Tool) []mcp.Tool {
+		hookRan = true
+		for i := range tools {
+			// Mutate letters only, leaving JSON punctuation (quotes, braces,
+			// colons) intact, so the mutated schema is still syntactically
+			// valid JSON — an encoding failure from corrupting the JSON
+			// syntax itself is a different scenario, covered separately by
+			// TestServer_EncodingFailure_ToolsList_ReturnsInternalErrorNotNotification.
+			for j := range tools[i].InputSchema {
+				if b := tools[i].InputSchema[j]; b >= 'a' && b <= 'z' {
+					tools[i].InputSchema[j] = 'x'
+				}
+			}
+		}
+		return tools
+	})
+
+	// First call: the hook corrupts ITS OWN copy in place, which is reflected
+	// in this call's response — that part is the hook's own choice and not
+	// under test here.
+	resp1 := callRaw(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	assertNoError(t, resp1)
+	if !hookRan {
+		t.Fatal("OnToolsListHook was not invoked")
+	}
+
+	// Remove the hook and verify the Server's internally registered schema
+	// for t1 is still the original, valid ObjectSchema — proving the hook's
+	// in-place mutation never reached Server.tools.
+	s.SetOnToolsList(nil)
+	resp2 := callRaw(t, s, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	assertNoError(t, resp2)
+
+	m := resultMap(t, resp2)
+	tools, _ := m["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools/list tools count = %d, want 1", len(tools))
+	}
+	tool, _ := tools[0].(map[string]any)
+	schema, _ := tool["inputSchema"].(map[string]any)
+	if schema["type"] != "object" {
+		t.Errorf("server-internal schema was corrupted by the hook's in-place mutation: tool = %v", tool)
+	}
+}
+
+// ---- Encoding failure must never surface as a notification / 202 (FIX 3) --
+
+// brokenSchemaTool returns a Tool whose InputSchema is deliberately invalid
+// JSON, so that any dialect's EncodeResult attempting to marshal it fails.
+// JSONSchema.MarshalJSON returns its bytes verbatim (see protocol.go), so
+// encoding/json's own compaction step rejects them as malformed JSON at
+// marshal time — this is the only realistic way to make a Server.Handle
+// response fail to encode, since ToolResult's own fields (plain strings/bool)
+// can never fail to marshal.
+func brokenSchemaTool(name string) mcp.Tool {
+	return mcp.Tool{Name: name, InputSchema: mcp.JSONSchema("not-valid-json")}
+}
+
+// TestServer_EncodingFailure_ToolsList_ReturnsInternalErrorNotNotification
+// verifies FIX 3: when a dialect's EncodeResult fails to marshal a response,
+// Handle must fall back to encodeFallback and report HintOK with a valid
+// CodeInternalError body — NEVER HintNotification (which HTTP callers map to
+// 202 Accepted with an empty body, silently discarding the failure). This is
+// checked for both eras, since dialect2026's payloadAsMap takes a different
+// code path than legacyDialect's direct marshal.
+func TestServer_EncodingFailure_ToolsList_ReturnsInternalErrorNotNotification(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		hdr  mcp.Header
+	}{
+		{"legacy era", mcp.MapHeader{}},
+		{"modern era", modernHeader()},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newTestServer("voidllm", "0.1.0")
+			s.RegisterTool(brokenSchemaTool("broken"),
+				func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
+					return mcp.TextResult("unreachable"), nil
+				})
+
+			// modernRequestBody's params._meta is harmless under the legacy
+			// dialect (its Decode never inspects params content for
+			// tools/list) and required under the modern one (docs/mcp-v2.md
+			// §3.2), so the same body exercises both era subtests here.
+			result := s.Handle(context.Background(),
+				[]byte(modernRequestBody(1, "tools/list", nil, nil)), tc.hdr)
+
+			if result.Hint == mcp.HintNotification {
+				t.Fatal("Hint = HintNotification: an encoding failure must never be reported as a " +
+					"notification — HTTP callers map this to 202 Accepted with no body, silently " +
+					"discarding the failure")
+			}
+			if result.Hint != mcp.HintOK {
+				t.Errorf("Hint = %v, want HintOK (encoding failures are still reported via a normal "+
+					"JSON-RPC error body)", result.Hint)
+			}
+			if result.Body == nil {
+				t.Fatal("Body = nil, want a valid JSON-RPC error response")
+			}
+			if !json.Valid(result.Body) {
+				t.Fatalf("Body is not valid JSON: %s", result.Body)
+			}
+
+			var resp mcp.Response
+			if err := json.Unmarshal(result.Body, &resp); err != nil {
+				t.Fatalf("unmarshal response: %v\nraw: %s", err, result.Body)
+			}
+			if resp.Error == nil {
+				t.Fatalf("Error is nil, want CodeInternalError; raw: %s", result.Body)
+			}
+			if resp.Error.Code != mcp.CodeInternalError {
+				t.Errorf("Error.Code = %d, want %d (CodeInternalError)", resp.Error.Code, mcp.CodeInternalError)
+			}
+		})
+	}
+}
+
+// TestServer_EncodingFailure_LoggedWithoutBodyContent verifies that the
+// encoding-failure log line (logEncodeFailure) carries only the error cause
+// and the JSON-RPC method name — never request or schema content — per
+// VoidLLM's zero-knowledge logging rule. This test is deliberately NOT
+// t.Parallel(): it swaps the process-global slog default logger for the
+// duration of the call and must not race with other tests' log output.
+func TestServer_EncodingFailure_LoggedWithoutBodyContent(t *testing.T) {
+	const corruptSchemaMarker = "not-valid-json"
+
+	var buf bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.RegisterTool(mcp.Tool{Name: "broken", InputSchema: mcp.JSONSchema(corruptSchemaMarker)},
+		func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
+			return mcp.TextResult("unreachable"), nil
+		})
+
+	result := s.Handle(context.Background(),
+		[]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`), mcp.MapHeader{})
+	if result.Hint != mcp.HintOK {
+		t.Fatalf("Hint = %v, want HintOK", result.Hint)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "mcp: failed to encode response") {
+		t.Errorf("log output missing the expected encode-failure message; got: %s", logged)
+	}
+	if !strings.Contains(logged, "method=tools/list") {
+		t.Errorf("log output missing method=tools/list; got: %s", logged)
+	}
+	if strings.Contains(logged, corruptSchemaMarker) {
+		t.Errorf("log output leaked the corrupt schema/body content %q; got: %s", corruptSchemaMarker, logged)
 	}
 }

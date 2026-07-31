@@ -235,6 +235,9 @@ settings:
   # MCP Gateway settings
   mcp:
     call_timeout: 30s             # Timeout for proxied MCP tool calls
+    tool_cache_ttl: 1h            # Fallback freshness window for the tool cache when an
+                                   # upstream sends no ttlMs hint (0 = never expires; see
+                                   # docs/configuration.md#tool-caching)
     allow_private_urls: false     # Block MCP servers on private/loopback IPs
     code_mode:
       enabled: false              # Enable WASM-sandboxed JS execution

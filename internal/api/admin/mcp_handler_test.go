@@ -1173,6 +1173,779 @@ func TestMCPHandler_SSE_GetHeaders(t *testing.T) {
 	}
 }
 
+// ---- Modern-era header validation (MCP Streamable HTTP §4.5) ---------------
+//
+// These tests cover internal/api/admin/mcp_handler.go's validateMCPHeaders:
+// for a request carrying a modern MCP-Protocol-Version, the standard request
+// headers (Mcp-Method, Mcp-Name) must be present and match the JSON-RPC body,
+// or the request is rejected with HTTP 400 and JSON-RPC CodeHeaderMismatch
+// (-32020), per docs/mcp-v2.md §4.5.
+
+// modernToolCallRequest builds a modern-era tools/call JSON-RPC body with a
+// params._meta block carrying the MUST/SHOULD identity fields.
+func modernToolCallRequest(id int, toolName string) string {
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      toolName,
+			"arguments": map[string]any{},
+			"_meta": map[string]any{
+				"io.modelcontextprotocol/protocolVersion":    "2026-07-28",
+				"io.modelcontextprotocol/clientCapabilities": map[string]any{},
+			},
+		},
+	}
+	b, _ := json.Marshal(req)
+	return string(b)
+}
+
+// mcpPostModern sends a POST with the given headers set on top of the modern
+// MCP-Protocol-Version header, and returns the response.
+func mcpPostModern(t *testing.T, app *fiber.App, key, body string, extraHeaders map[string]string) *http.Response {
+	t.Helper()
+	req := httptest.NewRequest("POST", mcpURL, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("MCP-Protocol-Version", "2026-07-28")
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	return resp
+}
+
+// decodeMCPErrorBody decodes a non-2xx JSON-RPC error response body. It does
+// NOT close body: every call site already holds its own
+// `defer resp.Body.Close()` for the surrounding test function (frequently
+// established before this helper is ever called, so other assertions in the
+// same test can still read resp.Body's headers/status afterward) — closing
+// it here too would close the same body twice. Closing is therefore the
+// caller's responsibility alone, exactly once, per this repo's "every test
+// closes its response bodies exactly once" convention.
+func decodeMCPErrorBody(t *testing.T, body io.ReadCloser) mcp.Response {
+	t.Helper()
+	var resp mcp.Response
+	raw, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode error body: %v; raw: %s", err, raw)
+	}
+	return resp
+}
+
+// ---- Era leak: dispatch is keyed on the negotiated dialect, never on body --
+// ---- content (FIX 5, docs/mcp-v2.md §4.5, §4.6) -----------------------------
+
+// modernMetaRequest builds a JSON-RPC request whose params._meta carries
+// exactly the given protocolVersion (and an empty clientCapabilities object,
+// so requests are otherwise well-formed).
+func modernMetaRequest(id int, method, protocolVersion string) string {
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  method,
+		"params": map[string]any{
+			"_meta": map[string]any{
+				"io.modelcontextprotocol/protocolVersion":    protocolVersion,
+				"io.modelcontextprotocol/clientCapabilities": map[string]any{},
+			},
+		},
+	}
+	b, _ := json.Marshal(req)
+	return string(b)
+}
+
+// TestMCPHandler_ModernHeaderMismatch_ProtocolVersionVsBody verifies the era
+// leak this whole revision guards against: a request whose MCP-Protocol-Version
+// header names the modern revision but whose body's
+// params._meta["io.modelcontextprotocol/protocolVersion"] names a legacy one
+// must NOT be silently served in either era — it is rejected outright with
+// HTTP 400 and JSON-RPC CodeHeaderMismatch (-32020), so that an intermediary
+// routing on the header and VoidLLM executing the body can never disagree
+// about which era served the request (docs/mcp-v2.md §4.5).
+func TestMCPHandler_ModernHeaderMismatch_ProtocolVersionVsBody(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_ModernHeaderMismatch_ProtocolVersionVsBody?mode=memory&cache=private")
+
+	// mcpPostModern always sets the header to "2026-07-28"; the body claims
+	// the legacy "2025-03-26" instead.
+	body := modernMetaRequest(1, "tools/list", "2025-03-26")
+	resp := mcpPostModern(t, app, key, body, map[string]string{"Mcp-Method": "tools/list"})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400; body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPErrorBody(t, resp.Body)
+	if mcpResp.Error == nil {
+		t.Fatal("expected JSON-RPC error, got nil")
+	}
+	if mcpResp.Error.Code != mcp.CodeHeaderMismatch {
+		t.Errorf("Error.Code = %d, want %d (CodeHeaderMismatch)", mcpResp.Error.Code, mcp.CodeHeaderMismatch)
+	}
+}
+
+// TestMCPHandler_ModernHeaderMatchesBody_Accepted verifies the positive
+// counterpart: header and body naming the SAME modern protocol version is not
+// a mismatch and the request proceeds normally.
+func TestMCPHandler_ModernHeaderMatchesBody_Accepted(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_ModernHeaderMatchesBody_Accepted?mode=memory&cache=private")
+
+	body := modernMetaRequest(1, "tools/list", "2026-07-28")
+	resp := mcpPostModern(t, app, key, body, map[string]string{"Mcp-Method": "tools/list"})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPResponse(t, resp.Body)
+	if mcpResp.Error != nil {
+		t.Fatalf("unexpected protocol error: %+v", mcpResp.Error)
+	}
+}
+
+// TestMCPHandler_ModernBodyClaimsVersion_MissingHeader verifies the other
+// direction of the same interop bug (docs/mcp-v2.md §4.5): a body whose
+// params._meta claims a modern protocol version, but with NO
+// MCP-Protocol-Version header at all, must not be silently served as the
+// legacy default (Negotiate's rule 4) — it is rejected with HTTP 400 and
+// CodeHeaderMismatch, since MCP-Protocol-Version is a MUST header for every
+// modern request.
+func TestMCPHandler_ModernBodyClaimsVersion_MissingHeader(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_ModernBodyClaimsVersion_MissingHeader?mode=memory&cache=private")
+
+	body := modernMetaRequest(1, "tools/list", "2026-07-28")
+	req := httptest.NewRequest("POST", mcpURL, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+key)
+	// Deliberately no MCP-Protocol-Version header.
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400; body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPErrorBody(t, resp.Body)
+	if mcpResp.Error == nil {
+		t.Fatal("expected JSON-RPC error, got nil")
+	}
+	if mcpResp.Error.Code != mcp.CodeHeaderMismatch {
+		t.Errorf("Error.Code = %d, want %d (CodeHeaderMismatch)", mcpResp.Error.Code, mcp.CodeHeaderMismatch)
+	}
+}
+
+// TestMCPHandler_LegacyInitializeWithModernBodyProtocolVersion_StaysLegacy is
+// the HTTP-level counterpart of
+// internal/mcp/server_test.go's
+// TestServer_EraLeak_LegacyInitializeWithModernBodyProtocolVersion_StaysLegacy
+// — the single most important regression test of the whole dual-era rework.
+// A legacy "initialize" handshake with NO MCP-Protocol-Version header, but
+// whose params.protocolVersion (a top-level legacy field, NOT
+// params._meta["io.modelcontextprotocol/protocolVersion"]) happens to name
+// the modern 2026-07-28 revision, must still be served a normal, valid
+// legacy initialize response — never CodeMethodNotFound. Since the
+// top-level params.protocolVersion field is not the modern _meta location
+// validateMCPHeaders inspects, this request is not even flagged as a header
+// mismatch: it must sail straight through to Server.Handle, which itself
+// must never let the body value switch dispatch to the modern era.
+func TestMCPHandler_LegacyInitializeWithModernBodyProtocolVersion_StaysLegacy(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_LegacyInitializeWithModernBodyProtocolVersion_StaysLegacy?mode=memory&cache=private")
+
+	body := mcpRequest(1, "initialize", map[string]any{"protocolVersion": "2026-07-28"})
+	resp := mcpPost(t, app, key, body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	mcpResp := decodeMCPResponse(t, resp.Body)
+	if mcpResp.Error != nil {
+		t.Fatalf("unexpected protocol error (a leaked era would report initialize as CodeMethodNotFound "+
+			"since the modern vocabulary has no \"initialize\" method): %+v", mcpResp.Error)
+	}
+
+	b, _ := json.Marshal(mcpResp.Result)
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if m["protocolVersion"] != "2025-03-26" {
+		t.Errorf("protocolVersion = %v, want %q — a body-claimed modern version must NOT leak the era",
+			m["protocolVersion"], "2025-03-26")
+	}
+	if _, ok := m["resultType"]; ok {
+		t.Errorf("legacy result must not carry \"resultType\" (a modern-era field), got: %v", m)
+	}
+}
+
+// TestMCPHandler_ModernHeaderMismatch_McpNameVsBody verifies that a modern
+// request whose Mcp-Name header names a different tool than params.name is
+// rejected with HTTP 400 and JSON-RPC CodeHeaderMismatch (-32020).
+func TestMCPHandler_ModernHeaderMismatch_McpNameVsBody(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_ModernHeaderMismatch_McpNameVsBody?mode=memory&cache=private")
+
+	body := modernToolCallRequest(1, "list_models")
+	resp := mcpPostModern(t, app, key, body, map[string]string{
+		"Mcp-Method": "tools/call",
+		"Mcp-Name":   "get_model_health", // deliberately does not match params.name
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400; body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPErrorBody(t, resp.Body)
+	if mcpResp.Error == nil {
+		t.Fatal("expected JSON-RPC error, got nil")
+	}
+	if mcpResp.Error.Code != mcp.CodeHeaderMismatch {
+		t.Errorf("Error.Code = %d, want %d (CodeHeaderMismatch)", mcpResp.Error.Code, mcp.CodeHeaderMismatch)
+	}
+}
+
+// TestMCPHandler_ModernMissingRequiredHeader verifies that a modern request
+// missing a header the spec requires (Mcp-Method for every request; Mcp-Name
+// additionally for tools/call) is rejected with 400 + CodeHeaderMismatch.
+func TestMCPHandler_ModernMissingRequiredHeader(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		body    string
+		headers map[string]string
+	}{
+		{
+			name:    "missing Mcp-Method entirely",
+			body:    modernToolCallRequest(1, "list_models"),
+			headers: map[string]string{"Mcp-Name": "list_models"},
+		},
+		{
+			name: "tools/call missing Mcp-Name",
+			body: modernToolCallRequest(2, "list_models"),
+			headers: map[string]string{
+				"Mcp-Method": "tools/call",
+				// Mcp-Name deliberately omitted.
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dsn := fmt.Sprintf("file:TestMCPHandler_ModernMissingRequiredHeader_%s?mode=memory&cache=private",
+				strings.ReplaceAll(tc.name, " ", "_"))
+			app, _, key := setupTestAppWithMCP(t, dsn)
+
+			resp := mcpPostModern(t, app, key, tc.body, tc.headers)
+			defer resp.Body.Close()
+
+			if resp.StatusCode != fiber.StatusBadRequest {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 400; body: %s", resp.StatusCode, raw)
+			}
+			mcpResp := decodeMCPErrorBody(t, resp.Body)
+			if mcpResp.Error == nil {
+				t.Fatal("expected JSON-RPC error, got nil")
+			}
+			if mcpResp.Error.Code != mcp.CodeHeaderMismatch {
+				t.Errorf("Error.Code = %d, want %d (CodeHeaderMismatch)", mcpResp.Error.Code, mcp.CodeHeaderMismatch)
+			}
+		})
+	}
+}
+
+// TestMCPHandler_ModernBase64SentinelHeaderDecoded verifies that a header
+// value wrapped in the =?base64?...?= sentinel (docs/mcp-v2.md §4.4) is
+// decoded before comparison against the body, so a request is accepted when
+// the decoded value matches even though the raw header bytes do not look like
+// the tool name.
+func TestMCPHandler_ModernBase64SentinelHeaderDecoded(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_ModernBase64SentinelHeaderDecoded?mode=memory&cache=private")
+
+	body := modernToolCallRequest(1, "list_models")
+	// base64("list_models") = bGlzdF9tb2RlbHM=
+	resp := mcpPostModern(t, app, key, body, map[string]string{
+		"Mcp-Method": "tools/call",
+		"Mcp-Name":   "=?base64?bGlzdF9tb2RlbHM=?=",
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200 (sentinel should decode to a matching value); body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPResponse(t, resp.Body)
+	if mcpResp.Error != nil {
+		t.Fatalf("unexpected protocol error: %+v", mcpResp.Error)
+	}
+}
+
+// TestMCPHandler_ModernBase64SentinelHeaderDecoded_MismatchStillRejected
+// verifies that base64-sentinel decoding does not weaken the comparison: a
+// sentinel-encoded value that decodes to something OTHER than the body's tool
+// name is still a header mismatch.
+func TestMCPHandler_ModernBase64SentinelHeaderDecoded_MismatchStillRejected(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_ModernBase64SentinelHeaderDecoded_MismatchStillRejected?mode=memory&cache=private")
+
+	body := modernToolCallRequest(1, "list_models")
+	// base64("get_model_health") decodes to a DIFFERENT tool name.
+	resp := mcpPostModern(t, app, key, body, map[string]string{
+		"Mcp-Method": "tools/call",
+		"Mcp-Name":   "=?base64?Z2V0X21vZGVsX2hlYWx0aA==?=",
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400; body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPErrorBody(t, resp.Body)
+	if mcpResp.Error == nil || mcpResp.Error.Code != mcp.CodeHeaderMismatch {
+		t.Errorf("Error = %+v, want CodeHeaderMismatch (%d)", mcpResp.Error, mcp.CodeHeaderMismatch)
+	}
+}
+
+// TestMCPHandler_ModernValidHeaders_Accepted verifies the positive case: a
+// modern request with all required headers present and matching the body
+// succeeds exactly like the equivalent legacy request would.
+func TestMCPHandler_ModernValidHeaders_Accepted(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_ModernValidHeaders_Accepted?mode=memory&cache=private")
+
+	body := modernToolCallRequest(1, "list_models")
+	resp := mcpPostModern(t, app, key, body, map[string]string{
+		"Mcp-Method": "tools/call",
+		"Mcp-Name":   "list_models",
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPResponse(t, resp.Body)
+	if mcpResp.Error != nil {
+		t.Fatalf("unexpected protocol error: %+v", mcpResp.Error)
+	}
+
+	// Modern-era results carry resultType: "complete" (docs/mcp-v2.md §3.8) —
+	// confirms the request actually took the modern dialect, not a legacy
+	// fallback.
+	b, _ := json.Marshal(mcpResp.Result)
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if m["resultType"] != "complete" {
+		t.Errorf("resultType = %v, want %q", m["resultType"], "complete")
+	}
+}
+
+// TestMCPHandler_GET_ModernHeader_405 verifies that GET /api/v1/mcp/voidllm
+// carrying a modern MCP-Protocol-Version is rejected with 405 Method Not
+// Allowed: the 2026-07-28 revision has no GET-based transport.
+func TestMCPHandler_GET_ModernHeader_405(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_GET_ModernHeader_405?mode=memory&cache=private")
+
+	req := httptest.NewRequest("GET", mcpURL, nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("MCP-Protocol-Version", "2026-07-28")
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusMethodNotAllowed {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want 405; body: %s", resp.StatusCode, raw)
+	}
+}
+
+// TestMCPHandler_GET_LegacyHeader_StillSSE verifies that GET carrying an
+// explicit LEGACY MCP-Protocol-Version (not merely an absent header) is still
+// served as SSE — only a modern header triggers 405. This is the important
+// regression guard alongside TestMCPHandler_SSE_GetOpensStream (which covers
+// the fully headerless legacy case): legacy SSE-only clients must keep
+// working exactly as before this revision, in every legacy shape they might
+// send.
+func TestMCPHandler_GET_LegacyHeader_StillSSE(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_GET_LegacyHeader_StillSSE?mode=memory&cache=private")
+
+	req := httptest.NewRequest("GET", mcpURL, nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("MCP-Protocol-Version", "2025-06-18")
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream prefix", ct)
+	}
+}
+
+// ---- HTTP status code mapping (FIX 2, docs/mcp-v2.md §4.5, §4.6) -----------
+
+// TestMCPHandler_UnsupportedProtocolVersion_Returns400 verifies that an
+// unrecognized MCP-Protocol-Version header (CodeUnsupportedProtocolVersion,
+// -32022) is rejected with HTTP 400 — so a dual-era client probing this
+// server recognizes it as modern from the status code and body, and retries
+// with one of the announced supported versions instead of falling back to a
+// legacy handshake (docs/mcp-v2.md §4.6).
+func TestMCPHandler_UnsupportedProtocolVersion_Returns400(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_UnsupportedProtocolVersion_Returns400?mode=memory&cache=private")
+
+	req := httptest.NewRequest("POST", mcpURL, strings.NewReader(mcpRequest(1, "tools/list", nil)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("MCP-Protocol-Version", "1900-01-01")
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400; body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPErrorBody(t, resp.Body)
+	if mcpResp.Error == nil {
+		t.Fatal("expected JSON-RPC error, got nil")
+	}
+	if mcpResp.Error.Code != mcp.CodeUnsupportedProtocolVersion {
+		t.Errorf("Error.Code = %d, want %d (CodeUnsupportedProtocolVersion)", mcpResp.Error.Code, mcp.CodeUnsupportedProtocolVersion)
+	}
+}
+
+// TestMCPHandler_ModernUnknownMethod_Returns404 verifies that an unknown
+// method under the MODERN era is rejected with HTTP 404 (in addition to
+// JSON-RPC CodeMethodNotFound in the body): the JSON-RPC body is what lets a
+// dual-era client distinguish this from the 404 a legacy-only server would
+// return for not hosting the modern endpoint at all (docs/mcp-v2.md §4.6).
+func TestMCPHandler_ModernUnknownMethod_Returns404(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_ModernUnknownMethod_Returns404?mode=memory&cache=private")
+
+	body := modernMetaRequest(1, "no/such/method", "2026-07-28")
+	resp := mcpPostModern(t, app, key, body, map[string]string{"Mcp-Method": "no/such/method"})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusNotFound {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 404; body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPErrorBody(t, resp.Body)
+	if mcpResp.Error == nil {
+		t.Fatal("expected JSON-RPC error, got nil")
+	}
+	if mcpResp.Error.Code != mcp.CodeMethodNotFound {
+		t.Errorf("Error.Code = %d, want %d (CodeMethodNotFound)", mcpResp.Error.Code, mcp.CodeMethodNotFound)
+	}
+}
+
+// TestMCPHandler_LegacyMethodNotFound_MustStayHTTP200_NotHTTP404 is the
+// highest-priority regression test for FIX 2's status code mapping: an
+// unknown method under the LEGACY era (no MCP-Protocol-Version header, or one
+// naming a pre-2026-07-28 revision) MUST keep responding HTTP 200 with the
+// JSON-RPC error in the body — NEVER HTTP 404. A legacy client that already
+// knows this endpoint exists would read a 404 as "wrong URL" and fall back to
+// the deprecated HTTP+SSE transport, breaking every legacy integration that
+// predates the modern era's own distinct 404 behavior (docs/mcp-v2.md §4.6,
+// see HintMethodNotFound's doc in internal/mcp/server.go).
+func TestMCPHandler_LegacyMethodNotFound_MustStayHTTP200_NotHTTP404(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_LegacyMethodNotFound_MustStayHTTP200_NotHTTP404?mode=memory&cache=private")
+
+	resp := mcpPost(t, app, key, mcpRequest(1, "no/such/method", nil))
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200 (NOT 404 — see test doc comment); body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPResponse(t, resp.Body)
+	if mcpResp.Error == nil {
+		t.Fatal("expected JSON-RPC error, got nil")
+	}
+	if mcpResp.Error.Code != mcp.CodeMethodNotFound {
+		t.Errorf("Error.Code = %d, want %d (CodeMethodNotFound)", mcpResp.Error.Code, mcp.CodeMethodNotFound)
+	}
+}
+
+// ---- Strict required-field validation (docs/mcp-v2.md §3.2) ----------------
+//
+// dialect2026.Decode rejects any modern-era request whose params._meta omits
+// io.modelcontextprotocol/protocolVersion or io.modelcontextprotocol/clientCapabilities
+// with CodeInvalidParams (-32602) and an explicit HTTP-400 hint — see
+// internal/mcp's TestServer_Handle_Modern_RequiredMetaFieldValidation for the
+// exhaustive table of accepted/rejected _meta shapes at the Server.Handle
+// level. The tests below cover the property that table cannot: the HTTP
+// status code distinction this handler is responsible for producing, and the
+// legacy compatibility guarantee that a request with no _meta at all must
+// never even reach this stricter validation in the first place.
+
+// TestMCPHandler_Modern_MissingRequiredMetaFields_Returns400 verifies that a
+// modern-era request whose body carries no params._meta at all — so it is
+// missing BOTH MUST fields — is rejected with HTTP 400, not HTTP 200: this is
+// the HTTP-status half of docs/mcp-v2.md §3.2's verbatim requirement, and the
+// exact distinction Error.Hint (dialect_2026.go) exists to carry, since an
+// ordinary CodeInvalidParams otherwise keeps the HTTP 200 JSON-RPC-error
+// convention (see TestMCPHandler_Modern_OrdinaryInvalidParams_StaysHTTP200,
+// its direct counterpart).
+func TestMCPHandler_Modern_MissingRequiredMetaFields_Returns400(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_Modern_MissingRequiredMetaFields_Returns400?mode=memory&cache=private")
+
+	// No params._meta at all — validateMCPHeaders itself does not require one
+	// (it only cross-checks headers against whatever _meta IS present), so
+	// this body sails past header validation and reaches Server.Handle, where
+	// dialect2026.Decode is the layer that must reject it.
+	body := mcpRequest(1, "tools/list", nil)
+	resp := mcpPostModern(t, app, key, body, map[string]string{"Mcp-Method": "tools/list"})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400; body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPErrorBody(t, resp.Body)
+	if mcpResp.Error == nil {
+		t.Fatal("expected JSON-RPC error, got nil")
+	}
+	if mcpResp.Error.Code != mcp.CodeInvalidParams {
+		t.Errorf("Error.Code = %d, want %d (CodeInvalidParams)", mcpResp.Error.Code, mcp.CodeInvalidParams)
+	}
+}
+
+// TestMCPHandler_Modern_OrdinaryInvalidParams_StaysHTTP200 verifies the other
+// half of the same distinction: an ORDINARY CodeInvalidParams — one that has
+// nothing to do with a missing MUST _meta field, here a tools/call naming a
+// tool that does not exist — must keep the usual HTTP 200 JSON-RPC-error
+// convention, exactly as it would under the legacy era. Both this test and
+// TestMCPHandler_Modern_MissingRequiredMetaFields_Returns400 share the same
+// JSON-RPC error code (-32602); only Error.Hint, set explicitly by
+// dialect2026.Decode for the missing-required-field case, tells them apart.
+func TestMCPHandler_Modern_OrdinaryInvalidParams_StaysHTTP200(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_Modern_OrdinaryInvalidParams_StaysHTTP200?mode=memory&cache=private")
+
+	const unknownTool = "definitely_not_a_real_tool"
+	body := modernToolCallRequest(1, unknownTool)
+	resp := mcpPostModern(t, app, key, body, map[string]string{
+		"Mcp-Method": "tools/call",
+		"Mcp-Name":   unknownTool,
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200 (an ordinary CodeInvalidParams unrelated to a missing _meta "+
+			"field must NOT be reported as HTTP 400); body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPResponse(t, resp.Body)
+	if mcpResp.Error == nil {
+		t.Fatal("expected JSON-RPC error, got nil")
+	}
+	if mcpResp.Error.Code != mcp.CodeInvalidParams {
+		t.Errorf("Error.Code = %d, want %d (CodeInvalidParams)", mcpResp.Error.Code, mcp.CodeInvalidParams)
+	}
+}
+
+// TestMCPHandler_LegacyRequestWithNoMeta_CompatibilityGuarantee is a
+// regression/compatibility guarantee test, named explicitly as such: a
+// legacy request — no MCP-Protocol-Version header, no params._meta at all —
+// must keep working completely unchanged by the 2026-07-28 strict
+// required-field validation added elsewhere in this file. Negotiate's rule 4
+// (negotiate.go) defaults such a request to V20250326 (EraLegacy), so it
+// never reaches dialect2026.Decode — and therefore never trips the
+// missing-_meta rejection — regardless of how strict that dialect has
+// become. If this test ever starts failing, the legacy fallback path itself
+// has regressed, not merely the modern-era validation this file is mostly
+// about.
+func TestMCPHandler_LegacyRequestWithNoMeta_CompatibilityGuarantee(t *testing.T) {
+	t.Parallel()
+
+	app, _, key := setupTestAppWithMCP(t, "file:TestMCPHandler_LegacyRequestWithNoMeta_CompatibilityGuarantee?mode=memory&cache=private")
+
+	// mcpPost sets no MCP-Protocol-Version header at all, and mcpRequest emits
+	// no params._meta — the plainest possible legacy shape.
+	resp := mcpPost(t, app, key, mcpRequest(1, "tools/list", nil))
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200 (legacy compatibility guarantee); body: %s", resp.StatusCode, raw)
+	}
+	mcpResp := decodeMCPResponse(t, resp.Body)
+	if mcpResp.Error != nil {
+		t.Fatalf("unexpected protocol error (a legacy request with no _meta at all must never be rejected "+
+			"by the modern dialect's required-field validation): %+v", mcpResp.Error)
+	}
+}
+
+// ---- Compatibility matrix (docs/mcp-v2.md §4.7, server role only) -----------
+//
+// Phase 1 gives VoidLLM only the server role of the matrix: a legacy client
+// and a modern client must both be able to reach our dual-era server, each
+// getting back the wire format their own era expects. The client-role rows
+// (VoidLLM as an outbound MCP client probing an upstream server) are Phase 2
+// (probe.go) and out of scope here.
+
+// TestMCPHandler_CompatibilityMatrix_ServerRole verifies both matrix rows that
+// concern VoidLLM as the server: "Legacy client, our (dual-era) server" and
+// "Modern client, our (dual-era) server" both succeed, each in its own era's
+// wire format.
+func TestMCPHandler_CompatibilityMatrix_ServerRole(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		buildReq  func(key string) *http.Request
+		checkWire func(t *testing.T, m map[string]any)
+	}{
+		{
+			name: "legacy client (initialize handshake, no MCP-Protocol-Version header) reaches our dual-era server",
+			buildReq: func(key string) *http.Request {
+				req := httptest.NewRequest("POST", mcpURL, strings.NewReader(mcpRequest(1, "initialize", nil)))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Authorization", "Bearer "+key)
+				return req
+			},
+			checkWire: func(t *testing.T, m map[string]any) {
+				t.Helper()
+				// Legacy wire format: protocolVersion/capabilities/serverInfo at
+				// the top level, no resultType/ttlMs/cacheScope wrapper.
+				if m["protocolVersion"] == nil {
+					t.Errorf("legacy result missing protocolVersion: %v", m)
+				}
+				if _, ok := m["resultType"]; ok {
+					t.Errorf("legacy result must not carry resultType: %v", m)
+				}
+			},
+		},
+		{
+			name: "modern client (per-request _meta, MCP-Protocol-Version header) reaches our dual-era server",
+			buildReq: func(key string) *http.Request {
+				params := map[string]any{
+					"_meta": map[string]any{
+						"io.modelcontextprotocol/protocolVersion":    "2026-07-28",
+						"io.modelcontextprotocol/clientCapabilities": map[string]any{},
+					},
+				}
+				req := httptest.NewRequest("POST", mcpURL, strings.NewReader(mcpRequest(1, "tools/list", params)))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Authorization", "Bearer "+key)
+				req.Header.Set("MCP-Protocol-Version", "2026-07-28")
+				req.Header.Set("Mcp-Method", "tools/list")
+				return req
+			},
+			checkWire: func(t *testing.T, m map[string]any) {
+				t.Helper()
+				// Modern wire format: resultType/cacheScope/_meta.serverInfo
+				// present, no bare protocolVersion field.
+				if m["resultType"] != "complete" {
+					t.Errorf("modern result resultType = %v, want \"complete\"", m["resultType"])
+				}
+				if m["cacheScope"] != "private" {
+					t.Errorf("modern tools/list cacheScope = %v, want \"private\"", m["cacheScope"])
+				}
+				meta, _ := m["_meta"].(map[string]any)
+				if meta == nil || meta["io.modelcontextprotocol/serverInfo"] == nil {
+					t.Errorf("modern result missing _meta.serverInfo: %v", m)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dsn := fmt.Sprintf("file:TestMCPHandler_CompatibilityMatrix_%s?mode=memory&cache=private",
+				strings.ReplaceAll(tc.name, " ", "_"))
+			app, _, key := setupTestAppWithMCP(t, dsn)
+
+			resp, err := app.Test(tc.buildReq(key), fiber.TestConfig{Timeout: testTimeout})
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != fiber.StatusOK {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+			}
+
+			mcpResp := decodeMCPResponse(t, resp.Body)
+			if mcpResp.Error != nil {
+				t.Fatalf("unexpected protocol error: %+v", mcpResp.Error)
+			}
+
+			b, _ := json.Marshal(mcpResp.Result)
+			var m map[string]any
+			if err := json.Unmarshal(b, &m); err != nil {
+				t.Fatalf("decode result: %v", err)
+			}
+			tc.checkWire(t, m)
+		})
+	}
+}
+
 // ---- Helpers ----------------------------------------------------------------
 
 // noopLogger returns a slog.Logger that discards all output.

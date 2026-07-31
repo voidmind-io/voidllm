@@ -175,13 +175,18 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 	// Version info is not sensitive; no additional role gate required.
 	api.Get("/system/update-check", handler.GetUpdateStatus)
 
+	// mcpOrigin enforces MCP Streamable HTTP's mandatory Origin validation
+	// (docs/mcp-v2.md §4.1) on every MCP endpoint below — POST and GET, both
+	// the Code Mode server and the /:alias gateway. See mcpOriginMiddleware.
+	mcpOrigin := mcpOriginMiddleware(handler.MCPAllowedOrigins, handler.Log)
+
 	// Code Mode MCP server — aggregated code execution tools (list_servers,
 	// search_tools, execute_code). These routes MUST be registered before the
 	// /mcp/:alias routes so that Fiber does not treat the bare /mcp path as
 	// alias="" on the parameterised route.
 	if handler.CodeModeServer != nil {
-		api.Post("/mcp", handler.HandleCodeModeMCP)
-		api.Get("/mcp", handler.HandleCodeModeMCPSSE)
+		api.Post("/mcp", mcpOrigin, handler.HandleCodeModeMCP)
+		api.Get("/mcp", mcpOrigin, handler.HandleCodeModeMCPSSE)
 	}
 
 	// MCP gateway — any authenticated caller may send MCP requests.
@@ -191,8 +196,8 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 	// GET opens a persistent SSE stream (legacy SSE transport for "voidllm");
 	// POST handles JSON-RPC and responds with JSON or SSE per the Accept header.
 	if handler.MCPServer != nil {
-		api.Post("/mcp/:alias", handler.HandleMCPProxy)
-		api.Get("/mcp/:alias", handler.HandleMCPProxySSE)
+		api.Post("/mcp/:alias", mcpOrigin, handler.HandleMCPProxy)
+		api.Get("/mcp/:alias", mcpOrigin, handler.HandleMCPProxySSE)
 	}
 
 	// MCP Servers — global resources (system_admin only for write; handler checks

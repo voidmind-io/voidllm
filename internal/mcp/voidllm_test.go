@@ -57,7 +57,7 @@ func callTool(t *testing.T, s *mcp.Server, ctx context.Context, toolName string,
 		t.Fatalf("marshal request: %v", err)
 	}
 
-	raw := s.Handle(ctx, reqBytes)
+	raw := s.Handle(ctx, reqBytes, mcp.MapHeader{}).Body
 	if raw == nil {
 		t.Fatalf("server returned nil for tools/call")
 	}
@@ -271,7 +271,7 @@ func TestVoidLLM_ListModels_DepError(t *testing.T) {
 		},
 	}
 	reqBytes, _ := json.Marshal(req)
-	raw := s.Handle(adminCtx, reqBytes)
+	raw := s.Handle(adminCtx, reqBytes, mcp.MapHeader{}).Body
 
 	var resp mcp.Response
 	if err := json.Unmarshal(raw, &resp); err != nil {
@@ -660,7 +660,7 @@ func TestVoidLLM_CreateKey_DepError(t *testing.T) {
 		},
 	}
 	reqBytes, _ := json.Marshal(req)
-	raw := s.Handle(ctx, reqBytes)
+	raw := s.Handle(ctx, reqBytes, mcp.MapHeader{}).Body
 
 	var resp mcp.Response
 	if err := json.Unmarshal(raw, &resp); err != nil {
@@ -711,7 +711,7 @@ func TestVoidLLM_ListKeys_DepError(t *testing.T) {
 		},
 	}
 	reqBytes, _ := json.Marshal(req)
-	raw := s.Handle(ctx, reqBytes)
+	raw := s.Handle(ctx, reqBytes, mcp.MapHeader{}).Body
 
 	var resp mcp.Response
 	if err := json.Unmarshal(raw, &resp); err != nil {
@@ -865,7 +865,7 @@ func TestKeyIdentity_ContextRoundTrip(t *testing.T) {
 	s := mcp.NewServer("rt", "0.1.0")
 	s.RegisterTool(mcp.Tool{
 		Name:        "read_identity",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(ctx context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		// We cannot call the private keyIdentityFromCtx, but we can confirm
 		// that a tool receiving a context from WithKeyIdentity sees the values
@@ -1083,7 +1083,7 @@ func TestVoidLLM_ListServers_DepError(t *testing.T) {
 		},
 	}
 	reqBytes, _ := json.Marshal(req)
-	raw := s.Handle(context.Background(), reqBytes)
+	raw := s.Handle(context.Background(), reqBytes, mcp.MapHeader{}).Body
 
 	var resp mcp.Response
 	if err := json.Unmarshal(raw, &resp); err != nil {
@@ -1214,7 +1214,7 @@ func TestVoidLLM_SearchTools_DepError(t *testing.T) {
 		},
 	}
 	reqBytes, _ := json.Marshal(req)
-	raw := s.Handle(context.Background(), reqBytes)
+	raw := s.Handle(context.Background(), reqBytes, mcp.MapHeader{}).Body
 
 	var resp mcp.Response
 	if err := json.Unmarshal(raw, &resp); err != nil {
@@ -1406,7 +1406,7 @@ func TestVoidLLM_ExecuteCode_DepError(t *testing.T) {
 		},
 	}
 	reqBytes, _ := json.Marshal(req)
-	raw := s.Handle(context.Background(), reqBytes)
+	raw := s.Handle(context.Background(), reqBytes, mcp.MapHeader{}).Body
 
 	var resp mcp.Response
 	if err := json.Unmarshal(raw, &resp); err != nil {

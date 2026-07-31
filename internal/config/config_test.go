@@ -1195,6 +1195,62 @@ func TestValidate_MCPServer(t *testing.T) {
 `),
 			wantErr: false,
 		},
+		{
+			name: "omitted protocol_version passes validation",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "No Pin MCP"
+    alias: "no-pin"
+    url: "https://mcp.example.com"
+    auth_type: "none"
+`),
+			wantErr: false,
+		},
+		{
+			name: "protocol_version auto is valid",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "Auto Pin MCP"
+    alias: "auto-pin"
+    url: "https://mcp.example.com"
+    auth_type: "none"
+    protocol_version: "auto"
+`),
+			wantErr: false,
+		},
+		{
+			name: "protocol_version pinned to a supported revision is valid",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "Pinned MCP"
+    alias: "pinned"
+    url: "https://mcp.example.com"
+    auth_type: "none"
+    protocol_version: "2025-11-25"
+`),
+			wantErr: false,
+		},
+		{
+			name: "protocol_version unrecognized date returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "Bad Pin MCP"
+    alias: "bad-pin"
+    url: "https://mcp.example.com"
+    auth_type: "none"
+    protocol_version: "1999-01-01"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].protocol_version",
+		},
+		{
+			name: "protocol_version garbage string returns error",
+			yaml: minimalValidYAMLWithMCPServers(`
+  - name: "Garbage Pin MCP"
+    alias: "garbage-pin"
+    url: "https://mcp.example.com"
+    auth_type: "none"
+    protocol_version: "not-a-version"
+`),
+			wantErr:     true,
+			errContains: "mcp_servers[0].protocol_version",
+		},
 
 		// ── Fallback max depth validation ────────────────────────────────────
 		// Note: setDefaults converts 0 and negative values to 3 before
@@ -1428,6 +1484,141 @@ models:
 				if err != nil {
 					t.Errorf("Load() unexpected error: %v", err)
 				}
+			}
+		})
+	}
+}
+
+// TestValidate_MCPAllowedOrigins verifies FIX D: settings.mcp.allowed_origins
+// entries must be exactly scheme://host[:port], with no path component at
+// all — not even a bare trailing "/". Browsers never send a trailing slash
+// on the Origin header they generate (RFC 6454: an Origin is scheme, host,
+// and port only), so an allowlist entry with one can never match a real
+// request and would silently 403 every legitimate browser call.
+func TestValidate_MCPAllowedOrigins(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		origin      string
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:    "bare scheme://host is valid",
+			origin:  "https://app.example.com",
+			wantErr: false,
+		},
+		{
+			name:    "scheme://host:port is valid",
+			origin:  "https://app.example.com:8443",
+			wantErr: false,
+		},
+		{
+			name:        "trailing slash is rejected",
+			origin:      "https://app.example.com/",
+			wantErr:     true,
+			errContains: "settings.mcp.allowed_origins[0]",
+		},
+		{
+			name:        "a real path is rejected",
+			origin:      "https://app.example.com/callback",
+			wantErr:     true,
+			errContains: "settings.mcp.allowed_origins[0]",
+		},
+		{
+			name:        "missing scheme is rejected",
+			origin:      "app.example.com",
+			wantErr:     true,
+			errContains: "settings.mcp.allowed_origins[0]",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			yaml := minimalValidYAML() + `
+  mcp:
+    allowed_origins:
+      - "` + tc.origin + `"
+`
+			path := writeTemp(t, "voidllm.yaml", yaml)
+			_, _, err := config.Load(path)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("Load() expected error, got nil")
+				}
+				if tc.errContains != "" && !strings.Contains(err.Error(), tc.errContains) {
+					t.Errorf("error %q does not contain %q", err.Error(), tc.errContains)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Load() unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestValidate_MCPAllowedOrigins_NormalizesCase verifies FIX 4
+// (docs/mcp-v2.md): settings.mcp.allowed_origins entries are normalized to
+// lowercase scheme and host in place during validation, since RFC 6454
+// defines both as case-insensitive. This keeps the in-memory allowlist
+// uniform from the moment it is loaded, independent of
+// mcpOriginMiddleware's own case-insensitive comparison (originEqualFold,
+// internal/api/admin/mcp_origin.go) ever being reached at all.
+func TestValidate_MCPAllowedOrigins_NormalizesCase(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "fully uppercase scheme and host are lowercased",
+			input: "HTTPS://APP.EXAMPLE.COM",
+			want:  "https://app.example.com",
+		},
+		{
+			name:  "mixed-case scheme and host are lowercased",
+			input: "HttpS://App.Example.Com",
+			want:  "https://app.example.com",
+		},
+		{
+			name:  "an already-lowercase entry is left unchanged",
+			input: "https://app.example.com",
+			want:  "https://app.example.com",
+		},
+		{
+			name:  "port is preserved verbatim, only scheme/host are case-normalized",
+			input: "HTTPS://App.Example.Com:8443",
+			want:  "https://app.example.com:8443",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			yaml := minimalValidYAML() + `
+  mcp:
+    allowed_origins:
+      - "` + tc.input + `"
+`
+			path := writeTemp(t, "voidllm.yaml", yaml)
+			cfg, _, err := config.Load(path)
+			if err != nil {
+				t.Fatalf("Load() unexpected error: %v", err)
+			}
+
+			if len(cfg.Settings.MCP.AllowedOrigins) != 1 {
+				t.Fatalf("AllowedOrigins = %v, want exactly one entry", cfg.Settings.MCP.AllowedOrigins)
+			}
+			if got := cfg.Settings.MCP.AllowedOrigins[0]; got != tc.want {
+				t.Errorf("AllowedOrigins[0] = %q, want %q (validation must normalize case in place)", got, tc.want)
 			}
 		})
 	}
@@ -1810,5 +2001,52 @@ models:
 	}
 	if cfg.Settings.Usage.FlushInterval != 10*time.Second {
 		t.Errorf("Usage.FlushInterval = %v, want 10s", cfg.Settings.Usage.FlushInterval)
+	}
+}
+
+// ---- MCPConfig.EffectiveStreamMaxBytes --------------------------------------
+
+// TestMCPConfig_EffectiveStreamMaxBytes verifies the resolution rules
+// StreamMaxBytes' own doc promises, purely through the config method itself —
+// deliberately not by ever sending anywhere near the 100 MiB default over a
+// real connection, which would make this check slow and memory-heavy for no
+// added confidence: never set in YAML (nil) falls back to the 100 MiB
+// default, while an explicit "0" is preserved as unbounded rather than being
+// folded into "not set".
+func TestMCPConfig_EffectiveStreamMaxBytes(t *testing.T) {
+	t.Parallel()
+
+	int64Ptr := func(v int64) *int64 { return &v }
+
+	tests := []struct {
+		name string
+		cfg  config.MCPConfig
+		want int64
+	}{
+		{
+			name: "never set in YAML (nil) defaults to 100 MiB",
+			cfg:  config.MCPConfig{},
+			want: 100 << 20,
+		},
+		{
+			name: "explicit zero means unbounded, not the default",
+			cfg:  config.MCPConfig{StreamMaxBytes: int64Ptr(0)},
+			want: 0,
+		},
+		{
+			name: "explicit positive value is used as-is",
+			cfg:  config.MCPConfig{StreamMaxBytes: int64Ptr(50 << 20)},
+			want: 50 << 20,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tc.cfg.EffectiveStreamMaxBytes(); got != tc.want {
+				t.Errorf("EffectiveStreamMaxBytes() = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

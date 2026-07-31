@@ -146,6 +146,42 @@ func (a *Application) warnIfSinglePortTLS(adminPort int) {
 	}
 }
 
+// warnIfMCPWriteTimeoutFinite emits one WARN at startup when the MCP gateway
+// is active and writeTimeout — the effective WriteTimeout of whichever Fiber
+// app serves the MCP routes (a.proxyApp in single-port mode, a.adminApp in
+// dual-port mode) — is finite.
+//
+// fasthttp's WriteTimeout is a single absolute per-socket write deadline set
+// once before response serialization begins; it is never refreshed by a
+// successful SSE flush (see tunnelStreamBudget's doc above and
+// docs/mcp-v2.md's review finding E). A long-lived MCP
+// subscriptions/listen stream (docs/mcp-v2.md §3.4) is therefore killed once
+// writeTimeout elapses no matter how healthy the traffic still flowing is,
+// and independent of settings.mcp.stream_idle_timeout, which only bounds
+// silence, not total duration. Operators who run subscriptions/listen in
+// production must set write_timeout to 0 — an explicitly unlimited deadline,
+// see the fiber.Config wiring below — to allow such a stream to run
+// arbitrarily long.
+//
+// The warning fires exactly once, at startup, and only when the MCP gateway
+// is actually active (a.adminHandler.MCPServer != nil — the same gate
+// admin.RegisterRoutes uses to decide whether to register the MCP proxy
+// routes at all): for a deployment that never uses MCP, this would otherwise
+// be pure noise about a limit nothing on that deployment can ever hit.
+func (a *Application) warnIfMCPWriteTimeoutFinite(writeTimeout time.Duration) {
+	if a.adminHandler.MCPServer == nil {
+		return
+	}
+	if writeTimeout <= 0 {
+		return
+	}
+	a.log.LogAttrs(context.Background(), slog.LevelWarn,
+		"MCP gateway is active with a finite write_timeout: subscriptions/listen streams cannot outlive it",
+		slog.Duration("write_timeout", writeTimeout),
+		slog.String("fix", "set write_timeout to 0 to allow unbounded MCP streams"),
+	)
+}
+
 // devCORSMiddleware returns a Fiber handler that sets permissive CORS headers
 // for every response. It is only installed when dev mode is active so that the
 // Vite development server can reach both the proxy and admin apps without
@@ -205,6 +241,11 @@ func (a *Application) setupRoutes() {
 		// Single-port mode: admin routes share the proxy app.
 		a.warnIfSinglePortTLS(adminPort)
 		admin.RegisterRoutes(a.proxyApp, a.adminHandler, a.keyCache, a.hmacSecret, a.auditLogger)
+
+		// MCP routes live on a.proxyApp in single-port mode, so its
+		// WriteTimeout is the one that bounds subscriptions/listen streams —
+		// see warnIfMCPWriteTimeoutFinite's doc.
+		a.warnIfMCPWriteTimeoutFinite(a.proxyApp.Config().WriteTimeout)
 
 		// The playground tunnel shares a.proxyApp in single-port mode, so its
 		// stream budget is derived from a.proxyApp's own (uncapped) WriteTimeout
@@ -280,6 +321,11 @@ func (a *Application) setupRoutes() {
 	a.adminApp.Get("/health", health.Liveness())
 	a.adminApp.Get("/metrics", health.Metrics())
 	admin.RegisterRoutes(a.adminApp, a.adminHandler, a.keyCache, a.hmacSecret, a.auditLogger)
+
+	// MCP routes live on a.adminApp in dual-port mode, so its (clamped)
+	// WriteTimeout is the one that bounds subscriptions/listen streams —
+	// see warnIfMCPWriteTimeoutFinite's doc.
+	a.warnIfMCPWriteTimeoutFinite(a.adminApp.Config().WriteTimeout)
 
 	// The playground tunnel lives on a.adminApp in dual-port mode, so its
 	// stream budget is derived from a.adminApp's clamped WriteTimeout

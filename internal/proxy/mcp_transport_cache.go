@@ -6,10 +6,16 @@ import (
 	"sync"
 	"time"
 
+	apihealth "github.com/voidmind-io/voidllm/internal/api/health"
 	"github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/pkg/crypto"
 )
+
+// mcpClientInfo self-identifies VoidLLM to upstream MCP servers in both
+// protocol eras: the legacy initialize handshake's clientInfo field and the
+// modern era's params._meta["io.modelcontextprotocol/clientInfo"].
+var mcpClientInfo = mcp.ClientInfo{Name: "voidllm", Version: apihealth.Version}
 
 // resolvedMCPServer holds a pre-resolved, ready-to-use MCP server configuration
 // with a persistent HTTP transport.
@@ -20,6 +26,7 @@ type resolvedMCPServer struct {
 	AuthHeader           string
 	AuthTokenEnc         string             // original encrypted value, used for change detection
 	OAuthClientSecretEnc string             // original encrypted value, used for change detection
+	ProtocolVersion      string             // db.MCPServer.ProtocolVersion, used for change detection
 	Transport            *mcp.HTTPTransport // persistent, reusable; closed on eviction
 }
 
@@ -31,31 +38,39 @@ type resolvedMCPServer struct {
 // closes transports for removed or changed servers and opens new ones, so the
 // hot-path Get never allocates.
 type MCPTransportCache struct {
-	mu           sync.RWMutex
-	servers      map[string]*resolvedMCPServer // keyed by serverID
-	stale        []*mcp.HTTPTransport          // closed at the start of the next LoadAll
-	encKey       []byte
-	callTimeout  time.Duration
-	allowPrivate bool
-	log          *slog.Logger
-	oauthManager *mcp.OAuthTokenManager // shared OAuth token manager; always non-nil
+	mu                sync.RWMutex
+	servers           map[string]*resolvedMCPServer // keyed by serverID
+	stale             []*mcp.HTTPTransport          // closed at the start of the next LoadAll
+	encKey            []byte
+	callTimeout       time.Duration
+	streamIdleTimeout time.Duration
+	allowPrivate      bool
+	log               *slog.Logger
+	oauthManager      *mcp.OAuthTokenManager // shared OAuth token manager; always non-nil
 }
 
 // NewMCPTransportCache returns an empty, ready-to-use MCPTransportCache.
 // encKey is the AES-256-GCM key used to decrypt stored auth tokens and OAuth
 // client secrets. callTimeout is passed to mcp.NewHTTPTransport for each
-// persistent transport; a zero value falls back to 30 seconds.
+// persistent transport as the buffered-path timeout (Call, probeEra,
+// Warmup); a zero value falls back to 30 seconds. streamIdleTimeout is
+// passed as the idle timeout for the streaming path (Forward); a zero value
+// falls back to 120 seconds — see config.MCPConfig.StreamIdleTimeout.
 // allowPrivate disables SSRF protection.
-func NewMCPTransportCache(encKey []byte, allowPrivate bool, callTimeout time.Duration, log *slog.Logger) *MCPTransportCache {
+func NewMCPTransportCache(encKey []byte, allowPrivate bool, callTimeout, streamIdleTimeout time.Duration, log *slog.Logger) *MCPTransportCache {
 	if callTimeout == 0 {
 		callTimeout = 30 * time.Second
 	}
+	if streamIdleTimeout == 0 {
+		streamIdleTimeout = 120 * time.Second
+	}
 	return &MCPTransportCache{
-		servers:      make(map[string]*resolvedMCPServer),
-		encKey:       encKey,
-		callTimeout:  callTimeout,
-		allowPrivate: allowPrivate,
-		log:          log,
+		servers:           make(map[string]*resolvedMCPServer),
+		encKey:            encKey,
+		callTimeout:       callTimeout,
+		streamIdleTimeout: streamIdleTimeout,
+		allowPrivate:      allowPrivate,
+		log:               log,
 		oauthManager: mcp.NewOAuthTokenManager(&http.Client{
 			Timeout:   30 * time.Second,
 			Transport: mcp.NewSSRFSafeTransport(allowPrivate),
@@ -76,8 +91,9 @@ func (c *MCPTransportCache) Get(serverID string) (*resolvedMCPServer, bool) {
 
 // LoadAll atomically replaces the cache contents with the supplied server
 // slice. For each server:
-//   - If an existing entry has the same URL, AuthType, AuthHeader, and
-//     encrypted token it is kept unchanged (the transport is reused).
+//   - If an existing entry has the same URL, AuthType, AuthHeader, encrypted
+//     token, encrypted OAuth client secret, and ProtocolVersion it is kept
+//     unchanged (the transport is reused).
 //   - If anything changed the old transport is closed and a new resolved
 //     server with a fresh transport is created.
 //   - Servers present in the old cache but absent from servers have their
@@ -124,7 +140,8 @@ func (c *MCPTransportCache) LoadAll(servers []db.MCPServer) {
 			existing.AuthType == s.AuthType &&
 			existing.AuthHeader == s.AuthHeader &&
 			existing.AuthTokenEnc == encToken &&
-			existing.OAuthClientSecretEnc == encOAuthSecret {
+			existing.OAuthClientSecretEnc == encOAuthSecret &&
+			existing.ProtocolVersion == s.ProtocolVersion {
 			next[s.ID] = existing
 			continue
 		}
@@ -175,7 +192,9 @@ func (c *MCPTransportCache) LoadAll(servers []db.MCPServer) {
 			AuthHeader:           s.AuthHeader,
 			AuthTokenEnc:         encToken,
 			OAuthClientSecretEnc: encOAuthSecret,
-			Transport:            mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, plainToken, c.callTimeout, c.allowPrivate, s.ID, c.oauthManager, oauthCfg),
+			ProtocolVersion:      s.ProtocolVersion,
+			Transport: mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, plainToken, c.callTimeout, c.allowPrivate,
+				s.ID, c.oauthManager, oauthCfg, mcpClientInfo, mcp.ResolvePinnedVersion(s.ProtocolVersion), c.streamIdleTimeout),
 		}
 	}
 

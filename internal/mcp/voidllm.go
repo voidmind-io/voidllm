@@ -185,88 +185,69 @@ func RegisterVoidLLMTools(s *Server, deps VoidLLMDeps) {
 	s.RegisterTool(Tool{
 		Name:        "list_models",
 		Description: "List all registered models with their metadata and current health status.",
-		InputSchema: InputSchema{
-			Type: "object",
-		},
+		InputSchema: ObjectSchema(nil),
 	}, makeListModels(deps))
 
 	s.RegisterTool(Tool{
 		Name:        "get_model_health",
 		Description: "Get the current health state for a specific model or deployment. Use \"modelName/deploymentName\" to target a specific deployment within a multi-deployment model.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"model": {
-					Type:        "string",
-					Description: "Canonical model name, or \"modelName/deploymentName\" for a specific deployment.",
-				},
+		InputSchema: ObjectSchema(map[string]SchemaProp{
+			"model": {
+				Type:        "string",
+				Description: "Canonical model name, or \"modelName/deploymentName\" for a specific deployment.",
 			},
-			Required: []string{"model"},
-		},
+		}, "model"),
 	}, makeGetModelHealth(deps))
 
 	s.RegisterTool(Tool{
 		Name:        "get_usage",
 		Description: "Get usage statistics for the caller's organization. Results can be filtered by time range and grouped by a dimension.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"from": {
-					Type:        "string",
-					Description: "Start of the time range as an RFC 3339 timestamp. Defaults to the start of the current day.",
-				},
-				"to": {
-					Type:        "string",
-					Description: "End of the time range as an RFC 3339 timestamp. Defaults to now.",
-				},
-				"group_by": {
-					Type:        "string",
-					Description: "Aggregation dimension, e.g. \"model\" or \"key\".",
-				},
+		InputSchema: ObjectSchema(map[string]SchemaProp{
+			"from": {
+				Type:        "string",
+				Description: "Start of the time range as an RFC 3339 timestamp. Defaults to the start of the current day.",
 			},
-		},
+			"to": {
+				Type:        "string",
+				Description: "End of the time range as an RFC 3339 timestamp. Defaults to now.",
+			},
+			"group_by": {
+				Type:        "string",
+				Description: "Aggregation dimension, e.g. \"model\" or \"key\".",
+			},
+		}),
 	}, makeGetUsage(deps))
 
 	s.RegisterTool(Tool{
 		Name:        "list_keys",
 		Description: "List API keys visible to the caller. Org admins and above see all keys in the org; members see only their own keys.",
-		InputSchema: InputSchema{
-			Type: "object",
-		},
+		InputSchema: ObjectSchema(nil),
 	}, makeListKeys(deps))
 
 	s.RegisterTool(Tool{
 		Name:        "create_key",
 		Description: "Create a temporary API key in the caller's organization. The plaintext key is returned once and cannot be retrieved again.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"name": {
-					Type:        "string",
-					Description: "Human-readable label for the key.",
-				},
-				"expires_in": {
-					Type:        "string",
-					Description: "Go duration until expiry, e.g. \"24h\" or \"168h\". Omit for no expiry.",
-				},
+		InputSchema: ObjectSchema(map[string]SchemaProp{
+			"name": {
+				Type:        "string",
+				Description: "Human-readable label for the key.",
 			},
-			Required: []string{"name"},
-		},
+			"expires_in": {
+				Type:        "string",
+				Description: "Go duration until expiry, e.g. \"24h\" or \"168h\". Omit for no expiry.",
+			},
+		}, "name"),
 	}, makeCreateKey(deps))
 
 	s.RegisterTool(Tool{
 		Name:        "list_deployments",
 		Description: "List the backend deployments configured for a model. Requires system_admin role.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"model_id": {
-					Type:        "string",
-					Description: "UUID of the model whose deployments should be listed.",
-				},
+		InputSchema: ObjectSchema(map[string]SchemaProp{
+			"model_id": {
+				Type:        "string",
+				Description: "UUID of the model whose deployments should be listed.",
 			},
-			Required: []string{"model_id"},
-		},
+		}, "model_id"),
 	}, makeListDeployments(deps))
 }
 
@@ -281,28 +262,22 @@ func RegisterCodeModeTools(s *Server, deps VoidLLMDeps) {
 	s.RegisterTool(Tool{
 		Name:        "list_servers",
 		Description: "List MCP servers available for Code Mode execution. Shows server names, aliases, and tool counts. For tool signatures and parameter shapes, use search_tools instead.",
-		InputSchema: InputSchema{
-			Type: "object",
-		},
+		InputSchema: ObjectSchema(nil),
 	}, makeListServers(deps))
 
 	s.RegisterTool(Tool{
 		Name:        "search_tools",
 		Description: "Discover tool signatures before using execute_code. Always call this first to learn parameter names, types, and return values. Returns matching tools with full TypeScript definitions including inferred return types from previous calls. Search by keyword across tool names and descriptions, or by server name via the optional \"server\" parameter. If no results are returned, no MCP servers are accessible to this caller yet — ask an admin to register or grant access. After search_tools() returns signatures, use execute_code to call them — especially if the task needs more than one tool call. Calling tools individually after searching wastes round-trips; chain them inside execute_code instead.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"query": {
-					Type:        "string",
-					Description: "Search keyword to match against tool names and descriptions.",
-				},
-				"server": {
-					Type:        "string",
-					Description: "Optional server alias to restrict search scope.",
-				},
+		InputSchema: ObjectSchema(map[string]SchemaProp{
+			"query": {
+				Type:        "string",
+				Description: "Search keyword to match against tool names and descriptions.",
 			},
-			Required: []string{"query"},
-		},
+			"server": {
+				Type:        "string",
+				Description: "Optional server alias to restrict search scope.",
+			},
+		}, "query"),
 	}, makeSearchTools(deps))
 
 	// execute_code — registered with the static codeModeDescription, but at
@@ -313,20 +288,16 @@ func RegisterCodeModeTools(s *Server, deps VoidLLMDeps) {
 	s.RegisterTool(Tool{
 		Name:        "execute_code",
 		Description: codeModeDescription,
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"code": {
-					Type:        "string",
-					Description: "JavaScript code to execute. MCP tools are available as async functions under tools.serverAlias.toolName(args).",
-				},
-				"servers": {
-					Type:        "array",
-					Description: "Optional list of server aliases to include. Omit for all accessible servers.",
-				},
+		InputSchema: ObjectSchema(map[string]SchemaProp{
+			"code": {
+				Type:        "string",
+				Description: "JavaScript code to execute. MCP tools are available as async functions under tools.serverAlias.toolName(args).",
 			},
-			Required: []string{"code"},
-		},
+			"servers": {
+				Type:        "array",
+				Description: "Optional list of server aliases to include. Omit for all accessible servers.",
+			},
+		}, "code"),
 	}, makeExecuteCode(deps))
 }
 

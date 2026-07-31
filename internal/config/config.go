@@ -352,6 +352,14 @@ type MCPServerConfig struct {
 	OAuthClientID     string `yaml:"oauth_client_id"`
 	OAuthClientSecret string `yaml:"oauth_client_secret" json:"-"`
 	OAuthScopes       string `yaml:"oauth_scopes"`
+
+	// ProtocolVersion pins the MCP protocol era for this server: "auto" (the
+	// default, also what an empty value normalizes to) probes the upstream via
+	// server/discover, falling back to a legacy initialize handshake when
+	// needed. Any other value must be one of mcp.SupportedVersions() and skips
+	// that probe entirely. Only needed when auto-detection guesses wrong for a
+	// specific upstream — see docs/mcp/servers.md.
+	ProtocolVersion string `yaml:"protocol_version"`
 }
 
 // LogValue implements slog.LogValuer to prevent the auth token and OAuth client
@@ -420,8 +428,56 @@ type MCPHealthConfig struct {
 // MCPConfig holds configuration for the MCP Gateway subsystem.
 type MCPConfig struct {
 	// CallTimeout is the maximum duration for a single proxied MCP tool call.
-	// Defaults to 30 seconds.
+	// Defaults to 30 seconds. This bounds internal/mcp.HTTPTransport.Call —
+	// VoidLLM's own buffered round trips (ListTools, CallMCPTool, the
+	// built-in tool fetcher) — never the transparent streaming proxy path
+	// (HandleMCPProxy), which has no total-duration limit at all; see
+	// StreamIdleTimeout.
 	CallTimeout time.Duration `yaml:"call_timeout"`
+	// StreamIdleTimeout bounds internal/mcp.HTTPTransport.Forward — the
+	// transparent streaming proxy path (HandleMCPProxy) — but as an IDLE
+	// timeout, not a total-duration one: the timer resets on every byte read
+	// from the upstream, so a long-lived subscriptions/listen response
+	// (docs/mcp-v2.md §3.4) that keeps producing notifications, or the
+	// periodic SSE keep-alive comment lines the spec recommends servers send
+	// on such a stream, never trips it. Only genuine silence for this long
+	// does. Defaults to 120 seconds. A total-duration limit here would abort
+	// every healthy, long-running subscription.
+	StreamIdleTimeout time.Duration `yaml:"stream_idle_timeout"`
+	// StreamMaxBytes bounds the aggregate number of bytes
+	// internal/mcp.HTTPTransport.Forward (the transparent streaming proxy
+	// path, HandleMCPProxy) will relay from a single upstream response before
+	// ending the stream — the byte-size counterpart to StreamIdleTimeout's
+	// idle-duration bound: an upstream that trickles data just under the idle
+	// timeout, or that simply never stops, would otherwise hold the
+	// connection open indefinitely regardless of StreamIdleTimeout. A pointer
+	// distinguishes "not set in YAML" (defaults to 100 MiB, see
+	// EffectiveStreamMaxBytes) from an explicit "0", which means unbounded —
+	// no byte limit at all. Exceeding the limit ends the stream exactly like
+	// any other transport-level break (docs/mcp-v2.md §3.9: the caller
+	// retries as a new request) — no synthetic event is written, and only
+	// the byte-count classification the zero-knowledge contract
+	// (docs/mcp-v2.md §11.5) allows is logged, at Debug level. Operators
+	// running very long-lived subscriptions/listen streams in production may
+	// need to raise this, or set it to 0; see docs/configuration.md for the
+	// attack-surface trade-off of doing so.
+	StreamMaxBytes *int64 `yaml:"stream_max_bytes"`
+	// ToolCacheTTL bounds how long mcp.ToolCache considers a server's cached
+	// tools/list result fresh WHEN the upstream sent no CacheableResult ttlMs
+	// hint at all (MCP 2026-07-28 §5) — which today is every MCP server that
+	// has not adopted that revision yet, i.e. most of them. When an upstream
+	// does send a ttlMs hint, ToolCache honors that instead (clamped to
+	// mcp.minToolFetchInterval..mcp.maxUpstreamToolTTL) and this setting has
+	// no effect for that server. Because it is the fallback for the majority
+	// of upstreams, not a rarely-hit edge case, raising or lowering it changes
+	// real staleness-vs-load-on-the-upstream behavior for most deployments.
+	// Defaults to 1 hour when unset (see EffectiveToolCacheTTL); 0 means
+	// entries never expire and are only refreshed by an explicit
+	// invalidation (config reload, Admin API update, RefreshServer/RefreshAll).
+	// A pointer distinguishes "not set in YAML" (apply the 1-hour default)
+	// from an explicit "0" (never expire), the same tri-state pattern
+	// StreamMaxBytes above and CodeModeConfig.SchemaTTL use.
+	ToolCacheTTL *time.Duration `yaml:"tool_cache_ttl"`
 	// AllowPrivateURLs disables SSRF protection for MCP server URLs, permitting
 	// localhost, private IPs, and link-local addresses. Enable this for internal
 	// deployments where MCP servers run on the same network. Default: false.
@@ -431,6 +487,56 @@ type MCPConfig struct {
 	Health MCPHealthConfig `yaml:"health"`
 	// CodeMode holds configuration for the sandboxed JavaScript execution runtime.
 	CodeMode CodeModeConfig `yaml:"code_mode"`
+	// AllowedOrigins is the explicit Origin allowlist for MCP endpoints
+	// (MCP Streamable HTTP §4.1's mandatory Origin validation, against
+	// DNS-rebinding attacks from browser-based clients). Each entry is
+	// compared case-insensitively against an inbound Origin header, e.g.
+	// "https://app.example.com". Supports ${ENV_VAR} interpolation like the
+	// rest of the config. Empty (the default) falls back to accepting an
+	// Origin whose host matches the request's own Host — see
+	// internal/api/admin's mcpOriginMiddleware. Only takes effect when an
+	// Origin header is present at all; non-browser callers (CLIs, SDKs,
+	// service-to-service integrations) never send one and are unaffected.
+	AllowedOrigins []string `yaml:"allowed_origins"`
+}
+
+// defaultMCPStreamMaxBytes is the byte ceiling MCPConfig.EffectiveStreamMaxBytes
+// applies when StreamMaxBytes was never set in YAML at all. See
+// MCPConfig.StreamMaxBytes' doc for why an explicit "0" is distinct from
+// this and means unbounded instead.
+const defaultMCPStreamMaxBytes int64 = 100 << 20 // 100 MiB
+
+// EffectiveStreamMaxBytes returns the resolved byte ceiling for
+// HandleMCPProxy's streaming pass-through path: the configured value
+// (including an explicit 0, meaning unbounded) when StreamMaxBytes was set,
+// or defaultMCPStreamMaxBytes when it was never set at all. Safe to call on a
+// zero-value MCPConfig — StreamMaxBytes being nil is exactly the "never set"
+// case this method exists to resolve, whether or not setDefaults has run.
+func (c MCPConfig) EffectiveStreamMaxBytes() int64 {
+	if c.StreamMaxBytes == nil {
+		return defaultMCPStreamMaxBytes
+	}
+	return *c.StreamMaxBytes
+}
+
+// defaultToolCacheTTL is the freshness window MCPConfig.EffectiveToolCacheTTL
+// applies when ToolCacheTTL was never set in YAML at all. See
+// MCPConfig.ToolCacheTTL's doc for why this is the fallback most upstreams
+// hit, not an edge case.
+const defaultToolCacheTTL = time.Hour
+
+// EffectiveToolCacheTTL returns the resolved freshness window mcp.ToolCache
+// falls back to for an upstream that sent no CacheableResult ttlMs hint: the
+// configured value (including an explicit 0, meaning entries never expire)
+// when ToolCacheTTL was set, or defaultToolCacheTTL when it was never set at
+// all. Safe to call on a zero-value MCPConfig — ToolCacheTTL being nil is
+// exactly the "never set" case this method exists to resolve, whether or not
+// setDefaults has run.
+func (c MCPConfig) EffectiveToolCacheTTL() time.Duration {
+	if c.ToolCacheTTL == nil {
+		return defaultToolCacheTTL
+	}
+	return *c.ToolCacheTTL
 }
 
 // HealthCheckConfig holds configuration for the upstream model health monitoring subsystem.
@@ -899,6 +1005,27 @@ func (c *Config) setDefaults() {
 	// MCP Gateway
 	if c.Settings.MCP.CallTimeout == 0 {
 		c.Settings.MCP.CallTimeout = 30 * time.Second
+	}
+	if c.Settings.MCP.StreamIdleTimeout == 0 {
+		c.Settings.MCP.StreamIdleTimeout = 120 * time.Second
+	}
+	// StreamMaxBytes is a pointer specifically so an explicit "0" (unbounded)
+	// survives this default — see MCPConfig.StreamMaxBytes' doc. Only a nil
+	// pointer (never set in YAML at all) is promoted to the default here.
+	if c.Settings.MCP.StreamMaxBytes == nil {
+		v := defaultMCPStreamMaxBytes
+		c.Settings.MCP.StreamMaxBytes = &v
+	}
+	// ToolCacheTTL is a pointer for the same reason StreamMaxBytes is — an
+	// explicit "0" (never expire) must survive this default. Only a nil
+	// pointer (never set in YAML at all) is promoted to defaultToolCacheTTL
+	// here. Set unconditionally, not gated on Code Mode being enabled: this
+	// is the fallback ToolCache uses for the majority of upstreams (every one
+	// that sends no ttlMs hint), so it governs behavior regardless of whether
+	// Code Mode itself is on.
+	if c.Settings.MCP.ToolCacheTTL == nil {
+		v := defaultToolCacheTTL
+		c.Settings.MCP.ToolCacheTTL = &v
 	}
 
 	// MCP Health — default on with a 60-second probe interval. The pointer

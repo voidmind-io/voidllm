@@ -91,6 +91,29 @@ func GenerateToolTypeDefs(serverTools map[string][]Tool, outputSchemas map[strin
 	return sb.String()
 }
 
+// parseObjectSchema extracts the top-level "properties" and "required"
+// keywords from an object JSONSchema for TypeScript declaration rendering.
+// Each property is returned as its raw parsed JSON Schema keywords rather
+// than a typed struct — writeToolDecl only reads "type" from it, rendering a
+// shallow, non-recursive argument list, consistent with how this function's
+// output has always been rendered. Malformed or missing schemas yield nil
+// results rather than an error: the enclosing description is best-effort
+// documentation for an LLM, not a validated contract.
+func parseObjectSchema(schema JSONSchema) (props map[string]map[string]any, required map[string]bool) {
+	var parsed struct {
+		Properties map[string]map[string]any `json:"properties"`
+		Required   []string                  `json:"required"`
+	}
+	if err := jsonx.Unmarshal(schema, &parsed); err != nil {
+		return nil, nil
+	}
+	required = make(map[string]bool, len(parsed.Required))
+	for _, r := range parsed.Required {
+		required[r] = true
+	}
+	return parsed.Properties, required
+}
+
 // writeToolDecl writes a single TypeScript function declaration into sb.
 // outSchema is the inferred output schema for the tool; when non-nil the
 // return type is a concrete TypeScript type with a comment noting it is
@@ -120,13 +143,8 @@ func writeToolDecl(sb *strings.Builder, tool Tool, outSchema jsonx.RawMessage) {
 	sb.WriteString(tool.Name)
 	sb.WriteString("(args: {")
 
-	props := tool.InputSchema.Properties
+	props, required := parseObjectSchema(tool.InputSchema)
 	if len(props) > 0 {
-		required := make(map[string]bool, len(tool.InputSchema.Required))
-		for _, r := range tool.InputSchema.Required {
-			required[r] = true
-		}
-
 		// Sort property names for deterministic output.
 		names := make([]string, 0, len(props))
 		for name := range props {
@@ -136,14 +154,14 @@ func writeToolDecl(sb *strings.Builder, tool Tool, outSchema jsonx.RawMessage) {
 
 		sb.WriteByte('\n')
 		for _, name := range names {
-			prop := props[name]
+			propType, _ := props[name]["type"].(string)
 			sb.WriteString("    ")
 			sb.WriteString(name)
 			if !required[name] {
 				sb.WriteByte('?')
 			}
 			sb.WriteString(": ")
-			sb.WriteString(tsType(prop.Type))
+			sb.WriteString(tsType(propType))
 			sb.WriteString(";\n")
 		}
 		sb.WriteString("  ")

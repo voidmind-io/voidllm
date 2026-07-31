@@ -258,7 +258,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			}
 			// For the startup SSE probe, OAuth is not needed — we pass nil for the
 			// OAuth manager and config. The probe only detects deprecated SSE transport.
-			transport := mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, token, 10*time.Second, cfg.Settings.MCP.AllowPrivateURLs, "", nil, nil)
+			transport := mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, token, 10*time.Second, cfg.Settings.MCP.AllowPrivateURLs,
+				"", nil, nil, mcp.ClientInfo{Name: "voidllm", Version: apihealth.Version}, mcp.ResolvePinnedVersion(s.ProtocolVersion), cfg.Settings.MCP.StreamIdleTimeout)
 			_, probeErr := transport.ListTools(ctx)
 			transport.Close()
 			if errors.Is(probeErr, mcp.ErrSSENotSupported) {
@@ -517,12 +518,19 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		log.Error("load mcp access cache", slog.String("error", mcpAccessErr.Error()))
 	}
 
-	mcpTransportCache := proxy.NewMCPTransportCache(encKey, cfg.Settings.MCP.AllowPrivateURLs, cfg.Settings.MCP.CallTimeout, log)
+	mcpTransportCache := proxy.NewMCPTransportCache(encKey, cfg.Settings.MCP.AllowPrivateURLs, cfg.Settings.MCP.CallTimeout, cfg.Settings.MCP.StreamIdleTimeout, log)
 	if mcpServersForTransport, mcpTransportErr := database.LoadAllActiveMCPServers(ctx); mcpTransportErr == nil {
 		mcpTransportCache.LoadAll(mcpServersForTransport)
 	} else {
 		log.Error("load mcp transport cache", slog.String("error", mcpTransportErr.Error()))
 	}
+
+	// mcpSessionRegistry is constructed once here and held on adminHandler
+	// (see admin.Handler.MCPSessionRegistry's doc) so it outlives every
+	// individual *mcp.HTTPTransport — including the ad-hoc ones
+	// HandleMCPProxy builds on a transport-cache miss — for the lifetime of
+	// this process.
+	mcpSessionRegistry := mcp.NewSessionRegistry()
 
 	// Step 10: connect Redis (optional). On failure, continue without Redis.
 	redisCtx, redisCancel := context.WithCancel(context.Background())
@@ -708,23 +716,24 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	loginThrottle := auth.NewLoginThrottle()
 
 	adminHandler := &admin.Handler{
-		DB:                database,
-		HMACSecret:        hmacSecret,
-		EncryptionKey:     encKey,
-		KeyCache:          keyCache,
-		Registry:          registry,
-		AccessCache:       accessCache,
-		AliasCache:        aliasCache,
-		MCPServerCache:    mcpServerCache,
-		MCPAccessCache:    mcpAccessCache,
-		MCPTransportCache: mcpTransportCache,
-		Redis:             redisClient,
-		AuditLogger:       auditLogger,
-		License:           licHolder,
-		Log:               log,
-		SSOProvider:       ssoProvider,
-		SSOConfig:         cfg.Settings.SSO,
-		LoginThrottle:     loginThrottle,
+		DB:                 database,
+		HMACSecret:         hmacSecret,
+		EncryptionKey:      encKey,
+		KeyCache:           keyCache,
+		Registry:           registry,
+		AccessCache:        accessCache,
+		AliasCache:         aliasCache,
+		MCPServerCache:     mcpServerCache,
+		MCPAccessCache:     mcpAccessCache,
+		MCPTransportCache:  mcpTransportCache,
+		MCPSessionRegistry: mcpSessionRegistry,
+		Redis:              redisClient,
+		AuditLogger:        auditLogger,
+		License:            licHolder,
+		Log:                log,
+		SSOProvider:        ssoProvider,
+		SSOConfig:          cfg.Settings.SSO,
+		LoginThrottle:      loginThrottle,
 	}
 	// Wire the in-process reload callback so SetLicense can re-gate the
 	// model registry immediately after storing a new license, even on
@@ -764,12 +773,17 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		toolStore = &dbToolStore{db: database}
 		httpFetcher := adminHandler.MakeToolFetcher()
 		builtinServerID := builtinServer.ID
-		adminHandler.ToolCache = mcp.NewPersistentToolCache(func(fetchCtx context.Context, serverID string) ([]mcp.Tool, error) {
+		adminHandler.ToolCache = mcp.NewPersistentToolCache(func(fetchCtx context.Context, serverID string) (*mcp.ToolListing, error) {
 			if serverID == builtinServerID && builtinMCPServer != nil {
-				return builtinMCPServer.Tools(), nil
+				// The built-in server's schemas are all built via
+				// mcp.ObjectSchema (internal/mcp/voidllm.go's tool
+				// registrations), which has no way to emit "x-mcp-header" —
+				// so HeaderParams is correctly nil here, with nothing to
+				// filter.
+				return &mcp.ToolListing{Tools: builtinMCPServer.Tools()}, nil
 			}
 			return httpFetcher(fetchCtx, serverID)
-		}, time.Hour, toolStore)
+		}, cfg.Settings.MCP.EffectiveToolCacheTTL(), toolStore)
 		if loadErr := adminHandler.ToolCache.LoadFromStore(ctx); loadErr != nil {
 			log.WarnContext(ctx, "failed to load cached tools from DB", slog.String("error", loadErr.Error()))
 		}
@@ -1025,16 +1039,22 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	}
 
 	adminHandler.MCPCallTimeout = cfg.Settings.MCP.CallTimeout
+	adminHandler.MCPStreamIdleTimeout = cfg.Settings.MCP.StreamIdleTimeout
+	adminHandler.MCPStreamMaxBytes = cfg.Settings.MCP.EffectiveStreamMaxBytes()
 	adminHandler.MCPAllowPrivateURLs = cfg.Settings.MCP.AllowPrivateURLs
+	adminHandler.MCPAllowedOrigins = cfg.Settings.MCP.AllowedOrigins
 	adminHandler.FallbackMaxDepth = cfg.Settings.FallbackMaxDepth
 
 	mcpLogger := usage.NewMCPLogger(database, 1000, log)
 	adminHandler.MCPLogger = mcpLogger
 
 	// Build the MCP health checker when enabled. The servers callback reads
-	// from the in-memory MCPServerCache so no DB I/O occurs during probe cycles.
-	// Tokens are decrypted on each callback invocation so that key rotations are
-	// picked up without restarting the checker.
+	// from the in-memory MCPServerCache so no DB I/O occurs during probe
+	// cycles. transportFor resolves each target's persistent, already
+	// auth-configured *mcp.HTTPTransport from the MCPTransportCache — the
+	// same cache the proxy hot path uses — so the checker never builds its
+	// own HTTP client or decrypts credentials itself (internal/health,
+	// mcp_checker.go).
 	var mcpHealthChecker *health.MCPHealthChecker
 	if cfg.Settings.MCP.Health.Enabled != nil && *cfg.Settings.MCP.Health.Enabled {
 		mcpHealthChecker = health.NewMCPHealthChecker(
@@ -1045,38 +1065,24 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 					if !s.IsActive {
 						continue
 					}
-					t := health.MCPServerTarget{
-						ID:            s.ID,
-						Name:          s.Name,
-						Alias:         s.Alias,
-						URL:           s.URL,
-						AuthType:      s.AuthType,
-						AuthHeader:    s.AuthHeader,
-						Source:        s.Source,
-						OAuthTokenURL: s.OAuthTokenURL,
-						OAuthClientID: s.OAuthClientID,
-						OAuthScopes:   s.OAuthScopes,
-					}
-					if s.AuthTokenEnc != nil {
-						token, decErr := crypto.DecryptString(*s.AuthTokenEnc, encKey, []byte("mcp_server:"+s.ID))
-						if decErr == nil {
-							t.AuthToken = token
-						}
-					}
-					if s.OAuthClientSecretEnc != nil {
-						secret, decErr := crypto.DecryptString(*s.OAuthClientSecretEnc, encKey, []byte("mcp_server:"+s.ID))
-						if decErr == nil {
-							t.OAuthClientSecret = secret
-						}
-					}
-					targets = append(targets, t)
+					targets = append(targets, health.MCPServerTarget{
+						ID:     s.ID,
+						Name:   s.Name,
+						Alias:  s.Alias,
+						Source: s.Source,
+					})
 				}
 				return targets
 			},
+			func(serverID string) (*mcp.HTTPTransport, bool) {
+				rs, ok := mcpTransportCache.Get(serverID)
+				if !ok || rs.Transport == nil {
+					return nil, false
+				}
+				return rs.Transport, true
+			},
 			cfg.Settings.MCP.Health.Interval,
-			cfg.Settings.MCP.AllowPrivateURLs,
 			log.With(slog.String("component", "mcp_health")),
-			mcpTransportCache.OAuthManager(),
 		)
 		adminHandler.MCPHealthChecker = mcpHealthChecker
 	}
@@ -1167,9 +1173,23 @@ func (a *Application) Start() error {
 		startTicker(30*time.Second, func() {
 			ctx1, cancel1 := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel1()
+			// Reconcile here does not replace the mutation-triggered cleanup in
+			// admin.Handler.refreshMCPCaches — it backstops it. If a refresh
+			// after a mutation fails, or its context is cancelled, that
+			// cleanup never runs; this periodic call catches up within one
+			// tick. Only reconcile against a list that was actually loaded:
+			// reconciling against an empty list on error would prune every
+			// server the registry currently tracks.
 			if servers, err := a.database.LoadAllActiveMCPServers(ctx1); err == nil {
 				a.mcpServerCache.LoadAll(servers)
 				a.mcpTransportCache.LoadAll(servers)
+				if a.adminHandler != nil && a.adminHandler.MCPSessionRegistry != nil {
+					activeIDs := make([]string, len(servers))
+					for i := range servers {
+						activeIDs[i] = servers[i].ID
+					}
+					a.adminHandler.MCPSessionRegistry.Reconcile(activeIDs)
+				}
 			} else {
 				a.log.LogAttrs(context.Background(), slog.LevelError, "mcp server cache refresh failed",
 					slog.String("error", err.Error()),

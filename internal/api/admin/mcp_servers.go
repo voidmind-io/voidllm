@@ -34,6 +34,15 @@ type createMCPServerRequest struct {
 	OAuthClientID     string `json:"oauth_client_id"`
 	OAuthClientSecret string `json:"oauth_client_secret"` // plaintext; encrypted before storage, never returned
 	OAuthScopes       string `json:"oauth_scopes"`        // optional space-separated scopes
+
+	// ProtocolVersion pins the MCP protocol era for this server: "auto" (the
+	// default, also what an empty value normalizes to) probes the upstream via
+	// server/discover, falling back to a legacy initialize handshake when
+	// needed (mcp.HTTPTransport.probeEra). Any other value must be one of
+	// mcp.SupportedVersions() and skips that probe entirely. Only needed when
+	// auto-detection guesses wrong for a specific upstream — see
+	// docs/mcp/servers.md.
+	ProtocolVersion string `json:"protocol_version"`
 }
 
 // updateMCPServerRequest is the JSON body accepted by UpdateMCPServer.
@@ -52,6 +61,10 @@ type updateMCPServerRequest struct {
 	OAuthClientID     *string `json:"oauth_client_id"`
 	OAuthClientSecret *string `json:"oauth_client_secret"` // plaintext; encrypted before storage, never returned
 	OAuthScopes       *string `json:"oauth_scopes"`
+
+	// ProtocolVersion, when non-nil, updates the protocol era pin. See
+	// createMCPServerRequest.ProtocolVersion.
+	ProtocolVersion *string `json:"protocol_version"`
 }
 
 // mcpServerResponse is the JSON representation of an MCP server returned by the API.
@@ -79,6 +92,10 @@ type mcpServerResponse struct {
 	OAuthTokenURL string `json:"oauth_token_url,omitempty"`
 	OAuthClientID string `json:"oauth_client_id,omitempty"`
 	OAuthScopes   string `json:"oauth_scopes,omitempty"`
+
+	// ProtocolVersion is the effective protocol era pin: "auto" or one of
+	// mcp.SupportedVersions(). See createMCPServerRequest.ProtocolVersion.
+	ProtocolVersion string `json:"protocol_version"`
 }
 
 // testMCPServerResponse is the JSON response from TestMCPServerConnection.
@@ -111,6 +128,74 @@ var blockedHeaders = map[string]bool{
 	"upgrade":           true,
 	"te":                true,
 	"trailer":           true,
+}
+
+// reservedMCPProtocolHeaders is the set of MCP standard request header names
+// (docs/mcp-v2.md §4.2, plus the legacy Mcp-Session-Id) that auth_header must
+// never be configured as. Comparison is done on the lowercased value,
+// mirroring blockedHeaders above.
+//
+// mcp.HTTPTransport.Forward (the transparent streaming proxy path,
+// HandleMCPProxy) sets these headers from the caller's own request, which
+// mcp_proxy.go's validateMCPHeaders has already cross-checked against the
+// request body. auth_header is applied by the same transport, to the same
+// outbound request — see http_transport.go's rawPost/Forward, which now set
+// authentication before these MCP headers specifically so that even an
+// already-registered server with a legacy misconfiguration cannot have its
+// auth credential silently win a name collision. Rejecting the
+// misconfiguration here, at registration time, is the primary defense: only
+// an admin can configure auth_header, so this is not a privilege escalation,
+// but it does defeat the header/body validation HandleMCPProxy performs on
+// every request if left unrejected (docs/mcp-v2.md, review finding C4).
+var reservedMCPProtocolHeaders = map[string]bool{
+	strings.ToLower(mcp.HeaderProtocolVersion): true,
+	strings.ToLower(mcp.HeaderMethod):          true,
+	strings.ToLower(mcp.HeaderName):            true,
+	strings.ToLower(mcp.HeaderSessionID):       true,
+}
+
+// reservedMCPParamHeaderPrefix is the lowercased prefix of the documented
+// Mcp-Param-{Name} header family (MCP Streamable HTTP §4.3, tool-input-
+// schema parameters mirrored onto headers) that auth_header must also never
+// be configured as — see reservedMCPProtocolHeaders' doc.
+const reservedMCPParamHeaderPrefix = "mcp-param-"
+
+// isReservedMCPHeader reports whether name (in any case) names an MCP
+// standard request header — or falls under the Mcp-Param-* family — that
+// auth_header must not be configured as. See reservedMCPProtocolHeaders' doc.
+func isReservedMCPHeader(name string) bool {
+	lower := strings.ToLower(name)
+	return reservedMCPProtocolHeaders[lower] || strings.HasPrefix(lower, reservedMCPParamHeaderPrefix)
+}
+
+// validMCPProtocolVersion reports whether raw is an accepted protocol_version
+// value: the empty string or "auto" (both mean "auto-detect via probeEra"),
+// or one of mcp.SupportedVersions() (a pin that skips auto-detection
+// entirely — see mcp.ResolvePinnedVersion).
+func validMCPProtocolVersion(raw string) bool {
+	if raw == "" || raw == "auto" {
+		return true
+	}
+	return mcp.Version(raw).Valid()
+}
+
+// mcpProtocolVersionChoices lists every accepted protocol_version value —
+// "auto" followed by mcp.SupportedVersions(), newest first — for use in
+// validation error messages.
+func mcpProtocolVersionChoices() []string {
+	supported := mcp.SupportedVersions()
+	choices := make([]string, 0, len(supported)+1)
+	choices = append(choices, "auto")
+	for _, v := range supported {
+		choices = append(choices, string(v))
+	}
+	return choices
+}
+
+// invalidMCPProtocolVersionMsg builds the validation error message for an
+// unrecognized protocol_version value, naming every accepted choice.
+func invalidMCPProtocolVersionMsg() string {
+	return "protocol_version must be one of: " + strings.Join(mcpProtocolVersionChoices(), ", ")
 }
 
 // cloudMetadataIP is the well-known link-local address used by cloud provider
@@ -191,6 +276,7 @@ func mcpServerToResponse(s *db.MCPServer) mcpServerResponse {
 		OAuthTokenURL:   s.OAuthTokenURL,
 		OAuthClientID:   s.OAuthClientID,
 		OAuthScopes:     s.OAuthScopes,
+		ProtocolVersion: s.ProtocolVersion,
 	}
 }
 
@@ -231,6 +317,12 @@ func validateAndNormalizeMCPServerRequest(c fiber.Ctx, req *createMCPServerReque
 	if msg := validateMCPAlias(req.Alias); msg != "" {
 		return fail(msg)
 	}
+	if !validMCPProtocolVersion(req.ProtocolVersion) {
+		return fail(invalidMCPProtocolVersionMsg())
+	}
+	if req.ProtocolVersion == "" {
+		req.ProtocolVersion = "auto"
+	}
 
 	at := req.AuthType
 	if at == "" {
@@ -245,6 +337,11 @@ func validateAndNormalizeMCPServerRequest(c fiber.Ctx, req *createMCPServerReque
 	if at == "header" && blockedHeaders[strings.ToLower(req.AuthHeader)] {
 		_ = apierror.Send(c, fiber.StatusBadRequest, "invalid_auth_header",
 			"auth_header cannot override structural HTTP headers")
+		return "", false
+	}
+	if at == "header" && isReservedMCPHeader(req.AuthHeader) {
+		_ = apierror.Send(c, fiber.StatusBadRequest, "invalid_auth_header",
+			"auth_header cannot override MCP protocol headers")
 		return "", false
 	}
 	if at == "oauth" {
@@ -439,19 +536,20 @@ func (h *Handler) CreateMCPServer(c fiber.Ctx) error {
 	}
 
 	s, err := h.createMCPServerWithTokenAndOAuth(c, db.CreateMCPServerParams{
-		Name:          req.Name,
-		Alias:         req.Alias,
-		URL:           req.URL,
-		AuthType:      authType,
-		AuthHeader:    req.AuthHeader,
-		AuthTokenEnc:  nil,
-		OrgID:         nil,
-		TeamID:        nil,
-		CreatedBy:     createdBy,
-		Source:        "api",
-		OAuthTokenURL: req.OAuthTokenURL,
-		OAuthClientID: req.OAuthClientID,
-		OAuthScopes:   req.OAuthScopes,
+		Name:            req.Name,
+		Alias:           req.Alias,
+		URL:             req.URL,
+		AuthType:        authType,
+		AuthHeader:      req.AuthHeader,
+		AuthTokenEnc:    nil,
+		OrgID:           nil,
+		TeamID:          nil,
+		CreatedBy:       createdBy,
+		Source:          "api",
+		OAuthTokenURL:   req.OAuthTokenURL,
+		OAuthClientID:   req.OAuthClientID,
+		OAuthScopes:     req.OAuthScopes,
+		ProtocolVersion: req.ProtocolVersion,
 	}, req.AuthToken, req.OAuthClientSecret)
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
@@ -513,19 +611,20 @@ func (h *Handler) CreateOrgMCPServer(c fiber.Ctx) error {
 	createdBy := keyInfo.UserID
 
 	s, err := h.createMCPServerWithTokenAndOAuth(c, db.CreateMCPServerParams{
-		Name:          req.Name,
-		Alias:         req.Alias,
-		URL:           req.URL,
-		AuthType:      authType,
-		AuthHeader:    req.AuthHeader,
-		AuthTokenEnc:  nil,
-		OrgID:         &orgID,
-		TeamID:        nil,
-		CreatedBy:     createdBy,
-		Source:        "api",
-		OAuthTokenURL: req.OAuthTokenURL,
-		OAuthClientID: req.OAuthClientID,
-		OAuthScopes:   req.OAuthScopes,
+		Name:            req.Name,
+		Alias:           req.Alias,
+		URL:             req.URL,
+		AuthType:        authType,
+		AuthHeader:      req.AuthHeader,
+		AuthTokenEnc:    nil,
+		OrgID:           &orgID,
+		TeamID:          nil,
+		CreatedBy:       createdBy,
+		Source:          "api",
+		OAuthTokenURL:   req.OAuthTokenURL,
+		OAuthClientID:   req.OAuthClientID,
+		OAuthScopes:     req.OAuthScopes,
+		ProtocolVersion: req.ProtocolVersion,
 	}, req.AuthToken, req.OAuthClientSecret)
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
@@ -590,19 +689,20 @@ func (h *Handler) CreateTeamMCPServer(c fiber.Ctx) error {
 	}
 
 	s, createErr := h.createMCPServerWithTokenAndOAuth(c, db.CreateMCPServerParams{
-		Name:          req.Name,
-		Alias:         req.Alias,
-		URL:           req.URL,
-		AuthType:      authType,
-		AuthHeader:    req.AuthHeader,
-		AuthTokenEnc:  nil,
-		OrgID:         &orgID,
-		TeamID:        &teamID,
-		CreatedBy:     keyInfo.UserID,
-		Source:        "api",
-		OAuthTokenURL: req.OAuthTokenURL,
-		OAuthClientID: req.OAuthClientID,
-		OAuthScopes:   req.OAuthScopes,
+		Name:            req.Name,
+		Alias:           req.Alias,
+		URL:             req.URL,
+		AuthType:        authType,
+		AuthHeader:      req.AuthHeader,
+		AuthTokenEnc:    nil,
+		OrgID:           &orgID,
+		TeamID:          &teamID,
+		CreatedBy:       keyInfo.UserID,
+		Source:          "api",
+		OAuthTokenURL:   req.OAuthTokenURL,
+		OAuthClientID:   req.OAuthClientID,
+		OAuthScopes:     req.OAuthScopes,
+		ProtocolVersion: req.ProtocolVersion,
 	}, req.AuthToken, req.OAuthClientSecret)
 	if createErr != nil {
 		if errors.Is(createErr, db.ErrConflict) {
@@ -828,6 +928,19 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 		return apierror.Send(c, fiber.StatusBadRequest, "invalid_auth_header",
 			"auth_header cannot override structural HTTP headers")
 	}
+	if req.AuthHeader != nil && isReservedMCPHeader(*req.AuthHeader) {
+		return apierror.Send(c, fiber.StatusBadRequest, "invalid_auth_header",
+			"auth_header cannot override MCP protocol headers")
+	}
+	if req.ProtocolVersion != nil {
+		if !validMCPProtocolVersion(*req.ProtocolVersion) {
+			return apierror.BadRequest(c, invalidMCPProtocolVersionMsg())
+		}
+		if *req.ProtocolVersion == "" {
+			normalized := "auto"
+			req.ProtocolVersion = &normalized
+		}
+	}
 	// Validate OAuth fields using the effective auth type — which may come from
 	// the request or the existing server record when auth_type is not being changed.
 	effectiveAuthType := existing.AuthType
@@ -864,6 +977,7 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 		CodeModeEnabled: req.CodeModeEnabled,
 		OAuthTokenURL:   req.OAuthTokenURL,
 		OAuthClientID:   req.OAuthClientID,
+		ProtocolVersion: req.ProtocolVersion,
 		OAuthScopes:     req.OAuthScopes,
 	}
 
@@ -1415,7 +1529,7 @@ func (h *Handler) TestMCPServerConnection(c fiber.Ctx) error {
 	}
 	defer transport.Close()
 
-	tools, probeErr := transport.ListTools(ctx)
+	listing, probeErr := transport.ListTools(ctx)
 	if probeErr != nil {
 		// If the server uses deprecated SSE transport, auto-deactivate it.
 		if errors.Is(probeErr, mcp.ErrSSENotSupported) {
@@ -1429,7 +1543,7 @@ func (h *Handler) TestMCPServerConnection(c fiber.Ctx) error {
 	}
 	return c.JSON(testMCPServerResponse{
 		Success: true,
-		Tools:   len(tools),
+		Tools:   len(listing.Tools),
 	})
 }
 

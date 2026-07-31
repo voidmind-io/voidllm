@@ -131,9 +131,9 @@ func newTestExecutor(t *testing.T) *mcp.Executor {
 // staticFetcher returns a ToolFetcher that serves pre-loaded tool lists keyed
 // by server alias.
 func staticFetcher(tools map[string][]mcp.Tool) mcp.ToolFetcher {
-	return func(_ context.Context, alias string) ([]mcp.Tool, error) {
+	return func(_ context.Context, alias string) (*mcp.ToolListing, error) {
 		if list, ok := tools[alias]; ok {
-			return list, nil
+			return &mcp.ToolListing{Tools: list}, nil
 		}
 		return nil, errors.New("unknown server: " + alias)
 	}
@@ -1024,7 +1024,7 @@ func TestExecuteCode_WithToolCall(t *testing.T) {
 		{
 			Name:        "get_value",
 			Description: "Returns a value",
-			InputSchema: mcp.InputSchema{Type: "object"},
+			InputSchema: mcp.ObjectSchema(nil),
 		},
 	}
 	tc := newPreloadedCache(t, map[string][]mcp.Tool{sv.ID: tools})
@@ -1201,13 +1201,9 @@ func TestToolsListHook_InjectsTypes(t *testing.T) {
 			{
 				Name:        "my_tool",
 				Description: "Does something useful",
-				InputSchema: mcp.InputSchema{
-					Type: "object",
-					Properties: map[string]mcp.Property{
-						"query": {Type: "string", Description: "search query"},
-					},
-					Required: []string{"query"},
-				},
+				InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{
+					"query": {Type: "string", Description: "search query"},
+				}, "query"),
 			},
 		},
 	})
@@ -1619,13 +1615,9 @@ func TestToolsListHook_InjectsCodeModePreference(t *testing.T) {
 			{
 				Name:        "fetch_data",
 				Description: "Fetches data by ID",
-				InputSchema: mcp.InputSchema{
-					Type: "object",
-					Properties: map[string]mcp.Property{
-						"id": {Type: "string", Description: "Record ID"},
-					},
-					Required: []string{"id"},
-				},
+				InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{
+					"id": {Type: "string", Description: "Record ID"},
+				}, "id"),
 			},
 		},
 	})
@@ -1719,7 +1711,7 @@ func TestExecuteCode_SaveOutputSchemaError_Logged(t *testing.T) {
 		{
 			Name:        "my_tool",
 			Description: "A tool with valid JSON output",
-			InputSchema: mcp.InputSchema{Type: "object"},
+			InputSchema: mcp.ObjectSchema(nil),
 		},
 	}
 	tc := newPreloadedCache(t, map[string][]mcp.Tool{sv.ID: tools})

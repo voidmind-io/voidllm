@@ -1,0 +1,36 @@
+-- Migration: 0017_mcp_protocol_version.up.sql
+-- Description: Adds protocol_version to mcp_servers so VoidLLM can pin the
+-- MCP protocol era a specific upstream server speaks.
+--
+-- MCP revision 2026-07-28 ("MCP v2") drops the initialize handshake and
+-- protocol sessions in favor of a stateless, per-request _meta scheme (see
+-- docs/mcp-v2.md). VoidLLM must know, per registered upstream, whether to
+-- build legacy (initialize/session) or modern (stateless _meta) requests.
+-- The era is normally auto-detected by probing the upstream, but detection
+-- can be wrong for a given server (e.g. a dual-era server that misreports
+-- itself, or a proxy in front of it that behaves differently than the
+-- origin) -- protocol_version is the manual override for that case.
+--
+-- 'auto' (the default) means: trust the probe result. Any other value pins
+-- the server to that specific revision and skips the probe.
+--
+-- Stored as TEXT with no CHECK constraint, mirroring the existing enum-like
+-- TEXT columns on this table (auth_type, source) and on mcp_tool_calls
+-- (status): allowed values are documented here, not enforced in the schema.
+-- This is deliberate, not an oversight -- the MCP working group ships a new
+-- revision on its own cadence, and each new revision would otherwise force a
+-- CHECK-constraint migration. Widening a CHECK constraint requires a full
+-- table rebuild on SQLite (inline constraints cannot be altered in place;
+-- see 0015_soft_delete_unique_collision.up.sql), which this project avoids.
+-- Validation of the allowed set lives in Go instead.
+--
+-- Allowed values: 'auto' | '2025-03-26' | '2025-06-18' | '2025-11-25' |
+-- '2026-07-28'.
+--
+-- ALTER TABLE ADD COLUMN with a NOT NULL DEFAULT is supported unchanged on
+-- both SQLite (modernc.org/sqlite ships 3.45+) and all PostgreSQL versions,
+-- following the precedent in 0011_model_fallback_chains.up.sql. Existing
+-- rows backfill to 'auto' via the column default.
+
+ALTER TABLE mcp_servers
+    ADD COLUMN protocol_version TEXT NOT NULL DEFAULT 'auto';

@@ -3,11 +3,13 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/internal/provider"
 )
 
@@ -300,6 +302,77 @@ func (c *Config) validate() error {
 				errs = append(errs, fmt.Errorf(`%s.oauth_client_secret: must not be empty when auth_type is "oauth"`, prefix))
 			}
 		}
+
+		if s.ProtocolVersion != "" && s.ProtocolVersion != "auto" && !mcp.Version(s.ProtocolVersion).Valid() {
+			errs = append(errs, fmt.Errorf(`%s.protocol_version: must be "auto" or one of %v, got %q`, prefix, mcp.SupportedVersions(), s.ProtocolVersion))
+		}
+	}
+
+	// --- settings.mcp.stream_idle_timeout ---
+	// Bounds are deliberately loose compared to call_timeout: this is an IDLE
+	// timeout for the transparent streaming proxy path (Forward), not a
+	// total-duration one — a long-lived subscriptions/listen response is
+	// meant to stay open for as long as the client wants it (docs/mcp-v2.md
+	// §3.4). The lower bound only guards against a misconfiguration (e.g. a
+	// value entered in the wrong unit) that would make every stream time out
+	// almost immediately; the upper bound guards against a value so large it
+	// is effectively "never", silently defeating the point of having an idle
+	// timeout at all.
+	if c.Settings.MCP.StreamIdleTimeout < time.Second || c.Settings.MCP.StreamIdleTimeout > 24*time.Hour {
+		errs = append(errs, fmt.Errorf("settings.mcp.stream_idle_timeout: must be between 1s and 24h, got %s", c.Settings.MCP.StreamIdleTimeout))
+	}
+
+	// --- settings.mcp.stream_max_bytes ---
+	// setDefaults has already run by the time validate is called (see Load),
+	// so StreamMaxBytes is never nil here — only an explicit negative value,
+	// which cannot be expressed as "unbounded" (that is 0, see
+	// MCPConfig.StreamMaxBytes' doc) and is therefore always a
+	// misconfiguration, is rejected.
+	if c.Settings.MCP.StreamMaxBytes != nil && *c.Settings.MCP.StreamMaxBytes < 0 {
+		errs = append(errs, fmt.Errorf("settings.mcp.stream_max_bytes: must not be negative, got %d", *c.Settings.MCP.StreamMaxBytes))
+	}
+
+	// --- settings.mcp.tool_cache_ttl ---
+	// setDefaults has already run by the time validate is called (see Load),
+	// so ToolCacheTTL is never nil here — only an explicit negative value,
+	// which cannot be expressed as "never expires" (that is 0, see
+	// MCPConfig.ToolCacheTTL's doc) and is therefore always a
+	// misconfiguration, is rejected.
+	if c.Settings.MCP.ToolCacheTTL != nil && *c.Settings.MCP.ToolCacheTTL < 0 {
+		errs = append(errs, fmt.Errorf("settings.mcp.tool_cache_ttl: must not be negative, got %s", *c.Settings.MCP.ToolCacheTTL))
+	}
+
+	// --- settings.mcp.allowed_origins ---
+	for i, origin := range c.Settings.MCP.AllowedOrigins {
+		if origin == "" {
+			errs = append(errs, fmt.Errorf("settings.mcp.allowed_origins[%d]: must not be empty", i))
+			continue
+		}
+		// An Origin, per RFC 6454, is exactly scheme://host[:port] — no path,
+		// not even a bare trailing slash. Browsers never send a trailing
+		// slash on the Origin header they generate, so a config entry that
+		// has one (e.g. "https://app.example.com/") can never match any real
+		// request: every browser request from that origin would be silently
+		// rejected with a 403 and no diagnosis beyond this validation error
+		// at startup. The origin value is config, not caller-supplied
+		// content, so it is safe to include verbatim in the error message.
+		u, parseErr := url.Parse(origin)
+		if parseErr != nil || u.Scheme == "" || u.Host == "" || u.Path != "" {
+			errs = append(errs, fmt.Errorf("settings.mcp.allowed_origins[%d]: must be exactly scheme://host[:port] with no path (not even a trailing \"/\"), got %q", i, origin))
+			continue
+		}
+		// Normalize scheme and host to lowercase in place: RFC 6454 defines
+		// both as case-insensitive, and mcpOriginMiddleware's own comparison
+		// (originEqualFold, internal/api/admin/mcp_origin.go) is
+		// case-insensitive too — but normalizing here as well means the
+		// in-memory allowlist is uniform from the moment it is loaded,
+		// independent of that comparison ever being called correctly. An
+		// operator who enters "HTTPS://App.Example.com" gets a config that
+		// already reads "https://app.example.com" rather than depending
+		// entirely on request-time comparison logic to paper over the
+		// casing — a silent 403 from a mismatch here would otherwise be
+		// close to undiagnosable (docs/mcp-v2.md, FIX 4).
+		c.Settings.MCP.AllowedOrigins[i] = strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
 	}
 
 	// --- settings.mcp.code_mode ---
