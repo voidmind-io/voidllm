@@ -290,8 +290,14 @@ Code Mode's tool cache (`GetTools`, `list_servers`, `search_tools`) refreshes ea
 
 Every MCP endpoint (`/api/v1/mcp`, `/api/v1/mcp/voidllm`, `/api/v1/mcp/:alias`, both `POST` and `GET`) validates the `Origin` header when a caller sends one, per the MCP Streamable HTTP spec's mandatory DNS-rebinding protection. Requests with no `Origin` header — the normal case for CLIs, SDKs, and service-to-service integrations — are never affected.
 
-- `allowed_origins` empty (default): an `Origin` header is accepted if its host matches the request's own `Host`; otherwise the request is rejected with HTTP 403.
-- `allowed_origins` set: an `Origin` header must exactly match one of the listed values (e.g. `https://app.example.com`); anything else is rejected with HTTP 403.
+This check is explicit-allow, the same principle VoidLLM applies to model access (an empty allowlist grants nothing):
+
+- `allowed_origins` set: an `Origin` header must exactly match one of the listed values (e.g. `https://app.example.com`); anything else is rejected with HTTP 403. The request's own `Host` header plays no role.
+- `allowed_origins` empty (default): only a built-in localhost allowlist is accepted — `http` or `https` on `localhost`, `127.0.0.1`, or `[::1]`, each with or without a port; anything else is rejected with HTTP 403.
+
+**Why this doesn't compare against the request's `Host` header.** A naive fix — accept an `Origin` whose host matches the request's own `Host` — sounds like it should catch DNS rebinding, but it cannot: in that attack, an attacker's DNS record for e.g. `evil.example.com` first resolves to their own server, which serves a malicious page, and is then rebound to resolve to `127.0.0.1`, so the browser's *next* request from that same page goes to the local service instead. The browser's `Origin` header is fixed by the page's own URL — `https://evil.example.com` — and its `Host` header is generated from that identical URL, so the two headers agree by construction on every request, no matter what the DNS record currently resolves to. An attacker who controls the DNS record controls both headers identically; comparing one attacker-supplied value against another can never detect anything. This is exactly the gap the MCP Streamable HTTP conformance suite's `dns-rebinding-protection` scenario checks for. Restricting the default to a fixed set of hostnames — `localhost`/`127.0.0.1`/`[::1]` — closes it: no DNS record an attacker controls can make VoidLLM see one of those for a page the attacker's own server served.
+
+**This is a breaking change for real deployments.** If you serve VoidLLM under a real domain and reach the MCP endpoints from a browser, set `allowed_origins` to that domain — the request's `Host` no longer helps you. VoidLLM always binds every network interface (there is no host-restricted listen option), so it cannot tell whether a given deployment is "really" loopback-only; it logs one WARN at startup whenever the MCP gateway is active and `allowed_origins` is empty, so a production deployment relying on the old (incorrect) behavior finds out at startup instead of via a wave of 403s from its browser clients.
 
 ### Privacy
 

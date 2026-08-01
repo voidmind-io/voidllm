@@ -129,9 +129,11 @@ type Handler struct {
 	MCPAllowPrivateURLs bool
 	// MCPAllowedOrigins is the explicit Origin allowlist for MCP endpoints
 	// (docs/mcp-v2.md §4.1's mandatory Origin validation). Empty (the
-	// default) falls back to matching the request's own Host — see
-	// mcpOriginMiddleware. Set via YAML config only — not exposed in Admin
-	// API.
+	// default) falls back to a built-in localhost-only allowlist — see
+	// mcpOriginMiddleware and isDefaultAllowedOrigin, and
+	// config.MCPConfig.AllowedOrigins for why this no longer falls back to
+	// matching the request's own Host. Set via YAML config only — not
+	// exposed in Admin API.
 	MCPAllowedOrigins []string
 	// ToolCache holds cached tool schemas from upstream MCP servers for use by
 	// Code Mode. Nil when Code Mode is disabled.

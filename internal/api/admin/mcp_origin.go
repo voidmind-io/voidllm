@@ -30,7 +30,10 @@ const maxLoggedOriginLen = 256
 // that predates this check, none of which are browsers subject to the
 // same-origin policy this check exists to backstop.
 //
-// When an Origin header IS present:
+// When an Origin header IS present, this is an explicit-allow check — the
+// same principle VoidLLM applies to model access (an empty allowlist grants
+// nothing):
+//
 //   - If allowed is non-empty, the Origin must match one of its entries — an
 //     explicit, operator-configured allowlist — compared case-insensitively
 //     via originEqualFold, since RFC 6454 defines an origin's scheme and host
@@ -40,15 +43,31 @@ const maxLoggedOriginLen = 256
 //     (docs/mcp-v2.md, FIX 4). A path component remains categorically
 //     forbidden in an Origin either way — see originEqualFold — this only
 //     changes how the scheme/host/port comparison itself is performed, not
-//     what shape is accepted.
-//   - If allowed is empty (the default), the Origin's host must match the
-//     request's own Host. This is the standard DNS-rebinding mitigation: the
-//     practical DNS-rebinding attack pattern has an attacker's page fetch a
-//     different host or port than its own origin, so the attacking page's
-//     Origin header and the rebound request's Host header diverge — that
-//     divergence is exactly what this check catches. It is a no-op for
-//     legitimate same-origin browser traffic and, per above, entirely
-//     invisible to non-browser clients.
+//     what shape is accepted. The request's Host header plays no role at all
+//     in this branch.
+//   - If allowed is empty (the default), only the built-in localhost origins
+//     isDefaultAllowedOrigin recognizes — http/https on localhost, 127.0.0.1,
+//     or [::1], each with or without a port — are accepted.
+//
+// This does NOT compare the Origin against the request's own Host, which is
+// the mistake this middleware used to make (originHostMatches, removed): in
+// the real DNS-rebinding attack, the attacker controls a DNS record — say
+// evil.example.com — that first resolves to their own server (to serve the
+// malicious page) and then, once the browser has loaded it, is rebound to
+// resolve to 127.0.0.1 (to reach a service the browser page then talks to as
+// if it were same-origin). The browser's Origin header always reads
+// "https://evil.example.com" — it is fixed by the page's own URL, not by
+// whatever the DNS record resolves to at request time — and its Host header
+// is generated from that exact same URL, so the two headers agree by
+// construction on every single request. An attacker who controls the DNS
+// record controls both headers identically; comparing one attacker-supplied
+// value against another attacker-supplied value can never detect anything,
+// which is exactly why the MCP Streamable HTTP conformance suite's
+// dns-rebinding-protection scenario fails against a same-origin check like
+// that. Restricting the default to a fixed, non-attacker-influenced set of
+// hostnames is what actually closes the gap: no DNS record an attacker
+// controls can ever make isDefaultAllowedOrigin see "localhost", "127.0.0.1",
+// or "[::1]" for a page the attacker's own server actually served.
 func mcpOriginMiddleware(allowed []string, log *slog.Logger) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		origin := c.Get(fiber.HeaderOrigin)
@@ -65,7 +84,7 @@ func mcpOriginMiddleware(allowed []string, log *slog.Logger) fiber.Handler {
 			return rejectMCPOrigin(c, log, origin)
 		}
 
-		if originHostMatches(origin, c.Host()) {
+		if isDefaultAllowedOrigin(origin) {
 			return c.Next()
 		}
 		return rejectMCPOrigin(c, log, origin)
@@ -85,17 +104,43 @@ func originEqualFold(a, origin string) bool {
 	return strings.EqualFold(a, origin)
 }
 
-// originHostMatches reports whether origin — a full Origin header value,
-// e.g. "https://example.com:8443" — has the same host (hostname plus port,
-// scheme ignored) as reqHost, the request's own Host (as Fiber's Ctx.Host
-// derives it from the Host or X-Forwarded-Host header). A Origin value that
-// fails to parse as a URL never matches.
-func originHostMatches(origin, reqHost string) bool {
+// defaultAllowedOriginHosts is the built-in localhost allowlist
+// isDefaultAllowedOrigin accepts when settings.mcp.allowed_origins is not
+// configured. It is exactly the "Valid localhost values" the MCP Streamable
+// HTTP DNS-rebinding conformance scenario expects: localhost, 127.0.0.1, and
+// [::1] (IPv6 loopback), compared against url.URL.Hostname() — which already
+// strips the brackets an IPv6 host carries in a URL — so entries are bare
+// hostnames, never bracketed.
+var defaultAllowedOriginHosts = map[string]struct{}{
+	"localhost": {},
+	"127.0.0.1": {},
+	"::1":       {},
+}
+
+// isDefaultAllowedOrigin reports whether origin — a full Origin header
+// value, e.g. "https://localhost:5173" — is one of the built-in localhost
+// origins mcpOriginMiddleware accepts by default, when
+// settings.mcp.allowed_origins is not configured: scheme http or https,
+// host localhost, 127.0.0.1, or [::1] (see defaultAllowedOriginHosts), with
+// or without an explicit port. The scheme and host comparison is
+// case-insensitive, matching RFC 6454. A port, if present, is not otherwise
+// inspected — any port on a genuinely local origin is accepted, since a port
+// number carries no rebinding risk by itself.
+//
+// Deliberately absent: any comparison against the request's own Host
+// header. See mcpOriginMiddleware's doc for why that comparison — the prior
+// behavior here — cannot detect DNS rebinding at all: an attacker who
+// controls the DNS record also controls both headers, so they always agree.
+func isDefaultAllowedOrigin(origin string) bool {
 	u, err := url.Parse(origin)
 	if err != nil {
 		return false
 	}
-	return strings.EqualFold(u.Host, reqHost)
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return false
+	}
+	_, ok := defaultAllowedOriginHosts[strings.ToLower(u.Hostname())]
+	return ok
 }
 
 // rejectMCPOrigin sends the HTTP 403 response for a request whose Origin

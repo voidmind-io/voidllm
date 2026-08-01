@@ -492,11 +492,31 @@ type MCPConfig struct {
 	// DNS-rebinding attacks from browser-based clients). Each entry is
 	// compared case-insensitively against an inbound Origin header, e.g.
 	// "https://app.example.com". Supports ${ENV_VAR} interpolation like the
-	// rest of the config. Empty (the default) falls back to accepting an
-	// Origin whose host matches the request's own Host — see
-	// internal/api/admin's mcpOriginMiddleware. Only takes effect when an
-	// Origin header is present at all; non-browser callers (CLIs, SDKs,
-	// service-to-service integrations) never send one and are unaffected.
+	// rest of the config.
+	//
+	// When set, it is the ONLY thing an inbound Origin is checked against —
+	// explicit-allow, the same principle VoidLLM applies to model access
+	// (an empty allowlist grants nothing). The request's own Host header is
+	// never consulted, deliberately: comparing an Origin against the
+	// request's Host cannot detect DNS rebinding, because in that attack the
+	// attacker controls the DNS record and therefore both headers agree by
+	// construction — see internal/api/admin's mcpOriginMiddleware for the
+	// full attack walkthrough.
+	//
+	// When empty (the default), a built-in localhost-only allowlist applies
+	// instead: http or https on localhost, 127.0.0.1, or [::1], each with or
+	// without an explicit port — see internal/api/admin's
+	// isDefaultAllowedOrigin. A deployment reachable from anywhere other than
+	// localhost (which describes almost every real deployment: VoidLLM
+	// always binds every interface, there is no host-restricted listen
+	// option) must set this field to browser-reach the MCP endpoints at all;
+	// VoidLLM logs one WARN at startup when the MCP gateway is active and
+	// this is left empty, precisely because that is very likely not what an
+	// operator serving a real domain wants.
+	//
+	// Only takes effect when an Origin header is present at all;
+	// non-browser callers (CLIs, SDKs, service-to-service integrations)
+	// never send one and are unaffected either way.
 	AllowedOrigins []string `yaml:"allowed_origins"`
 }
 

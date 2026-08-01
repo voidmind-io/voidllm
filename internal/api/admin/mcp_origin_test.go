@@ -134,17 +134,83 @@ func TestMCPOriginMiddleware(t *testing.T) {
 			wantAllowed:    false,
 		},
 		{
-			// httptest.NewRequest defaults the request Host to "example.com"
-			// for a relative target URL.
-			name:           "Origin set, allowlist empty, Origin host equals request host passes",
+			// REVERSED (security fix, DNS-rebinding regression test): this
+			// used to pass, because the old check compared the Origin's host
+			// against the request's own Host header (httptest.NewRequest
+			// defaults that to "example.com" for a relative target URL) and
+			// the two matched. That comparison is exactly the DNS-rebinding
+			// hole the MCP conformance suite's dns-rebinding-protection
+			// scenario catches: an attacker who controls the DNS record for
+			// evil.example.com controls both the Origin and Host headers a
+			// browser sends identically, so a same-origin check like this one
+			// can never distinguish an attack from legitimate traffic. With
+			// allowed_origins empty, only the built-in localhost allowlist
+			// (see "Origin set, allowlist empty, http://localhost passes"
+			// below) is accepted now — a non-localhost Origin is always
+			// rejected regardless of what Host the request happens to carry.
+			name:           "REGRESSION (DNS-rebinding fix): Origin host equalling request Host no longer passes; only the built-in localhost allowlist does",
 			allowedOrigins: nil,
 			originHeader:   "https://example.com",
-			wantAllowed:    true,
+			wantAllowed:    false,
 		},
 		{
 			name:           "Origin set, allowlist empty, foreign host is rejected",
 			allowedOrigins: nil,
 			originHeader:   "https://evil.example.com",
+			wantAllowed:    false,
+		},
+		{
+			name:           "Origin set, allowlist empty, http://localhost (no port) passes (built-in default)",
+			allowedOrigins: nil,
+			originHeader:   "http://localhost",
+			wantAllowed:    true,
+		},
+		{
+			name:           "Origin set, allowlist empty, https://localhost:5173 (with port) passes (built-in default)",
+			allowedOrigins: nil,
+			originHeader:   "https://localhost:5173",
+			wantAllowed:    true,
+		},
+		{
+			name:           "Origin set, allowlist empty, http://127.0.0.1 (no port) passes (built-in default)",
+			allowedOrigins: nil,
+			originHeader:   "http://127.0.0.1",
+			wantAllowed:    true,
+		},
+		{
+			name:           "Origin set, allowlist empty, https://127.0.0.1:8443 (with port) passes (built-in default)",
+			allowedOrigins: nil,
+			originHeader:   "https://127.0.0.1:8443",
+			wantAllowed:    true,
+		},
+		{
+			name:           "Origin set, allowlist empty, http://[::1] (IPv6 loopback, no port) passes (built-in default)",
+			allowedOrigins: nil,
+			originHeader:   "http://[::1]",
+			wantAllowed:    true,
+		},
+		{
+			name:           "Origin set, allowlist empty, https://[::1]:9000 (IPv6 loopback, with port) passes (built-in default)",
+			allowedOrigins: nil,
+			originHeader:   "https://[::1]:9000",
+			wantAllowed:    true,
+		},
+		{
+			// RFC 6454 case-insensitivity applies to the built-in default
+			// allowlist too, not just an operator-configured one.
+			name:           "Origin set, allowlist empty, HTTP://LOCALHOST (uppercase) still passes (RFC 6454 case-insensitivity)",
+			allowedOrigins: nil,
+			originHeader:   "HTTP://LOCALHOST",
+			wantAllowed:    true,
+		},
+		{
+			// A non-http(s) scheme on an otherwise-localhost host must not
+			// pass the built-in default: the default allowlist is scoped to
+			// scheme http/https like the rest of this check, not to the host
+			// component alone.
+			name:           "Origin set, allowlist empty, non-http(s) scheme on localhost host is rejected",
+			allowedOrigins: nil,
+			originHeader:   "ftp://localhost",
 			wantAllowed:    false,
 		},
 		{
