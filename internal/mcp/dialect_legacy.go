@@ -64,13 +64,14 @@ func (d *legacyDialect) Decode(raw []byte, _ Header) (*Envelope, *Error) {
 		}
 		env.ClientInfo = init.ClientInfo
 		env.ClientCaps = Capabilities(init.Capabilities)
-	case "tools/call":
-		var call struct {
-			Name string `json:"name"`
-		}
-		_ = jsonx.Unmarshal(req.Params, &call)
-		env.Name = call.Name
 	}
+
+	// Populated for every method TargetParamKey names — not only tools/call —
+	// so a future dispatch of resources/read or prompts/get inherits a
+	// correctly populated Envelope.Name instead of silently getting an empty
+	// string (docs/mcp-v2.md Fund 5), symmetrically with dialect_2026.go's
+	// Decode. See envelopeTargetName's own doc.
+	env.Name = envelopeTargetName(req.Method, req.Params)
 
 	return env, nil
 }

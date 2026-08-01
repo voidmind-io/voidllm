@@ -300,7 +300,7 @@ MCP tool call arguments and results are not logged or stored. Only metadata is t
 ### Metrics
 
 ```
-voidllm_mcp_tool_calls_total{server, tool, status}
+voidllm_mcp_tool_calls_total{server, method, status}
 voidllm_mcp_tool_call_duration_seconds{server, tool}
 voidllm_mcp_transport_errors_total{server, error_type}
 ```

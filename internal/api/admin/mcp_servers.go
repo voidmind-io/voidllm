@@ -1012,9 +1012,61 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update MCP server")
 	}
 
+	// An auth- or transport-relevant change invalidates this server's cached
+	// tool listing, not only its transport (docs/mcp-v2.md Fund 9):
+	// h.refreshMCPCaches below already reloads MCPTransportCache, whose own
+	// LoadAll rebuilds the *mcp.HTTPTransport when any of these same fields
+	// changed (see mcpAuthOrTransportFieldsChanged and
+	// MCPTransportCache.LoadAll's own doc for why this exact field set). The
+	// tool cache is a SEPARATE cache, keyed by server ID alone, and was never
+	// invalidated by a plain UpdateMCPServer call before this fix — a listing
+	// fetched (and any x-mcp-header bindings mirrored from it) under the OLD
+	// credential kept deciding which tools were visible and which headers went
+	// out after the credential had already changed. InvalidateWithStore is the
+	// same mechanism DeleteMCPServer and setMCPServerActive(false) already use
+	// for the identical "this server's cached listing is no longer trustworthy"
+	// situation — reused here rather than duplicated.
+	if h.ToolCache != nil && mcpAuthOrTransportFieldsChanged(existing, s) {
+		h.ToolCache.InvalidateWithStore(ctx, s.ID)
+	}
+
 	h.refreshMCPCaches(ctx)
 
 	return c.JSON(mcpServerToResponse(s))
+}
+
+// mcpAuthOrTransportFieldsChanged reports whether any field that affects how
+// VoidLLM authenticates to or reaches an MCP server differs between before
+// and after — the same field set MCPTransportCache.LoadAll compares to
+// decide whether to rebuild a server's *mcp.HTTPTransport (see its own doc),
+// checked here a second time so UpdateMCPServer can invalidate that server's
+// cached tool listing (h.ToolCache) in lockstep with the transport rebuild
+// (docs/mcp-v2.md Fund 8/Fund 9). Name, Alias, and CodeModeEnabled
+// deliberately do NOT participate: none of them changes what credential is
+// sent or where it is sent to, so none of them makes a previously fetched
+// tool listing stale.
+func mcpAuthOrTransportFieldsChanged(before, after *db.MCPServer) bool {
+	return before.URL != after.URL ||
+		before.AuthType != after.AuthType ||
+		before.AuthHeader != after.AuthHeader ||
+		strPtrValue(before.AuthTokenEnc) != strPtrValue(after.AuthTokenEnc) ||
+		strPtrValue(before.OAuthClientSecretEnc) != strPtrValue(after.OAuthClientSecretEnc) ||
+		before.OAuthTokenURL != after.OAuthTokenURL ||
+		before.OAuthClientID != after.OAuthClientID ||
+		before.OAuthScopes != after.OAuthScopes ||
+		before.ProtocolVersion != after.ProtocolVersion
+}
+
+// strPtrValue dereferences p, or returns "" for a nil pointer — the same
+// nil-to-empty-string normalization internal/proxy/mcp_transport_cache.go's
+// LoadAll applies to AuthTokenEnc/OAuthClientSecretEnc before comparing them,
+// reused here so both change-detection sites treat "nil" and "pointer to an
+// empty string" identically rather than as a spurious difference.
+func strPtrValue(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // DeleteMCPServer handles DELETE /api/v1/mcp-servers/:server_id.

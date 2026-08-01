@@ -92,6 +92,24 @@ func TestToolHeaderParams_ConstraintTable(t *testing.T) {
 				`"properties":{"code":{"type":"string","x-mcp-header":"Region"}}}}}`,
 		},
 		{
+			// Distinct from the case immediately above: there the $ref sits
+			// on an ANCESTOR of the annotated node (region), clearing
+			// reachability for its children before the walk ever reaches the
+			// annotation. Here $ref and x-mcp-header are both properties of
+			// the very SAME node — the annotation is not reached "through" a
+			// $ref-carrying ancestor at all, it sits directly ON one. This
+			// exercises walk's own node-vs-children distinction: hasRef
+			// clears childReachable for this node's CHILDREN, but the node's
+			// OWN annotation must use that same childReachable, not the
+			// unadjusted (still-reachable) value the node itself was visited
+			// with — otherwise a schema that pairs $ref with a local "type"
+			// (whose truthfulness this package cannot verify against
+			// whatever the $ref actually resolves to) would sail through as
+			// reachable.
+			name:   "$ref sits on the SAME node as the x-mcp-header annotation, not on an ancestor",
+			schema: `{"type":"object","properties":{"region":{"type":"string","$ref":"#/$defs/Base","x-mcp-header":"Region"}}}`,
+		},
+		{
 			// Regression case for the walk's reachability check being an
 			// allowlist of "properties" alone, not a blocklist of named
 			// composition keywords: "dependentSchemas" is not, and has never

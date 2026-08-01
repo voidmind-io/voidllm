@@ -211,13 +211,23 @@ func TestHTTPTransport_Call_Notification_202(t *testing.T) {
 	}
 }
 
-// TestHTTPTransport_Call_BodyLimit uses a legacy-pinned transport: the
-// modern dialect's doCall feeds every non-empty 200 body through Parse (to
-// detect MRTR's input_required), which would itself fail on the garbage,
-// non-JSON payload this test serves. The legacy dialect never parses a
-// response body at all — Call is purely a byte-limited pass-through for it —
-// which is the actual property under test here (truncation, not
-// interpretation).
+// TestHTTPTransport_Call_BodyOverLimit_Rejected uses a legacy-pinned
+// transport: the modern dialect's doCall feeds every non-empty 200 body
+// through Parse (to detect MRTR's input_required), which would itself fail
+// on the garbage, non-JSON payload this test serves. The legacy dialect
+// never parses a response body at all — Call is purely a byte-limited
+// pass-through for it — which is the actual property under test here (a
+// too-large body being rejected, not interpreted).
+//
+// This test previously asserted the opposite: that a response exceeding the
+// 10 MiB limit was silently truncated to the limit and returned as if it
+// were the complete body ("Call() error = nil, want nil (body should be
+// truncated not error)"). That was itself the review finding this test now
+// guards against (Fund 7, docs/mcp-v2.md): rawPost's +1-byte LimitReader
+// trick means an oversized body is now rejected outright with an error
+// instead of being silently truncated and handed to the caller as if
+// complete. Renamed from TestHTTPTransport_Call_BodyLimit and inverted to
+// match.
 //
 // The oversized garbage payload is served only for the real "ping" request
 // under test. "initialize" gets a small, well-formed JSON-RPC result of its
@@ -225,14 +235,13 @@ func TestHTTPTransport_Call_Notification_202(t *testing.T) {
 // OTHER response it later sends is oversized or malformed — since
 // legacyClientDialect.Warmup now rejects a 2xx initialize response that is
 // not a well-formed JSON-RPC result (see jsonRPCInitializeOutcome), and this
-// test's actual target is the body-limit truncation on Call, not the
+// test's actual target is the body-limit rejection on Call, not the
 // handshake.
-func TestHTTPTransport_Call_BodyLimit(t *testing.T) {
+func TestHTTPTransport_Call_BodyOverLimit_Rejected(t *testing.T) {
 	t.Parallel()
 
-	// Serve exactly 10 MiB + 1 byte on the real request. The transport must
-	// not crash — it should silently truncate to the limit and still return a
-	// non-nil body.
+	// Serve exactly 10 MiB + 1 byte on the real request — one byte over the
+	// limit rawPost now enforces as a hard rejection.
 	const limit = 10 << 20 // 10 MiB
 	oversized := bytes.Repeat([]byte("x"), limit+1)
 
@@ -257,13 +266,55 @@ func TestHTTPTransport_Call_BodyLimit(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tr := newLegacyTransport(srv.URL, "none", "", "")
-	got, err := tr.Call(context.Background(), &mcp.CallRequest{Raw: []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)}, "")
-	// Must not error — body is merely truncated.
-	if err != nil {
-		t.Fatalf("Call() error = %v, want nil (body should be truncated not error)", err)
+	_, err := tr.Call(context.Background(), &mcp.CallRequest{Raw: []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)}, "")
+	if err == nil {
+		t.Fatal("Call() error = nil, want an error for a response body exceeding the 10 MiB limit (it must be rejected, not silently truncated)")
 	}
-	if len(got.Body) > limit {
-		t.Errorf("body len = %d, want at most %d (10 MiB limit)", len(got.Body), limit)
+}
+
+// TestHTTPTransport_Call_BodyExactlyAtLimit_Accepted is the boundary
+// counterpart of TestHTTPTransport_Call_BodyOverLimit_Rejected: a response
+// body of EXACTLY the 10 MiB limit — not one byte over — must still be
+// accepted and returned in full, unmodified. rawPost's own +1-byte
+// LimitReader trick (its doc explains why: reading exactly the limit would
+// make a response that fits exactly indistinguishable from one truncated at
+// it) exists specifically to make this boundary work; if that trick were
+// ever "simplified" back to reading only the limit itself, a body of exactly
+// this size would look truncated and this test would start failing instead
+// of TestHTTPTransport_Call_BodyOverLimit_Rejected.
+func TestHTTPTransport_Call_BodyExactlyAtLimit_Accepted(t *testing.T) {
+	t.Parallel()
+
+	const limit = 10 << 20 // 10 MiB
+	exact := bytes.Repeat([]byte("x"), limit)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var rpc struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(body, &rpc)
+
+		w.Header().Set("Content-Type", "application/json")
+		switch rpc.Method {
+		case "initialize":
+			fmt.Fprint(w, `{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-03-26","capabilities":{}}}`)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(exact)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	tr := newLegacyTransport(srv.URL, "none", "", "")
+	got, err := tr.Call(context.Background(), &mcp.CallRequest{Raw: []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)}, "")
+	if err != nil {
+		t.Fatalf("Call() error = %v, want nil for a response body of exactly the 10 MiB limit", err)
+	}
+	if len(got.Body) != limit {
+		t.Errorf("Call() body length = %d, want exactly %d (the complete, untruncated body)", len(got.Body), limit)
 	}
 }
 

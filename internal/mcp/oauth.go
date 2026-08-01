@@ -127,6 +127,21 @@ func (m *OAuthTokenManager) Evict(serverID string) {
 	m.mu.Unlock()
 }
 
+// oauthResponseMaxBytes bounds discoverTokenURL's and fetchToken's reads of
+// an authorization server's response body, to prevent OOM on a misbehaving
+// or malicious endpoint. Both call sites give the underlying LimitReader
+// oauthResponseMaxBytes+1, one byte more than this ceiling, and reject the
+// read outright when the result comes back that one byte too long — the
+// same +1 trick rawPost uses (internal/mcp/http_transport.go's
+// rawPostMaxBodyBytes) and for the identical reason: reading exactly
+// oauthResponseMaxBytes would make a response that fits EXACTLY at the limit
+// indistinguishable from one truncated at it, both coming back as a
+// len(body) == oauthResponseMaxBytes read with no error. Before this fix, a
+// response exceeding the limit was silently truncated and the truncated
+// bytes handed to json.Unmarshal as if they were the complete document,
+// rather than rejected outright (docs/mcp-v2.md, Fund 7's sibling pattern).
+const oauthResponseMaxBytes int64 = 1 << 20 // 1 MiB
+
 // discoverTokenURL attempts RFC 8414 OAuth Authorization Server Metadata
 // discovery at serverURL/.well-known/oauth-authorization-server and returns
 // the token_endpoint from the response.
@@ -150,9 +165,12 @@ func (m *OAuthTokenManager) discoverTokenURL(ctx context.Context, serverURL stri
 		return "", fmt.Errorf("discovery endpoint returned %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, oauthResponseMaxBytes+1))
 	if err != nil {
 		return "", err
+	}
+	if int64(len(body)) > oauthResponseMaxBytes {
+		return "", fmt.Errorf("discovery response exceeds %d byte limit", oauthResponseMaxBytes)
 	}
 
 	var meta struct {
@@ -204,9 +222,12 @@ func (m *OAuthTokenManager) fetchToken(ctx context.Context, tokenURL string, cfg
 		return "", 0, fmt.Errorf("token endpoint returned HTTP %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB limit
+	body, err := io.ReadAll(io.LimitReader(resp.Body, oauthResponseMaxBytes+1))
 	if err != nil {
 		return "", 0, fmt.Errorf("read token response: %w", err)
+	}
+	if int64(len(body)) > oauthResponseMaxBytes {
+		return "", 0, fmt.Errorf("token response exceeds %d byte limit", oauthResponseMaxBytes)
 	}
 
 	var tokenResp struct {

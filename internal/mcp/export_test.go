@@ -24,6 +24,23 @@ var ErrSessionExpired = errSessionExpired
 // construct errOAuthNotConfigured themselves.
 var ErrOAuthNotConfigured = errOAuthNotConfigured
 
+// ErrEmptyAuthCredential exposes the unexported errEmptyAuthCredential
+// sentinel for white-box testing from the mcp_test package — see that
+// error's own doc in http_transport.go for why rawPost and Forward must fail
+// closed (never send a request carrying an empty Authorization/custom-header
+// credential) when authType is "bearer" with an empty token, or "header"
+// with a configured header name but an empty token value. Tests need this to
+// assert the failure via errors.Is without being able to construct
+// errEmptyAuthCredential themselves.
+var ErrEmptyAuthCredential = errEmptyAuthCredential
+
+// OAuthResponseMaxBytes exposes oauthResponseMaxBytes so tests can construct
+// a response body exactly at, or one byte over, the ceiling
+// OAuthTokenManager.fetchToken and discoverTokenURL enforce, instead of
+// duplicating the literal byte count and risking silent drift if the
+// constant is ever tuned.
+const OAuthResponseMaxBytes = oauthResponseMaxBytes
+
 // UnwrapToolResult exposes the internal unwrapToolResult function for
 // white-box testing from the mcp_test package.
 var UnwrapToolResult = unwrapToolResult

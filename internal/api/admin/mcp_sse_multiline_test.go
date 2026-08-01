@@ -419,7 +419,18 @@ func TestMCPProxy_GenuineUpstreamSSE_NeverRewrapped_RegardlessOfClientAccept(t *
 			org := mustCreateTestOrg(t, database, alias)
 			memberKey := addMCPTestKey(t, keyCache, org.ID)
 
-			s := createExternalMCPServer(t, database, alias, upstream.URL)
+			// Pinned, not probed (createExternalMCPServerPinned's own doc):
+			// this fixture answers every request — including whatever
+			// server/discover or initialize probe an unpinned transport would
+			// send first — with the identical canned SSE body below, which
+			// carries a fixed id ("1") that will not match a probe's own id.
+			// Before rawPost gained real request-id matching for SSE
+			// responses (Fund 1), that mismatch was invisible to era probing;
+			// now it would surface as a probe failure this test has nothing
+			// to do with. Pinning sidesteps probing entirely, exactly the
+			// noise this helper exists to avoid, and Forward — the only path
+			// this test exercises — never depends on which era was pinned.
+			s := createExternalMCPServerPinned(t, database, alias, upstream.URL, "2026-07-28")
 			if err := database.SetOrgMCPAccess(context.Background(), org.ID, []string{s}); err != nil {
 				t.Fatalf("SetOrgMCPAccess: %v", err)
 			}

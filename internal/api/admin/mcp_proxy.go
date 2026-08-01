@@ -580,8 +580,23 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	// path: a session ID is a bearer credential (docs/mcp-v2.md §11.5), and
 	// this repo's zero-knowledge logging contract applies to it exactly as
 	// it does to prompt content.
+	//
+	// mcpConnectionOptions(result.Header) is consulted here — reusing
+	// copyMCPResponseHeaders' own hop-by-hop determination (mcp_headers.go)
+	// rather than re-deriving it a second time — because an upstream MAY name
+	// Mcp-Session-Id as one of its own Connection field's connection-options
+	// (RFC 7230 §6.1: "Connection: Mcp-Session-Id"), declaring the header
+	// connection-specific for this one response. copyMCPResponseHeaders below
+	// already honors that declaration and never mirrors such a header back to
+	// the caller — so a session recorded here despite it would be one this
+	// proxy remembers on the caller's behalf while the caller itself never
+	// learns the ID at all. That session would then sit in the registry,
+	// unreachable by any legitimate follow-up request (the caller has nothing
+	// to send back), until it ages out or evicts a real one under
+	// maxKeysPerOrg/maxOrgsPerServer (see SessionRegistry's own doc) — the
+	// registry may only ever remember what the caller actually received.
 	if h.MCPSessionRegistry != nil {
-		if sid := result.Header.Get(mcp.HeaderSessionID); sid != "" {
+		if sid := result.Header.Get(mcp.HeaderSessionID); sid != "" && !mcpConnectionOptions(result.Header)[mcp.HeaderSessionID] {
 			h.MCPSessionRegistry.Record(server.ID, sessionScope, sid)
 		}
 	}

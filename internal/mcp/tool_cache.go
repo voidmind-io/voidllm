@@ -255,7 +255,7 @@ func (tc *ToolCache) resolveTTL(hint CacheHint) (ttl time.Duration, neverExpires
 }
 
 // persistListing writes listing's tools through to tc.store on behalf of
-// serverID, honoring listing.Cache.Scope (MCP 2026-07-28 §5):
+// serverID, honoring listing.Cache (MCP 2026-07-28 §5):
 //
 //   - CacheScopePrivate: the tools are NOT saved. Any previously persisted
 //     copy for serverID is actively deleted instead. A left-behind copy
@@ -269,10 +269,33 @@ func (tc *ToolCache) resolveTTL(hint CacheHint) (ttl time.Duration, neverExpires
 //     ListTools always authenticates to the upstream with one server-wide
 //     credential, so the authorization context behind an in-memory entry is
 //     the same for every caller regardless of scope.
-//   - CacheScopePublic, or "" (no hint at all — every legacy upstream today):
-//     saved exactly as before. Treating "no hint" the same as "public" is
-//     deliberate: equating it with "private" instead would evict every
-//     legacy upstream's cache from the store on every single fetch.
+//   - A hint WAS offered (listing.Cache.TTLMsSet) but its Scope is anything
+//     other than CacheScopePublic — meaning either the upstream explicitly
+//     said "private" (handled above) or it set ttlMs/cacheScope at all
+//     without a recognizable "public"/"private" value, which parseCacheHint
+//     leaves as Scope == "": NOT saved, and — unlike the private case —
+//     nothing is deleted either. §5 grants permission to store a result and
+//     serve it to ANY caller only for cacheScope: "public" ("Jeder Client
+//     […] DARF sie speichern und an beliebige Nutzer ausliefern"); an
+//     upstream that opted into CacheableResult at all but then sent no valid
+//     public grant has given VoidLLM no basis to treat this listing as safe
+//     to share across every organization and key that can reach this shared,
+//     server-wide tool cache. This is deliberately distinct from the next
+//     case: an upstream that implements CacheableResult has said SOMETHING,
+//     even if unusable, so persistListing takes it as "unproven", not as the
+//     "said nothing, so persist as always" default the next case is.
+//   - No hint at all (TTLMsSet is false — every legacy upstream today, and a
+//     modern one that has simply not implemented CacheableResult yet):
+//     saved exactly as before this fix. Treating "no hint" as permission to
+//     persist, unlike an unusable hint, is deliberate and unchanged: refusing
+//     it instead would evict every legacy upstream's cache from the store on
+//     every single fetch, for a distinction §5 never asked this package to
+//     draw in the first place — CacheableResult is itself a MCP 2026-07-28
+//     concept a legacy response has no way to express an opinion on. This
+//     preserves this function's era-neutrality (see resolveTTL's own doc for
+//     why that is load-bearing): the branch above reads only
+//     listing.Cache.TTLMsSet and .Scope, both already era-neutral fields on
+//     CacheHint, never the dialect or protocol version that produced them.
 //
 // Called only when tc.store is non-nil. A Save failure is swallowed, as it
 // always was before this method existed — it is not new behavior introduced
@@ -286,6 +309,13 @@ func (tc *ToolCache) persistListing(ctx context.Context, serverID string, listin
 				slog.String("server_id", serverID),
 				slog.String("error", err.Error()))
 		}
+		return
+	}
+	if listing.Cache.TTLMsSet && listing.Cache.Scope != CacheScopePublic {
+		// A hint was offered but did not grant public-scope sharing — see the
+		// doc above. Neither saved nor deleted: this is not the "the upstream
+		// said private" case (handled above), just an absence of proof this
+		// listing is safe to persist and hand to any caller.
 		return
 	}
 	_ = tc.store.Save(ctx, serverID, listing.Tools) //nolint:errcheck

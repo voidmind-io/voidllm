@@ -214,8 +214,23 @@ func (w *headerParamWalker) walk(node any, path []string, reachable bool, depth 
 		_, hasRef := v["$ref"]
 		childReachable := reachable && !hasRef
 
+		// The node's OWN annotation, if present, is recorded using
+		// childReachable — not reachable — even though the annotation sits ON
+		// this node rather than on one of its children. recordAnnotation reads
+		// "type" directly off v (see its own doc: "so 'type' can be read
+		// alongside it"); if v also carries "$ref", the node's EFFECTIVE type
+		// can come from wherever that $ref resolves to, and may agree with, or
+		// simply contradict, whatever local "type" value happens to sit next
+		// to it — this package never resolves $ref, so it has no way to tell
+		// which. Recording the annotation as reachable here would mean
+		// mirroring a header whose declared type this package cannot actually
+		// vouch for. hasRef already clears reachability for this node's
+		// CHILDREN (childReachable); using the unadjusted reachable for the
+		// node's own annotation was an oversight that left exactly this one
+		// case — an x-mcp-header sitting on the very node that also carries
+		// $ref — validated against a "type" that might not be the real one.
 		if rawName, ok := v["x-mcp-header"]; ok {
-			if err := w.recordAnnotation(v, rawName, path, reachable); err != nil {
+			if err := w.recordAnnotation(v, rawName, path, childReachable); err != nil {
 				return err
 			}
 		}

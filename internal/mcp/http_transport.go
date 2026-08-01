@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"strings"
@@ -36,6 +37,33 @@ var errSessionExpired = errors.New("mcp session expired")
 // exported package-internally to let a test assert the failure via
 // errors.Is.
 var errOAuthNotConfigured = errors.New("oauth not configured")
+
+// errEmptyAuthCredential is returned by rawPost and Forward when authType is
+// "bearer" or "header" but the credential that would be sent is empty — an
+// empty authToken for either type, or an empty authHeader name for "header".
+// This is the same fail-open class errOAuthNotConfigured already closes for
+// authType "oauth". Before this sentinel existed, neither branch checked its
+// value at all — only "header" checked that authHeader (the header NAME) was
+// non-empty, never that authToken (the header VALUE) was — so a transport
+// built with an empty authToken still sent "Authorization: Bearer " (or an
+// equally empty configured header) instead of failing the call. The two
+// callers that construct an HTTPTransport from a stored, encrypted credential
+// (MCPTransportCache.LoadAll and buildAdHocTransport, mcp_proxy.go) now both
+// already fail closed BEFORE ever reaching here — a decrypt failure aborts
+// the transport's construction entirely rather than leaving authToken at its
+// zero value — so this check is the second, independent layer of the same
+// defense: it also catches an authToken that was simply never configured to
+// begin with (no decrypt failure involved at all), and it remains the last
+// line of defense against any future call site that constructs an
+// HTTPTransport some other way. Both authType switches must fail closed here
+// regardless, rather than silently sending a credential-carrying header with
+// no credential in it, so this sentinel is exported package-internally to
+// let a test assert the failure via errors.Is. The message never names which
+// of the two (missing header name vs. missing token value) applied, nor the
+// configured header name itself — both are operator configuration, not
+// upstream or caller content, but the message stays generic anyway to keep
+// this sentinel's text stable regardless of which branch produced it.
+var errEmptyAuthCredential = errors.New("auth credential is empty")
 
 // ErrSSENotSupported is returned by probeEra when the upstream MCP server
 // uses the deprecated SSE transport (pre 2025-03-26 spec). SSE requires
@@ -456,9 +484,10 @@ func applyExtraHeaders(req *http.Request, hdr MapHeader, protect string) {
 // time, while doCall and the RoundTripper Warmup depends on pass the
 // already-resolved eraBinding's postURL (see postTarget). rawPost performs
 // no interpretation of the response body's JSON-RPC shape, but does unwrap a
-// text/event-stream response down to its first "data:" line, since every
-// caller needs the same JSON payload regardless of which content type the
-// upstream chose to answer with.
+// text/event-stream response down to the one event that answers raw's own
+// JSON-RPC id (see extractSSEResult), since every caller needs the same JSON
+// payload regardless of which content type the upstream chose to answer
+// with.
 func (t *HTTPTransport) rawPost(ctx context.Context, target string, raw []byte, hdr MapHeader) (*httpResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(raw))
 	if err != nil {
@@ -488,11 +517,15 @@ func (t *HTTPTransport) rawPost(ctx context.Context, target string, raw []byte, 
 	// (docs/mcp-v2.md, review finding C4).
 	switch t.authType {
 	case "bearer":
+		if t.authToken == "" {
+			return nil, errEmptyAuthCredential
+		}
 		req.Header.Set("Authorization", "Bearer "+t.authToken)
 	case "header":
-		if t.authHeader != "" {
-			req.Header.Set(t.authHeader, t.authToken)
+		if t.authHeader == "" || t.authToken == "" {
+			return nil, errEmptyAuthCredential
 		}
+		req.Header.Set(t.authHeader, t.authToken)
 	case "oauth":
 		if t.oauthManager == nil || t.oauthConfig == nil {
 			return nil, errOAuthNotConfigured
@@ -512,31 +545,278 @@ func (t *HTTPTransport) rawPost(ctx context.Context, target string, raw []byte, 
 	}
 	defer resp.Body.Close()
 
-	// Limit body reads to 10 MiB to prevent OOM on misbehaving upstream servers.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	// The limit reader is deliberately given rawPostMaxBodyBytes+1, one byte
+	// more than the ceiling this function actually enforces — see
+	// legacySSEWrapReadCap's identical +1 trick (internal/api/admin/mcp_proxy.go)
+	// for the full reasoning: reading exactly rawPostMaxBodyBytes would make a
+	// response that fits EXACTLY at the limit indistinguishable from one that
+	// was truncated at it — both come back as a len(body) == rawPostMaxBodyBytes
+	// read with no error. The extra byte lets the length check below tell the
+	// two apart: len == rawPostMaxBodyBytes+1 only happens when the upstream
+	// body was actually longer than the limit. Before this fix, an oversized
+	// body was silently truncated at exactly 10 MiB and the truncated bytes
+	// handed to the JSON-RPC decoder as if they were the complete response,
+	// rather than rejected outright.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, rawPostMaxBodyBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
+	if int64(len(body)) > rawPostMaxBodyBytes {
+		return nil, fmt.Errorf("response body exceeds %d byte limit", rawPostMaxBodyBytes)
+	}
 
-	ct := resp.Header.Get("Content-Type")
-	if strings.HasPrefix(ct, "text/event-stream") {
-		body = extractSSEData(body)
+	// len(body) > 0 guards against a response that labels itself
+	// text/event-stream but carries no body at all — most notably an HTTP 202
+	// Accepted acknowledging a notification (MCP Streamable HTTP §4.1: "202
+	// Accepted ohne Body"), which some upstream could still send with a
+	// stray/copy-pasted Content-Type header despite there being nothing to
+	// parse. Without this guard extractSSEResult would see an empty body,
+	// find no event of any kind, and fail with errSSENoResultEvent for a
+	// response doCall's own status switch would otherwise have handled
+	// harmlessly (StatusAccepted never inspects the body at all). An empty
+	// body is left as empty either way — doCall's separate
+	// len(res.body) == 0 check further down handles it identically for every
+	// era regardless of Content-Type.
+	if len(body) > 0 && isSSEContentType(resp.Header.Get("Content-Type")) {
+		matched, sseErr := extractSSEResult(body, outboundRequestID(raw))
+		if sseErr != nil {
+			return nil, fmt.Errorf("sse response: %w", sseErr)
+		}
+		body = matched
 	}
 
 	return &httpResult{status: resp.StatusCode, body: body, header: resp.Header}, nil
 }
 
-// extractSSEData pulls the first "data:" line from an SSE response body.
-func extractSSEData(body []byte) []byte {
-	for _, line := range bytes.Split(body, []byte("\n")) {
-		if bytes.HasPrefix(line, []byte("data: ")) {
-			return bytes.TrimPrefix(line, []byte("data: "))
+// rawPostMaxBodyBytes bounds how much of an upstream response body rawPost
+// will read, to prevent OOM on a misbehaving upstream server. It is enforced
+// as a hard reject, not a silent truncation — see the +1-byte LimitReader
+// trick at rawPost's own read site.
+const rawPostMaxBodyBytes int64 = 10 << 20 // 10 MiB
+
+// isSSEContentType reports whether ct — a response's raw Content-Type header
+// value — names the "text/event-stream" media type, ignoring any parameters
+// (e.g. "; charset=utf-8") and case. rawPost previously decided this with a
+// plain strings.HasPrefix(ct, "text/event-stream") check, which happens to
+// tolerate a trailing "; charset=..." parameter by accident — HasPrefix stops
+// comparing at the end of the literal regardless of what follows — but is
+// not robust to anything RFC 9110's media-type grammar itself allows and a
+// prefix comparison cannot: a different case ("Text/Event-Stream", which a
+// prefix comparison would reject as not-SSE and hand to the plain-JSON
+// decode path instead, corrupting a genuine SSE response), or leading
+// whitespace inside a value net/http did not already trim. mime.ParseMediaType
+// parses the value per that grammar and returns the bare type in lowercase, so
+// this compares it exactly rather than by prefix. A ct that fails to parse at
+// all — a malformed header — is reported as not SSE: the previous prefix
+// check would already have rejected most malformed values (they rarely start
+// with the literal "text/event-stream" by accident), so this preserves that
+// same safe default rather than guessing.
+func isSSEContentType(ct string) bool {
+	mediaType, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(mediaType, "text/event-stream")
+}
+
+// maxSSEEventsSkipped bounds how many SSE events extractSSEResult examines
+// and discards — because they carry no JSON-RPC id at all (a notification,
+// MCP 2026-07-28 §3.4) or an id that does not match the request this
+// response belongs to — before giving up on this response ever carrying a
+// matching one, at which point it fails with errSSETooManyEvents rather than
+// scanning indefinitely.
+//
+// rawPostMaxBodyBytes already bounds the SAME response by total wire bytes
+// (Fund 7), and for events of realistic size that bound is the tighter of
+// the two in practice: a genuine notifications/progress event runs to tens
+// or a few hundred bytes, so rawPostMaxBodyBytes alone already caps the
+// count reachable within one response to a five-digit number at most. This
+// separate, size-independent cap exists for the pathological case
+// rawPostMaxBodyBytes cannot catch on its own: a flood of minimal-size
+// events — a bare `data:{}` costs under ten bytes on the wire — could
+// otherwise reach into the hundreds of thousands of iterations before
+// rawPostMaxBodyBytes ever triggers. In that scenario this cap, not
+// rawPostMaxBodyBytes, is the one that actually stops the scan.
+const maxSSEEventsSkipped = 1000
+
+// errSSENoResultEvent is returned by extractSSEResult when the response body
+// contains no SSE event this function can treat as the JSON-RPC response to
+// the outbound request — every event either carried no "id" field
+// (notifications/progress, notifications/message, or any other JSON-RPC
+// notification, MCP 2026-07-28 §3.4) or one that did not match the outbound
+// request's own id, and the body was exhausted before a match was found.
+// Never returned silently as an empty result — see this package's own review
+// finding (docs/mcp-v2.md §11.3 Befund 3) for why a caller reading an empty
+// []Tool with a nil error, the previous behavior in this exact case, is the
+// failure mode this sentinel exists to replace with a loud one.
+var errSSENoResultEvent = errors.New("sse response contained no event matching the request")
+
+// errSSETooManyEvents is returned by extractSSEResult once
+// maxSSEEventsSkipped is exceeded — see that constant's own doc for why this
+// bound exists independently of rawPostMaxBodyBytes.
+var errSSETooManyEvents = errors.New("sse response exceeded the maximum number of events examined")
+
+// outboundRequestID extracts the top-level JSON-RPC "id" field from raw — a
+// single already-serialized outbound request, exactly as every caller of
+// rawPost builds it (Streamable HTTP §4.1: "Body ist genau ein Request oder
+// eine Notification") — so extractSSEResult can recognize which SSE event on
+// a per-request response stream actually answers THIS request, as opposed to
+// a notifications/progress or notifications/message event the same stream
+// may carry ahead of it (MCP 2026-07-28 §3.4). A genuine JSON-RPC
+// notification never reaches this code path with a body to parse at all: it
+// is acknowledged with HTTP 202 and no body (see doCall's status switch), so
+// raw always names an id whenever this function's return value actually
+// matters.
+//
+// Returns nil — not an error — when raw does not parse as a JSON-RPC request
+// or carries no id at all: extractSSEResult's fallback for a nil wantID is
+// to accept the first event carrying ANY id, rather than failing the whole
+// call over an id VoidLLM itself failed to parse back out of bytes it just
+// built.
+func outboundRequestID(raw []byte) jsonx.RawMessage {
+	var req Request
+	if err := jsonx.Unmarshal(raw, &req); err != nil {
+		return nil
+	}
+	if req.IsNotification() {
+		return nil
+	}
+	return bytes.TrimSpace(req.ID)
+}
+
+// extractSSEResult parses body as an SSE event stream and returns the raw
+// JSON-RPC message carried by the one event that answers wantID, or an error
+// if none does.
+//
+// Event framing follows the WHATWG "Server-Sent Events" interpretation
+// algorithm (https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation,
+// referenced but not restated by docs/mcp-v2.md, which assumes the
+// underlying SSE framing): events are separated by a blank line; a single
+// event's "data:" field may itself be split across several consecutive
+// "data:" lines, which are reassembled by joining them with "\n" in the
+// order they appeared; a line beginning with ":" is a comment and is
+// skipped; every other field ("event:", "id:", "retry:", or anything else)
+// is recognized only enough to be ignored, never acted on — this package's
+// use of SSE is confined to the JSON-RPC payload inside "data:", nothing
+// else in the framing carries information VoidLLM interprets. \r\n and bare
+// \r line endings are normalized to \n before splitting, tolerating an
+// upstream that does not use bare LF.
+//
+// For each reassembled event, the joined data is treated as a candidate
+// JSON-RPC message and its own top-level "id" field is inspected:
+//
+//   - No "id" field at all (or an explicit JSON null) means the event is a
+//     JSON-RPC notification (MCP 2026-07-28 §3.4: notifications/progress and
+//     notifications/message may precede a request's own result on its
+//     response stream) — never a candidate, always skipped.
+//   - wantID non-empty and the event's id does not match it, byte-for-byte
+//     after trimming whitespace: not the response to THIS request — skipped.
+//     wantID is always VoidLLM's own previously-marshaled id (see
+//     outboundRequestID), so a plain byte comparison is exact; no numeric or
+//     string-vs-number normalization is needed.
+//   - wantID empty (outboundRequestID could not determine it) and the event
+//     carries any id at all: accepted. This is the most defensible fallback
+//     available without restructuring every rawPost caller to thread a
+//     request id through independently of raw — see outboundRequestID's own
+//     doc for why wantID is expected to be non-empty on every real call
+//     rawPost ever makes, making this branch a safety net rather than the
+//     common case.
+//   - The event's data does not even parse as a JSON object with a
+//     "id"-shaped top level: treated as "not a match" rather than a fatal
+//     parse error — an unparsable event is exactly as unusable as one that
+//     is a known notification shape, and rejecting the whole call over one
+//     upstream field VoidLLM was never going to read anyway would be more
+//     fragile than simply continuing to look for the real result.
+//
+// Every event examined and rejected counts against maxSSEEventsSkipped;
+// exceeding it fails with errSSETooManyEvents instead of scanning
+// indefinitely (see that constant's own doc for how it relates to
+// rawPostMaxBodyBytes, which already bounds this same body by total wire
+// bytes). Reaching the end of body with no event ever accepted fails with
+// errSSENoResultEvent — this function never falls back to returning body,
+// or any part of it, unexamined: MCP 2026-07-28 §11.3 Befund 3 (see
+// docs/mcp-v2.md) is explicit that a silent, "leer, nicht fehlerhaft"
+// (empty, not erroring) result is the failure mode this replaces.
+func extractSSEResult(body []byte, wantID jsonx.RawMessage) ([]byte, error) {
+	normalized := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+	normalized = bytes.ReplaceAll(normalized, []byte("\r"), []byte("\n"))
+	lines := bytes.Split(normalized, []byte("\n"))
+
+	var dataLines [][]byte
+	skipped := 0
+
+	dispatch := func() ([]byte, bool, error) {
+		if len(dataLines) == 0 {
+			return nil, false, nil
 		}
-		if bytes.HasPrefix(line, []byte("data:")) {
-			return bytes.TrimPrefix(line, []byte("data:"))
+		data := bytes.Join(dataLines, []byte("\n"))
+		dataLines = dataLines[:0]
+
+		if sseEventMatches(data, wantID) {
+			return data, true, nil
+		}
+		skipped++
+		if skipped > maxSSEEventsSkipped {
+			return nil, false, fmt.Errorf("%w: examined more than %d events", errSSETooManyEvents, maxSSEEventsSkipped)
+		}
+		return nil, false, nil
+	}
+
+	for _, line := range lines {
+		switch {
+		case len(line) == 0:
+			data, matched, err := dispatch()
+			if err != nil {
+				return nil, err
+			}
+			if matched {
+				return data, nil
+			}
+		case bytes.HasPrefix(line, []byte(":")):
+			// Comment line — ignored.
+		case bytes.HasPrefix(line, []byte("data: ")):
+			dataLines = append(dataLines, line[len("data: "):])
+		case bytes.HasPrefix(line, []byte("data:")):
+			dataLines = append(dataLines, line[len("data:"):])
+		default:
+			// Some other SSE field ("event:", "id:", "retry:", or an
+			// unrecognized one) — ignored, see the function's own doc.
 		}
 	}
-	return body // fallback: return as-is
+	// A final event with no terminating blank line at end-of-body still gets
+	// dispatched here — every fixture in this package's own tests happens to
+	// end with a blank line, but a well-formed upstream that omits the
+	// trailing one must not have its final (and, in the single-event case,
+	// only) event silently dropped.
+	data, matched, err := dispatch()
+	if err != nil {
+		return nil, err
+	}
+	if matched {
+		return data, nil
+	}
+
+	return nil, errSSENoResultEvent
+}
+
+// sseEventMatches reports whether data — one SSE event's already-joined
+// "data:" payload — is the JSON-RPC response wantID names. See
+// extractSSEResult's own doc for the full matching rule this implements.
+func sseEventMatches(data []byte, wantID jsonx.RawMessage) bool {
+	var probe struct {
+		ID jsonx.RawMessage `json:"id"`
+	}
+	if err := jsonx.Unmarshal(data, &probe); err != nil {
+		return false
+	}
+	id := bytes.TrimSpace(probe.ID)
+	if len(id) == 0 || string(id) == "null" {
+		return false
+	}
+	if len(wantID) == 0 {
+		return true
+	}
+	return bytes.Equal(id, wantID)
 }
 
 // httpHeaderAdapter adapts net/http's Header to the mcp.Header interface so
@@ -944,11 +1224,15 @@ func (t *HTTPTransport) Forward(ctx context.Context, raw []byte, hdr MapHeader) 
 	// from silently drifting apart again.
 	switch t.authType {
 	case "bearer":
+		if t.authToken == "" {
+			return nil, errEmptyAuthCredential
+		}
 		req.Header.Set("Authorization", "Bearer "+t.authToken)
 	case "header":
-		if t.authHeader != "" {
-			req.Header.Set(t.authHeader, t.authToken)
+		if t.authHeader == "" || t.authToken == "" {
+			return nil, errEmptyAuthCredential
 		}
+		req.Header.Set(t.authHeader, t.authToken)
 	case "oauth":
 		if t.oauthManager == nil || t.oauthConfig == nil {
 			return nil, errOAuthNotConfigured
