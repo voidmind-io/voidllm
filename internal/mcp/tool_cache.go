@@ -127,9 +127,18 @@ func (e *cacheEntry) isFresh() bool {
 type ToolCache struct {
 	mu      sync.RWMutex
 	entries map[string]*cacheEntry // keyed by server ID
-	fetcher ToolFetcher
-	maxAge  time.Duration
-	store   ToolStore // optional, nil for pure in-memory
+	// generations counts, per server ID, how many times Invalidate or
+	// InvalidateWithStore has discarded that server's entry. It is read and
+	// written under mu, the same lock that guards entries — see
+	// RefreshServer's own doc for why this is the compare-and-swap
+	// RefreshServer needs to avoid publishing a fetch that started before an
+	// invalidation superseded it. A server ID absent from this map reads as
+	// generation 0, Go's ordinary zero-value-on-miss map semantics; no entry
+	// is ever pre-populated for a server that has not yet been invalidated.
+	generations map[string]uint64
+	fetcher     ToolFetcher
+	maxAge      time.Duration
+	store       ToolStore // optional, nil for pure in-memory
 }
 
 // NewToolCache creates a ToolCache that uses fetcher to retrieve tool schemas
@@ -137,9 +146,10 @@ type ToolCache struct {
 // never expire automatically.
 func NewToolCache(fetcher ToolFetcher, maxAge time.Duration) *ToolCache {
 	return &ToolCache{
-		entries: make(map[string]*cacheEntry),
-		fetcher: fetcher,
-		maxAge:  maxAge,
+		entries:     make(map[string]*cacheEntry),
+		generations: make(map[string]uint64),
+		fetcher:     fetcher,
+		maxAge:      maxAge,
 	}
 }
 
@@ -150,10 +160,11 @@ func NewToolCache(fetcher ToolFetcher, maxAge time.Duration) *ToolCache {
 // LoadFromStore.
 func NewPersistentToolCache(fetcher ToolFetcher, maxAge time.Duration, store ToolStore) *ToolCache {
 	return &ToolCache{
-		entries: make(map[string]*cacheEntry),
-		fetcher: fetcher,
-		maxAge:  maxAge,
-		store:   store,
+		entries:     make(map[string]*cacheEntry),
+		generations: make(map[string]uint64),
+		fetcher:     fetcher,
+		maxAge:      maxAge,
+		store:       store,
 	}
 }
 
@@ -466,7 +477,35 @@ func (tc *ToolCache) GetAllTools() map[string][]Tool {
 // RefreshServer forces a re-fetch of the tool list for serverID regardless of
 // whether the cached entry is still fresh. On fetch failure the existing cache
 // entry is preserved and the error is returned.
+//
+// The fetch itself (tc.fetcher) runs outside tc.mu, same as before this
+// method's own generation counter existed — an upstream round-trip has no
+// business holding the cache lock for its whole duration (unlike entryFor's
+// fetch-on-miss path, which single-flights under a full Lock by design; see
+// that method's own doc for why the two are not the same tradeoff). That gap
+// is exactly what lets a concurrent Invalidate or InvalidateWithStore run
+// while this fetch is still in flight — including one triggered because an
+// admin just changed this very server's credential. Without a check, this
+// method would publish a result it fetched under the OLD credential straight
+// back into tc.entries once the fetch returns, silently undoing the
+// invalidation. tc.generations[serverID] is this method's guard against
+// exactly that: it is read once, before the fetch starts, and compared
+// again, under tc.mu, once the fetch returns — the same compare-and-swap
+// shape http_transport.go's eraBinding/invalidateBinding use to solve the
+// identical "a late-returning call must not clobber a newer generation"
+// problem for a resolved upstream era binding. A mismatch means Invalidate
+// or InvalidateWithStore ran in between: this fetch's result is discarded
+// entirely — neither published to tc.entries nor persisted to tc.store, so a
+// stale, pre-invalidation listing can never reach either — and RefreshServer
+// returns nil, since the fetch itself succeeded; it is simply no longer the
+// freshest information available about serverID; entryFor will re-fetch
+// under the new state the next time serverID is accessed, exactly as it
+// would after any other invalidation.
 func (tc *ToolCache) RefreshServer(ctx context.Context, serverID string) error {
+	tc.mu.RLock()
+	startGen := tc.generations[serverID]
+	tc.mu.RUnlock()
+
 	listing, err := tc.fetcher(ctx, serverID)
 	if err != nil {
 		return err
@@ -474,6 +513,12 @@ func (tc *ToolCache) RefreshServer(ctx context.Context, serverID string) error {
 
 	ttl, neverExpires := tc.resolveTTL(listing.Cache)
 	tc.mu.Lock()
+	if tc.generations[serverID] != startGen {
+		tc.mu.Unlock()
+		slog.Default().LogAttrs(ctx, slog.LevelDebug, "mcp: discarding refresh superseded by a concurrent invalidation",
+			slog.String("server_id", serverID))
+		return nil
+	}
 	tc.entries[serverID] = &cacheEntry{
 		tools:        listing.Tools,
 		headerParams: listing.HeaderParams,
@@ -537,18 +582,32 @@ func (tc *ToolCache) SetTools(serverID string, tools []Tool) {
 
 // Invalidate removes the cached entry for serverID. Subsequent calls to
 // GetTools for that serverID will trigger a fresh upstream fetch.
+//
+// It also advances serverID's generation counter (tc.generations), which is
+// what makes a RefreshServer call already in flight for serverID discard its
+// result instead of publishing it after this call returns — see
+// RefreshServer's own doc for the full compare-and-swap this enables.
 func (tc *ToolCache) Invalidate(serverID string) {
 	tc.mu.Lock()
 	delete(tc.entries, serverID)
+	tc.generations[serverID]++
 	tc.mu.Unlock()
 }
 
 // InvalidateWithStore removes a server from the cache and deletes its
 // persisted tools from the backing store. serverID is the database ID used
 // both as the cache key and to address the store deletion.
+//
+// Like Invalidate, it advances serverID's generation counter before
+// releasing tc.mu — see Invalidate's and RefreshServer's own docs — so a
+// RefreshServer already mid-fetch under the credential or configuration this
+// call is reacting to (an admin rotating a server's auth token, for example)
+// cannot re-publish that stale fetch, or persist it to tc.store, after this
+// call has already deleted both copies.
 func (tc *ToolCache) InvalidateWithStore(ctx context.Context, serverID string) {
 	tc.mu.Lock()
 	delete(tc.entries, serverID)
+	tc.generations[serverID]++
 	tc.mu.Unlock()
 	if tc.store != nil {
 		_ = tc.store.Delete(ctx, serverID) //nolint:errcheck

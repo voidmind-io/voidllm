@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -551,55 +552,31 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 
 	// An upstream Mcp-Session-Id longer than mcp.MaxSessionIDLength is
 	// stripped from result.Header here, before anything below ever reads it
-	// again — neither mirrored back to the caller by copyMCPResponseHeaders
-	// nor recorded by h.MCPSessionRegistry.Record, which would silently
-	// refuse to remember it anyway (see that constant's doc). Without this,
-	// the caller would receive a session ID this proxy itself can never
-	// recognize, and only discover the mismatch a request later, once the
-	// inbound check below drops it as unrecognized and the upstream 404s —
-	// an extra, confusing round trip. Deleting it here instead means the
-	// caller sees no Mcp-Session-Id at all on this response, a defined state
-	// that leads it to reinitialize immediately.
+	// again — neither mirrored back to the caller nor recorded into
+	// h.MCPSessionRegistry, which would silently refuse to remember it
+	// anyway (see that constant's doc). Without this, the caller would
+	// receive a session ID this proxy itself can never recognize, and only
+	// discover the mismatch a request later, once the inbound check below
+	// drops it as unrecognized and the upstream 404s — an extra, confusing
+	// round trip. Deleting it here instead means the caller sees no
+	// Mcp-Session-Id at all on this response, a defined state that leads it
+	// to reinitialize immediately.
 	if sid := result.Header.Get(mcp.HeaderSessionID); sid != "" && len(sid) > mcp.MaxSessionIDLength {
 		result.Header.Del(mcp.HeaderSessionID)
 	}
 
 	// The upstream's Mcp-Session-Id, if any, is mirrored back to the caller
-	// exactly as received by copyMCPResponseHeaders below via
-	// allowedMCPResponseHeaders — not set here. See that allowlist entry
-	// (mcp_headers.go) for why the legacy session belongs entirely to the
-	// caller on the other side of this proxy: an explicit c.Set here as well
-	// would duplicate that single source of truth and send the header twice.
-	//
-	// It IS recorded into h.MCPSessionRegistry here, unconditionally and
-	// regardless of era: a fresh mint (no inbound session, upstream starts
-	// one) and a refresh (upstream rotates an existing one) look identical
-	// from this vantage point — an Mcp-Session-Id present on the response —
-	// so a later request from the same caller carrying it back passes the
-	// check above. No session ID is ever logged here or anywhere on this
-	// path: a session ID is a bearer credential (docs/mcp-v2.md §11.5), and
-	// this repo's zero-knowledge logging contract applies to it exactly as
-	// it does to prompt content.
-	//
-	// mcpConnectionOptions(result.Header) is consulted here — reusing
-	// copyMCPResponseHeaders' own hop-by-hop determination (mcp_headers.go)
-	// rather than re-deriving it a second time — because an upstream MAY name
-	// Mcp-Session-Id as one of its own Connection field's connection-options
-	// (RFC 7230 §6.1: "Connection: Mcp-Session-Id"), declaring the header
-	// connection-specific for this one response. copyMCPResponseHeaders below
-	// already honors that declaration and never mirrors such a header back to
-	// the caller — so a session recorded here despite it would be one this
-	// proxy remembers on the caller's behalf while the caller itself never
-	// learns the ID at all. That session would then sit in the registry,
-	// unreachable by any legitimate follow-up request (the caller has nothing
-	// to send back), until it ages out or evicts a real one under
-	// maxKeysPerOrg/maxOrgsPerServer (see SessionRegistry's own doc) — the
-	// registry may only ever remember what the caller actually received.
-	if h.MCPSessionRegistry != nil {
-		if sid := result.Header.Get(mcp.HeaderSessionID); sid != "" && !mcpConnectionOptions(result.Header)[mcp.HeaderSessionID] {
-			h.MCPSessionRegistry.Record(server.ID, sessionScope, sid)
-		}
-	}
+	// exactly as received, and — only once it has actually been mirrored —
+	// recorded into h.MCPSessionRegistry. Both happen together, in
+	// h.mirrorMCPResponseHeaders, below: the 202 Accepted branch and the
+	// 3xx-from-upstream branch immediately below both return before ever
+	// reaching that call, so neither one mirrors OR records a session — see
+	// mirrorMCPResponseHeaders' own doc for why recording anywhere earlier
+	// than the point that determines what the caller actually receives is
+	// exactly the bug this shape avoids. No session ID is ever logged on
+	// this path: a session ID is a bearer credential (docs/mcp-v2.md
+	// §11.5), and this repo's zero-knowledge logging contract applies to it
+	// exactly as it does to prompt content.
 
 	// Notification — upstream returned 202 Accepted with no response body
 	// expected. There is nothing to stream to the caller; result.Body, if
@@ -648,7 +625,7 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	// passed through untouched by the genuine pass-through path below like
 	// everything else.
 	if acceptsOnlySSE(downstreamAccept) && strings.HasPrefix(result.Header.Get("Content-Type"), "application/json") {
-		return h.sendLegacySSEWrapped(c, result, alias, meta, ki, start)
+		return h.sendLegacySSEWrapped(c, result, alias, meta, ki, start, server.ID, sessionScope)
 	}
 
 	// From here on this is a genuine transparent pass-through: VoidLLM does
@@ -657,14 +634,16 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	// resultType:"input_required" (the real MCP client on the other side of
 	// this proxy is the one the spec obligates to retry, docs/mcp-v2.md
 	// §3.7) and any other non-2xx status the upstream chose to answer with.
-	// copyMCPResponseHeaders (headers.go) mirrors only the allowlisted
+	// h.mirrorMCPResponseHeaders (below) mirrors only the allowlisted
 	// response headers — never Server, X-Powered-By, or any hop-by-hop
 	// header — and the upstream alone decides Content-Type: there is no
 	// Accept-based branch and no self-set content type on this path, unlike
 	// the built-in server's handleMCPRequest (mcp_handler.go), which
 	// produces its own response and must format it for callers that only
-	// accept text/event-stream.
-	copyMCPResponseHeaders(c, result.Header)
+	// accept text/event-stream. It also records the caller's
+	// Mcp-Session-Id, if any, into h.MCPSessionRegistry — see its own doc
+	// for why that recording belongs exactly here.
+	h.mirrorMCPResponseHeaders(c, result.Header, server.ID, sessionScope)
 	upstreamContentType := result.Header.Get("Content-Type")
 	if strings.HasPrefix(upstreamContentType, "text/event-stream") {
 		// Set once, by VoidLLM, for the response VoidLLM itself sends to its
@@ -744,6 +723,40 @@ func (h *Handler) HandleMCPProxy(c fiber.Ctx) error {
 	})
 }
 
+// mirrorMCPResponseHeaders mirrors header's allowlisted fields onto c's
+// outgoing response via copyMCPResponseHeaders, then — only for whatever
+// Mcp-Session-Id value c's own response now actually carries, read back off
+// c itself rather than re-derived a second time from header — records it
+// into h.MCPSessionRegistry.
+//
+// This is deliberately the ONLY place HandleMCPProxy (directly, or via
+// sendLegacySSEWrapped) ever records a session. Recording anywhere upstream
+// of this call — straight off result.Header, before this function decides
+// what actually gets mirrored — used to let a session be entered into the
+// registry on the 202 Accepted and 3xx-from-upstream branches, even though
+// neither of those branches ever mirrors a response header to the caller at
+// all: the caller received no Mcp-Session-Id, yet the registry remembered
+// one anyway, sitting there unreachable by any legitimate follow-up request
+// until it aged out or evicted a real session (SessionRegistry's own doc).
+// Deriving what to record from c's own outgoing response, instead of
+// re-checking header's hop-by-hop Connection options a second time, is what
+// keeps this guarantee true regardless of how copyMCPResponseHeaders' own
+// filtering evolves: whatever this method records is, by construction,
+// exactly what the caller is about to see on the wire — never more.
+//
+// No session ID is ever logged: a session ID is a bearer credential
+// (docs/mcp-v2.md §11.5), and this repo's zero-knowledge logging contract
+// applies to it exactly as it does to prompt content.
+func (h *Handler) mirrorMCPResponseHeaders(c fiber.Ctx, header http.Header, serverID string, sessionScope mcp.SessionScope) {
+	copyMCPResponseHeaders(c, header)
+	if h.MCPSessionRegistry == nil {
+		return
+	}
+	if sid := string(c.Response().Header.Peek(mcp.HeaderSessionID)); sid != "" {
+		h.MCPSessionRegistry.Record(serverID, sessionScope, sid)
+	}
+}
+
 // legacySSEWrapReadCap is the hard ceiling sendLegacySSEWrapped enforces on
 // its upstream body read, regardless of settings.mcp.stream_max_bytes
 // (h.MCPStreamMaxBytes) — including when that setting is explicitly 0,
@@ -802,7 +815,13 @@ const legacySSEWrapReadCap int64 = 10 << 20 // 10 MiB
 // socket errors, per review finding A1), only ever hands Fiber a single,
 // already fully read body bounded by effectiveMaxBytes: "success" here means
 // VoidLLM handed a complete body to Fiber, not that the caller received it.
-func (h *Handler) sendLegacySSEWrapped(c fiber.Ctx, result *mcp.ForwardResult, alias string, meta mcpRequestMeta, ki *auth.KeyInfo, start time.Time) error {
+//
+// serverID and sessionScope are passed through unchanged from HandleMCPProxy
+// so this function's own call to h.mirrorMCPResponseHeaders below can record
+// the caller's Mcp-Session-Id (if the upstream sent one and it is actually
+// mirrored) into h.MCPSessionRegistry — see that method's doc for why
+// recording happens there and nowhere earlier.
+func (h *Handler) sendLegacySSEWrapped(c fiber.Ctx, result *mcp.ForwardResult, alias string, meta mcpRequestMeta, ki *auth.KeyInfo, start time.Time, serverID string, sessionScope mcp.SessionScope) error {
 	defer result.Body.Close() //nolint:errcheck // best-effort close; the body has already been fully consumed or the read failed
 
 	// effectiveMaxBytes is the smaller of the two ceilings this branch
@@ -832,13 +851,14 @@ func (h *Handler) sendLegacySSEWrapped(c fiber.Ctx, result *mcp.ForwardResult, a
 			mcp.NewErrorResponse(nil, mcp.CodeInternalError, "upstream MCP server unavailable"))
 	}
 
-	// copyMCPResponseHeaders no longer ever mirrors Content-Encoding (it was
-	// dropped from allowedMCPResponseHeaders as part of docs/mcp-v2.md review
-	// finding B), so — unlike before this fix — there is nothing here left to
-	// strip: formatSSEMessage's plain-text "data:" re-framing below can never
-	// be mislabeled with a stale encoding the upstream's original bytes may
-	// have carried.
-	copyMCPResponseHeaders(c, result.Header)
+	// h.mirrorMCPResponseHeaders no longer ever mirrors Content-Encoding (it
+	// was dropped from allowedMCPResponseHeaders as part of docs/mcp-v2.md
+	// review finding B), so — unlike before this fix — there is nothing here
+	// left to strip: formatSSEMessage's plain-text "data:" re-framing below
+	// can never be mislabeled with a stale encoding the upstream's original
+	// bytes may have carried. It also records the caller's Mcp-Session-Id,
+	// if any, into h.MCPSessionRegistry — see its own doc.
+	h.mirrorMCPResponseHeaders(c, result.Header, serverID, sessionScope)
 	c.Set("Content-Type", "text/event-stream")
 	c.Set("Cache-Control", "no-cache")
 	c.Set("X-Accel-Buffering", "no")
