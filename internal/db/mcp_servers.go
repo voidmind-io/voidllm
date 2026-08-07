@@ -9,14 +9,31 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/voidmind-io/voidllm/internal/config"
+	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/pkg/crypto"
 )
+
+// validProtocolVersion reports whether raw is an accepted mcp_servers.
+// protocol_version value: the empty string or "auto" (both mean "auto-detect
+// via probeEra" — see MCPServer.ProtocolVersion), or one of
+// mcp.SupportedVersions() (a pin that skips auto-detection entirely — see
+// mcp.ResolvePinnedVersion). Mirrors internal/api/admin's own
+// validMCPProtocolVersion, which this package cannot import directly (db is
+// a lower layer than admin) without inverting that dependency; internal/mcp
+// is safe to depend on from here since it in turn depends on neither db nor
+// config.
+func validProtocolVersion(raw string) bool {
+	if raw == "" || raw == "auto" {
+		return true
+	}
+	return mcp.Version(raw).Valid()
+}
 
 // mcpServerSelectColumns is the ordered column list used in all mcp_servers SELECT queries.
 // It must match the scan order in scanMCPServer exactly.
 const mcpServerSelectColumns = "id, name, alias, url, auth_type, auth_header, " +
 	"auth_token_enc, org_id, team_id, is_active, created_by, source, code_mode_enabled, created_at, updated_at, deleted_at, " +
-	"oauth_token_url, oauth_client_id, oauth_client_secret_enc, oauth_scopes"
+	"oauth_token_url, oauth_client_id, oauth_client_secret_enc, oauth_scopes, protocol_version"
 
 // MCPServer represents an external MCP server record in the database.
 type MCPServer struct {
@@ -47,6 +64,12 @@ type MCPServer struct {
 	OAuthClientID        string  `json:"oauth_client_id"`
 	OAuthClientSecretEnc *string `json:"-"` // AES-256-GCM encrypted; never returned in API
 	OAuthScopes          string  `json:"oauth_scopes"`
+
+	// ProtocolVersion is the MCP protocol era override for this upstream
+	// server: "auto" (the default) means auto-detect via probeEra, any other
+	// recognized revision string pins that era and skips detection. See
+	// migration 0017_mcp_protocol_version and mcp.ResolvePinnedVersion.
+	ProtocolVersion string `json:"protocol_version"`
 }
 
 // CreateMCPServerParams holds the input for creating an MCP server record.
@@ -72,6 +95,11 @@ type CreateMCPServerParams struct {
 	OAuthClientID        string
 	OAuthClientSecretEnc *string
 	OAuthScopes          string
+
+	// ProtocolVersion pins the MCP protocol era for this server; "auto" (or
+	// empty, which is normalized to "auto") probes it instead. See
+	// MCPServer.ProtocolVersion.
+	ProtocolVersion string
 }
 
 // UpdateMCPServerParams holds optional fields for updating an MCP server.
@@ -94,11 +122,20 @@ type UpdateMCPServerParams struct {
 	OAuthClientID        *string
 	OAuthClientSecretEnc *string
 	OAuthScopes          *string
+
+	// ProtocolVersion, when non-nil, sets the protocol_version override. See
+	// MCPServer.ProtocolVersion.
+	ProtocolVersion *string
 }
 
 // CreateMCPServer inserts a new MCP server record and returns the persisted row.
-// It returns ErrConflict if a server with the same (org_id, team_id, alias) combination already exists.
+// It returns ErrConflict if a server with the same (org_id, team_id, alias) combination already exists,
+// and ErrInvalidProtocolVersion if params.ProtocolVersion is neither "auto"/empty nor a recognized MCP revision.
 func (d *DB) CreateMCPServer(ctx context.Context, params CreateMCPServerParams) (*MCPServer, error) {
+	if !validProtocolVersion(params.ProtocolVersion) {
+		return nil, fmt.Errorf("create mcp server: protocol_version %q: %w", params.ProtocolVersion, ErrInvalidProtocolVersion)
+	}
+
 	id, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("create mcp server: generate id: %w", err)
@@ -114,18 +151,23 @@ func (d *DB) CreateMCPServer(ctx context.Context, params CreateMCPServerParams) 
 		codeModeEnabled = 0
 	}
 
+	protocolVersion := params.ProtocolVersion
+	if protocolVersion == "" {
+		protocolVersion = "auto"
+	}
+
 	p := d.dialect.Placeholder
 	insertQuery := "INSERT INTO mcp_servers " +
 		"(id, name, alias, url, auth_type, auth_header, auth_token_enc, " +
 		"org_id, team_id, is_active, created_by, source, code_mode_enabled, " +
-		"oauth_token_url, oauth_client_id, oauth_client_secret_enc, oauth_scopes, " +
+		"oauth_token_url, oauth_client_id, oauth_client_secret_enc, oauth_scopes, protocol_version, " +
 		"created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " +
 		p(6) + ", " + p(7) + ", " +
 		p(8) + ", " + p(9) + ", " +
 		"1, " + p(10) + ", " + p(11) + ", " + p(12) + ", " +
-		p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) + ", " +
+		p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + mcpServerSelectColumns +
@@ -155,6 +197,7 @@ func (d *DB) CreateMCPServer(ctx context.Context, params CreateMCPServerParams) 
 			params.OAuthClientID,
 			params.OAuthClientSecretEnc,
 			params.OAuthScopes,
+			protocolVersion,
 		)
 		if execErr != nil {
 			return translateError(execErr)
@@ -348,8 +391,14 @@ func (d *DB) ListMCPServersByTeam(ctx context.Context, teamID, orgID string) ([]
 // Only non-nil fields in params are written. If all fields are nil the record
 // is returned unchanged without issuing an UPDATE.
 // It returns ErrNotFound if the server does not exist or has been soft-deleted,
-// and ErrConflict if the new alias collides with an existing server in the same scope.
+// ErrConflict if the new alias collides with an existing server in the same scope,
+// and ErrInvalidProtocolVersion if params.ProtocolVersion is non-nil and neither
+// "auto"/empty nor a recognized MCP revision.
 func (d *DB) UpdateMCPServer(ctx context.Context, id string, params UpdateMCPServerParams) (*MCPServer, error) {
+	if params.ProtocolVersion != nil && !validProtocolVersion(*params.ProtocolVersion) {
+		return nil, fmt.Errorf("update mcp server %s: protocol_version %q: %w", id, *params.ProtocolVersion, ErrInvalidProtocolVersion)
+	}
+
 	p := d.dialect.Placeholder
 	argN := 1
 	var setClauses []string
@@ -421,6 +470,11 @@ func (d *DB) UpdateMCPServer(ctx context.Context, id string, params UpdateMCPSer
 	if params.OAuthScopes != nil {
 		setClauses = append(setClauses, "oauth_scopes = "+p(argN))
 		args = append(args, *params.OAuthScopes)
+		argN++
+	}
+	if params.ProtocolVersion != nil {
+		setClauses = append(setClauses, "protocol_version = "+p(argN))
+		args = append(args, *params.ProtocolVersion)
 		argN++
 	}
 
@@ -528,6 +582,7 @@ func scanMCPServer(scanner interface{ Scan(...any) error }) (*MCPServer, error) 
 		&s.AuthTokenEnc, &s.OrgID, &s.TeamID, &isActiveInt, &s.CreatedBy,
 		&s.Source, &codeModeEnabledInt, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt,
 		&oauthTokenURL, &oauthClientID, &s.OAuthClientSecretEnc, &oauthScopes,
+		&s.ProtocolVersion,
 	)
 	if err != nil {
 		return nil, err
@@ -619,15 +674,16 @@ func (d *DB) SyncYAMLMCPServers(ctx context.Context, servers []config.MCPServerC
 		if errors.Is(err, ErrNotFound) {
 			// Server is not in the DB — create it with source="yaml".
 			created, createErr := d.CreateMCPServer(ctx, CreateMCPServerParams{
-				Name:          s.Name,
-				Alias:         s.Alias,
-				URL:           s.URL,
-				AuthType:      authType,
-				AuthHeader:    s.AuthHeader,
-				Source:        "yaml",
-				OAuthTokenURL: s.OAuthTokenURL,
-				OAuthClientID: s.OAuthClientID,
-				OAuthScopes:   s.OAuthScopes,
+				Name:            s.Name,
+				Alias:           s.Alias,
+				URL:             s.URL,
+				AuthType:        authType,
+				AuthHeader:      s.AuthHeader,
+				Source:          "yaml",
+				OAuthTokenURL:   s.OAuthTokenURL,
+				OAuthClientID:   s.OAuthClientID,
+				OAuthScopes:     s.OAuthScopes,
+				ProtocolVersion: s.ProtocolVersion,
 			})
 			if createErr != nil {
 				return fmt.Errorf("sync yaml mcp servers: create %s: %w", s.Alias, createErr)
@@ -675,15 +731,20 @@ func (d *DB) SyncYAMLMCPServers(ctx context.Context, servers []config.MCPServerC
 		oauthTokenURL := s.OAuthTokenURL
 		oauthClientID := s.OAuthClientID
 		oauthScopes := s.OAuthScopes
+		protocolVersion := s.ProtocolVersion
+		if protocolVersion == "" {
+			protocolVersion = "auto"
+		}
 
 		updateParams := UpdateMCPServerParams{
-			Name:          &name,
-			URL:           &url,
-			AuthType:      &authTypeVal,
-			AuthHeader:    &authHeader,
-			OAuthTokenURL: &oauthTokenURL,
-			OAuthClientID: &oauthClientID,
-			OAuthScopes:   &oauthScopes,
+			Name:            &name,
+			URL:             &url,
+			AuthType:        &authTypeVal,
+			AuthHeader:      &authHeader,
+			OAuthTokenURL:   &oauthTokenURL,
+			OAuthClientID:   &oauthClientID,
+			OAuthScopes:     &oauthScopes,
+			ProtocolVersion: &protocolVersion,
 		}
 
 		if s.AuthToken != "" {

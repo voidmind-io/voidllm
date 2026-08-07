@@ -9,6 +9,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"testing"
@@ -71,7 +72,7 @@ func sampleTools(names ...string) []mcp.Tool {
 		tools[i] = mcp.Tool{
 			Name:        n,
 			Description: "does " + n,
-			InputSchema: mcp.InputSchema{Type: "object"},
+			InputSchema: mcp.ObjectSchema(nil),
 		}
 	}
 	return tools
@@ -194,6 +195,60 @@ func TestDBToolStore_Save_Replace(t *testing.T) {
 	}
 }
 
+// TestDBToolStore_Save_MarshalFailure_WritesNothing verifies FIX 9: when any
+// tool's InputSchema fails to marshal, Save returns an error and writes
+// NOTHING to the database — not even the other, well-formed tools in the same
+// batch. Silently writing an empty schema for the broken tool instead would
+// make it vanish invisibly after the next restart (LoadAll's corrupt-schema
+// skip in dbToolStore.LoadAll would then also silently drop it); returning
+// early with no partial write is what makes the failure visible and
+// recoverable instead.
+func TestDBToolStore_Save_MarshalFailure_WritesNothing(t *testing.T) {
+	t.Parallel()
+
+	d := openToolStoreDB(t)
+	store := &dbToolStore{db: d}
+
+	s := mustCreateToolStoreServer(t, d, "ts-marshal-failure")
+
+	tools := []mcp.Tool{
+		{Name: "well_formed_tool", InputSchema: mcp.ObjectSchema(nil)},
+		// JSONSchema.MarshalJSON returns these bytes verbatim; encoding/json's
+		// own compaction step then rejects them as malformed JSON at marshal
+		// time — see the identical reasoning in internal/mcp/server_test.go's
+		// brokenSchemaTool.
+		{Name: "broken_schema_tool", InputSchema: mcp.JSONSchema("not-valid-json")},
+	}
+
+	err := store.Save(context.Background(), s.ID, tools)
+	if err == nil {
+		t.Fatal("Save() error = nil, want a marshal error for the broken tool's InputSchema")
+	}
+	if !strings.Contains(err.Error(), "broken_schema_tool") {
+		t.Errorf("Save() error = %q, want it to name the offending tool %q", err.Error(), "broken_schema_tool")
+	}
+
+	// Nothing must have been written — not even well_formed_tool, which by
+	// itself would have marshaled fine.
+	stored, listErr := d.ListServerTools(context.Background(), s.ID)
+	if listErr != nil {
+		t.Fatalf("ListServerTools(): %v", listErr)
+	}
+	if len(stored) != 0 {
+		t.Errorf("ListServerTools() len = %d, want 0 — Save() must write nothing on a marshal failure, got: %+v",
+			len(stored), stored)
+	}
+
+	// LoadAll must likewise report no tools for this server.
+	loaded, loadErr := store.LoadAll(context.Background())
+	if loadErr != nil {
+		t.Fatalf("LoadAll(): %v", loadErr)
+	}
+	if len(loaded[s.ID]) != 0 {
+		t.Errorf("LoadAll()[s.ID] len = %d, want 0 after a failed Save()", len(loaded[s.ID]))
+	}
+}
+
 func TestDBToolStore_Save_UnknownServerID(t *testing.T) {
 	t.Parallel()
 
@@ -302,12 +357,9 @@ func TestDBToolStore_Save_SchemaPreserved(t *testing.T) {
 		{
 			Name:        "search",
 			Description: "search the web",
-			InputSchema: mcp.InputSchema{
-				Type: "object",
-				Properties: map[string]mcp.Property{
-					"query": {Type: "string", Description: "search query"},
-				},
-			},
+			InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{
+				"query": {Type: "string", Description: "search query"},
+			}),
 		},
 	}
 	if err := store.Save(context.Background(), s.ID, tools); err != nil {
@@ -328,10 +380,18 @@ func TestDBToolStore_Save_SchemaPreserved(t *testing.T) {
 	if tool.Name != "search" {
 		t.Errorf("tool.Name = %q, want %q", tool.Name, "search")
 	}
-	if tool.InputSchema.Type != "object" {
-		t.Errorf("InputSchema.Type = %q, want %q", tool.InputSchema.Type, "object")
+
+	// InputSchema is now raw JSON (mcp.JSONSchema); decode it to verify the
+	// type and properties keywords survived the Save → LoadAll round-trip.
+	var schema map[string]any
+	if err := json.Unmarshal(tool.InputSchema, &schema); err != nil {
+		t.Fatalf("unmarshal InputSchema: %v", err)
 	}
-	if _, ok := tool.InputSchema.Properties["query"]; !ok {
-		t.Error("InputSchema.Properties missing 'query' after round-trip")
+	if schema["type"] != "object" {
+		t.Errorf("InputSchema.type = %v, want %q", schema["type"], "object")
+	}
+	props, _ := schema["properties"].(map[string]any)
+	if _, ok := props["query"]; !ok {
+		t.Error("InputSchema.properties missing 'query' after round-trip")
 	}
 }

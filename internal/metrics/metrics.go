@@ -191,21 +191,37 @@ var MCPServerHealthLatency = promauto.NewGaugeVec(
 )
 
 // MCPToolCallsTotal counts MCP tool calls proxied to external servers, partitioned
-// by server alias, tool name, and call status ("success", "error", or "timeout").
+// by server alias, JSON-RPC method name, and call status ("success", "error", or
+// "timeout"). The "method" label carries a method name (e.g. "tools/call",
+// "resources/read") — validMCPMethods in internal/api/admin/mcp_proxy.go bounds
+// it to a fixed set to prevent cardinality explosion — never an individual tool
+// name: both call sites populate it with a method, not a tool. It was previously
+// misnamed "tool", which claimed a tool-name breakdown ("get_weather", etc.)
+// this metric has never actually provided; any alert or dashboard query written
+// against a "tool" label value never matched anything and cannot depend on this
+// rename, since it was never populated with tool names to begin with.
 var MCPToolCallsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "voidllm",
 	Name:      "mcp_tool_calls_total",
 	Help:      "Total MCP tool calls proxied to external servers.",
-}, []string{"server", "tool", "status"})
+}, []string{"server", "method", "status"})
 
 // MCPToolCallDurationSeconds observes the round-trip duration of each proxied
-// MCP tool call in seconds, labelled by server alias and tool name.
+// MCP tool call in seconds, labelled by server alias and JSON-RPC method name.
+// The "method" label carries a method name (e.g. "tools/call",
+// "resources/read") — never an individual tool name: both call sites (see
+// MCPToolCallsTotal's own doc, which shares that call site) populate it with
+// a method, not a tool. It was previously misnamed "tool", which claimed a
+// tool-name breakdown this metric has never actually provided; any alert or
+// dashboard query written against a "tool" label value never matched
+// anything and cannot depend on this rename, since it was never populated
+// with tool names to begin with.
 var MCPToolCallDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Namespace: "voidllm",
 	Name:      "mcp_tool_call_duration_seconds",
 	Help:      "Duration of proxied MCP tool calls.",
 	Buckets:   []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10},
-}, []string{"server", "tool"})
+}, []string{"server", "method"})
 
 // MCPTransportErrorsTotal counts transport-level failures when contacting
 // external MCP servers (i.e. the HTTP client returned a non-nil error),

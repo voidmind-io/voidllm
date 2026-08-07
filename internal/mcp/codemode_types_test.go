@@ -43,13 +43,9 @@ func TestGenerateToolTypeDefs_SingleServerSingleTool(t *testing.T) {
 			tool: mcp.Tool{
 				Name:        "search",
 				Description: "Search the web.",
-				InputSchema: mcp.InputSchema{
-					Type: "object",
-					Properties: map[string]mcp.Property{
-						"query": {Type: "string"},
-					},
-					Required: []string{"query"},
-				},
+				InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{
+					"query": {Type: "string"},
+				}, "query"),
 			},
 			wantContain: []string{
 				"declare namespace tools.aws",
@@ -64,13 +60,9 @@ func TestGenerateToolTypeDefs_SingleServerSingleTool(t *testing.T) {
 			tool: mcp.Tool{
 				Name:        "paginate",
 				Description: "Paginate results.",
-				InputSchema: mcp.InputSchema{
-					Type: "object",
-					Properties: map[string]mcp.Property{
-						"limit": {Type: "number"},
-					},
-					Required: []string{"limit"},
-				},
+				InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{
+					"limit": {Type: "number"},
+				}, "limit"),
 			},
 			wantContain: []string{
 				"limit: number",
@@ -81,13 +73,9 @@ func TestGenerateToolTypeDefs_SingleServerSingleTool(t *testing.T) {
 			tool: mcp.Tool{
 				Name:        "offset_tool",
 				Description: "Offset results.",
-				InputSchema: mcp.InputSchema{
-					Type: "object",
-					Properties: map[string]mcp.Property{
-						"offset": {Type: "integer"},
-					},
-					Required: []string{"offset"},
-				},
+				InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{
+					"offset": {Type: "integer"},
+				}, "offset"),
 			},
 			wantContain: []string{
 				"offset: number",
@@ -98,13 +86,9 @@ func TestGenerateToolTypeDefs_SingleServerSingleTool(t *testing.T) {
 			tool: mcp.Tool{
 				Name:        "toggle",
 				Description: "Toggle a flag.",
-				InputSchema: mcp.InputSchema{
-					Type: "object",
-					Properties: map[string]mcp.Property{
-						"enabled": {Type: "boolean"},
-					},
-					Required: []string{"enabled"},
-				},
+				InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{
+					"enabled": {Type: "boolean"},
+				}, "enabled"),
 			},
 			wantContain: []string{
 				"enabled: boolean",
@@ -133,14 +117,10 @@ func TestGenerateToolTypeDefs_RequiredVsOptional(t *testing.T) {
 
 	tool := mcp.Tool{
 		Name: "mixed_params",
-		InputSchema: mcp.InputSchema{
-			Type: "object",
-			Properties: map[string]mcp.Property{
-				"required_field": {Type: "string"},
-				"optional_field": {Type: "string"},
-			},
-			Required: []string{"required_field"},
-		},
+		InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{
+			"required_field": {Type: "string"},
+			"optional_field": {Type: "string"},
+		}, "required_field"),
 	}
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
@@ -164,13 +144,10 @@ func TestGenerateToolTypeDefs_ArrayAndObjectParams(t *testing.T) {
 
 	tool := mcp.Tool{
 		Name: "complex_tool",
-		InputSchema: mcp.InputSchema{
-			Type: "object",
-			Properties: map[string]mcp.Property{
-				"tags":     {Type: "array"},
-				"metadata": {Type: "object"},
-			},
-		},
+		InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{
+			"tags":     {Type: "array"},
+			"metadata": {Type: "object"},
+		}),
 	}
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
@@ -190,12 +167,9 @@ func TestGenerateToolTypeDefs_UnknownTypeMapToAny(t *testing.T) {
 
 	tool := mcp.Tool{
 		Name: "weird_tool",
-		InputSchema: mcp.InputSchema{
-			Type: "object",
-			Properties: map[string]mcp.Property{
-				"val": {Type: ""},
-			},
-		},
+		InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{
+			"val": {Type: ""},
+		}),
 	}
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
@@ -213,7 +187,7 @@ func TestGenerateToolTypeDefs_EmptyDescription(t *testing.T) {
 	tool := mcp.Tool{
 		Name:        "no_desc",
 		Description: "",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
@@ -236,7 +210,7 @@ func TestGenerateToolTypeDefs_LongDescriptionTruncated(t *testing.T) {
 	tool := mcp.Tool{
 		Name:        "verbose",
 		Description: "First sentence. Second sentence with extra details.",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
@@ -257,7 +231,7 @@ func TestGenerateToolTypeDefs_LongDescriptionNewlineTruncated(t *testing.T) {
 	tool := mcp.Tool{
 		Name:        "multiline",
 		Description: "First line\nSecond line with more info.",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
@@ -276,9 +250,9 @@ func TestGenerateToolTypeDefs_MultipleServersSortedAlphabetically(t *testing.T) 
 	t.Parallel()
 
 	tools := map[string][]mcp.Tool{
-		"zebra": {{Name: "tool_z", InputSchema: mcp.InputSchema{Type: "object"}}},
-		"alpha": {{Name: "tool_a", InputSchema: mcp.InputSchema{Type: "object"}}},
-		"mango": {{Name: "tool_m", InputSchema: mcp.InputSchema{Type: "object"}}},
+		"zebra": {{Name: "tool_z", InputSchema: mcp.ObjectSchema(nil)}},
+		"alpha": {{Name: "tool_a", InputSchema: mcp.ObjectSchema(nil)}},
+		"mango": {{Name: "tool_m", InputSchema: mcp.ObjectSchema(nil)}},
 	}
 
 	got := mcp.GenerateToolTypeDefs(tools, nil)
@@ -302,7 +276,7 @@ func TestGenerateToolTypeDefs_ToolNamesWithHyphensAndDots(t *testing.T) {
 	tool := mcp.Tool{
 		Name:        "get-user.profile",
 		Description: "Fetch user profile.",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
@@ -332,7 +306,7 @@ func TestGenerateToolTypeDefs_NoPropertiesProducesEmptyArgs(t *testing.T) {
 
 	tool := mcp.Tool{
 		Name:        "no_args",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
@@ -350,7 +324,7 @@ func TestGenerateToolTypeDefs_ServerWithNoToolsOmitted(t *testing.T) {
 
 	// A server entry with an empty tools slice should produce no output.
 	tools := map[string][]mcp.Tool{
-		"real_server":  {{Name: "do_something", InputSchema: mcp.InputSchema{Type: "object"}}},
+		"real_server":  {{Name: "do_something", InputSchema: mcp.ObjectSchema(nil)}},
 		"empty_server": {},
 	}
 
@@ -369,9 +343,9 @@ func TestGenerateToolTypeDefs_ToolsSortedWithinNamespace(t *testing.T) {
 
 	tools := map[string][]mcp.Tool{
 		"srv": {
-			{Name: "zzz_last", InputSchema: mcp.InputSchema{Type: "object"}},
-			{Name: "aaa_first", InputSchema: mcp.InputSchema{Type: "object"}},
-			{Name: "mmm_middle", InputSchema: mcp.InputSchema{Type: "object"}},
+			{Name: "zzz_last", InputSchema: mcp.ObjectSchema(nil)},
+			{Name: "aaa_first", InputSchema: mcp.ObjectSchema(nil)},
+			{Name: "mmm_middle", InputSchema: mcp.ObjectSchema(nil)},
 		},
 	}
 
@@ -396,8 +370,8 @@ func TestGenerateToolTypeDefs_DeterministicOutput(t *testing.T) {
 	// Running GenerateToolTypeDefs twice on the same input must yield identical
 	// results — no map iteration order non-determinism.
 	tools := map[string][]mcp.Tool{
-		"beta":  {{Name: "tool_b", InputSchema: mcp.InputSchema{Type: "object"}}},
-		"alpha": {{Name: "tool_a", InputSchema: mcp.InputSchema{Type: "object"}}},
+		"beta":  {{Name: "tool_b", InputSchema: mcp.ObjectSchema(nil)}},
+		"alpha": {{Name: "tool_a", InputSchema: mcp.ObjectSchema(nil)}},
 	}
 
 	first := mcp.GenerateToolTypeDefs(tools, nil)
@@ -415,14 +389,10 @@ func TestGenerateToolTypeDefs_OutputStructure(t *testing.T) {
 	tool := mcp.Tool{
 		Name:        "find_user",
 		Description: "Find a user by ID.",
-		InputSchema: mcp.InputSchema{
-			Type: "object",
-			Properties: map[string]mcp.Property{
-				"id":    {Type: "string"},
-				"limit": {Type: "number"},
-			},
-			Required: []string{"id"},
-		},
+		InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{
+			"id":    {Type: "string"},
+			"limit": {Type: "number"},
+		}, "id"),
 	}
 
 	got := mcp.GenerateToolTypeDefs(map[string][]mcp.Tool{
@@ -457,7 +427,7 @@ func TestServer_SetOnToolsList_BasicModification(t *testing.T) {
 	s.RegisterTool(mcp.Tool{
 		Name:        "original_tool",
 		Description: "Original description.",
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		return mcp.TextResult("ok"), nil
 	})
@@ -491,11 +461,11 @@ func TestServer_SetOnToolsList_FilterTools(t *testing.T) {
 	t.Parallel()
 
 	s := newTestServer("voidllm", "0.1.0")
-	s.RegisterTool(mcp.Tool{Name: "public_tool", InputSchema: mcp.InputSchema{Type: "object"}},
+	s.RegisterTool(mcp.Tool{Name: "public_tool", InputSchema: mcp.ObjectSchema(nil)},
 		func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 			return mcp.TextResult("ok"), nil
 		})
-	s.RegisterTool(mcp.Tool{Name: "hidden_tool", InputSchema: mcp.InputSchema{Type: "object"}},
+	s.RegisterTool(mcp.Tool{Name: "hidden_tool", InputSchema: mcp.ObjectSchema(nil)},
 		func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 			return mcp.TextResult("ok"), nil
 		})
@@ -537,7 +507,7 @@ func TestServer_SetOnToolsList_HookReceivesCopy(t *testing.T) {
 	s.RegisterTool(mcp.Tool{
 		Name:        "my_tool",
 		Description: originalDesc,
-		InputSchema: mcp.InputSchema{Type: "object"},
+		InputSchema: mcp.ObjectSchema(nil),
 	}, func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 		return mcp.TextResult("ok"), nil
 	})
@@ -578,7 +548,7 @@ func TestServer_SetOnToolsList_NilHookClearsHook(t *testing.T) {
 	t.Parallel()
 
 	s := newTestServer("voidllm", "0.1.0")
-	s.RegisterTool(mcp.Tool{Name: "a_tool", InputSchema: mcp.InputSchema{Type: "object"}},
+	s.RegisterTool(mcp.Tool{Name: "a_tool", InputSchema: mcp.ObjectSchema(nil)},
 		func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 			return mcp.TextResult("ok"), nil
 		})
@@ -605,7 +575,7 @@ func TestServer_SetOnToolsList_HookCanReturnEmpty(t *testing.T) {
 	t.Parallel()
 
 	s := newTestServer("voidllm", "0.1.0")
-	s.RegisterTool(mcp.Tool{Name: "some_tool", InputSchema: mcp.InputSchema{Type: "object"}},
+	s.RegisterTool(mcp.Tool{Name: "some_tool", InputSchema: mcp.ObjectSchema(nil)},
 		func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 			return mcp.TextResult("ok"), nil
 		})
@@ -630,7 +600,7 @@ func TestServer_SetOnToolsList_ConcurrentAccess(t *testing.T) {
 	t.Parallel()
 
 	s := newTestServer("voidllm", "0.1.0")
-	s.RegisterTool(mcp.Tool{Name: "concurrent_tool", InputSchema: mcp.InputSchema{Type: "object"}},
+	s.RegisterTool(mcp.Tool{Name: "concurrent_tool", InputSchema: mcp.ObjectSchema(nil)},
 		func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 			return mcp.TextResult("ok"), nil
 		})
@@ -645,7 +615,7 @@ func TestServer_SetOnToolsList_ConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for range 10 {
 				_ = s.Handle(context.Background(),
-					[]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+					[]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`), mcp.MapHeader{})
 			}
 		}()
 	}
@@ -674,7 +644,7 @@ func TestServer_SetOnToolsList_HookInvocationCount(t *testing.T) {
 	t.Parallel()
 
 	s := newTestServer("voidllm", "0.1.0")
-	s.RegisterTool(mcp.Tool{Name: "probe", InputSchema: mcp.InputSchema{Type: "object"}},
+	s.RegisterTool(mcp.Tool{Name: "probe", InputSchema: mcp.ObjectSchema(nil)},
 		func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 			return mcp.TextResult("ok"), nil
 		})

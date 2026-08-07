@@ -390,6 +390,66 @@ func TestCallMCPTool_BuiltinServer(t *testing.T) {
 	}
 }
 
+// ---- TestCallMCPTool_HeaderParams_MirroredOntoUpstream -----------------------
+
+// TestCallMCPTool_HeaderParams_MirroredOntoUpstream verifies CallMCPTool
+// looks up the addressed tool's validated x-mcp-header bindings via
+// h.ToolCache.HeaderParams and mirrors them onto the outbound request as
+// Mcp-Param-{Name} headers (MCP 2026-07-28 §4.3) — the CallRequest.HeaderParams
+// wiring documented on that field and exercised end to end here rather than
+// only at the dialect-Prepare unit-test level. The server's protocol_version
+// is pinned to 2026-07-28 so era probing cannot interfere with the single
+// upstream request this test inspects.
+func TestCallMCPTool_HeaderParams_MirroredOntoUpstream(t *testing.T) {
+	t.Parallel()
+
+	var gotRegion string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRegion = r.Header.Get("Mcp-Param-Region")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	dsn := "file:TestCallMCPTool_HeaderParams_MirroredOntoUpstream?mode=memory&cache=private"
+	handler, database := newCallMCPToolHandler(t, dsn, nil)
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:            "Header Param Server",
+		Alias:           "headerparam-server",
+		URL:             upstream.URL,
+		AuthType:        "none",
+		ProtocolVersion: "2026-07-28",
+	})
+	if err != nil {
+		t.Fatalf("CreateMCPServer: %v", err)
+	}
+
+	org := mustCreateTestOrg(t, database, "call-headerparams")
+	ki := newTestKeyInfo(org.ID, "")
+	if err := database.SetOrgMCPAccess(context.Background(), org.ID, []string{s.ID}); err != nil {
+		t.Fatalf("SetOrgMCPAccess: %v", err)
+	}
+
+	handler.ToolCache = mcp.NewToolCache(func(_ context.Context, _ string) (*mcp.ToolListing, error) {
+		return &mcp.ToolListing{
+			Tools: []mcp.Tool{{Name: "lookup_region"}},
+			HeaderParams: map[string][]mcp.HeaderParam{
+				"lookup_region": {{Name: "Region", Path: []string{"region"}, Kind: mcp.HeaderParamKindString}},
+			},
+		}, nil
+	}, time.Hour)
+
+	args := json.RawMessage(`{"region":"us-west1"}`)
+	if _, err := handler.CallMCPTool(context.Background(), ki, "headerparam-server", "lookup_region", args, false, ""); err != nil {
+		t.Fatalf("CallMCPTool() error = %v, want nil", err)
+	}
+
+	if gotRegion != "us-west1" {
+		t.Errorf("upstream Mcp-Param-Region = %q, want %q", gotRegion, "us-west1")
+	}
+}
+
 // ---- TestCallMCPTool_LoggerFields -------------------------------------------
 
 // TestCallMCPTool_LoggerFields verifies that the event emitted to MCPLogger

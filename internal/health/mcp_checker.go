@@ -1,16 +1,11 @@
 package health
 
 import (
-	"bytes"
 	"context"
-	"fmt"
 	"log/slog"
-	"net/http"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 )
@@ -42,84 +37,79 @@ type MCPServerHealth struct {
 	ToolCount int `json:"tool_count"`
 }
 
-// MCPServerTarget holds the minimal fields needed to probe a single MCP server.
-// The health checker receives targets via the servers callback, which the caller
-// builds from the in-memory cache so that no database I/O occurs on the hot path.
+// MCPServerTarget holds the minimal fields needed to probe a single MCP
+// server. The health checker receives targets via the servers callback,
+// which the caller builds from the in-memory MCPServerCache so that no
+// database I/O occurs during probe cycles. It carries no endpoint or
+// authentication details — those live on the *mcp.HTTPTransport the checker
+// resolves separately via the transportFor callback (see
+// NewMCPHealthChecker), so this type only needs to identify the server and
+// tell the checker how to label and route around it.
 type MCPServerTarget struct {
-	// ID is the database ID of the MCP server (used as the sync.Map key).
+	// ID is the database ID of the MCP server (used as the sync.Map key and
+	// as the lookup key passed to transportFor).
 	ID string
 	// Name is the display name used in logs and health results.
 	Name string
 	// Alias is the routing alias used in Prometheus metric labels.
 	Alias string
-	// URL is the full endpoint URL that receives the JSON-RPC POST.
-	URL string
-	// AuthType is the authentication scheme: "none", "bearer", "header", or "oauth".
-	AuthType string
-	// AuthToken is the plaintext (decrypted) authentication token. Empty when
-	// AuthType is "none".
-	AuthToken string
-	// AuthHeader is the custom header name used when AuthType is "header".
-	AuthHeader string
 	// Source is the origin of the server definition: "api", "yaml", or "builtin".
 	// Built-in servers are skipped during health probes.
 	Source string
-
-	// OAuth Client Credentials Flow fields. Populated when AuthType is "oauth".
-	OAuthTokenURL     string
-	OAuthClientID     string
-	OAuthClientSecret string // plaintext (decrypted)
-	OAuthScopes       string
 }
 
-// MCPHealthChecker periodically probes registered MCP servers via a
-// tools/list JSON-RPC request and stores the results in memory. All methods
+// MCPHealthChecker periodically probes registered MCP servers via
+// *mcp.HTTPTransport.ListTools and stores the results in memory. All methods
 // are safe for concurrent use.
+//
+// The checker does not speak JSON-RPC or HTTP itself. It resolves each
+// target's *mcp.HTTPTransport through the transportFor callback and delegates
+// the actual probe to ListTools, which already knows how to negotiate the
+// protocol era, run the legacy handshake when needed, and set the required
+// headers and _meta for the modern era (docs/mcp-v2.md §2, §4.2) — exactly
+// what a health probe needs, including the tool count and latency. This
+// keeps auth, SSRF hardening, body-size limiting, and redirect prohibition
+// defined in exactly one place (internal/mcp) instead of being duplicated
+// here.
+//
+// Two side effects of reusing ListTools are deliberate, not incidental:
+//   - The first health probe of a newly registered server is also that
+//     server's first era probe. By the time the proxy path serves its first
+//     real request, the era binding is already resolved and cached on the
+//     shared *mcp.HTTPTransport (see HTTPTransport.resolveBinding), so that
+//     request never pays the probe cost itself.
+//   - ListTools always calls Call with the empty SessionScope (tool
+//     discovery is not performed on behalf of any one organization — see
+//     ListTools's doc), which is the same scope health probing uses. A
+//     legacy upstream's warmup handshake therefore runs at most once for
+//     that scope's lifetime, shared between health probing and tool
+//     discovery, rather than once per probe cycle.
 type MCPHealthChecker struct {
 	// servers is a callback that returns the current list of probe targets.
 	// It is called at the start of every probe cycle so newly added or removed
 	// servers are picked up without restarting the checker.
-	servers      func() []MCPServerTarget
+	servers func() []MCPServerTarget
+	// transportFor returns the resolved transport for a server ID, or false
+	// when the transport cache has no entry yet. Supplied as a callback so
+	// this package stays independent of internal/proxy — the same reason the
+	// servers callback exists.
+	transportFor func(serverID string) (*mcp.HTTPTransport, bool)
 	results      sync.Map // serverID -> *MCPServerHealth (replaced atomically)
 	interval     time.Duration
-	client       *http.Client
 	log          *slog.Logger
-	oauthManager *mcp.OAuthTokenManager // shared token manager for OAuth servers; always non-nil
 }
 
-// toolsListPayload is the JSON-RPC 2.0 request body sent to each MCP server.
-var toolsListPayload = []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
-
 // NewMCPHealthChecker constructs an MCPHealthChecker that calls servers to
-// retrieve the current list of targets and probes each one at the given
-// interval. interval must be positive; the caller is responsible for reading
-// the configured value from config.MCPHealthConfig.
-//
-// When allowPrivateURLs is false the underlying TCP dialer refuses connections
-// to loopback, private-range, link-local, and cloud metadata addresses,
-// preventing DNS rebinding SSRF attacks. Set allowPrivateURLs to true only
-// when MCP servers run on a private network (mirrors MCPConfig.AllowPrivateURLs).
-//
-// oauthMgr is the shared OAuthTokenManager used when probing OAuth-authenticated
-// servers. When nil a new manager is created internally.
-func NewMCPHealthChecker(servers func() []MCPServerTarget, interval time.Duration, allowPrivateURLs bool, log *slog.Logger, oauthMgr *mcp.OAuthTokenManager) *MCPHealthChecker {
-	transport := mcp.NewSSRFSafeTransport(allowPrivateURLs)
-	transport.TLSHandshakeTimeout = 10 * time.Second
-	transport.IdleConnTimeout = 90 * time.Second
-	if oauthMgr == nil {
-		oauthMgr = mcp.NewOAuthTokenManager(nil)
-	}
+// retrieve the current list of targets, resolves each target's transport via
+// transportFor, and probes each one at the given interval. interval must be
+// positive; the caller is responsible for reading the configured value from
+// config.MCPHealthConfig.
+func NewMCPHealthChecker(servers func() []MCPServerTarget, transportFor func(serverID string) (*mcp.HTTPTransport, bool), interval time.Duration, log *slog.Logger) *MCPHealthChecker {
 	return &MCPHealthChecker{
-		servers:  servers,
-		interval: interval,
-		client: &http.Client{
-			Transport: transport,
-			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
+		servers:      servers,
+		transportFor: transportFor,
+		interval:     interval,
 		log:          log,
-		oauthManager: oauthMgr,
 	}
 }
 
@@ -222,13 +212,38 @@ func (c *MCPHealthChecker) runAll() {
 	})
 }
 
-// runOne executes a single tools/list probe against target t and stores the
-// result using copy-on-write to avoid data races with concurrent readers.
+// runOne resolves t's transport via transportFor and, when found, probes it
+// with ListTools, storing the result using copy-on-write to avoid data races
+// with concurrent readers.
+//
+// When transportFor reports no transport for t.ID — a cold start, or a
+// server registered between two transport-cache refreshes — this probe cycle
+// skips t entirely: no result is stored or updated, and t's existing record
+// (if any) is left exactly as it was. A server that has never been probed
+// therefore keeps reporting Status "unknown" via GetHealth's zero-value
+// fallback, which is deliberately distinct from "unhealthy": VoidLLM has not
+// checked it yet, which is not the same claim as having checked it and found
+// it broken. The next probe cycle tries again once the transport cache has
+// caught up.
 func (c *MCPHealthChecker) runOne(t MCPServerTarget) {
+	transport, ok := c.transportFor(t.ID)
+	if !ok {
+		c.log.LogAttrs(context.Background(), slog.LevelDebug, "mcp health probe skipped: transport not cached yet",
+			slog.String("server_id", t.ID),
+			slog.String("alias", t.Alias),
+		)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 
-	latencyMs, toolCount, err := probeMCPServer(ctx, c.client, c.oauthManager, t)
+	start := time.Now()
+	listing, err := transport.ListTools(ctx)
+	latencyMs := time.Since(start).Milliseconds()
+	if latencyMs == 0 {
+		latencyMs = 1
+	}
 
 	// Load existing state or seed a zero value so the copy-on-write always
 	// starts from a consistent base.
@@ -249,10 +264,16 @@ func (c *MCPHealthChecker) runOne(t MCPServerTarget) {
 	if err == nil {
 		updated.Status = "healthy"
 		updated.LatencyMs = latencyMs
-		updated.ToolCount = toolCount
+		updated.ToolCount = len(listing.Tools)
 		updated.LastError = ""
 	} else {
 		updated.Status = "unhealthy"
+		// sanitizeError strips upstream-controlled text; ListTools itself
+		// already reduces a JSON-RPC error to its numeric code rather than
+		// the upstream's free-form message (see ListTools's doc), so this
+		// never has upstream text to strip in the first place — but every
+		// other failure returned by ListTools (a transport error, an HTTP
+		// status) still goes through the same sanitizer for consistency.
 		updated.LastError = sanitizeError(err)
 		c.log.LogAttrs(ctx, slog.LevelDebug, "mcp health probe failed",
 			slog.String("server_id", t.ID),
@@ -263,81 +284,6 @@ func (c *MCPHealthChecker) runOne(t MCPServerTarget) {
 
 	c.results.Store(t.ID, &updated)
 	updateMCPMetrics(t.Name, t.Alias, &updated)
-}
-
-// probeMCPServer sends a tools/list JSON-RPC 2.0 POST request to the target
-// URL, parses the response, and returns the round-trip latency in milliseconds
-// and the number of tools reported. It returns a non-nil error on any
-// connection failure or non-2xx HTTP status.
-func probeMCPServer(ctx context.Context, client *http.Client, oauthMgr *mcp.OAuthTokenManager, t MCPServerTarget) (latencyMs int64, toolCount int, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.URL, bytes.NewReader(toolsListPayload))
-	if err != nil {
-		return 0, 0, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-
-	// Handle OAuth inline since token fetching requires a context.
-	if strings.ToLower(t.AuthType) == "oauth" && oauthMgr != nil {
-		cfg := mcp.OAuthConfig{
-			TokenURL:     t.OAuthTokenURL,
-			ServerURL:    t.URL,
-			ClientID:     t.OAuthClientID,
-			ClientSecret: t.OAuthClientSecret,
-			Scopes:       t.OAuthScopes,
-		}
-		token, tokenErr := oauthMgr.GetToken(ctx, t.ID, cfg)
-		if tokenErr != nil {
-			return 0, 0, fmt.Errorf("oauth token: %w", tokenErr)
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
-	} else {
-		setMCPAuthHeaders(req, t)
-	}
-
-	start := time.Now()
-	resp, err := client.Do(req)
-	latencyMs = time.Since(start).Milliseconds()
-	if latencyMs == 0 {
-		latencyMs = 1
-	}
-	if err != nil {
-		return 0, 0, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, 0, fmt.Errorf("http %d", resp.StatusCode)
-	}
-
-	// Parse the JSON-RPC response to count the available tools. The response
-	// shape is: {"jsonrpc":"2.0","id":1,"result":{"tools":[...]}}
-	// A parse failure is non-fatal — we still report the server as reachable
-	// because it returned a 2xx status; toolCount just stays at zero.
-	var rpcResp struct {
-		Result struct {
-			Tools []struct{} `json:"tools"`
-		} `json:"result"`
-	}
-	_ = jsonx.NewDecoder(resp.Body).Decode(&rpcResp)
-	return latencyMs, len(rpcResp.Result.Tools), nil
-}
-
-// setMCPAuthHeaders adds the appropriate authentication header to req based on
-// the target's auth type. "bearer" uses the standard Authorization header;
-// "header" uses the custom header name stored in t.AuthHeader.
-func setMCPAuthHeaders(req *http.Request, t MCPServerTarget) {
-	if t.AuthToken == "" {
-		return
-	}
-	switch strings.ToLower(t.AuthType) {
-	case "bearer":
-		req.Header.Set("Authorization", "Bearer "+t.AuthToken)
-	case "header":
-		if t.AuthHeader != "" {
-			req.Header.Set(t.AuthHeader, t.AuthToken)
-		}
-	}
 }
 
 // updateMCPMetrics refreshes the Prometheus gauges for the given MCP server

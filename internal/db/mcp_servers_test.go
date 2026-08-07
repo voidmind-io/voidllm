@@ -3,9 +3,11 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/voidmind-io/voidllm/internal/config"
+	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/pkg/crypto"
 )
 
@@ -1060,6 +1062,205 @@ func TestSyncYAMLMCPServers_Empty(t *testing.T) {
 	}
 	if err := d.SyncYAMLMCPServers(context.Background(), []config.MCPServerConfig{}, testSyncEncKey); err != nil {
 		t.Errorf("SyncYAMLMCPServers([]) error = %v, want nil", err)
+	}
+}
+
+// ---- SyncYAMLMCPServers — protocol_version ----------------------------------
+
+// TestSyncYAMLMCPServers_SetsProtocolVersion verifies that a pin present in
+// the YAML config is persisted verbatim on the created row's create path,
+// not silently dropped — this is the field the whole "protocol_version is
+// unreachable" gap was about for YAML-sourced servers specifically.
+func TestSyncYAMLMCPServers_SetsProtocolVersion(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	servers := []config.MCPServerConfig{
+		{Name: "Pinned MCP", Alias: "pinned-mcp", URL: "https://pinned.example.com", AuthType: "none", ProtocolVersion: "2025-11-25"},
+	}
+	if err := d.SyncYAMLMCPServers(context.Background(), servers, testSyncEncKey); err != nil {
+		t.Fatalf("SyncYAMLMCPServers() error = %v, want nil", err)
+	}
+
+	got, err := d.GetMCPServerByAlias(context.Background(), "pinned-mcp")
+	if err != nil {
+		t.Fatalf("GetMCPServerByAlias() error = %v", err)
+	}
+	if got.ProtocolVersion != "2025-11-25" {
+		t.Errorf("ProtocolVersion = %q, want %q", got.ProtocolVersion, "2025-11-25")
+	}
+}
+
+// TestSyncYAMLMCPServers_EmptyProtocolVersionNormalizesToAuto verifies the
+// create path's default: an omitted protocol_version in YAML must resolve to
+// the stored value "auto" — the sentinel HTTPTransport treats as "probe the
+// upstream" — not to an empty string that downstream code would have to
+// special-case separately from an explicit "auto".
+func TestSyncYAMLMCPServers_EmptyProtocolVersionNormalizesToAuto(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	servers := []config.MCPServerConfig{
+		{Name: "Default Proto MCP", Alias: "default-proto-mcp", URL: "https://default-proto.example.com", AuthType: "none"},
+	}
+	if err := d.SyncYAMLMCPServers(context.Background(), servers, testSyncEncKey); err != nil {
+		t.Fatalf("SyncYAMLMCPServers() error = %v, want nil", err)
+	}
+
+	got, err := d.GetMCPServerByAlias(context.Background(), "default-proto-mcp")
+	if err != nil {
+		t.Fatalf("GetMCPServerByAlias() error = %v", err)
+	}
+	if got.ProtocolVersion != "auto" {
+		t.Errorf("ProtocolVersion = %q, want %q", got.ProtocolVersion, "auto")
+	}
+}
+
+// TestSyncYAMLMCPServers_UpdatesProtocolVersion verifies the update path (a
+// second sync against an existing source="yaml" row): changing only the pin
+// in YAML must be reflected in the DB on re-sync, exercising the separate
+// UpdateMCPServerParams.ProtocolVersion assignment in the update branch of
+// SyncYAMLMCPServers, distinct from the create-path coverage above.
+func TestSyncYAMLMCPServers_UpdatesProtocolVersion(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	initial := []config.MCPServerConfig{
+		{Name: "Repin MCP", Alias: "repin-mcp", URL: "https://repin.example.com", AuthType: "none", ProtocolVersion: "auto"},
+	}
+	if err := d.SyncYAMLMCPServers(context.Background(), initial, testSyncEncKey); err != nil {
+		t.Fatalf("first SyncYAMLMCPServers() error = %v", err)
+	}
+
+	updated := []config.MCPServerConfig{
+		{Name: "Repin MCP", Alias: "repin-mcp", URL: "https://repin.example.com", AuthType: "none", ProtocolVersion: "2025-06-18"},
+	}
+	if err := d.SyncYAMLMCPServers(context.Background(), updated, testSyncEncKey); err != nil {
+		t.Fatalf("second SyncYAMLMCPServers() error = %v", err)
+	}
+
+	got, err := d.GetMCPServerByAlias(context.Background(), "repin-mcp")
+	if err != nil {
+		t.Fatalf("GetMCPServerByAlias() error = %v", err)
+	}
+	if got.ProtocolVersion != "2025-06-18" {
+		t.Errorf("ProtocolVersion = %q, want %q", got.ProtocolVersion, "2025-06-18")
+	}
+}
+
+// TestSyncYAMLMCPServers_RemovingPinOnUpdateResetsToAuto verifies that
+// removing a protocol_version pin from YAML (going back to the empty value)
+// and re-syncing actually clears the pin back to "auto" on the update path,
+// rather than leaving the previous pin silently in effect forever because
+// SyncYAMLMCPServers treated an empty incoming value as "leave unchanged".
+func TestSyncYAMLMCPServers_RemovingPinOnUpdateResetsToAuto(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	initial := []config.MCPServerConfig{
+		{Name: "Unpin MCP", Alias: "unpin-mcp", URL: "https://unpin.example.com", AuthType: "none", ProtocolVersion: "2025-11-25"},
+	}
+	if err := d.SyncYAMLMCPServers(context.Background(), initial, testSyncEncKey); err != nil {
+		t.Fatalf("first SyncYAMLMCPServers() error = %v", err)
+	}
+
+	updated := []config.MCPServerConfig{
+		{Name: "Unpin MCP", Alias: "unpin-mcp", URL: "https://unpin.example.com", AuthType: "none", ProtocolVersion: ""},
+	}
+	if err := d.SyncYAMLMCPServers(context.Background(), updated, testSyncEncKey); err != nil {
+		t.Fatalf("second SyncYAMLMCPServers() error = %v", err)
+	}
+
+	got, err := d.GetMCPServerByAlias(context.Background(), "unpin-mcp")
+	if err != nil {
+		t.Fatalf("GetMCPServerByAlias() error = %v", err)
+	}
+	if got.ProtocolVersion != "auto" {
+		t.Errorf("ProtocolVersion = %q, want %q (removing the pin from YAML must clear it, not leave the previous pin in effect)", got.ProtocolVersion, "auto")
+	}
+}
+
+// ---- CreateMCPServer / UpdateMCPServer — protocol_version validation -------
+//
+// These are the DB-layer regression tests for the validation promise
+// migration 0017_mcp_protocol_version.up.sql documents but never itself
+// enforced: "Validation of the allowed set lives in Go instead." Before this
+// fix, that Go-side validation existed only in internal/api/admin and
+// internal/config — a direct DB caller bypassing both, or a future bug in
+// either validator, could still persist a protocol_version value nothing
+// else in VoidLLM knows how to interpret.
+
+// TestCreateMCPServer_RejectsInvalidProtocolVersion verifies that an
+// unrecognized protocol_version value is rejected outright — a Go error, not
+// a silent normalization to "auto" the way the empty string is handled.
+func TestCreateMCPServer_RejectsInvalidProtocolVersion(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	params := defaultMCPParams("invalid-protocol-create")
+	params.ProtocolVersion = "not-a-real-mcp-revision"
+
+	_, err := d.CreateMCPServer(context.Background(), params)
+	if !errors.Is(err, ErrInvalidProtocolVersion) {
+		t.Fatalf("CreateMCPServer() error = %v, want ErrInvalidProtocolVersion", err)
+	}
+
+	if _, getErr := d.GetMCPServerByAlias(context.Background(), "invalid-protocol-create"); !errors.Is(getErr, ErrNotFound) {
+		t.Errorf("GetMCPServerByAlias() error = %v, want ErrNotFound (the rejected row must never have been inserted)", getErr)
+	}
+}
+
+// TestCreateMCPServer_AcceptsValidProtocolVersions verifies every value the
+// validator must accept: the empty string, "auto", and every entry in
+// mcp.SupportedVersions() — a table so a future revision added to
+// mcp.SupportedVersions() is automatically covered here too.
+func TestCreateMCPServer_AcceptsValidProtocolVersions(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	valid := []string{"", "auto"}
+	for _, v := range mcp.SupportedVersions() {
+		valid = append(valid, string(v))
+	}
+
+	for i, v := range valid {
+		alias := fmt.Sprintf("valid-protocol-%d", i)
+		params := defaultMCPParams(alias)
+		params.ProtocolVersion = v
+		if _, err := d.CreateMCPServer(context.Background(), params); err != nil {
+			t.Errorf("CreateMCPServer(protocol_version=%q) error = %v, want nil", v, err)
+		}
+	}
+}
+
+// TestUpdateMCPServer_RejectsInvalidProtocolVersion verifies the same
+// rejection on the update path, and that the row's previously valid value is
+// left untouched by the rejected update.
+func TestUpdateMCPServer_RejectsInvalidProtocolVersion(t *testing.T) {
+	t.Parallel()
+
+	d := openMigratedDB(t)
+
+	created := mustCreateMCPServer(t, d, defaultMCPParams("invalid-protocol-update"))
+
+	bogus := "not-a-real-mcp-revision"
+	_, err := d.UpdateMCPServer(context.Background(), created.ID, UpdateMCPServerParams{ProtocolVersion: &bogus})
+	if !errors.Is(err, ErrInvalidProtocolVersion) {
+		t.Fatalf("UpdateMCPServer() error = %v, want ErrInvalidProtocolVersion", err)
+	}
+
+	got, getErr := d.GetMCPServer(context.Background(), created.ID)
+	if getErr != nil {
+		t.Fatalf("GetMCPServer() error = %v", getErr)
+	}
+	if got.ProtocolVersion != "auto" {
+		t.Errorf("ProtocolVersion = %q, want %q (the rejected update must not have changed it)", got.ProtocolVersion, "auto")
 	}
 }
 

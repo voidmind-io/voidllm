@@ -15,8 +15,8 @@ import (
 // makeStaticFetcher returns a ToolFetcher that always returns the given tools
 // for any alias.
 func makeStaticFetcher(tools []mcp.Tool) mcp.ToolFetcher {
-	return func(_ context.Context, _ string) ([]mcp.Tool, error) {
-		return tools, nil
+	return func(_ context.Context, _ string) (*mcp.ToolListing, error) {
+		return &mcp.ToolListing{Tools: tools}, nil
 	}
 }
 
@@ -24,11 +24,11 @@ func makeStaticFetcher(tools []mcp.Tool) mcp.ToolFetcher {
 // been called per alias and returns the configured tools.
 func makeCountingFetcher(tools []mcp.Tool) (mcp.ToolFetcher, *sync.Map) {
 	counts := &sync.Map{}
-	fetcher := func(_ context.Context, alias string) ([]mcp.Tool, error) {
+	fetcher := func(_ context.Context, alias string) (*mcp.ToolListing, error) {
 		v, _ := counts.LoadOrStore(alias, new(int64))
 		counter := v.(*int64)
 		atomic.AddInt64(counter, 1)
-		return tools, nil
+		return &mcp.ToolListing{Tools: tools}, nil
 	}
 	return fetcher, counts
 }
@@ -136,11 +136,11 @@ func TestToolCache_GetTools_Concurrent(t *testing.T) {
 	tools := []mcp.Tool{{Name: "concurrent_tool"}}
 
 	var fetchCallCount int64
-	fetcher := func(_ context.Context, _ string) ([]mcp.Tool, error) {
+	fetcher := func(_ context.Context, _ string) (*mcp.ToolListing, error) {
 		// Simulate a slightly slow fetch to maximise race window.
 		time.Sleep(5 * time.Millisecond)
 		atomic.AddInt64(&fetchCallCount, 1)
-		return tools, nil
+		return &mcp.ToolListing{Tools: tools}, nil
 	}
 
 	cache := mcp.NewToolCache(fetcher, time.Hour)
@@ -172,7 +172,7 @@ func TestToolCache_GetTools_FetchError(t *testing.T) {
 	t.Parallel()
 
 	fetchErr := errors.New("upstream unavailable")
-	fetcher := func(_ context.Context, _ string) ([]mcp.Tool, error) {
+	fetcher := func(_ context.Context, _ string) (*mcp.ToolListing, error) {
 		return nil, fetchErr
 	}
 
@@ -189,9 +189,9 @@ func TestToolCache_RefreshServer(t *testing.T) {
 	t.Parallel()
 
 	callCount := 0
-	fetcher := func(_ context.Context, _ string) ([]mcp.Tool, error) {
+	fetcher := func(_ context.Context, _ string) (*mcp.ToolListing, error) {
 		callCount++
-		return []mcp.Tool{{Name: fmt.Sprintf("tool_v%d", callCount)}}, nil
+		return &mcp.ToolListing{Tools: []mcp.Tool{{Name: fmt.Sprintf("tool_v%d", callCount)}}}, nil
 	}
 
 	cache := mcp.NewToolCache(fetcher, time.Hour)
@@ -227,10 +227,10 @@ func TestToolCache_RefreshServer_Error_PreservesCache(t *testing.T) {
 
 	originalTools := []mcp.Tool{{Name: "original"}}
 	callCount := 0
-	fetcher := func(_ context.Context, _ string) ([]mcp.Tool, error) {
+	fetcher := func(_ context.Context, _ string) (*mcp.ToolListing, error) {
 		callCount++
 		if callCount == 1 {
-			return originalTools, nil
+			return &mcp.ToolListing{Tools: originalTools}, nil
 		}
 		return nil, errors.New("network error")
 	}
@@ -265,11 +265,11 @@ func TestToolCache_RefreshAll(t *testing.T) {
 	// Populate two entries.
 	fetchCounts := map[string]int{}
 	var mu sync.Mutex
-	fetcher := func(_ context.Context, alias string) ([]mcp.Tool, error) {
+	fetcher := func(_ context.Context, alias string) (*mcp.ToolListing, error) {
 		mu.Lock()
 		fetchCounts[alias]++
 		mu.Unlock()
-		return []mcp.Tool{{Name: alias + "_tool"}}, nil
+		return &mcp.ToolListing{Tools: []mcp.Tool{{Name: alias + "_tool"}}}, nil
 	}
 
 	cache := mcp.NewToolCache(fetcher, time.Hour)
@@ -315,7 +315,7 @@ func TestToolCache_RefreshAll_PartialError(t *testing.T) {
 		callCounts = map[string]int{}
 	)
 
-	fetcher := func(_ context.Context, alias string) ([]mcp.Tool, error) {
+	fetcher := func(_ context.Context, alias string) (*mcp.ToolListing, error) {
 		mu.Lock()
 		callCounts[alias]++
 		n := callCounts[alias]
@@ -324,7 +324,7 @@ func TestToolCache_RefreshAll_PartialError(t *testing.T) {
 		if alias == "broken" && n > 1 {
 			return nil, errors.New("fetch failed")
 		}
-		return []mcp.Tool{{Name: alias + "_tool"}}, nil
+		return &mcp.ToolListing{Tools: []mcp.Tool{{Name: alias + "_tool"}}}, nil
 	}
 
 	cache := mcp.NewToolCache(fetcher, time.Hour)
@@ -460,8 +460,8 @@ func TestToolCache_GetAllTools_Empty(t *testing.T) {
 func TestToolCache_MultipleAliasesIndependent(t *testing.T) {
 	t.Parallel()
 
-	fetcher := func(_ context.Context, alias string) ([]mcp.Tool, error) {
-		return []mcp.Tool{{Name: alias + "_specific"}}, nil
+	fetcher := func(_ context.Context, alias string) (*mcp.ToolListing, error) {
+		return &mcp.ToolListing{Tools: []mcp.Tool{{Name: alias + "_specific"}}}, nil
 	}
 
 	cache := mcp.NewToolCache(fetcher, time.Hour)
@@ -509,6 +509,201 @@ func TestToolCache_GetTools_ReturnsCopy(t *testing.T) {
 	}
 }
 
+// TestToolCache_GetTools_ReturnsCopy_SchemaBytesAreDeepCopied verifies
+// copyTools copies InputSchema's underlying bytes, not just the Tool header —
+// docs/mcp-v2.md FIX 3. JSONSchema is a []byte-backed alias
+// (mcp.JSONSchema = jsonx.RawMessage = []byte under the hood), so a shallow
+// `copy` of a []Tool slice (Go's built-in copy, or a plain field assignment)
+// only duplicates each Tool's three struct fields: Name and Description are
+// plain strings (already immutable, copy-safe), but InputSchema is a slice
+// HEADER pointing at the SAME backing array the cache holds. Mutating the
+// returned InputSchema bytes in place — without ever touching cache internals
+// or taking tc's lock — would therefore corrupt the cache under exactly this
+// scenario: GetTools, mutate the schema bytes in place, GetTools again, and
+// check the second call is unaffected. Both GetAllTools and SetTools share
+// copyTools, so this same regression is checked for each entry point below.
+func TestToolCache_GetTools_ReturnsCopy_SchemaBytesAreDeepCopied(t *testing.T) {
+	t.Parallel()
+
+	original := []mcp.Tool{{Name: "schema_tool", InputSchema: mcp.JSONSchema(`{"type":"object"}`)}}
+	cache := mcp.NewToolCache(makeStaticFetcher(original), time.Hour)
+
+	got1, err := cache.GetTools(context.Background(), "srv")
+	if err != nil {
+		t.Fatalf("GetTools: %v", err)
+	}
+
+	// Mutate the returned InputSchema's bytes IN PLACE — not by reassigning
+	// got1[0].InputSchema to a new slice, which would never touch the cache's
+	// backing array regardless of whether copyTools did its job. This is
+	// exactly the mutation a shallow Tool copy would leave exposed.
+	for i := range got1[0].InputSchema {
+		got1[0].InputSchema[i] = 'X'
+	}
+
+	got2, err := cache.GetTools(context.Background(), "srv")
+	if err != nil {
+		t.Fatalf("GetTools: %v", err)
+	}
+	if string(got2[0].InputSchema) != `{"type":"object"}` {
+		t.Errorf("GetTools InputSchema after in-place byte mutation = %q, want %q (mutation must not reach the cache's backing array)",
+			got2[0].InputSchema, `{"type":"object"}`)
+	}
+}
+
+// TestToolCache_GetAllTools_ReturnsCopy_SchemaBytesAreDeepCopied is
+// TestToolCache_GetTools_ReturnsCopy_SchemaBytesAreDeepCopied's counterpart
+// for GetAllTools, which builds its snapshot via the same copyTools helper.
+func TestToolCache_GetAllTools_ReturnsCopy_SchemaBytesAreDeepCopied(t *testing.T) {
+	t.Parallel()
+
+	tools := []mcp.Tool{{Name: "schema_tool", InputSchema: mcp.JSONSchema(`{"type":"object"}`)}}
+	cache := mcp.NewToolCache(makeStaticFetcher(tools), time.Hour)
+
+	if _, err := cache.GetTools(context.Background(), "srv"); err != nil {
+		t.Fatalf("GetTools (populate cache): %v", err)
+	}
+
+	all1 := cache.GetAllTools()
+	got1, ok := all1["srv"]
+	if !ok || len(got1) != 1 {
+		t.Fatalf("GetAllTools() = %+v, want one entry for \"srv\"", all1)
+	}
+	for i := range got1[0].InputSchema {
+		got1[0].InputSchema[i] = 'X'
+	}
+
+	all2 := cache.GetAllTools()
+	got2, ok := all2["srv"]
+	if !ok || len(got2) != 1 {
+		t.Fatalf("GetAllTools() (after mutation) = %+v, want one entry for \"srv\"", all2)
+	}
+	if string(got2[0].InputSchema) != `{"type":"object"}` {
+		t.Errorf("GetAllTools() InputSchema after in-place byte mutation = %q, want %q (mutation must not reach the cache's backing array)",
+			got2[0].InputSchema, `{"type":"object"}`)
+	}
+}
+
+// TestSetTools_ReturnsCopy_SchemaBytesAreDeepCopied is the same regression for
+// the SetTools entry point (used by the built-in server, whose tools come
+// from memory rather than an HTTP fetch): GetTools/GetAllTools reading back
+// what SetTools stored must also return copies whose schema bytes are
+// independent of both the caller's original slice AND of each other across
+// repeated reads.
+func TestSetTools_ReturnsCopy_SchemaBytesAreDeepCopied(t *testing.T) {
+	t.Parallel()
+
+	tools := []mcp.Tool{{Name: "builtin_tool", InputSchema: mcp.JSONSchema(`{"type":"object"}`)}}
+	fetcher := func(_ context.Context, _ string) (*mcp.ToolListing, error) {
+		return nil, errors.New("should not be called")
+	}
+	cache := mcp.NewToolCache(fetcher, time.Hour)
+
+	cache.SetTools("voidllm", tools)
+
+	// Mutate what GetTools itself returned, in place, and confirm a second
+	// GetTools call is unaffected — the same property
+	// TestToolCache_GetTools_ReturnsCopy_SchemaBytesAreDeepCopied checks for
+	// the fetcher-backed path, exercised here for the SetTools-backed path:
+	// GetTools's own copyTools call on the way OUT protects the cache
+	// regardless of which path (fetch vs. SetTools) populated the entry.
+	got, err := cache.GetTools(context.Background(), "voidllm")
+	if err != nil {
+		t.Fatalf("GetTools: %v", err)
+	}
+	for i := range got[0].InputSchema {
+		got[0].InputSchema[i] = 'Y'
+	}
+	got2, err := cache.GetTools(context.Background(), "voidllm")
+	if err != nil {
+		t.Fatalf("GetTools (second call): %v", err)
+	}
+	if string(got2[0].InputSchema) != `{"type":"object"}` {
+		t.Errorf("GetTools() InputSchema after in-place byte mutation of a previous read = %q, want %q",
+			got2[0].InputSchema, `{"type":"object"}`)
+	}
+}
+
+// TestSetTools_CopiesOnIngest verifies that SetTools deep-copies its tools
+// argument on the way in, symmetric with the deep copies GetTools and
+// GetAllTools already hand back on the way out. Mutating the caller's slice
+// (and its InputSchema backing array) after SetTools returns must not affect
+// what the cache serves on a subsequent GetTools call.
+func TestSetTools_CopiesOnIngest(t *testing.T) {
+	t.Parallel()
+
+	tools := []mcp.Tool{{Name: "builtin_tool", InputSchema: mcp.JSONSchema(`{"type":"object"}`)}}
+	cache := mcp.NewToolCache(makeStaticFetcher(nil), time.Hour)
+
+	cache.SetTools("voidllm", tools)
+
+	// Mutating the slice PASSED TO SetTools, after the call, must not reach
+	// the cache's internal entry.
+	tools[0].InputSchema[0] = 'X'
+
+	got, err := cache.GetTools(context.Background(), "voidllm")
+	if err != nil {
+		t.Fatalf("GetTools: %v", err)
+	}
+	if string(got[0].InputSchema) != `{"type":"object"}` {
+		t.Errorf("GetTools() InputSchema after mutating the caller's original SetTools slice = %q, want %q",
+			got[0].InputSchema, `{"type":"object"}`)
+	}
+}
+
+// TestToolCache_GetTools_SchemaBytesRace exercises the exact race FIX 3
+// closes: one goroutine reads tools via GetTools and mutates its own copy's
+// InputSchema bytes in place, while another goroutine concurrently reads the
+// same server's tools via GetTools too. Before the fix, both goroutines could
+// observe (and corrupt) the SAME backing array without either one ever
+// holding tc's lock while doing so, which -race reliably flags as a data
+// race. Run with `go test -race` to verify.
+func TestToolCache_GetTools_SchemaBytesRace(t *testing.T) {
+	t.Parallel()
+
+	tools := []mcp.Tool{{Name: "schema_tool", InputSchema: mcp.JSONSchema(`{"type":"object","properties":{}}`)}}
+	cache := mcp.NewToolCache(makeStaticFetcher(tools), time.Hour)
+
+	// Populate the cache before racing readers start, so every goroutine hits
+	// the fast (already-fresh) GetTools path rather than also racing the
+	// initial fetch.
+	if _, err := cache.GetTools(context.Background(), "srv"); err != nil {
+		t.Fatalf("GetTools (populate cache): %v", err)
+	}
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			got, err := cache.GetTools(context.Background(), "srv")
+			if err != nil {
+				t.Errorf("GetTools: %v", err)
+				return
+			}
+			// Mutate this goroutine's own copy in place. If copyTools ever
+			// regresses to a shallow copy, concurrent goroutines here would
+			// be mutating the SAME backing array -race would catch.
+			for i := range got[0].InputSchema {
+				got[0].InputSchema[i] = 'Z'
+			}
+		}()
+	}
+	wg.Wait()
+
+	// After every mutator has finished, the cache's own copy must still be
+	// pristine.
+	got, err := cache.GetTools(context.Background(), "srv")
+	if err != nil {
+		t.Fatalf("GetTools (final check): %v", err)
+	}
+	if string(got[0].InputSchema) != `{"type":"object","properties":{}}` {
+		t.Errorf("GetTools() InputSchema after concurrent mutation = %q, want the original schema untouched",
+			got[0].InputSchema)
+	}
+}
+
 // ---- SetTools ----------------------------------------------------------------
 
 // TestSetTools_PopulatesCache verifies that SetTools writes tools into the
@@ -523,7 +718,7 @@ func TestSetTools_PopulatesCache(t *testing.T) {
 
 	// Use a fetcher that always fails so any GetTools call would error — only
 	// SetTools should populate the cache.
-	fetcher := func(_ context.Context, _ string) ([]mcp.Tool, error) {
+	fetcher := func(_ context.Context, _ string) (*mcp.ToolListing, error) {
 		return nil, errors.New("should not be called")
 	}
 	cache := mcp.NewToolCache(fetcher, time.Hour)
@@ -559,7 +754,7 @@ func TestSetTools_OverwritesExisting(t *testing.T) {
 		{Name: "v2_tool_b"},
 	}
 
-	fetcher := func(_ context.Context, _ string) ([]mcp.Tool, error) {
+	fetcher := func(_ context.Context, _ string) (*mcp.ToolListing, error) {
 		return nil, errors.New("should not be called")
 	}
 	cache := mcp.NewToolCache(fetcher, time.Hour)

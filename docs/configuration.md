@@ -23,7 +23,7 @@ server:
   proxy:
     port: 8080              # Proxy port — LLM clients connect here
     read_timeout: 30s
-    write_timeout: 120s     # High for streaming responses
+    write_timeout: 120s     # High for streaming responses — see MCP "Write timeout and long-lived streams" below for why this also caps MCP subscriptions/listen
     idle_timeout: 60s
     drain_timeout: 25s      # Graceful shutdown drain window (5s–120s)
 
@@ -233,7 +233,12 @@ External server via VoidLLM proxy:
 settings:
   mcp:
     call_timeout: 30s            # Max duration per proxied tool call (default: 30s)
+    stream_idle_timeout: 120s    # Idle timeout for the streaming proxy path (default: 120s)
+    stream_max_bytes: 104857600  # Byte ceiling for the streaming proxy path (default: 100 MiB; 0 = unbounded)
+    tool_cache_ttl: 1h            # Fallback freshness window for the tool cache (default: 1h; 0 = never expires)
     allow_private_urls: false     # Allow localhost/private IPs for MCP server URLs
+    allowed_origins:              # Origin allowlist for MCP endpoints (default: empty)
+      - https://app.example.com
     health:
       enabled: true              # Enable MCP server health probing (default: true)
       interval: 60s              # Probe interval (default: 60s)
@@ -244,9 +249,55 @@ mcp_servers:
     url: https://mcp.github.com/sse
     auth_type: bearer
     auth_token: ${GITHUB_TOKEN}
+    protocol_version: auto        # MCP revision to pin this server to (default: auto)
 ```
 
 MCP servers declared here are synced to the database at startup with `source: yaml`. Servers created via the Admin API (`source: api`) are never overwritten by YAML entries.
+
+`protocol_version` (per server, also settable via the Admin API and the Admin UI) controls which MCP specification revision VoidLLM speaks to that upstream. `auto` — the default, and what an empty value normalizes to — probes the server automatically and needs no attention in the normal case. Set it explicitly, to one of `2025-03-26`, `2025-06-18`, `2025-11-25`, or `2026-07-28`, only when auto-detection misidentifies a specific upstream. See [MCP Server Setup](mcp/servers.md#protocol-version) for details.
+
+### Streaming
+
+Requests proxied to an external MCP server through `/api/v1/mcp/:alias` (`HandleMCPProxy`) are streamed through transparently rather than buffered: VoidLLM does not read the full response before forwarding it, so a `tools/call` that sends `notifications/progress` before its result, or a long-lived `subscriptions/listen` response, both pass through intact.
+
+Because of that, this path has no total-duration limit — `call_timeout` does not apply to it. Instead, `stream_idle_timeout` bounds how long the connection may go completely silent: the timer resets on every byte read from the upstream, so a healthy stream that keeps sending data — including the periodic SSE keep-alive comment lines the MCP spec recommends servers send on a long-lived stream — never trips it, no matter how long it has been open in total. Only genuine silence for the configured duration ends the stream. `call_timeout` continues to bound VoidLLM's own buffered calls to upstream servers (tool discovery, Code Mode tool execution) unchanged.
+
+`stream_max_bytes` bounds the total number of bytes a single streamed response may carry, independent of `stream_idle_timeout`: an idle timeout alone does not stop an upstream that keeps trickling small amounts of data forever, or that sends an unbounded amount of data quickly. Once the ceiling is exceeded the stream ends exactly like any other mid-stream break — no error event is invented, the caller simply sees a truncated stream and, per the MCP spec, must retry as a new request. The default is 100 MiB. Set it to `0` to disable the limit entirely for deployments that need very long-lived `subscriptions/listen` streams to carry more data than that — understand that this also removes VoidLLM's only defense against a malicious or misbehaving upstream MCP server pushing unbounded data through the proxy, so only disable it for upstreams you trust.
+
+#### Write timeout and long-lived streams
+
+`server.proxy.write_timeout` (or `server.admin.write_timeout` in dual-port mode, whichever app serves `/api/v1/mcp/*`) is a **hard ceiling on every MCP stream**, including a healthy `subscriptions/listen` response that is still receiving data: fasthttp's `WriteTimeout` is a single absolute deadline on the socket, set once before the response starts and never refreshed by a successful flush. Neither `stream_idle_timeout` nor `stream_max_bytes` above can extend it — the connection is simply cut once it elapses, regardless of how much healthy traffic is still flowing.
+
+If you run `subscriptions/listen` (or any other stream expected to outlive the default 120s) in production, set:
+
+```yaml
+server:
+  proxy:
+    write_timeout: 0   # 0 disables the deadline entirely
+```
+
+VoidLLM logs one WARN at startup if the MCP gateway is active and `write_timeout` is finite, naming the configured value. Setting it to `0` removes the ceiling for **every** route on that app, not just MCP — including the unauthenticated ones (login, invite redemption). This trades away one layer of defense against slow-client (slowloris-style) connection exhaustion on those routes; combine it with a reverse proxy or load balancer that enforces its own connection-level timeouts if that trade-off is a concern for your deployment.
+
+### Tool Caching
+
+Code Mode's tool cache (`GetTools`, `list_servers`, `search_tools`) refreshes each server's `tools/list` result lazily, on access, once it goes stale. How long a result stays fresh depends on whether the upstream sent a CacheableResult freshness hint (MCP `2026-07-28` §5, `ttlMs`/`cacheScope` on the `tools/list` response):
+
+- **Upstream sent no hint** (every MCP server that has not adopted `2026-07-28` yet — in practice most upstreams today): `tool_cache_ttl` applies. Default `1h`; set to `0` to never expire an entry automatically — it is then only refreshed by an explicit invalidation (server update via the Admin API, or a manual refresh).
+- **Upstream sent `ttlMs`**: that value is honored instead of `tool_cache_ttl`, clamped to a minimum of 1 second and a maximum of 24 hours. The minimum exists because Code Mode calls `GetTools` once per incoming request; without it, an upstream reporting `ttlMs: 0` would turn every incoming request into an upstream `tools/list` call. The maximum guards against an upstream hint effectively pinning a stale tool list forever.
+- **Upstream sent `cacheScope: "private"`**: the result is still cached in memory for the configured TTL (VoidLLM calls `tools/list` with a single server-wide credential, so the authorization context is the same for every caller), but it is never written to the database. Any copy from before the upstream started reporting `private` is deleted from the database on the next fetch. `cacheScope: "public"`, or no `cacheScope` at all, is persisted as before.
+
+### Origin Validation
+
+Every MCP endpoint (`/api/v1/mcp`, `/api/v1/mcp/voidllm`, `/api/v1/mcp/:alias`, both `POST` and `GET`) validates the `Origin` header when a caller sends one, per the MCP Streamable HTTP spec's mandatory DNS-rebinding protection. Requests with no `Origin` header — the normal case for CLIs, SDKs, and service-to-service integrations — are never affected.
+
+This check is explicit-allow, the same principle VoidLLM applies to model access (an empty allowlist grants nothing):
+
+- `allowed_origins` set: an `Origin` header must exactly match one of the listed values (e.g. `https://app.example.com`); anything else is rejected with HTTP 403. The request's own `Host` header plays no role.
+- `allowed_origins` empty (default): only a built-in localhost allowlist is accepted — `http` or `https` on `localhost`, `127.0.0.1`, or `[::1]`, each with or without a port; anything else is rejected with HTTP 403.
+
+**Why this doesn't compare against the request's `Host` header.** A naive fix — accept an `Origin` whose host matches the request's own `Host` — sounds like it should catch DNS rebinding, but it cannot: in that attack, an attacker's DNS record for e.g. `evil.example.com` first resolves to their own server, which serves a malicious page, and is then rebound to resolve to `127.0.0.1`, so the browser's *next* request from that same page goes to the local service instead. The browser's `Origin` header is fixed by the page's own URL — `https://evil.example.com` — and its `Host` header is generated from that identical URL, so the two headers agree by construction on every request, no matter what the DNS record currently resolves to. An attacker who controls the DNS record controls both headers identically; comparing one attacker-supplied value against another can never detect anything. This is exactly the gap the MCP Streamable HTTP conformance suite's `dns-rebinding-protection` scenario checks for. Restricting the default to a fixed set of hostnames — `localhost`/`127.0.0.1`/`[::1]` — closes it: no DNS record an attacker controls can make VoidLLM see one of those for a page the attacker's own server served.
+
+**This is a breaking change for real deployments.** If you serve VoidLLM under a real domain and reach the MCP endpoints from a browser, set `allowed_origins` to that domain — the request's `Host` no longer helps you. VoidLLM always binds every network interface (there is no host-restricted listen option), so it cannot tell whether a given deployment is "really" loopback-only; it logs one WARN at startup whenever the MCP gateway is active and `allowed_origins` is empty, so a production deployment relying on the old (incorrect) behavior finds out at startup instead of via a wave of 403s from its browser clients.
 
 ### Privacy
 
@@ -255,8 +306,8 @@ MCP tool call arguments and results are not logged or stored. Only metadata is t
 ### Metrics
 
 ```
-voidllm_mcp_tool_calls_total{server, tool, status}
-voidllm_mcp_tool_call_duration_seconds{server, tool}
+voidllm_mcp_tool_calls_total{server, method, status}
+voidllm_mcp_tool_call_duration_seconds{server, method}
 voidllm_mcp_transport_errors_total{server, error_type}
 ```
 
