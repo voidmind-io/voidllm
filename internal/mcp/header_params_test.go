@@ -1,8 +1,10 @@
 package mcp_test
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -412,6 +414,42 @@ func TestFilterHeaderParamTools_ExcludesOnlyViolatingTool(t *testing.T) {
 	}
 	if _, ok := params["broken_tool"]; ok {
 		t.Error("params contains an entry for the excluded broken_tool")
+	}
+}
+
+// TestFilterHeaderParamTools_ExcludedToolName_LoggedBounded verifies
+// docs/mcp-v2.md review round Fund 4's second bullet: tool.Name is
+// upstream-controlled, exactly like an x-mcp-header annotation name
+// truncateForError already bounds inside ToolHeaderParams' own error text —
+// FilterHeaderParamTools' Warn log line must bound it the same way, so an
+// attacker-controlled server cannot inflate that log line without limit
+// merely by choosing an enormous tool name. This test is deliberately NOT
+// t.Parallel(): it swaps the process-global slog default logger for the
+// duration of the call and must not race with other tests' log output.
+func TestFilterHeaderParamTools_ExcludedToolName_LoggedBounded(t *testing.T) {
+	longName := strings.Repeat("n", 10_000)
+	brokenTool := mcp.Tool{
+		Name:        longName,
+		InputSchema: mcp.JSONSchema(`{"type":"object","oneOf":[{"type":"string","x-mcp-header":"Foo"}]}`),
+	}
+
+	var buf bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+
+	kept, _ := mcp.FilterHeaderParamTools(t.Context(), "server-1", []mcp.Tool{brokenTool})
+	if len(kept) != 0 {
+		t.Fatalf("len(kept) = %d, want 0 (the tool violates §4.3 and must be excluded)", len(kept))
+	}
+
+	logged := buf.String()
+	if strings.Contains(logged, longName) {
+		t.Errorf("log output contains the full %d-byte tool name unbounded, want it truncated: %s", len(longName), logged)
+	}
+	if len(logged) > len(longName) {
+		t.Errorf("log output (%d bytes) is not shorter than the unbounded tool name (%d bytes), want it bounded",
+			len(logged), len(longName))
 	}
 }
 

@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,19 @@ import (
 	"time"
 
 	"golang.org/x/sync/singleflight"
+)
+
+// errDiscoveryResponseDecodeFailed and errTokenResponseDecodeFailed are
+// returned in place of the raw encoding/json error whenever
+// discoverTokenURL's or fetchToken's own body fails to decode as JSON — see
+// each call site's own comment for why. encoding/json's own SyntaxError and
+// UnmarshalTypeError messages can quote a fragment of the offending input
+// (e.g. "invalid character '<' looking for beginning of value"), which here
+// would be response content from an authorization server VoidLLM does not
+// control (docs/mcp-v2.md review round, Fund 4).
+var (
+	errDiscoveryResponseDecodeFailed = errors.New("mcp: oauth discovery response is not valid JSON")
+	errTokenResponseDecodeFailed     = errors.New("mcp: oauth token response is not valid JSON")
 )
 
 // OAuthConfig holds the Client Credentials Flow configuration for an MCP server.
@@ -177,7 +191,9 @@ func (m *OAuthTokenManager) discoverTokenURL(ctx context.Context, serverURL stri
 		TokenEndpoint string `json:"token_endpoint"`
 	}
 	if err := json.Unmarshal(body, &meta); err != nil {
-		return "", err
+		// err's own message is never returned here — see
+		// errDiscoveryResponseDecodeFailed's doc for why.
+		return "", errDiscoveryResponseDecodeFailed
 	}
 	if meta.TokenEndpoint == "" {
 		return "", fmt.Errorf("no token_endpoint in discovery response")
@@ -236,7 +252,9 @@ func (m *OAuthTokenManager) fetchToken(ctx context.Context, tokenURL string, cfg
 		ExpiresIn   int64  `json:"expires_in"`
 	}
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
-		return "", 0, fmt.Errorf("parse token response: %w", err)
+		// err's own message is never returned here — see
+		// errTokenResponseDecodeFailed's doc for why.
+		return "", 0, errTokenResponseDecodeFailed
 	}
 	if tokenResp.AccessToken == "" {
 		return "", 0, fmt.Errorf("token response missing access_token")

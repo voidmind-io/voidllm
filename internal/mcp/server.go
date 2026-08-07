@@ -64,10 +64,34 @@ func (s *Server) SetResultTTLMs(ms int64) {
 // server-side registration policy — currently only RequireExtensions — that
 // is enforced before handler runs, without appearing in the wire-visible
 // Tool schema itself.
+//
+// RegisterTool also computes tool's x-mcp-header bindings (MCP 2026-07-28
+// §4.3) once, via ToolHeaderParams, and stores them on the registeredTool for
+// handleToolsCall to validate against the request body on every tools/call
+// (§4.5) — see registeredTool.headerParams' own doc. If tool.InputSchema
+// violates a §4.3 constraint, RegisterTool registers NOTHING and returns a
+// non-nil error wrapping ErrHeaderParamConstraint: unlike
+// FilterHeaderParamTools, which excludes an upstream's non-conforming tool
+// from tools/list and only logs a warning (the upstream is not VoidLLM's own
+// code, and a Warn-and-continue is the most a gateway can do about someone
+// else's schema), a tool registered here is VoidLLM's OWN schema — a
+// constraint violation is a VoidLLM programming error, not attacker-supplied
+// data, and letting the server start anyway with that one tool silently
+// unregistered (or, worse, registered without header enforcement) would turn
+// a build-time-catchable defect into a silent gap in the exact protection
+// this mechanism exists to provide. Callers are expected to treat a non-nil
+// return as fatal to startup — see RegisterVoidLLMTools' and
+// RegisterCodeModeTools' own docs.
+//
 // It is not safe to call concurrently with Handle — register all tools
 // before starting to handle requests.
-func (s *Server) RegisterTool(tool Tool, handler ToolHandler, opts ...ToolOption) {
-	rt := registeredTool{handler: handler}
+func (s *Server) RegisterTool(tool Tool, handler ToolHandler, opts ...ToolOption) error {
+	headerParams, err := ToolHeaderParams(tool.InputSchema)
+	if err != nil {
+		return fmt.Errorf("register tool %q: %w", tool.Name, err)
+	}
+
+	rt := registeredTool{handler: handler, headerParams: headerParams}
 	for _, opt := range opts {
 		opt(&rt)
 	}
@@ -76,6 +100,7 @@ func (s *Server) RegisterTool(tool Tool, handler ToolHandler, opts ...ToolOption
 	defer s.mu.Unlock()
 	s.tools = append(s.tools, tool)
 	s.handlers[tool.Name] = rt
+	return nil
 }
 
 // Tools returns a deep copy of the registered tool schemas. The returned
@@ -196,7 +221,7 @@ func (s *Server) Handle(ctx context.Context, raw []byte, hdr Header) HandleResul
 		return HandleResult{Body: out, Hint: statusHintFor(decErr, era), Era: era}
 	}
 
-	result, dispatchErr := s.dispatch(ctx, dialect, env)
+	result, dispatchErr := s.dispatch(ctx, dialect, env, hdr)
 
 	if env.IsNotification {
 		return HandleResult{Body: nil, Hint: HintNotification, Era: era}
@@ -325,12 +350,12 @@ func peekID(raw []byte) jsonx.RawMessage {
 // vocabulary — e.g. "initialize" carried by a modern-era dialect, or
 // "server/discover" carried by a legacy-era one — falls through to
 // CodeMethodNotFound in the era-specific dispatcher.
-func (s *Server) dispatch(ctx context.Context, dialect ServerDialect, env *Envelope) (*Result, *Error) {
+func (s *Server) dispatch(ctx context.Context, dialect ServerDialect, env *Envelope, hdr Header) (*Result, *Error) {
 	switch env.Method {
 	case "tools/list":
 		return s.handleToolsList(), nil
 	case "tools/call":
-		payload, err := s.handleToolsCall(ctx, env)
+		payload, err := s.handleToolsCall(ctx, env, hdr, dialect.Version().Era())
 		if err != nil {
 			return nil, err
 		}
@@ -363,7 +388,16 @@ func (s *Server) dispatchLegacy(env *Envelope) (*Result, *Error) {
 	case "ping":
 		return &Result{Payload: map[string]any{}}, nil
 	default:
-		return nil, &Error{Code: CodeMethodNotFound, Message: fmt.Sprintf("method not found: %s", env.Method)}
+		// env.Method is caller-controlled and unbounded — a large body could
+		// otherwise inflate this error object without limit (docs/mcp-v2.md
+		// review round, Fund 7). truncateForError (header_params.go) bounds
+		// its length exactly as it already does for an x-mcp-header
+		// annotation name; %q, rather than %s, is what additionally escapes
+		// any control characters it contains (the same reason
+		// recordAnnotation's own error text always embeds its truncated name
+		// via %q, never %s) — truncateForError performs no escaping itself,
+		// only truncation.
+		return nil, &Error{Code: CodeMethodNotFound, Message: fmt.Sprintf("method not found: %q", truncateForError(env.Method))}
 	}
 }
 
@@ -385,7 +419,9 @@ func (s *Server) dispatchModern(env *Envelope) (*Result, *Error) {
 		// Real support is Phase 4 (streaming passthrough) work.
 		return nil, &Error{Code: CodeMethodNotFound, Message: "method not found: subscriptions/listen (streaming not yet supported)"}
 	default:
-		return nil, &Error{Code: CodeMethodNotFound, Message: fmt.Sprintf("method not found: %s", env.Method)}
+		// See dispatchLegacy's identical default case for why
+		// truncateForError plus %q, not env.Method plus %s, is used here.
+		return nil, &Error{Code: CodeMethodNotFound, Message: fmt.Sprintf("method not found: %q", truncateForError(env.Method))}
 	}
 }
 
@@ -477,10 +513,22 @@ func (s *Server) handleToolsList() *Result {
 // handleToolsCall dispatches a tools/call request to the registered handler.
 // It takes the whole Envelope, not just its Params, because enforcing a
 // tool's declared RequireExtensions needs env.ClientCaps — the caller's
-// declared capabilities — which Params alone does not carry. Unexpected
-// handler errors are converted to tool-level error results rather than
-// JSON-RPC protocol errors, keeping protocol integrity intact.
-func (s *Server) handleToolsCall(ctx context.Context, env *Envelope) (any, *Error) {
+// declared capabilities — which Params alone does not carry. hdr is the
+// inbound transport headers Handle received, threaded all the way down here
+// so a registered tool's x-mcp-header bindings (rt.headerParams) can be
+// validated against call.Arguments per MCP 2026-07-28 §4.5 — see
+// registeredTool.headerParams' and validateHeaderParams' own docs. era is
+// dialect.Version().Era() from Handle's own already-negotiated dialect
+// (docs/mcp-v2.md's own warning against ever branching on env.Version
+// applies here too — see dispatch's doc): header/body validation runs ONLY
+// for EraModern, since Mcp-Param-{Name} is a modern-era-only header family —
+// no ClientDialect this package ships ever renders it for a legacy request
+// (see legacyClientDialect.Prepare's own doc) — so a genuinely legacy caller
+// calling a header-annotated tool structurally cannot carry the header at
+// all, and must not be rejected for an omission it has no way to satisfy.
+// Unexpected handler errors are converted to tool-level error results rather
+// than JSON-RPC protocol errors, keeping protocol integrity intact.
+func (s *Server) handleToolsCall(ctx context.Context, env *Envelope, hdr Header, era Era) (any, *Error) {
 	var call struct {
 		Name      string           `json:"name"`
 		Arguments jsonx.RawMessage `json:"arguments"`
@@ -494,7 +542,10 @@ func (s *Server) handleToolsCall(ctx context.Context, env *Envelope) (any, *Erro
 	s.mu.RUnlock()
 
 	if !ok {
-		return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("unknown tool: %s", call.Name)}
+		// call.Name is caller-controlled and unbounded — see dispatchLegacy's
+		// identical default case (docs/mcp-v2.md review round, Fund 7) for
+		// why truncateForError plus %q, not call.Name plus %s, is used here.
+		return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("unknown tool: %q", truncateForError(call.Name))}
 	}
 
 	if missing := missingExtensions(rt.requires, env.ClientCaps); len(missing) > 0 {
@@ -502,6 +553,12 @@ func (s *Server) handleToolsCall(ctx context.Context, env *Envelope) (any, *Erro
 			Code:    CodeMissingRequiredClientCapability,
 			Message: "missing required client capability",
 			Data:    MissingCapabilityData{RequiredCapabilities: missing},
+		}
+	}
+
+	if era == EraModern && len(rt.headerParams) > 0 {
+		if mismatchErr := rt.validateHeaderParams(call.Arguments, hdr); mismatchErr != nil {
+			return nil, mismatchErr
 		}
 	}
 

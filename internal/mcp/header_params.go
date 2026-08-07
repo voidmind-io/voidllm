@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"sort"
 	"strings"
 
@@ -393,9 +394,17 @@ func FilterHeaderParamTools(ctx context.Context, serverID string, tools []Tool) 
 	for _, tool := range tools {
 		hp, err := ToolHeaderParams(tool.InputSchema)
 		if err != nil {
+			// tool.Name is upstream-controlled, exactly like the x-mcp-header
+			// annotation names truncateForError already bounds inside
+			// ToolHeaderParams' own error text (see that function's doc) — an
+			// attacker-controlled server must not be able to inflate this Warn
+			// line without limit merely by choosing a long tool name
+			// (docs/mcp-v2.md review round, Fund 4). Reusing truncateForError
+			// here, rather than a second length constant and helper, keeps the
+			// two call sites bounded identically.
 			slog.Default().LogAttrs(ctx, slog.LevelWarn, "mcp: tool excluded from tools/list: x-mcp-header constraint violation",
 				slog.String("server_id", serverID),
-				slog.String("tool_name", tool.Name),
+				slog.String("tool_name", truncateForError(tool.Name)),
 				slog.String("reason", err.Error()),
 			)
 			continue
@@ -520,4 +529,87 @@ func isJSONBareInteger(s string) bool {
 		}
 	}
 	return true
+}
+
+// validateHeaderParams checks arguments — a tools/call request's raw
+// params.arguments — against hdr for every one of rt's validated
+// x-mcp-header bindings (MCP 2026-07-28 §4.3), per §4.5's requirement that a
+// server processing the body MUST validate header against body. This is the
+// built-in server's own counterpart to the outbound mirroring
+// dialect2026Client.Prepare performs — see registeredTool.headerParams' own
+// doc for why the bindings themselves are computed once, at registration,
+// rather than here on every call.
+//
+// Returns a non-nil *Error (CodeHeaderMismatch, HTTP 400 per §4.5) on the
+// first violation found, in binding order: a missing Mcp-Param-{Name}
+// header, a header value that fails base64-sentinel decoding, or a decoded
+// header value that disagrees with the value headerParamValue extracts from
+// arguments at the binding's Path — compared numerically for
+// HeaderParamKindInteger (§4.5: "42.0 == 42", not a string comparison; see
+// integerHeaderMatchesBody) and as an exact string otherwise. A binding
+// whose Path does not resolve in arguments at all (headerParamValue reports
+// ok == false — a missing, null, or type-mismatched argument) is itself a
+// mismatch: the header claims a value the body does not actually carry.
+//
+// The returned Error's Message never includes the decoded header value or
+// the body-derived value — both are tool-argument content, covered by this
+// repo's zero-knowledge logging and error-message policy — only the
+// binding's own Name, which is a x-mcp-header annotation name VoidLLM itself
+// declared in the tool's schema, not caller-supplied data.
+func (rt *registeredTool) validateHeaderParams(arguments jsonx.RawMessage, hdr Header) *Error {
+	for _, p := range rt.headerParams {
+		headerName := HeaderParamPrefix + p.Name
+		raw := hdr.Get(headerName)
+		if raw == "" {
+			return &Error{Code: CodeHeaderMismatch, Message: fmt.Sprintf("missing required header: %s", headerName)}
+		}
+		decoded, ok := DecodeHeaderValue(raw)
+		if !ok {
+			return &Error{Code: CodeHeaderMismatch, Message: fmt.Sprintf("invalid header value: %s", headerName)}
+		}
+		bodyVal, ok := headerParamValue(arguments, p)
+		if !ok {
+			return &Error{Code: CodeHeaderMismatch, Message: fmt.Sprintf("header disagrees with body: %s", headerName)}
+		}
+
+		var matches bool
+		if p.Kind == HeaderParamKindInteger {
+			matches = integerHeaderMatchesBody(decoded, bodyVal)
+		} else {
+			matches = decoded == bodyVal
+		}
+		if !matches {
+			return &Error{Code: CodeHeaderMismatch, Message: fmt.Sprintf("header disagrees with body: %s", headerName)}
+		}
+	}
+	return nil
+}
+
+// integerHeaderMatchesBody reports whether headerVal — a decoded
+// Mcp-Param-{Name} header value for a HeaderParamKindInteger binding — and
+// bodyVal — the bare JSON integer literal headerParamValue extracted from
+// the request body for that same binding (see that function's own doc: it
+// is always digits, with an optional leading '-', never '.', 'e', or 'E')
+// — denote the same number, per MCP 2026-07-28 §4.5's explicit numeric
+// comparison requirement ("42.0 == 42"): a header sent as "42.0" must match
+// a body value of 42. Comparison uses math/big.Rat rather than float64 so
+// neither side loses precision for an integer beyond float64's 53-bit
+// mantissa — the same verbatim-precision concern headerParamValue's own doc
+// for HeaderParamKindInteger already applies to the outbound direction.
+// Returns false, not a panic or an error, if headerVal does not parse as a
+// number at all — that is itself a mismatch, not a distinct failure mode.
+func integerHeaderMatchesBody(headerVal, bodyVal string) bool {
+	hr, ok := new(big.Rat).SetString(headerVal)
+	if !ok {
+		return false
+	}
+	br, ok := new(big.Rat).SetString(bodyVal)
+	if !ok {
+		// bodyVal is always a bare JSON integer literal per headerParamValue's
+		// own contract for HeaderParamKindInteger, so this should never
+		// happen — but treating it as "no match" rather than trusting an
+		// invariant across a package boundary is the safer failure mode.
+		return false
+	}
+	return hr.Cmp(br) == 0
 }

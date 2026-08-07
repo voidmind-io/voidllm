@@ -139,6 +139,32 @@ type ToolCache struct {
 	fetcher     ToolFetcher
 	maxAge      time.Duration
 	store       ToolStore // optional, nil for pure in-memory
+	// storeMu serializes every write RefreshServer and InvalidateWithStore
+	// make to tc.store for the same serverID, without ever being held during
+	// an upstream fetch (unlike tc.mu, which entryFor's fetch-on-miss path
+	// does hold across the fetch, by design — see entryFor's own doc). It
+	// exists solely to close the race RefreshServer's own doc describes:
+	// tc.mu is only ever held long enough to check tc.generations and publish
+	// a *cacheEntry, then released BEFORE the store write, because the store
+	// write is I/O and I/O has no business running under the lock that guards
+	// the hot GetTools/HeaderParams path. Without storeMu, an
+	// InvalidateWithStore landing in that gap could run its own store.Delete
+	// concurrently with — and in either order relative to — RefreshServer's
+	// store.Save, so a Save that happens to commit after the Delete would
+	// resurrect a listing InvalidateWithStore just removed. storeMu forces
+	// RefreshServer's persistListing call and InvalidateWithStore's
+	// store.Delete call into one total order per serverID; combined with
+	// RefreshServer re-checking tc.generations while holding storeMu (see
+	// RefreshServer's own doc), whichever of the two entered storeMu first
+	// determines the final state, and it is always the more recent one: if
+	// InvalidateWithStore's generation bump (which always happens before it
+	// even attempts to acquire storeMu) is visible by the time RefreshServer
+	// gets storeMu, RefreshServer skips its write entirely; otherwise
+	// RefreshServer's write completes and is unconditionally overwritten by
+	// InvalidateWithStore's Delete once it acquires storeMu afterward. Only
+	// these two call sites touch storeMu — GetTools, HeaderParams, and every
+	// other read never do, so it adds no contention to the hot path.
+	storeMu sync.Mutex
 }
 
 // NewToolCache creates a ToolCache that uses fetcher to retrieve tool schemas
@@ -183,22 +209,32 @@ func (tc *ToolCache) LoadFromStore(ctx context.Context) error {
 	defer tc.mu.Unlock()
 	for serverID, tools := range all {
 		// Set fetchedAt to zero so entries loaded from the DB are considered
-		// stale on first access. This ensures tools are refreshed from upstream
-		// within maxAge of startup, while still providing immediate availability
-		// for TypeScript type generation and list_servers tool counts.
+		// stale on first access, regardless of maxAge. This ensures tools are
+		// refreshed from upstream on first access after startup, while still
+		// providing immediate availability for TypeScript type generation and
+		// list_servers tool counts in the meantime.
 		//
-		// ttl and neverExpires are resolved exactly as they were before ttlMs
-		// hints existed: a DB-loaded entry carries no fetch-time CacheHint (the
-		// store persists only tools, see ToolStore.LoadAll), so it always falls
-		// back to tc.maxAge here, same as resolveTTL's no-hint branch would. The
-		// entry is stale on first access when maxAge > 0 (the production case)
-		// and fresh when maxAge == 0, unchanged from before this cacheEntry had
-		// ttl/neverExpires fields at all.
+		// neverExpires is always false here, even when tc.maxAge == 0 — this is
+		// deliberately NOT the same fallback resolveTTL's no-hint branch uses
+		// for a fetch that actually reached the upstream. ToolStore persists
+		// only []Tool (see dbToolStore.Save / ToolStore.LoadAll): a DB-loaded
+		// entry carries neither the x-mcp-header bindings a fetch would have
+		// populated in headerParams nor the CacheableResult hint that would
+		// have justified caching it at all. Marking it neverExpires would let
+		// it stand in as authoritative forever whenever maxAge == 0 — a tool
+		// annotated with x-mcp-header (MCP 2026-07-28 §4.3) would then be
+		// called without its required Mcp-Param-* mirror header, silently and
+		// permanently, since nothing would ever trigger a refetch to repopulate
+		// headerParams. Setting ttl to tc.maxAge with neverExpires forced false
+		// means isFresh() compares time.Since(zero-time) against ttl, which is
+		// always stale (zero-time is decades in the past) regardless of
+		// maxAge's value, so the very next access always refetches and
+		// replaces this placeholder with a real, fully-populated entry.
 		tc.entries[serverID] = &cacheEntry{
 			tools:        tools,
 			fetchedAt:    time.Time{},
 			ttl:          tc.maxAge,
-			neverExpires: tc.maxAge == 0,
+			neverExpires: false,
 		}
 	}
 	return nil
@@ -501,6 +537,18 @@ func (tc *ToolCache) GetAllTools() map[string][]Tool {
 // freshest information available about serverID; entryFor will re-fetch
 // under the new state the next time serverID is accessed, exactly as it
 // would after any other invalidation.
+//
+// The "neither published nor persisted" promise above only covers the
+// window this method's own generation check runs in. There is a second,
+// narrower window between that check's tc.mu.Unlock() and the store write
+// below, entirely outside tc.mu (deliberately - see tc.storeMu's own doc for
+// why this write cannot simply move inside the lock above): an
+// InvalidateWithStore for serverID that lands in that second window would
+// otherwise race its own store.Delete against this method's store write,
+// with either able to commit last. tc.storeMu plus a second, nested
+// generation check just before the write (rather than trusting the first
+// check alone) closes that window without ever holding tc.mu during I/O; see
+// tc.storeMu's own doc for the full ordering argument.
 func (tc *ToolCache) RefreshServer(ctx context.Context, serverID string) error {
 	tc.mu.RLock()
 	startGen := tc.generations[serverID]
@@ -530,7 +578,17 @@ func (tc *ToolCache) RefreshServer(ctx context.Context, serverID string) error {
 	tc.mu.Unlock()
 
 	if tc.store != nil {
-		tc.persistListing(ctx, serverID, listing)
+		tc.storeMu.Lock()
+		tc.mu.RLock()
+		stillCurrent := tc.generations[serverID] == startGen
+		tc.mu.RUnlock()
+		if stillCurrent {
+			tc.persistListing(ctx, serverID, listing)
+		} else {
+			slog.Default().LogAttrs(ctx, slog.LevelDebug, "mcp: skipping tool store write superseded by a concurrent invalidation",
+				slog.String("server_id", serverID))
+		}
+		tc.storeMu.Unlock()
 	}
 	return nil
 }
@@ -604,13 +662,22 @@ func (tc *ToolCache) Invalidate(serverID string) {
 // call is reacting to (an admin rotating a server's auth token, for example)
 // cannot re-publish that stale fetch, or persist it to tc.store, after this
 // call has already deleted both copies.
+//
+// The generation counter is bumped BEFORE this method even attempts to
+// acquire tc.storeMu, and the store delete itself runs under tc.storeMu —
+// see that field's own doc for why this ordering, combined with
+// RefreshServer's nested re-check while holding the same lock, is what
+// guarantees this call's store.Delete is never silently undone by a
+// RefreshServer that started before it.
 func (tc *ToolCache) InvalidateWithStore(ctx context.Context, serverID string) {
 	tc.mu.Lock()
 	delete(tc.entries, serverID)
 	tc.generations[serverID]++
 	tc.mu.Unlock()
 	if tc.store != nil {
+		tc.storeMu.Lock()
 		_ = tc.store.Delete(ctx, serverID) //nolint:errcheck
+		tc.storeMu.Unlock()
 	}
 }
 

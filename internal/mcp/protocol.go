@@ -53,6 +53,28 @@ const (
 	// a disagreement between the two — the body is never even inspected for
 	// this check, only the inbound header count.
 	CodeTooManyParamHeaders = -32001
+
+	// CodeParamHeaderValueTooLong indicates the caller sent a valid, otherwise
+	// forwardable Mcp-Param-{Name} header (MCP 2026-07-28 §4.3) whose value
+	// exceeds MaxParamHeaderValueLength once encoded. Before this code
+	// existed, both collectMCPParamHeaders (internal/api/admin/mcp_proxy.go)
+	// and dialect2026Client.Prepare (internal/mcp/dialect_2026_client.go)
+	// silently dropped an over-length value and let the request proceed
+	// without it — the header and the JSON-RPC body then carried different
+	// information about the same call, exactly the gap §4.3 exists to close.
+	// Both sites now reject the whole request instead, fail-closed and
+	// consistent with CodeTooManyParamHeaders' reasoning: what cannot be
+	// mirrored in full is not sent at all. The message accompanying this code
+	// carries only the limit and the value's length, never the header name or
+	// the value itself — see collectMCPParamHeaders' own doc for why.
+	//
+	// Allocated from the -32000..-32019 implementation-defined range for the
+	// same reason as CodeTooManyParamHeaders: §4.3 sets no ceiling on a
+	// mirrored value's length, so a local ceiling being exceeded has no
+	// meaning the specification itself assigns a code for, and it is not a
+	// disagreement between header and body (CodeHeaderMismatch, -32020) since
+	// the body is never inspected for this check either.
+	CodeParamHeaderValueTooLong = -32002
 )
 
 // Request is a JSON-RPC 2.0 request.

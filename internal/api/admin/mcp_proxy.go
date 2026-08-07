@@ -110,8 +110,10 @@ type mcpParamHeaderCandidate struct {
 //
 // Returns a non-nil *mcp.Error, and leaves hdr untouched, when more than
 // mcp.MaxParamHeaders headers survive validation and deduplication (rule 6
-// below). §4.3 obligates forwarding the WHOLE set of Mcp-Param-{Name}
-// headers this proxy does not itself recognize, and there is no principled
+// below), or when any single header's value is longer than
+// mcp.MaxParamHeaderValueLength (rule 3 below). §4.3 obligates forwarding
+// the WHOLE set of Mcp-Param-{Name} headers this proxy does not itself
+// recognize, and there is no principled
 // way to choose a subset once that set is too large to forward in full: any
 // subset dropped silently would make the headers Forward sends upstream
 // describe a different call than the JSON-RPC body they travel alongside,
@@ -158,11 +160,22 @@ type mcpParamHeaderCandidate struct {
 //     header on an ordinary request, which is why no candidate slice is
 //     even allocated until the first one passes this check) or not validly
 //     shaped.
-//  3. A value that mcp.ValidParamHeaderValue rejects is silently skipped,
-//     never rejects the request outright: §4.3 obligates forwarding a
-//     HEADER, not forwarding something that does not even parse as one,
-//     and this proxy has no body-derived schema to fall back on validating
-//     against (see above).
+//  3. A value longer than mcp.MaxParamHeaderValueLength
+//     (mcp.ParamHeaderValueTooLong) rejects the WHOLE request outright,
+//     mirroring rule 6 below: this proxy cannot forward the header in full,
+//     and forwarding it truncated, or omitting it and forwarding the rest,
+//     would both leave the outbound header set describing a different call
+//     than the JSON-RPC body it travels alongside (docs/mcp-v2.md review
+//     round, Fund 3) — the same reasoning rule 6 already applies to too many
+//     headers, now applied to one that is too long. This check runs before
+//     any upstream I/O, same as every other rejection in this function. A
+//     value mcp.ValidParamHeaderValue rejects for any OTHER reason (empty,
+//     or not visible ASCII) is still silently skipped, never rejects the
+//     request outright: §4.3 obligates forwarding a HEADER, not forwarding
+//     something that does not even parse as one, and this proxy has no
+//     body-derived schema to fall back on validating against (see above) —
+//     unlike a too-long value, there is no length this proxy could forward
+//     instead that would make such a value valid.
 //  4. A name that recurs, case-insensitively, anywhere in the request is
 //     dropped entirely — neither occurrence is forwarded. hdr is a plain
 //     map, so keeping whichever occurrence was visited last would depend on
@@ -201,6 +214,21 @@ func collectMCPParamHeaders(c fiber.Ctx, authHeaderName string, hdr mcp.MapHeade
 			continue
 		}
 		value := string(v)
+		// Rule 3: a value too long to mirror in full fails the whole request
+		// closed, before any of this function's other checks (dedup, the
+		// auth-header collision guard, the count limit) even run — see the
+		// function's own doc for why this is a separate condition from the
+		// silently-skipped ValidParamHeaderValue checks below. The message
+		// carries only the limit, never the header name or the value itself
+		// (see the type doc above for why).
+		if mcp.ParamHeaderValueTooLong(value) {
+			return &mcp.Error{
+				Code: mcp.CodeParamHeaderValueTooLong,
+				Message: fmt.Sprintf(
+					"Mcp-Param-* header value exceeds the limit of %d bytes",
+					mcp.MaxParamHeaderValueLength),
+			}
+		}
 		if !mcp.ValidParamHeaderValue(value) {
 			continue
 		}

@@ -1180,7 +1180,12 @@ func TestServer_EncodingFailure_ToolsList_ReturnsInternalErrorNotNotification(t 
 			t.Parallel()
 
 			s := newTestServer("voidllm", "0.1.0")
-			s.RegisterTool(brokenSchemaTool("broken"),
+			// RegisterToolUnsafe, not RegisterTool: a schema this broken can
+			// never pass RegisterTool's own x-mcp-header validation (it does
+			// not even parse as JSON), so forcing it into the registry to
+			// exercise Handle's encoding-failure fallback needs the
+			// unvalidated test-only path — see that helper's own doc.
+			s.RegisterToolUnsafe(brokenSchemaTool("broken"),
 				func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 					return mcp.TextResult("unreachable"), nil
 				})
@@ -1237,7 +1242,9 @@ func TestServer_EncodingFailure_LoggedWithoutBodyContent(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prevLogger) })
 
 	s := newTestServer("voidllm", "0.1.0")
-	s.RegisterTool(mcp.Tool{Name: "broken", InputSchema: mcp.JSONSchema(corruptSchemaMarker)},
+	// RegisterToolUnsafe, not RegisterTool — see the identical comment in
+	// TestServer_EncodingFailure_ToolsList_ReturnsInternalErrorNotNotification.
+	s.RegisterToolUnsafe(mcp.Tool{Name: "broken", InputSchema: mcp.JSONSchema(corruptSchemaMarker)},
 		func(_ context.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
 			return mcp.TextResult("unreachable"), nil
 		})

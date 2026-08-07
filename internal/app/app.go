@@ -529,7 +529,12 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// (see admin.Handler.MCPSessionRegistry's doc) so it outlives every
 	// individual *mcp.HTTPTransport — including the ad-hoc ones
 	// HandleMCPProxy builds on a transport-cache miss — for the lifetime of
-	// this process.
+	// this process. It needs no seeding call here: Record still creates an
+	// entry for any server ID it has never seen (see SessionRegistry's own
+	// doc, docs/mcp-v2.md review round Fund 5) — Reconcile's role is only to
+	// tombstone a server that has since left the active set, closing the
+	// late-Record-after-removal race, not to gate creation for one that
+	// simply has not been reconciled yet.
 	mcpSessionRegistry := mcp.NewSessionRegistry()
 
 	// Step 10: connect Redis (optional). On failure, continue without Redis.
@@ -1004,7 +1009,16 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		ListAccessibleMCPServers: cmService.ListAccessibleMCPServers,
 		SearchMCPTools:           cmService.SearchMCPTools,
 	}
-	mcp.RegisterVoidLLMTools(mcpServer, voidllmDeps)
+	// A non-nil error here means one of VoidLLM's own built-in tool schemas
+	// violates the x-mcp-header constraints RegisterTool enforces at
+	// registration time (MCP 2026-07-28 §4.3; docs/mcp-v2.md review round,
+	// Fund 6) — a VoidLLM programming error, not attacker input, that must
+	// fail startup loudly rather than start serving with that tool silently
+	// unregistered or registered without header/body validation.
+	if regErr := mcp.RegisterVoidLLMTools(mcpServer, voidllmDeps); regErr != nil {
+		redisCancel()
+		return nil, fmt.Errorf("register voidllm mcp tools: %w", regErr)
+	}
 	adminHandler.MCPServer = mcpServer
 
 	// Expose the built-in server's tools through the ToolCache so Code Mode
@@ -1023,11 +1037,16 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// /api/v1/mcp (distinct from the management server at /api/v1/mcp/voidllm).
 	if cfg.Settings.MCP.CodeMode.IsEnabled() {
 		codeModeServer := mcp.NewServer("voidllm-code-mode", apihealth.Version)
-		mcp.RegisterCodeModeTools(codeModeServer, mcp.VoidLLMDeps{
+		// See the identical RegisterVoidLLMTools check above for why a
+		// non-nil error here is fatal to startup.
+		if regErr := mcp.RegisterCodeModeTools(codeModeServer, mcp.VoidLLMDeps{
 			ExecuteCode:              voidllmDeps.ExecuteCode,
 			ListAccessibleMCPServers: voidllmDeps.ListAccessibleMCPServers,
 			SearchMCPTools:           voidllmDeps.SearchMCPTools,
-		})
+		}); regErr != nil {
+			redisCancel()
+			return nil, fmt.Errorf("register code mode mcp tools: %w", regErr)
+		}
 
 		// Inject TypeScript type declarations into the execute_code tool
 		// description so LLMs can generate correct tool calls without calling

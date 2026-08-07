@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -181,14 +182,27 @@ type VoidLLMDeps struct {
 // Caller identity is read from the request context via WithKeyIdentity; the
 // MCP transport handler is responsible for populating the context before
 // invoking Server.Handle.
-func RegisterVoidLLMTools(s *Server, deps VoidLLMDeps) {
-	s.RegisterTool(Tool{
+//
+// Returns a non-nil, errors.Join-aggregated error if ANY tool's schema
+// violates the x-mcp-header constraints RegisterTool now enforces at
+// registration time (MCP 2026-07-28 §4.3; see that method's own doc,
+// docs/mcp-v2.md review round Fund 6). None of the tools below declares an
+// x-mcp-header annotation today, so this is unreachable in practice — but a
+// non-nil return here is a VoidLLM programming error, not attacker input, and
+// callers are expected to treat it as fatal to process startup (see
+// internal/app's own wiring) rather than start serving with a tool silently
+// unregistered or, worse, registered without the header/body validation its
+// schema was supposed to require.
+func RegisterVoidLLMTools(s *Server, deps VoidLLMDeps) error {
+	var errs error
+
+	errs = errors.Join(errs, s.RegisterTool(Tool{
 		Name:        "list_models",
 		Description: "List all registered models with their metadata and current health status.",
 		InputSchema: ObjectSchema(nil),
-	}, makeListModels(deps))
+	}, makeListModels(deps)))
 
-	s.RegisterTool(Tool{
+	errs = errors.Join(errs, s.RegisterTool(Tool{
 		Name:        "get_model_health",
 		Description: "Get the current health state for a specific model or deployment. Use \"modelName/deploymentName\" to target a specific deployment within a multi-deployment model.",
 		InputSchema: ObjectSchema(map[string]SchemaProp{
@@ -197,9 +211,9 @@ func RegisterVoidLLMTools(s *Server, deps VoidLLMDeps) {
 				Description: "Canonical model name, or \"modelName/deploymentName\" for a specific deployment.",
 			},
 		}, "model"),
-	}, makeGetModelHealth(deps))
+	}, makeGetModelHealth(deps)))
 
-	s.RegisterTool(Tool{
+	errs = errors.Join(errs, s.RegisterTool(Tool{
 		Name:        "get_usage",
 		Description: "Get usage statistics for the caller's organization. Results can be filtered by time range and grouped by a dimension.",
 		InputSchema: ObjectSchema(map[string]SchemaProp{
@@ -216,15 +230,15 @@ func RegisterVoidLLMTools(s *Server, deps VoidLLMDeps) {
 				Description: "Aggregation dimension, e.g. \"model\" or \"key\".",
 			},
 		}),
-	}, makeGetUsage(deps))
+	}, makeGetUsage(deps)))
 
-	s.RegisterTool(Tool{
+	errs = errors.Join(errs, s.RegisterTool(Tool{
 		Name:        "list_keys",
 		Description: "List API keys visible to the caller. Org admins and above see all keys in the org; members see only their own keys.",
 		InputSchema: ObjectSchema(nil),
-	}, makeListKeys(deps))
+	}, makeListKeys(deps)))
 
-	s.RegisterTool(Tool{
+	errs = errors.Join(errs, s.RegisterTool(Tool{
 		Name:        "create_key",
 		Description: "Create a temporary API key in the caller's organization. The plaintext key is returned once and cannot be retrieved again.",
 		InputSchema: ObjectSchema(map[string]SchemaProp{
@@ -237,9 +251,9 @@ func RegisterVoidLLMTools(s *Server, deps VoidLLMDeps) {
 				Description: "Go duration until expiry, e.g. \"24h\" or \"168h\". Omit for no expiry.",
 			},
 		}, "name"),
-	}, makeCreateKey(deps))
+	}, makeCreateKey(deps)))
 
-	s.RegisterTool(Tool{
+	errs = errors.Join(errs, s.RegisterTool(Tool{
 		Name:        "list_deployments",
 		Description: "List the backend deployments configured for a model. Requires system_admin role.",
 		InputSchema: ObjectSchema(map[string]SchemaProp{
@@ -248,24 +262,32 @@ func RegisterVoidLLMTools(s *Server, deps VoidLLMDeps) {
 				Description: "UUID of the model whose deployments should be listed.",
 			},
 		}, "model_id"),
-	}, makeListDeployments(deps))
+	}, makeListDeployments(deps)))
+
+	return errs
 }
 
 // RegisterCodeModeTools registers the Code Mode tools (list_servers,
 // search_tools, execute_code) on the given MCP server. These tools are
-// only registered when deps.ExecuteCode is non-nil (Code Mode enabled).
-func RegisterCodeModeTools(s *Server, deps VoidLLMDeps) {
+// only registered when deps.ExecuteCode is non-nil (Code Mode enabled); it
+// returns nil in that case, having registered nothing. Otherwise it returns
+// a non-nil, errors.Join-aggregated error under the same circumstances, and
+// with the same "treat as fatal to startup" expectation, as
+// RegisterVoidLLMTools — see that function's own doc.
+func RegisterCodeModeTools(s *Server, deps VoidLLMDeps) error {
 	if deps.ExecuteCode == nil {
-		return
+		return nil
 	}
 
-	s.RegisterTool(Tool{
+	var errs error
+
+	errs = errors.Join(errs, s.RegisterTool(Tool{
 		Name:        "list_servers",
 		Description: "List MCP servers available for Code Mode execution. Shows server names, aliases, and tool counts. For tool signatures and parameter shapes, use search_tools instead.",
 		InputSchema: ObjectSchema(nil),
-	}, makeListServers(deps))
+	}, makeListServers(deps)))
 
-	s.RegisterTool(Tool{
+	errs = errors.Join(errs, s.RegisterTool(Tool{
 		Name:        "search_tools",
 		Description: "Discover tool signatures before using execute_code. Always call this first to learn parameter names, types, and return values. Returns matching tools with full TypeScript definitions including inferred return types from previous calls. Search by keyword across tool names and descriptions, or by server name via the optional \"server\" parameter. If no results are returned, no MCP servers are accessible to this caller yet — ask an admin to register or grant access. After search_tools() returns signatures, use execute_code to call them — especially if the task needs more than one tool call. Calling tools individually after searching wastes round-trips; chain them inside execute_code instead.",
 		InputSchema: ObjectSchema(map[string]SchemaProp{
@@ -278,14 +300,14 @@ func RegisterCodeModeTools(s *Server, deps VoidLLMDeps) {
 				Description: "Optional server alias to restrict search scope.",
 			},
 		}, "query"),
-	}, makeSearchTools(deps))
+	}, makeSearchTools(deps)))
 
 	// execute_code — registered with the static codeModeDescription, but at
 	// runtime the app-package toolsListHook rewrites this description on every
 	// tools/list call, appending the live "## Available Tools" TypeScript block
 	// via mcp.CodeModeDescription() + generated defs. Edits to codeModeDescription
 	// flow through automatically because the hook calls CodeModeDescription().
-	s.RegisterTool(Tool{
+	errs = errors.Join(errs, s.RegisterTool(Tool{
 		Name:        "execute_code",
 		Description: codeModeDescription,
 		InputSchema: ObjectSchema(map[string]SchemaProp{
@@ -298,7 +320,9 @@ func RegisterCodeModeTools(s *Server, deps VoidLLMDeps) {
 				Description: "Optional list of server aliases to include. Omit for all accessible servers.",
 			},
 		}, "code"),
-	}, makeExecuteCode(deps))
+	}, makeExecuteCode(deps)))
+
+	return errs
 }
 
 // makeListModels returns the handler for the list_models tool. Callers with

@@ -7,15 +7,28 @@ import (
 )
 
 // registeredTool pairs a tool's handler with server-side registration
-// options — currently only the client extensions it requires (see
-// RequireExtensions) — so Server.handleToolsCall can enforce them before the
-// handler ever runs. This is deliberately separate from Tool, which is the
-// wire-visible schema a client sees: mixing execution policy into that
-// struct would leak server-internal enforcement rules into what crosses the
-// wire.
+// options — the client extensions it requires (see RequireExtensions) and
+// its validated x-mcp-header bindings (see headerParams below) — so
+// Server.handleToolsCall can enforce both before the handler ever runs. This
+// is deliberately separate from Tool, which is the wire-visible schema a
+// client sees: mixing execution policy into that struct would leak
+// server-internal enforcement rules into what crosses the wire.
 type registeredTool struct {
 	handler  ToolHandler
 	requires []string
+	// headerParams holds tool's validated x-mcp-header bindings (MCP
+	// 2026-07-28 §4.3), computed exactly once at RegisterTool time via
+	// ToolHeaderParams rather than on every tools/call — the same
+	// once-at-registration approach the outbound path already uses (see
+	// ToolCache.HeaderParams' own doc for why re-deriving bindings per
+	// request would be wasteful on a hot path). Empty when tool's schema
+	// carries no x-mcp-header annotation at all — the common case for every
+	// tool registered today (docs/mcp-v2.md review round, Fund 6).
+	// handleToolsCall uses this to validate an inbound Mcp-Param-{Name}
+	// header against the request body per §4.5, the built-in server's own
+	// counterpart to the outbound mirroring dialect2026Client.Prepare
+	// performs.
+	headerParams []HeaderParam
 }
 
 // ToolOption configures a registeredTool at RegisterTool time.

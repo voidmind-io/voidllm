@@ -59,6 +59,10 @@ func (d *dialect2026Client) Warmup(_ context.Context, _ RoundTripper, _ *Upstrea
 // each resolvable binding onto an Mcp-Param-{Name} header (MCP 2026-07-28
 // §4.3): this is the only ClientDialect that does, since Mcp-Param-* is a
 // modern-era-only header family (see legacyClientDialect.Prepare's doc).
+// Prepare returns a non-nil error, building nothing, if any binding's
+// mirrored value is too long to forward in full (MaxParamHeaderValueLength)
+// — see the mirroring loop's own inline comment for why this is fail-closed
+// rather than a silently-skipped header.
 func (d *dialect2026Client) Prepare(req *CallRequest, _ *UpstreamState) ([]byte, MapHeader, error) {
 	raw := req.Raw
 
@@ -155,11 +159,27 @@ func (d *dialect2026Client) Prepare(req *CallRequest, _ *UpstreamState) ([]byte,
 				continue
 			}
 			encoded := EncodeHeaderValue(val)
-			if !ValidParamHeaderValue(encoded) {
-				// The one case §4.4's encoding alone does not cover: an
-				// argument whose base64-sentinel form exceeds
-				// MaxParamHeaderValueLength once encoded.
-				continue
+			// A too-long encoded value fails the WHOLE request closed,
+			// before any upstream I/O — Prepare's caller (doCall) never
+			// calls rawPost when this returns a non-nil error (see doCall's
+			// own doc). This mirrors collectMCPParamHeaders'
+			// (internal/api/admin/mcp_proxy.go) identical fail-closed
+			// treatment of the same condition on the inbound side
+			// (docs/mcp-v2.md review round, Fund 3): silently omitting this
+			// one header and sending the request anyway would let the
+			// outbound Mcp-Param-{Name} header set describe a different
+			// call than the JSON-RPC body's arguments carry. Any OTHER
+			// reason ValidParamHeaderValue might reject encoded — it cannot,
+			// in practice: EncodeHeaderValue's own output is always either
+			// unchanged visible ASCII or a base64-sentinel wrapper, both
+			// non-empty and visible ASCII by construction — is deliberately
+			// not distinguished here; length is the only failure mode this
+			// encoding can produce. The error names only the configured
+			// limit, never the property name or its value.
+			if ParamHeaderValueTooLong(encoded) {
+				return nil, nil, fmt.Errorf(
+					"dialect2026 client: x-mcp-header value exceeds the limit of %d bytes",
+					MaxParamHeaderValueLength)
 			}
 			hdr[HeaderParamPrefix+p.Name] = encoded
 		}

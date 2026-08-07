@@ -173,6 +173,28 @@ func ValidParamHeaderValue(v string) bool {
 	return v != "" && len(v) <= MaxParamHeaderValueLength && isVisibleASCIIHeaderValue(v)
 }
 
+// ParamHeaderValueTooLong reports whether v, exactly as it would appear on
+// the wire, exceeds MaxParamHeaderValueLength — the single check both
+// collectMCPParamHeaders (internal/api/admin/mcp_proxy.go) and
+// dialect2026Client.Prepare use to fail an ENTIRE request closed, rather
+// than silently omit one Mcp-Param-{Name} header, when a value cannot be
+// mirrored in full (docs/mcp-v2.md review round, Fund 3).
+//
+// This is deliberately a separate check from ValidParamHeaderValue, not a
+// reuse of its "too long" branch: a value ValidParamHeaderValue rejects for
+// any OTHER reason (empty, or not visible ASCII pre-encoding) is not
+// forwardable as a header at all, encoded or not, regardless of length — for
+// that class collectMCPParamHeaders' rule 3 and Prepare's ok-check both
+// still silently skip the one header, exactly as before this fix. Only
+// "too long to mirror in full" gets the fail-closed treatment, symmetric
+// with MaxParamHeaders' own count-limit rejection: a header this
+// intermediary cannot forward completely is not sent at all, rather than
+// sent with the JSON-RPC body it travels alongside carrying different
+// information about the same call (MCP 2026-07-28 §4.3).
+func ParamHeaderValueTooLong(v string) bool {
+	return len(v) > MaxParamHeaderValueLength
+}
+
 // EncodeHeaderValue renders v as an MCP standard request header value,
 // applying the base64 sentinel encoding (docs/mcp-v2.md §4.4) whenever v is
 // not visible ASCII or already looks like the sentinel format itself. This

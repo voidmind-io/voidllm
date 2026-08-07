@@ -392,16 +392,27 @@ func TestToolCache_LoadFromStore_MaxAgeNonZero_TriggersRefetch(t *testing.T) {
 	}
 }
 
-// TestToolCache_LoadFromStore_MaxAgeZero_NoRefetch is the maxAge=0 half of
-// the same regression guard: a DB-loaded entry is immediately fresh
-// (neverExpires), so GetTools must serve it without ever calling the
-// fetcher.
-func TestToolCache_LoadFromStore_MaxAgeZero_NoRefetch(t *testing.T) {
+// TestToolCache_LoadFromStore_MaxAgeZero_StillTriggersRefetch is the
+// maxAge=0 half of the same regression guard, and used to be named
+// TestToolCache_LoadFromStore_MaxAgeZero_NoRefetch: it asserted that a
+// DB-loaded entry was immediately fresh (neverExpires) when maxAge == 0, so
+// GetTools served it forever without ever calling the fetcher. That was the
+// bug in review FUND 1 — a DB-loaded entry carries neither headerParams nor
+// a CacheableResult hint (ToolStore persists only []Tool), so treating it as
+// neverExpires let a tool's x-mcp-header binding (MCP 2026-07-28 §4.3) go
+// missing permanently whenever tool_cache_ttl was configured as 0. A
+// DB-loaded entry must always be refetched on first access, regardless of
+// maxAge, so this test now asserts the opposite: the fetcher IS called
+// exactly once, and its result — not the DB placeholder — is what GetTools
+// returns.
+func TestToolCache_LoadFromStore_MaxAgeZero_StillTriggersRefetch(t *testing.T) {
 	t.Parallel()
 
 	store := &fakeToolStore{loadAll: map[string][]mcp.Tool{"srv": {{Name: "from_store"}}}}
+	var calls int64
 	fetcher := func(context.Context, string) (*mcp.ToolListing, error) {
-		return nil, errors.New("fetcher must not be called when maxAge is 0")
+		atomic.AddInt64(&calls, 1)
+		return &mcp.ToolListing{Tools: []mcp.Tool{{Name: "from_upstream"}}}, nil
 	}
 	cache := mcp.NewPersistentToolCache(fetcher, 0, store)
 
@@ -413,8 +424,11 @@ func TestToolCache_LoadFromStore_MaxAgeZero_NoRefetch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTools: %v", err)
 	}
-	if len(got) != 1 || got[0].Name != "from_store" {
-		t.Errorf("GetTools = %+v, want the DB-loaded entry served without any refetch", got)
+	if len(got) != 1 || got[0].Name != "from_upstream" {
+		t.Errorf("GetTools = %+v, want a refetch to have replaced the DB-loaded entry even with maxAge == 0", got)
+	}
+	if c := atomic.LoadInt64(&calls); c != 1 {
+		t.Errorf("fetcher called %d times, want 1", c)
 	}
 }
 

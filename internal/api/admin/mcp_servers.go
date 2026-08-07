@@ -1013,24 +1013,31 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 	}
 
 	// An auth- or transport-relevant change invalidates this server's cached
-	// tool listing, not only its transport (docs/mcp-v2.md Fund 9):
-	// h.refreshMCPCaches below already reloads MCPTransportCache, whose own
-	// LoadAll rebuilds the *mcp.HTTPTransport when any of these same fields
-	// changed (see mcpAuthOrTransportFieldsChanged and
-	// MCPTransportCache.LoadAll's own doc for why this exact field set). The
-	// tool cache is a SEPARATE cache, keyed by server ID alone, and was never
-	// invalidated by a plain UpdateMCPServer call before this fix — a listing
-	// fetched (and any x-mcp-header bindings mirrored from it) under the OLD
-	// credential kept deciding which tools were visible and which headers went
-	// out after the credential had already changed. InvalidateWithStore is the
-	// same mechanism DeleteMCPServer and setMCPServerActive(false) already use
-	// for the identical "this server's cached listing is no longer trustworthy"
-	// situation — reused here rather than duplicated.
+	// tool listing, not only its transport (docs/mcp-v2.md Fund 9). Order
+	// matters here (docs/mcp-v2.md review round, Fund 2 / Window A):
+	// h.refreshMCPCaches MUST run first, so MCPTransportCache.LoadAll has
+	// already rebuilt this server's *mcp.HTTPTransport under the NEW
+	// credential before the tool cache is invalidated. Invalidating first
+	// would leave a window in which a concurrent tool-cache miss can still
+	// grab the OLD transport, start its fetch AFTER this generation bump, and
+	// therefore isn't discarded by RefreshServer's generation check — it
+	// would publish a listing (and any x-mcp-header bindings mirrored from
+	// it) fetched with the credential that update just replaced. Refreshing
+	// transports first closes that window: any fetch that starts after this
+	// point, whenever it started relative to the invalidation below, uses the
+	// new transport. The tool cache is a SEPARATE cache, keyed by server ID
+	// alone, and was never invalidated by a plain UpdateMCPServer call before
+	// this fix (see mcpAuthOrTransportFieldsChanged and
+	// MCPTransportCache.LoadAll's own doc for why this exact field set).
+	// InvalidateWithStore is the same mechanism DeleteMCPServer and
+	// setMCPServerActive(false) already use for the identical "this server's
+	// cached listing is no longer trustworthy" situation — reused here rather
+	// than duplicated.
+	h.refreshMCPCaches(ctx)
+
 	if h.ToolCache != nil && mcpAuthOrTransportFieldsChanged(existing, s) {
 		h.ToolCache.InvalidateWithStore(ctx, s.ID)
 	}
-
-	h.refreshMCPCaches(ctx)
 
 	return c.JSON(mcpServerToResponse(s))
 }
@@ -1110,11 +1117,16 @@ func (h *Handler) DeleteMCPServer(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to delete MCP server")
 	}
 
+	// Refresh the transport cache before invalidating the tool cache — see
+	// UpdateMCPServer's identical ordering comment (docs/mcp-v2.md review
+	// round, Fund 2 / Window A) for why the reverse order leaves a window in
+	// which a concurrent fetch can still grab the transport this server just
+	// lost and publish a listing fetched under it after the invalidation.
+	h.refreshMCPCaches(ctx)
+
 	if h.ToolCache != nil {
 		h.ToolCache.InvalidateWithStore(ctx, existing.ID)
 	}
-
-	h.refreshMCPCaches(ctx)
 
 	return c.SendStatus(fiber.StatusNoContent)
 }
@@ -1189,6 +1201,16 @@ func (h *Handler) setMCPServerActive(c fiber.Ctx, active bool) error {
 		return apierror.InternalError(c, "failed to update MCP server")
 	}
 
+	// Refresh the transport cache before touching the tool cache — see
+	// UpdateMCPServer's identical ordering comment (docs/mcp-v2.md review
+	// round, Fund 2 / Window A). This matters most for the deactivate branch
+	// below: without this ordering, a concurrent fetch could still grab the
+	// transport MCPTransportCache.LoadAll is about to drop and publish a
+	// listing for a server that is no longer active. The activate branch's
+	// RefreshServer call runs in its own goroutine and already only starts
+	// after this line, so it always sees the just-reloaded transport too.
+	h.refreshMCPCaches(ctx)
+
 	if h.ToolCache != nil {
 		if active {
 			serverID := updated.ID
@@ -1201,8 +1223,6 @@ func (h *Handler) setMCPServerActive(c fiber.Ctx, active bool) error {
 			h.ToolCache.InvalidateWithStore(ctx, updated.ID)
 		}
 	}
-
-	h.refreshMCPCaches(ctx)
 
 	return c.JSON(mcpServerToResponse(updated))
 }

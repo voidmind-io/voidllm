@@ -109,7 +109,21 @@ const maxKeysPerOrg = 16
 // Entries are also removed proactively, not only via eviction: Reconcile
 // drops every server ID that has left the active set (deleted, or merely
 // deactivated) so its scopes and sessions do not outlive the server itself
-// for the rest of the process' life.
+// for the rest of the process' life. When Reconcile removes an entry this
+// way it also tombstones the server ID (see the removed/removedLRU fields'
+// own doc): Record refuses to recreate an entry for a tombstoned server ID,
+// so a Record call already in flight when Reconcile ran cannot resurrect the
+// very entry Reconcile just removed (docs/mcp-v2.md review round, Fund 5).
+// Record still creates an entry on demand, exactly as before, for any server
+// ID Reconcile has never removed — including a server this registry has
+// never heard of at all, e.g. the very first request against a freshly
+// started process, before Reconcile has run even once — so the ordinary
+// "grows lazily on first use" shape this type has always had is unaffected
+// outside the narrow removed-then-late-Record race this closes. Reconcile
+// itself clears a server ID's tombstone the moment that ID reappears in the
+// active set it is given, so a reactivated server's very next Record call
+// creates a genuinely fresh, empty entry rather than being permanently
+// locked out.
 //
 // Entries are looked up by serverID (the MCP server's stable database ID,
 // not its alias, which can be renamed) and a SessionScope. Record and Known
@@ -121,13 +135,43 @@ const maxKeysPerOrg = 16
 type SessionRegistry struct {
 	mu      sync.Mutex
 	servers map[string]*serverSessionRegistry
+	// removed and removedLRU remember, bounded and oldest-evicted-first, the
+	// server IDs Reconcile has most recently removed from the active set —
+	// see maxRemovedServers' own doc for the bound and Record's own doc for
+	// why this exists: a tombstoned server ID refuses a Record call instead
+	// of silently recreating the very entry Reconcile just removed.
+	removed    map[string]*list.Element
+	removedLRU *list.List // string values (server IDs); back = oldest tombstone
 }
 
 // NewSessionRegistry returns an empty *SessionRegistry, ready for concurrent
 // use.
 func NewSessionRegistry() *SessionRegistry {
-	return &SessionRegistry{servers: make(map[string]*serverSessionRegistry)}
+	return &SessionRegistry{
+		servers:    make(map[string]*serverSessionRegistry),
+		removed:    make(map[string]*list.Element),
+		removedLRU: list.New(),
+	}
 }
+
+// maxRemovedServers bounds how many recently deactivated-or-deleted server
+// IDs SessionRegistry remembers as tombstoned, so a late Record call cannot
+// resurrect one (see Record's own doc; docs/mcp-v2.md review round, Fund 5).
+// Bounded and oldest-evicted-first for the same reason every other bound in
+// this file is: an org_admin can create and deactivate/delete MCP servers at
+// will, and each one mints a fresh UUIDv7 ID that is never reused (see
+// CLAUDE.md's UUID convention), so an unbounded tombstone set would grow for
+// the lifetime of the process — and, unlike maxOrgsPerServer/maxKeysPerOrg,
+// this is driven entirely by admin mutations, not by request volume, so it
+// needs its own independent cap rather than inheriting one of theirs. Once
+// full, the oldest tombstone is evicted to make room for a new one — the
+// evicted server ID reverts to being treated as "never removed", reopening
+// the narrow, race-only resurrection window this mechanism closes for that
+// one server, but only after maxRemovedServers MORE servers have since been
+// deactivated or deleted, by which point a request racing the original
+// deactivation has long since completed or timed out — the same graceful
+// degradation every other bound in this file already provides.
+const maxRemovedServers = 4096
 
 // serverSessionRegistry is one SessionRegistry's state for a single server
 // ID: a two-level LRU — organizations at the top (bounded by
@@ -227,12 +271,33 @@ func (e *scopeSessions) known(sessionID string) bool {
 // refreshed sessionID for scope, so a later Known call for the same
 // (serverID, scope, sessionID) reports it as recognized. It is a no-op for an
 // empty sessionID or one longer than MaxSessionIDLength (see that constant's
-// doc). Safe for concurrent use.
+// doc), creating an entry for serverID on first use exactly as it always
+// has — UNLESS serverID is currently tombstoned (see r.removed's own doc),
+// in which case it is also a no-op.
+//
+// The tombstone check is what closes the race docs/mcp-v2.md review round
+// Fund 5 identified: without it, a Record call already in flight when an
+// admin deactivated or deleted serverID — Reconcile having just removed its
+// entry — would recreate that entry after the fact, indistinguishable from a
+// legitimately active server, and nothing would ever remove it again once
+// the admin reactivated serverID before the next Reconcile call (which would
+// otherwise have pruned it a second time). Because Reconcile tombstones
+// serverID in that same removal (and clears the tombstone the moment
+// serverID reappears in an active set Reconcile is given — see that
+// method's own doc), a late Record for a server still tombstoned finds
+// nothing to record into and does nothing, while a server ID Reconcile has
+// never touched at all — including the ordinary "very first request against
+// a freshly started process, before Reconcile has run even once" shape this
+// type has always supported — creates an entry exactly as before. Safe for
+// concurrent use.
 func (r *SessionRegistry) Record(serverID string, scope SessionScope, sessionID string) {
 	if sessionID == "" || len(sessionID) > MaxSessionIDLength {
 		return
 	}
-	srv := r.serverFor(serverID)
+	srv, ok := r.serverForIfNotRemoved(serverID)
+	if !ok {
+		return
+	}
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 	srv.touch(scope).record(sessionID)
@@ -286,8 +351,14 @@ func (r *SessionRegistry) Known(serverID string, scope SessionScope, sessionID s
 // not present in activeServerIDs, so a server that has been deleted, or has
 // merely left the active set (deactivated), does not keep every scope and
 // session it ever saw alive for the rest of the process' life — nothing else
-// ever shrinks r.servers itself, only the bounded LRUs one level down. It is
-// called from admin.Handler.refreshMCPCaches with the exact set
+// ever shrinks r.servers itself, only the bounded LRUs one level down. Every
+// entry removed this way is also tombstoned (see r.removed's own doc), and
+// every ID in activeServerIDs that WAS tombstoned has that tombstone
+// cleared, so a server that was deactivated and is now active again is
+// exactly as eligible for Record to create a fresh entry as a server this
+// registry has never seen at all (docs/mcp-v2.md review round, Fund 5).
+//
+// It is called from admin.Handler.refreshMCPCaches with the exact set
 // LoadAllActiveMCPServers just returned, after every MCP server mutation
 // (create, update, delete, activate/deactivate): reusing that query, rather
 // than adding a dedicated per-mutation Delete call, also prunes a server
@@ -295,10 +366,13 @@ func (r *SessionRegistry) Known(serverID string, scope SessionScope, sessionID s
 // dedicated call happened to be wired into. Pruning a merely-deactivated
 // server is deliberate, not just a side effect of reusing the query: a
 // deactivated server should not still be relaying sessions, and reactivating
-// it later simply starts it fresh — the same graceful degradation an
-// ordinary maxOrgsPerServer/maxSessionsPerScope eviction already provides
-// (see SessionRegistry's own doc). Safe for concurrent use with Record and
-// Known.
+// it later really does start it fresh — a late Record for the removed entry
+// can no longer resurrect it while the tombstone stands (Record is a no-op
+// against a tombstoned server ID), and the tombstone itself is cleared the
+// moment Reconcile sees the server active again — the same graceful
+// degradation an ordinary maxOrgsPerServer/maxSessionsPerScope eviction
+// already provides (see SessionRegistry's own doc). Safe for concurrent use
+// with Record and Known.
 func (r *SessionRegistry) Reconcile(activeServerIDs []string) {
 	keep := make(map[string]struct{}, len(activeServerIDs))
 	for _, id := range activeServerIDs {
@@ -309,24 +383,68 @@ func (r *SessionRegistry) Reconcile(activeServerIDs []string) {
 	for id := range r.servers {
 		if _, ok := keep[id]; !ok {
 			delete(r.servers, id)
+			r.tombstone(id)
 		}
+	}
+	for id := range keep {
+		r.untombstone(id)
 	}
 }
 
-// serverFor returns r's *serverSessionRegistry for serverID, creating an
-// empty one on first use. This is the only place r.mu itself is held; once a
+// tombstone marks serverID as just removed from the active set, evicting the
+// oldest tombstone first once more than maxRemovedServers would otherwise be
+// remembered (see that constant's own doc). A no-op if serverID is already
+// tombstoned — Reconcile calls this once per removed ID per call, but
+// repeated Reconcile calls across ticks would otherwise re-tombstone (and
+// therefore keep bumping to the front of removedLRU) a server that has
+// stayed inactive the whole time, which is not a "use" worth refreshing the
+// eviction order for. Callers must hold r.mu.
+func (r *SessionRegistry) tombstone(serverID string) {
+	if _, ok := r.removed[serverID]; ok {
+		return
+	}
+	if len(r.removed) >= maxRemovedServers {
+		if oldest := r.removedLRU.Back(); oldest != nil {
+			r.removedLRU.Remove(oldest)
+			delete(r.removed, oldest.Value.(string))
+		}
+	}
+	r.removed[serverID] = r.removedLRU.PushFront(serverID)
+}
+
+// untombstone clears serverID's tombstone, if it has one, so Record can
+// create a fresh entry for it again. A no-op if serverID was never
+// tombstoned — the ordinary case for the overwhelming majority of IDs
+// Reconcile is called with, since most active servers were never removed in
+// the first place. Callers must hold r.mu.
+func (r *SessionRegistry) untombstone(serverID string) {
+	if el, ok := r.removed[serverID]; ok {
+		r.removedLRU.Remove(el)
+		delete(r.removed, serverID)
+	}
+}
+
+// serverForIfNotRemoved returns r's *serverSessionRegistry for serverID,
+// creating an empty one on first use — UNLESS serverID is currently
+// tombstoned (see r.removed's own doc), in which case it returns (nil,
+// false) and creates nothing. This is Record's sole entry point into
+// r.servers; every other reader (Known) looks r.servers up directly without
+// ever creating an entry. This is the only place r.mu itself is held; once a
 // *serverSessionRegistry exists, all further access to it goes through its
 // own mu instead, so lookups against different servers never contend with
 // one another.
-func (r *SessionRegistry) serverFor(serverID string) *serverSessionRegistry {
+func (r *SessionRegistry) serverForIfNotRemoved(serverID string) (*serverSessionRegistry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, tombstoned := r.removed[serverID]; tombstoned {
+		return nil, false
+	}
 	srv, ok := r.servers[serverID]
 	if !ok {
 		srv = &serverSessionRegistry{orgLRU: list.New(), orgs: make(map[string]*list.Element)}
 		r.servers[serverID] = srv
 	}
-	return srv
+	return srv, true
 }
 
 // scopeBucket splits scope into the (orgID, apiKeyID) pair

@@ -70,6 +70,15 @@ var errEmptyAuthCredential = errors.New("auth credential is empty")
 // a persistent bidirectional connection that VoidLLM does not yet support.
 var ErrSSENotSupported = errors.New("server uses deprecated SSE transport (not supported, use Streamable HTTP)")
 
+// errToolsListDecodeFailed is wrapped, never the raw jsonx.Unmarshal error
+// itself, into ListTools' returned error when an upstream's tools/list
+// response fails to decode as JSON-RPC — see that call site's own comment
+// for why: internal/jsonx's decoder quotes a window of the source bytes
+// around a syntax error, and those bytes are upstream-controlled response
+// content this repo's zero-knowledge logging contract must never let reach
+// a log line via err.Error().
+var errToolsListDecodeFailed = errors.New("mcp: tools/list response decode failed")
+
 // cloudMetadataIP is the well-known link-local address used by cloud provider
 // instance metadata services (AWS, GCP, Azure, DigitalOcean, etc.).
 var cloudMetadataIP = net.ParseIP("169.254.169.254")
@@ -1456,7 +1465,17 @@ func (t *HTTPTransport) ListTools(ctx context.Context) (*ToolListing, error) {
 		Error *Error `json:"error"`
 	}
 	if err := jsonx.Unmarshal(result.Body, &rpcResp); err != nil {
-		return nil, fmt.Errorf("decode tools/list response: %w", err)
+		// err's own message is deliberately never embedded here: this
+		// package's JSON decoder (internal/jsonx, backed by sonic) reports a
+		// syntax error by quoting a window of the SOURCE bytes around the
+		// failure position — an upstream that returns deliberately malformed
+		// JSON with embedded content would otherwise put those bytes into
+		// whatever log line a caller builds from err.Error() (docs/mcp-v2.md
+		// review round, Fund 4; the same class ToolHeaderParams' own decode
+		// error already closed — see that function's identical comment). The
+		// fixed message plus errToolsListDecodeFailed is diagnosis enough:
+		// this response did not even parse as the expected JSON-RPC shape.
+		return nil, fmt.Errorf("%w: tools/list response is not valid JSON-RPC", errToolsListDecodeFailed)
 	}
 	if rpcResp.Error != nil {
 		// rpcResp.Error.Message is upstream-controlled, free-form text — never

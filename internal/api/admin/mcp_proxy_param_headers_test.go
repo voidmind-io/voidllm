@@ -85,18 +85,20 @@ func TestCollectMCPParamHeaders_PassedThroughUnmodified(t *testing.T) {
 
 // ---- 2. Invalid names/values never reach upstream, request still succeeds --
 
-// TestCollectMCPParamHeaders_InvalidRejectedButRequestSucceeds verifies both
-// halves of collectMCPParamHeaders' rules 2/3 together: an invalid
-// Mcp-Param-{Name} header is silently dropped (never reaches the upstream),
-// AND the request is answered normally (HTTP 200), not with an error status.
-// The second half is the one that actually matters: without
-// ValidParamHeaderValue's length check gating what collectMCPParamHeaders
-// puts into hdr, an over-length value would still be handed to Forward's
-// req.Header.Set — which itself would not error, but a caller could smuggle
-// arbitrarily large header state through an intermediary that is supposed to
-// bound it. A valid header sent alongside the invalid one in the same
-// request proves the rejection is scoped to the one bad header, not the
-// whole family.
+// TestCollectMCPParamHeaders_InvalidRejectedButRequestSucceeds verifies
+// collectMCPParamHeaders' rule 2 (and the surviving, non-length half of rule
+// 3): an invalid Mcp-Param-{Name} header NAME, or a value that is empty or
+// not visible ASCII, is silently dropped (never reaches the upstream), AND
+// the request is answered normally (HTTP 200), not with an error status. A
+// value over MaxParamHeaderValueLength is deliberately NOT covered here any
+// more — see TestCollectMCPParamHeaders_ValueTooLong_Rejected, which used to
+// be a case in this very table asserting the opposite (HTTP 200, silent
+// drop) until docs/mcp-v2.md review round Fund 3 made that the bug: a value
+// this proxy cannot forward in full must fail the whole request closed, the
+// same way too many headers already did, rather than silently omit it and
+// let the header set disagree with the JSON-RPC body it travels alongside.
+// A valid header sent alongside the invalid one in the same request proves
+// the rejection is scoped to the one bad header, not the whole family.
 func TestCollectMCPParamHeaders_InvalidRejectedButRequestSucceeds(t *testing.T) {
 	t.Parallel()
 
@@ -111,12 +113,6 @@ func TestCollectMCPParamHeaders_InvalidRejectedButRequestSucceeds(t *testing.T) 
 			invalidName:    "Mcp-Param-",
 			invalidValue:   "should-never-arrive",
 			wantAbsentName: "Mcp-Param-",
-		},
-		{
-			name:           "a value over MaxParamHeaderValueLength is rejected",
-			invalidName:    "Mcp-Param-Toolong",
-			invalidValue:   strings.Repeat("a", mcp.MaxParamHeaderValueLength+1),
-			wantAbsentName: "Mcp-Param-Toolong",
 		},
 	}
 
@@ -172,6 +168,79 @@ func TestCollectMCPParamHeaders_InvalidRejectedButRequestSucceeds(t *testing.T) 
 				t.Errorf("upstream Mcp-Param-Valid = %q, want %q (a valid header sent alongside the invalid one must still be forwarded)", gotValid, "still-works")
 			}
 		})
+	}
+}
+
+// ---- 2b. A too-long value rejects the whole request, like too many headers -
+
+// TestCollectMCPParamHeaders_ValueTooLong_Rejected REPLACES the
+// "a value over MaxParamHeaderValueLength is rejected" case that used to
+// live in TestCollectMCPParamHeaders_InvalidRejectedButRequestSucceeds'
+// table, where it asserted HTTP 200 and a silent drop. docs/mcp-v2.md review
+// round Fund 3 identified that as the bug: a value too long to mirror in
+// full left the outbound Mcp-Param-* header set silently missing information
+// the JSON-RPC body's arguments still carried, while the sibling "too many
+// headers" case already failed the whole request closed for the identical
+// underlying problem (unable to forward in full). This test asserts the
+// corrected, fail-closed behavior instead, mirroring
+// TestCollectMCPParamHeaders_TooMany_Rejected's shape: HTTP 400, a JSON-RPC
+// mcp.CodeParamHeaderValueTooLong error, the upstream never contacted at
+// all, and an error message that names only the configured limit — never
+// the header name or any fragment of the oversized value.
+func TestCollectMCPParamHeaders_ValueTooLong_Rejected(t *testing.T) {
+	t.Parallel()
+
+	const sentinelValue = "should-never-leak-into-the-error-message"
+	overLong := sentinelValue + strings.Repeat("a", mcp.MaxParamHeaderValueLength)
+
+	var mu sync.Mutex
+	var upstreamCalled bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		upstreamCalled = true
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	dsn := "file:TestCollectMCPParamHeaders_ValueTooLong_Rejected?mode=memory&cache=private"
+	app, database, keyCache := setupMCPProxyApp(t, dsn)
+	org := mustCreateTestOrg(t, database, "param-hdr-toolong")
+	key := addMCPTestKey(t, keyCache, org.ID)
+
+	const alias = "param-toolong-server"
+	s := createExternalMCPServer(t, database, alias, upstream.URL)
+	if err := database.SetOrgMCPAccess(context.Background(), org.ID, []string{s}); err != nil {
+		t.Fatalf("SetOrgMCPAccess: %v", err)
+	}
+
+	resp := proxyPostWithHeaders(t, app, alias, key,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
+		map[string]string{"Mcp-Param-Toolong": overLong})
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != fiber.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", resp.StatusCode, raw)
+	}
+
+	mu.Lock()
+	called := upstreamCalled
+	mu.Unlock()
+	if called {
+		t.Error("upstream was called, want the request rejected at VoidLLM's own edge before any upstream call")
+	}
+
+	mcpResp := decodeMCPErrorBody(t, io.NopCloser(bytes.NewReader(raw)))
+	if mcpResp.Error == nil {
+		t.Fatal("expected JSON-RPC error, got nil")
+	}
+	if mcpResp.Error.Code != mcp.CodeParamHeaderValueTooLong {
+		t.Errorf("Error.Code = %d, want %d (CodeParamHeaderValueTooLong)", mcpResp.Error.Code, mcp.CodeParamHeaderValueTooLong)
+	}
+	if strings.Contains(mcpResp.Error.Message, "Toolong") || strings.Contains(mcpResp.Error.Message, sentinelValue) {
+		t.Errorf("Error.Message %q leaks the header name or value, want only the configured limit", mcpResp.Error.Message)
 	}
 }
 

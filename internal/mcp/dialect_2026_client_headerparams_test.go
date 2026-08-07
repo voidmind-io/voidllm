@@ -217,3 +217,48 @@ func TestDialect2026Client_Prepare_HeaderParams_OnlyForToolsCall(t *testing.T) {
 		}
 	}
 }
+
+// ---- A too-long value fails the whole request closed -----------------------
+
+// TestDialect2026Client_Prepare_HeaderParams_ValueTooLong_ErrorsClosed
+// verifies docs/mcp-v2.md review round Fund 3's fix on the client-issuing
+// side of collectMCPParamHeaders' identical fail-closed rule
+// (internal/api/admin/mcp_proxy.go): a bound argument whose encoded form
+// exceeds mcp.MaxParamHeaderValueLength must fail Prepare entirely — nil
+// body, nil headers, non-nil error — rather than silently omit the one
+// Mcp-Param-{Name} header and let the request go out with a header set that
+// disagrees with the JSON-RPC body's arguments. doCall
+// (internal/mcp/http_transport.go) never calls rawPost when Prepare returns
+// an error, so this also proves the failure happens before any upstream I/O.
+// The error text is checked to exclude both the property name and the
+// oversized value itself.
+func TestDialect2026Client_Prepare_HeaderParams_ValueTooLong_ErrorsClosed(t *testing.T) {
+	t.Parallel()
+
+	d := mcp.NewDialect2026Client(mcp.V20260728, mcp.ClientInfo{})
+	param := mcp.HeaderParam{Name: "Region", Path: []string{"region"}, Kind: mcp.HeaderParamKindString}
+
+	const sentinelValue = "should-never-leak-into-the-error-message"
+	overLong := sentinelValue + strings.Repeat("a", mcp.MaxParamHeaderValueLength)
+
+	argsJSON, err := json.Marshal(map[string]string{"region": overLong})
+	if err != nil {
+		t.Fatalf("marshal test arguments: %v", err)
+	}
+	raw := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lookup","arguments":` + string(argsJSON) + `}}`)
+
+	body, hdr, prepErr := d.Prepare(&mcp.CallRequest{Raw: raw, HeaderParams: []mcp.HeaderParam{param}}, &mcp.UpstreamState{})
+	if prepErr == nil {
+		t.Fatal("Prepare() error = nil, want a fail-closed error for an over-length x-mcp-header value")
+	}
+	if body != nil {
+		t.Errorf("Prepare() body = %v, want nil on a fail-closed error", body)
+	}
+	if hdr != nil {
+		t.Errorf("Prepare() hdr = %v, want nil on a fail-closed error", hdr)
+	}
+	msg := prepErr.Error()
+	if strings.Contains(msg, "Region") || strings.Contains(msg, sentinelValue) {
+		t.Errorf("Prepare() error = %q, leaks the property name or value, want only the configured limit", msg)
+	}
+}

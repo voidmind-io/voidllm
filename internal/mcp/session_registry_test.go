@@ -770,13 +770,21 @@ func TestSessionRegistry_Reconcile_KeepsActiveServer(t *testing.T) {
 	}
 }
 
-// TestSessionRegistry_Reconcile_EmptySet_ClearsEverythingButStaysUsable
-// verifies Reconcile(nil) — the "no server is active" case (e.g. every MCP
-// server has been deleted or deactivated) — prunes every server this
-// registry ever held, and that the registry remains fully usable afterward:
-// a fresh Record/Known cycle against a server ID that was JUST pruned works
-// exactly as it would on a brand new registry.
-func TestSessionRegistry_Reconcile_EmptySet_ClearsEverythingButStaysUsable(t *testing.T) {
+// TestSessionRegistry_Reconcile_EmptySet_ClearsEverythingAndTombstonesIt
+// REPLACES TestSessionRegistry_Reconcile_EmptySet_ClearsEverythingButStaysUsable,
+// which asserted that a fresh Record/Known cycle against a server ID
+// immediately after Reconcile(nil) just pruned it worked exactly as it would
+// on a brand new registry. docs/mcp-v2.md review round Fund 5 is precisely
+// why that is no longer true: Reconcile now tombstones every ID it removes
+// (see that method's own doc), and Record refuses to recreate an entry for a
+// tombstoned ID (see Record's own doc) — a late Record for the very server
+// Reconcile(nil) just excluded must NOT revive it, exactly the same
+// property TestSessionRegistry_Reconcile_LateRecordCannotReviveRemovedServer
+// checks for a non-empty active set. This test now asserts that instead, and
+// separately proves the registry as a WHOLE stays usable — a server ID
+// Reconcile(nil) never even knew about (as opposed to one it just pruned)
+// still records and looks up normally on the same registry.
+func TestSessionRegistry_Reconcile_EmptySet_ClearsEverythingAndTombstonesIt(t *testing.T) {
 	t.Parallel()
 
 	reg := mcp.NewSessionRegistry()
@@ -791,33 +799,51 @@ func TestSessionRegistry_Reconcile_EmptySet_ClearsEverythingButStaysUsable(t *te
 		t.Error("session still known after Reconcile(nil), want everything pruned")
 	}
 
+	// The just-pruned server ID is now tombstoned: a Record call against it
+	// must be a no-op, not a silent revival.
+	reg.Record(serverID, scope, sid)
+	if reg.Known(serverID, scope, sid) {
+		t.Error("session known after Record on a server ID Reconcile(nil) just tombstoned, want it refused")
+	}
+
+	// The registry as a whole is still usable: a DIFFERENT, never-tombstoned
+	// server ID records and looks up exactly as it would on a brand new
+	// registry.
+	const otherServerID = "server-2"
+	reg.Record(otherServerID, scope, sid)
+	if !reg.Known(otherServerID, scope, sid) {
+		t.Error("Record/Known do not work for a fresh server ID after Reconcile(nil), want the registry to stay fully usable")
+	}
+
+	// Reconciling serverID back into the active set clears its tombstone, so
+	// it too becomes recordable again — proving the tombstone is not
+	// permanent, only in effect until the server is seen active again.
+	reg.Reconcile([]string{serverID})
 	reg.Record(serverID, scope, sid)
 	if !reg.Known(serverID, scope, sid) {
-		t.Error("Record/Known no longer work on serverID after Reconcile(nil), want the registry to stay fully usable")
+		t.Error("session not known after Record following Reconcile bringing serverID back into the active set, " +
+			"want the tombstone cleared")
 	}
 }
 
-// TestSessionRegistry_Reconcile_LateRecordRevivesRemovedServer_NextReconcileRemovesItAgain
-// documents and locks in ACCEPTED, KNOWN behavior — not a bug still open:
-// Record (via serverFor) unconditionally recreates a server's entry, so a
-// Record call that was already in flight when Reconcile ran (e.g. a proxied
-// request whose response, carrying a fresh Mcp-Session-Id, is still being
-// processed by HandleMCPProxy at the moment an admin deletes or deactivates
-// that same server) can re-insert the very entry Reconcile just removed. That
-// race is not closed here, and is not this test's concern.
+// TestSessionRegistry_Reconcile_LateRecordCannotReviveRemovedServer REPLACES
+// TestSessionRegistry_Reconcile_LateRecordRevivesRemovedServer_NextReconcileRemovesItAgain,
+// which used to document and lock in the OPPOSITE of what this test asserts:
+// that Record (via serverFor, unconditionally) recreated a removed server's
+// entry, and merely relied on the periodic 30-second Reconcile backstop to
+// remove it again on its next tick. docs/mcp-v2.md review round Fund 5
+// identified the actual bug that framing was accepting: if an admin
+// reactivated the server before that next tick ever landed, no Reconcile
+// call would exclude the server again, so the revived entry — carrying a
+// session from before the deactivation — would survive forever, silently
+// contradicting this type's own "reactivating later starts it fresh" doc.
 //
-// What this test locks in is the property the periodic 30-second Reconcile
-// backstop in internal/app.Application.Start relies on to make that race
-// self-healing rather than permanent: a revived entry is not "stuck" — the
-// NEXT Reconcile call that still excludes the server's ID removes it again,
-// exactly as if the late Record had never happened. Without this property,
-// adding a periodic Reconcile call would not actually bound how long a
-// deleted/deactivated server's sessions stay reachable; a revived entry could
-// survive every subsequent tick forever. internal/app has no test harness
-// that constructs a real *Application to drive that ticker directly (Start
-// wires it inline against a fully constructed application), so this test
-// exercises the registry-level property in isolation instead.
-func TestSessionRegistry_Reconcile_LateRecordRevivesRemovedServer_NextReconcileRemovesItAgain(t *testing.T) {
+// The fix (see SessionRegistry.Reconcile's and Record's own docs) tombstones
+// a server ID the moment Reconcile removes it, and Record now refuses to
+// recreate an entry for a tombstoned ID — so the late Record in this exact
+// scenario no longer revives anything, and there is nothing left for a
+// second Reconcile call to have to clean up.
+func TestSessionRegistry_Reconcile_LateRecordCannotReviveRemovedServer(t *testing.T) {
 	t.Parallel()
 
 	reg := mcp.NewSessionRegistry()
@@ -833,34 +859,32 @@ func TestSessionRegistry_Reconcile_LateRecordRevivesRemovedServer_NextReconcileR
 	}
 
 	// The server leaves the active set (deleted or deactivated) — Reconcile
-	// removes it.
+	// removes it and tombstones its ID.
 	reg.Reconcile([]string{"some-other-server"})
 	if reg.Known(serverID, scope, sid) {
-		t.Fatal("session still known after the first Reconcile, test setup is broken")
+		t.Fatal("session still known after Reconcile, test setup is broken")
 	}
 
 	// A Record call that started before the deletion — e.g. HandleMCPProxy
-	// still processing an in-flight response — returns late and re-inserts
-	// the server's entry. This is the "late Record revives a removed server"
-	// scenario itself: proven here as a precondition, not as this test's
-	// point.
+	// still processing an in-flight response — returns late. The property
+	// under test: this must NOT revive the entry, because serverID is
+	// tombstoned.
 	reg.Record(serverID, scope, sid)
-	if !reg.Known(serverID, scope, sid) {
-		t.Fatal("a late Record after Reconcile did not revive the entry — test setup is broken " +
-			"(this precondition is what the periodic Reconcile backstop exists to correct for)")
+	if reg.Known(serverID, scope, sid) {
+		t.Error("session known after a late Record following Reconcile, want the tombstoned server ID to " +
+			"refuse the Record entirely — a late-returning proxied response must never resurrect a server " +
+			"an admin has already deactivated or deleted")
 	}
 
-	// The property under test: the periodic backstop's NEXT tick — another
-	// Reconcile still excluding serverID — catches the revived entry and
-	// removes it again, exactly as it did the first time. If this failed, a
-	// revived entry would survive every subsequent Reconcile call forever,
-	// and adding a periodic call to Reconcile would not actually bound
-	// anything.
-	reg.Reconcile([]string{"some-other-server"})
-	if reg.Known(serverID, scope, sid) {
-		t.Error("session still known after the SECOND Reconcile, want the revived entry removed again — a " +
-			"repeated Reconcile must catch a late-Record revival, which is the property the periodic ticker " +
-			"backstop in internal/app depends on")
+	// Reactivating the server clears its tombstone, so the NEXT Record call
+	// creates a genuinely fresh entry — proving the server really does "start
+	// fresh" on reactivation, not merely "start fresh unless a late Record
+	// got there first" (the property the old, now-inverted test settled for).
+	reg.Reconcile([]string{serverID})
+	reg.Record(serverID, scope, sid)
+	if !reg.Known(serverID, scope, sid) {
+		t.Error("session not known after Record following reactivation, want a reactivated server ID to accept " +
+			"Record again exactly as a never-before-seen one would")
 	}
 }
 

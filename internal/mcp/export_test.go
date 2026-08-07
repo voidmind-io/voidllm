@@ -254,6 +254,31 @@ func (tc *ToolCache) ResolveTTL(hint CacheHint) (ttl time.Duration, neverExpires
 	return tc.resolveTTL(hint)
 }
 
+// MaxHeaderParamNameInError exposes maxHeaderParamNameInError so tests can
+// assert the exact bound truncateForError enforces — reused by server.go's
+// dispatchLegacy/dispatchModern/handleToolsCall for method-name and
+// tool-name error text (docs/mcp-v2.md review round, Fund 7) — instead of
+// duplicating the literal and risking silent drift if the constant is ever
+// tuned.
+const MaxHeaderParamNameInError = maxHeaderParamNameInError
+
+// RegisterToolUnsafe registers tool on s exactly like the exported
+// RegisterTool, but WITHOUT the x-mcp-header schema validation that method
+// now performs at registration time (ToolHeaderParams; see RegisterTool's
+// own doc, docs/mcp-v2.md review round Fund 6). It exists purely so
+// TestServer_EncodingFailure_* can still force a genuinely malformed schema
+// into the registry, to exercise Handle's encoding-failure fallback path —
+// something the production RegisterTool now refuses to register at all,
+// since a schema that fails to even parse as JSON can never satisfy §4.3's
+// constraints either (see ToolHeaderParams' own doc). Production code must
+// never call this: it is reachable only from the mcp_test package.
+func (s *Server) RegisterToolUnsafe(tool Tool, handler ToolHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tools = append(s.tools, tool)
+	s.handlers[tool.Name] = registeredTool{handler: handler}
+}
+
 // ScopedStateCount returns the number of distinct SessionScope entries the
 // currently resolved *eraBinding has ever created a scopedState for (see
 // eraBinding.stateFor), for testing that EraModern's Call genuinely skips
