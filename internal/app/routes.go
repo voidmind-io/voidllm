@@ -108,8 +108,8 @@ func tunnelStreamBudget(writeTimeout time.Duration) time.Duration {
 //
 // The request path is rewritten from "/api/v1/playground/<rest>" to
 // "/v1/<rest>" before delegating, so that ProxyHandler.Handle derives the
-// same upstream path it would for a direct /v1/<rest> request (see
-// handler.go: upstreamPath := path.Clean(strings.TrimPrefix(c.Path(), "/v1/"))).
+// same upstream path it would for a direct /v1/<rest> request (Handle strips
+// a leading "/v1/" or "/v2/" from the request path to get the upstream path).
 // The handler's own isAllowedPath check still gates which upstream endpoints
 // are reachable through the tunnel — it is not bypassed or duplicated here.
 //
@@ -198,6 +198,16 @@ func (a *Application) setupRoutes() {
 	// It must be registered BEFORE the catch-all to take precedence.
 	a.proxyApp.Get("/v1/models", auth.Middleware(a.keyCache, a.hmacSecret), a.proxyHandler.ModelsHandler)
 	a.proxyApp.All("/v1/*", auth.Middleware(a.keyCache, a.hmacSecret), a.proxyHandler.Handle)
+
+	// /v2 is a true alias of /v1: same auth, same handler, same upstream-path
+	// allowlist, so any endpoint reachable under /v1/ (e.g. rerank) is
+	// reachable under /v2/ too, for clients written against a versioned API
+	// convention. GET /v2/models must be registered BEFORE the catch-all,
+	// exactly mirroring /v1/models, or an unmatched GET /v2/models would fall
+	// through to the catch-all and be treated as a proxy request instead of
+	// the local model list.
+	a.proxyApp.Get("/v2/models", auth.Middleware(a.keyCache, a.hmacSecret), a.proxyHandler.ModelsHandler)
+	a.proxyApp.All("/v2/*", auth.Middleware(a.keyCache, a.hmacSecret), a.proxyHandler.Handle)
 
 	adminPort := a.cfg.Server.Admin.Port
 

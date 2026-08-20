@@ -1023,7 +1023,22 @@ func (p *ProxyHandler) resolveModel(c fiber.Ctx, keyInfo *auth.KeyInfo, modelNam
 // a cancel function for its context, the adapter (needed later for response
 // transformation), or an API error response and error for Handle to propagate.
 func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byte, envelope requestEnvelope) (*http.Request, context.CancelFunc, Adapter, error) {
-	upstreamPath := path.Clean(strings.TrimPrefix(c.Path(), "/v1/"))
+	// The API version prefix is stripped to get the upstream path. "/v1/"
+	// and "/v2/" are checked as alternatives, never chained one after the
+	// other — chaining would let a crafted double-prefixed path like
+	// "/v1//v2/x" strip through both and reach an upstream path its caller
+	// never asked for. Only one version prefix is ever stripped per request.
+	reqPath := c.Path()
+	var trimmed string
+	switch {
+	case strings.HasPrefix(reqPath, "/v1/"):
+		trimmed = strings.TrimPrefix(reqPath, "/v1/")
+	case strings.HasPrefix(reqPath, "/v2/"):
+		trimmed = strings.TrimPrefix(reqPath, "/v2/")
+	default:
+		trimmed = reqPath
+	}
+	upstreamPath := path.Clean(trimmed)
 
 	if !isAllowedPath(upstreamPath) {
 		if err := apierror.Send(c, fiber.StatusBadRequest,
@@ -2248,7 +2263,7 @@ func isAzureAdapter(a Adapter) bool {
 // only for paths that have legitimate sub-routes (images/, audio/, models/).
 func isAllowedPath(p string) bool {
 	switch p {
-	case "chat/completions", "completions", "embeddings", "models":
+	case "chat/completions", "completions", "embeddings", "models", "rerank", "score":
 		return true
 	}
 	return strings.HasPrefix(p, "images/") ||

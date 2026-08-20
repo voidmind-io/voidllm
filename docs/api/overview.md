@@ -18,7 +18,7 @@ Authorization: Bearer vl_uk_...
 
 Key types: `vl_uk_` (user), `vl_tk_` (team), `vl_sa_` (service account), `vl_sk_` (session).
 
-## Proxy API (`/v1/*`)
+## Proxy API (`/v1/*`, also available under `/v2/*`)
 
 The proxy forwards requests to upstream LLM providers. Any OpenAI-compatible endpoint works:
 
@@ -30,7 +30,13 @@ The proxy forwards requests to upstream LLM providers. Any OpenAI-compatible end
 | `POST /v1/images/generations` | Image generation |
 | `POST /v1/audio/transcriptions` | Audio transcription |
 | `POST /v1/audio/speech` | Text to speech |
+| `POST /v1/rerank` | Rerank documents by relevance to a query |
+| `POST /v1/score` | Score document relevance to a query |
 | `GET /v1/models` | List available models |
+
+Every endpoint above is also reachable under `/v2/` (e.g. `POST /v2/rerank`), for clients
+written against a versioned API convention such as Cohere's current API. `/v2/` is a true
+alias of `/v1/`: same auth, same endpoints, same behavior.
 
 VoidLLM does not validate request bodies beyond extracting the `model` field. The upstream provider handles validation.
 

@@ -2,6 +2,13 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [Unreleased]
+
+### Features
+- The proxy now forwards rerank and score requests to upstream providers that support them. Every proxy endpoint, including these two, is also reachable under a `/v2/` path alias alongside the existing `/v1/` path, for clients written against a versioned API convention such as Cohere's current API (#196)
+
+---
+
 ## [0.0.25] - 2026-07-26
 
 ### Features

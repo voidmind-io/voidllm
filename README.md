@@ -130,7 +130,7 @@ Any OpenAI-compatible SDK works out of the box - just change the base URL to you
 
 | Feature | Details |
 |---|---|
-| OpenAI-compatible proxy | `/v1/chat/completions`, embeddings, images, audio, streaming |
+| OpenAI-compatible proxy | `/v1/chat/completions`, embeddings, images, audio, rerank, score, streaming (also available under `/v2/`) |
 | Multi-provider routing | OpenAI, Anthropic, Azure, Ollama, vLLM, any custom endpoint |
 | Load balancing | Round-robin, least-latency, weighted, priority across deployments |
 | Automatic failover | Retry on 5xx/timeout, circuit breakers, health-aware routing |
