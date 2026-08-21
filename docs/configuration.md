@@ -23,9 +23,12 @@ server:
   proxy:
     port: 8080              # Proxy port — LLM clients connect here
     read_timeout: 30s
-    write_timeout: 120s     # High for streaming responses
+    write_timeout: 120s     # Absolute response write deadline; raise for longer streams
     idle_timeout: 60s
     drain_timeout: 25s      # Graceful shutdown drain window (5s–120s)
+    # Hard cap on a single streaming response, used when the model sets no
+    # timeout of its own. Default 5m; accepted range 10s–1h inclusive.
+    max_stream_duration: 5m
 
   # Optional: separate admin port for UI + Admin API
   admin:
@@ -35,6 +38,34 @@ server:
       cert: /certs/tls.crt
       key: /certs/tls.key
 ```
+
+**Streaming and timeouts.** Several independent settings can end a streaming response, and
+whichever is reached first wins.
+
+`max_stream_duration` is a hard wall-clock cap on a single streaming response, measured from
+when VoidLLM begins streaming the upstream response to the client. It is not reset by
+activity: a stream still producing tokens is aborted once the cap is reached. When it fires,
+VoidLLM cancels the upstream request and logs `stream timeout exceeded, aborting upstream
+connection`. Depending on the provider, the upstream's own logs may then show only a client
+cancellation, or no error at all, which can make the cutoff look like a model failure.
+
+A per-model `timeout` **replaces** this global value rather than combining with it. A model
+with `timeout: 30s` is capped at 30 seconds even when `max_stream_duration` is an hour, and a
+model with `timeout: 10m` streams for ten minutes despite a 5m global cap.
+
+`write_timeout` is a separate absolute deadline on writing the response, and it is likewise
+not refreshed by streaming activity, so it can truncate a stream on its own. Raising it does
+not extend a stream beyond the effective duration cap, and raising that cap does not help
+while `write_timeout` is shorter, so a long stream needs both to be large enough.
+
+`idle_timeout` governs idle keep-alive connections, not the duration of an active streaming
+response.
+
+Reasoning-heavy models and long agentic completions can exceed the 5m default. When serving
+them, raise `max_stream_duration` (or set a per-model `timeout`) together with `write_timeout`.
+Requests issued through the admin UI's playground are tunneled in-process, and they may be
+capped slightly below the hosting server's `write_timeout` no matter how the settings above
+are configured.
 
 ## Database
 
@@ -68,7 +99,9 @@ models:
     provider: ollama              # openai, anthropic, azure, vllm, ollama, custom
     base_url: http://localhost:11434/v1
     api_key: ${OLLAMA_KEY}        # Optional, depends on provider
-    timeout: 30s                  # Per-model upstream timeout (default: 5min)
+    # timeout: 10m                # Optional. Replaces server.proxy.max_stream_duration
+                                  # for this model, for both streaming and non-streaming
+                                  # requests. Omit to use the global cap.
     aliases:                      # Alternative names clients can use
       - dolphin
       - default
