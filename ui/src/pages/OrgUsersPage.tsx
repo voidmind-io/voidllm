@@ -20,6 +20,7 @@ import {
 import { useUser } from '../hooks/useUsers'
 import { useCreateInvite } from '../hooks/useInvites'
 import { useToast } from '../hooks/useToast'
+import { parseLimitInput } from '../lib/utils'
 
 // ---------------------------------------------------------------------------
 // Role constants
@@ -46,6 +47,39 @@ function roleLabel(role: string): string {
 
 function isAdminRole(role: string): boolean {
   return role === 'org_admin' || role === 'system_admin'
+}
+
+// ---------------------------------------------------------------------------
+// Limit helpers
+// ---------------------------------------------------------------------------
+
+function formatCompact(n: number): string {
+  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(n)
+}
+
+function formatLimitsSummary(m: OrgMembershipResponse): string {
+  const parts: string[] = []
+  if (m.requests_per_minute > 0) parts.push(`${formatCompact(m.requests_per_minute)} rpm`)
+  if (m.requests_per_day > 0) parts.push(`${formatCompact(m.requests_per_day)} req/day`)
+  if (m.daily_token_limit > 0) parts.push(`${formatCompact(m.daily_token_limit)} tok/day`)
+  if (m.monthly_token_limit > 0) parts.push(`${formatCompact(m.monthly_token_limit)} tok/mo`)
+  return parts.length > 0 ? parts.join(' · ') : 'Unlimited'
+}
+
+interface LimitsFormState {
+  dailyTokenLimit: string
+  monthlyTokenLimit: string
+  requestsPerMinute: string
+  requestsPerDay: string
+}
+
+function limitsFormFromMember(m: OrgMembershipResponse): LimitsFormState {
+  return {
+    dailyTokenLimit: m.daily_token_limit > 0 ? String(m.daily_token_limit) : '',
+    monthlyTokenLimit: m.monthly_token_limit > 0 ? String(m.monthly_token_limit) : '',
+    requestsPerMinute: m.requests_per_minute > 0 ? String(m.requests_per_minute) : '',
+    requestsPerDay: m.requests_per_day > 0 ? String(m.requests_per_day) : '',
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +271,145 @@ function InviteUserDialog({ open, onClose, orgId }: InviteUserDialogProps) {
 }
 
 // ---------------------------------------------------------------------------
+// EditLimitsDialog
+// ---------------------------------------------------------------------------
+
+interface EditLimitsDialogProps {
+  member: OrgMembershipResponse
+  onClose: () => void
+  orgId: string
+}
+
+function EditLimitsDialog({ member, onClose, orgId }: EditLimitsDialogProps) {
+  const [form, setForm] = useState<LimitsFormState>(() => limitsFormFromMember(member))
+  const updateMember = useUpdateOrgMember(orgId)
+  const { toast } = useToast()
+
+  function patch(field: keyof LimitsFormState) {
+    return (e: React.ChangeEvent<HTMLInputElement>) =>
+      setForm((prev) => ({ ...prev, [field]: e.target.value }))
+  }
+
+  const dailyTokenLimit = parseLimitInput(form.dailyTokenLimit)
+  const monthlyTokenLimit = parseLimitInput(form.monthlyTokenLimit)
+  const requestsPerMinute = parseLimitInput(form.requestsPerMinute)
+  const requestsPerDay = parseLimitInput(form.requestsPerDay)
+
+  const hasError = Boolean(
+    dailyTokenLimit.error ||
+      monthlyTokenLimit.error ||
+      requestsPerMinute.error ||
+      requestsPerDay.error,
+  )
+
+  const isDirty =
+    dailyTokenLimit.value !== member.daily_token_limit ||
+    monthlyTokenLimit.value !== member.monthly_token_limit ||
+    requestsPerMinute.value !== member.requests_per_minute ||
+    requestsPerDay.value !== member.requests_per_day
+
+  function handleSubmit(e: React.FormEvent | React.MouseEvent) {
+    e.preventDefault()
+    if (hasError) return
+    if (!isDirty) {
+      onClose()
+      return
+    }
+
+    const params: {
+      daily_token_limit?: number
+      monthly_token_limit?: number
+      requests_per_minute?: number
+      requests_per_day?: number
+    } = {}
+
+    if (dailyTokenLimit.value !== member.daily_token_limit) params.daily_token_limit = dailyTokenLimit.value
+    if (monthlyTokenLimit.value !== member.monthly_token_limit) params.monthly_token_limit = monthlyTokenLimit.value
+    if (requestsPerMinute.value !== member.requests_per_minute) params.requests_per_minute = requestsPerMinute.value
+    if (requestsPerDay.value !== member.requests_per_day) params.requests_per_day = requestsPerDay.value
+
+    updateMember.mutate(
+      { membershipId: member.id, params },
+      {
+        onSuccess: () => {
+          toast({ variant: 'success', message: 'Limits updated' })
+          onClose()
+        },
+        onError: (err) => {
+          toast({
+            variant: 'error',
+            message: err instanceof Error ? err.message : 'Failed to update limits',
+          })
+        },
+      },
+    )
+  }
+
+  return (
+    <Dialog open onClose={onClose} title="Edit User Limits">
+      <form onSubmit={handleSubmit} className="space-y-4" noValidate>
+        <p className="text-xs text-text-secondary">
+          These limits apply across all of this user&apos;s API keys in the organization. The most
+          restrictive of org, team, user, and key limits always wins.
+        </p>
+        <div className="grid grid-cols-2 gap-4">
+          <Input
+            label="Daily Token Limit"
+            type="number"
+            min="0"
+            value={form.dailyTokenLimit}
+            onChange={patch('dailyTokenLimit')}
+            placeholder="0 = unlimited"
+            error={dailyTokenLimit.error}
+            disabled={updateMember.isPending}
+          />
+          <Input
+            label="Monthly Token Limit"
+            type="number"
+            min="0"
+            value={form.monthlyTokenLimit}
+            onChange={patch('monthlyTokenLimit')}
+            placeholder="0 = unlimited"
+            error={monthlyTokenLimit.error}
+            disabled={updateMember.isPending}
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          <Input
+            label="Requests per Minute"
+            type="number"
+            min="0"
+            value={form.requestsPerMinute}
+            onChange={patch('requestsPerMinute')}
+            placeholder="0 = unlimited"
+            error={requestsPerMinute.error}
+            disabled={updateMember.isPending}
+          />
+          <Input
+            label="Requests per Day"
+            type="number"
+            min="0"
+            value={form.requestsPerDay}
+            onChange={patch('requestsPerDay')}
+            placeholder="0 = unlimited"
+            error={requestsPerDay.error}
+            disabled={updateMember.isPending}
+          />
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <Button variant="secondary" onClick={onClose} disabled={updateMember.isPending}>
+            Cancel
+          </Button>
+          <Button onClick={handleSubmit} loading={updateMember.isPending} disabled={!isDirty || hasError}>
+            Save Changes
+          </Button>
+        </div>
+      </form>
+    </Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // OrgUsersPage
 // ---------------------------------------------------------------------------
 
@@ -252,13 +425,14 @@ export default function OrgUsersPage() {
     membershipId: string
     newRole: string
   } | null>(null)
+  const [editLimitsMember, setEditLimitsMember] = useState<OrgMembershipResponse | null>(null)
 
   const { data: members, isLoading } = useOrgMembers(orgId, cursor)
   const deleteMember = useDeleteOrgMember(orgId)
   const updateMember = useUpdateOrgMember(orgId)
   const { toast } = useToast()
 
-  const isAdmin = me?.role === 'org_admin' || me?.role === 'system_admin'
+  const isAdmin = me?.role === 'org_admin' || me?.role === 'system_admin' || me?.is_system_admin === true
 
   if (me && !isAdmin) {
     return (
@@ -302,6 +476,13 @@ export default function OrgUsersPage() {
       },
     },
     {
+      key: 'limits',
+      header: 'Limits',
+      render: (row) => (
+        <span className="text-xs text-text-tertiary">{formatLimitsSummary(row)}</span>
+      ),
+    },
+    {
       key: 'created_at',
       header: 'Joined',
       render: (row) => <TimeAgo date={row.created_at} />,
@@ -311,31 +492,60 @@ export default function OrgUsersPage() {
       header: '',
       align: 'right',
       render: (row) => {
-        if (row.user_id === me?.id) return null
+        const isSelf = row.user_id === me?.id
         return (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setDeleteMembershipId(row.id)}
-            className="!px-1.5 text-text-tertiary hover:text-error"
-            disabled={deleteMember.isPending}
-            title="Remove user"
-          >
-            <svg
-              className="w-4 h-4"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={1.75}
-              viewBox="0 0 24 24"
-              aria-hidden="true"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0"
-              />
-            </svg>
-          </Button>
+          <div className="flex items-center justify-end gap-0.5">
+            {isAdmin && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setEditLimitsMember(row)}
+                className="!px-1.5 text-text-tertiary hover:text-text-primary"
+                disabled={updateMember.isPending}
+                title="Edit limits"
+              >
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={1.75}
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L6.832 19.82a4.5 4.5 0 01-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 011.13-1.897L16.863 4.487zm0 0L19.5 7.125"
+                  />
+                </svg>
+              </Button>
+            )}
+            {!isSelf && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setDeleteMembershipId(row.id)}
+                className="!px-1.5 text-text-tertiary hover:text-error"
+                disabled={deleteMember.isPending}
+                title="Remove user"
+              >
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={1.75}
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0"
+                  />
+                </svg>
+              </Button>
+            )}
+          </div>
         )
       },
     },
@@ -508,6 +718,14 @@ export default function OrgUsersPage() {
         onClose={() => setShowInviteDialog(false)}
         orgId={orgId}
       />
+
+      {editLimitsMember !== null && (
+        <EditLimitsDialog
+          member={editLimitsMember}
+          onClose={() => setEditLimitsMember(null)}
+          orgId={orgId}
+        />
+      )}
 
       <ConfirmDialog
         open={deleteMembershipId !== null}

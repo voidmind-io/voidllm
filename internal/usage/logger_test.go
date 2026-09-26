@@ -759,13 +759,14 @@ func TestLog_TokenCounterUpdatedBeforeFlush(t *testing.T) {
 	keyLimits := ratelimit.Limits{DailyTokenLimit: 200}
 	noLimits := ratelimit.Limits{}
 
-	if err := counter.CheckTokens("tc-key", "tc-team", "tc-org", keyLimits, noLimits, noLimits); err != nil {
+	scopes := ratelimit.Scopes{KeyID: "tc-key", TeamID: "tc-team", OrgID: "tc-org"}
+	if err := counter.CheckTokens(scopes, ratelimit.ScopeLimits{Key: keyLimits, Team: noLimits, Org: noLimits}); err != nil {
 		t.Errorf("CheckTokens() immediately after Log() = %v, want nil (100 tokens < limit 200)", err)
 	}
 
 	// Now verify the counter blocks a request that would exceed the budget.
 	keyLimitsExceeded := ratelimit.Limits{DailyTokenLimit: 100}
-	if err := counter.CheckTokens("tc-key", "tc-team", "tc-org", keyLimitsExceeded, noLimits, noLimits); err == nil {
+	if err := counter.CheckTokens(scopes, ratelimit.ScopeLimits{Key: keyLimitsExceeded, Team: noLimits, Org: noLimits}); err == nil {
 		t.Error("CheckTokens() = nil, want ErrTokenBudgetExceeded (100 tokens >= limit 100)")
 	}
 
@@ -820,14 +821,15 @@ func TestLog_TokenCounterConsumesFullAnthropicShapedTotal(t *testing.T) {
 	// still have headroom.
 	keyLimitsExceeded := ratelimit.Limits{DailyTokenLimit: 99}
 	noLimits := ratelimit.Limits{}
-	if err := counter.CheckTokens("anthropic-cache-key", "", "anthropic-cache-org", keyLimitsExceeded, noLimits, noLimits); err == nil {
+	scopes := ratelimit.Scopes{KeyID: "anthropic-cache-key", OrgID: "anthropic-cache-org"}
+	if err := counter.CheckTokens(scopes, ratelimit.ScopeLimits{Key: keyLimitsExceeded, Team: noLimits, Org: noLimits}); err == nil {
 		t.Error("CheckTokens() = nil, want ErrTokenBudgetExceeded (full 100-token total, including cache reads, must be counted)")
 	}
 
 	// A budget of exactly 100 (the correct, fully-inclusive total) must not
 	// yet be exceeded — this distinguishes "counts the full total" from "over-counts".
 	keyLimitsExact := ratelimit.Limits{DailyTokenLimit: 101}
-	if err := counter.CheckTokens("anthropic-cache-key", "", "anthropic-cache-org", keyLimitsExact, noLimits, noLimits); err != nil {
+	if err := counter.CheckTokens(scopes, ratelimit.ScopeLimits{Key: keyLimitsExact, Team: noLimits, Org: noLimits}); err != nil {
 		t.Errorf("CheckTokens() with limit 101 = %v, want nil (100 tokens < limit 101)", err)
 	}
 }

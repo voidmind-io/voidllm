@@ -310,8 +310,10 @@ func (h *Handler) OIDCCallback(c fiber.Ctx) error {
 		}
 	}
 
-	// Step 9: Resolve the user's effective role and org for the session key.
-	sessionRole, sessionOrgID, resolveErr := h.DB.ResolveUserRole(ctx, user.ID)
+	// Step 9: Resolve the user's org for the session key. The role itself is
+	// re-resolved from the DB below via LoadActiveKey + KeyInfoFromRecord so
+	// the cached KeyInfo carries the full org/team/user limit hierarchy.
+	_, sessionOrgID, resolveErr := h.DB.ResolveUserRole(ctx, user.ID)
 	if resolveErr != nil {
 		h.Log.ErrorContext(ctx, "oidc callback: resolve user role", slog.String("error", resolveErr.Error()))
 		return c.Redirect().To("/login?error=auth_failed")
@@ -350,15 +352,31 @@ func (h *Handler) OIDCCallback(c fiber.Ctx) error {
 		return c.Redirect().To("/login?error=auth_failed")
 	}
 
-	h.KeyCache.Set(keyHash, auth.KeyInfo{
-		ID:        apiKey.ID,
-		KeyType:   keygen.KeyTypeSession,
-		Role:      sessionRole,
-		OrgID:     sessionOrgID,
-		UserID:    user.ID,
-		Name:      "SSO session",
-		ExpiresAt: &expiresAt,
-	})
+	// Populate the cache from a fresh read of the session key with its full
+	// org, team, and per-user membership limits resolved via JOIN, so the
+	// session is subject to its complete limit hierarchy immediately instead
+	// of waiting for the next periodic cache reload. A lookup or mapping
+	// failure is logged and the cache write is skipped rather than failing
+	// the login — the key was already created, and the next reload (at most
+	// 30s later) will pick it up.
+	rec, err := h.DB.LoadActiveKey(ctx, apiKey.ID)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "oidc callback: load session key for cache", slog.String("error", err.Error()))
+	} else if !auth.Cacheable(*rec) {
+		h.Log.LogAttrs(ctx, slog.LevelWarn, "oidc callback: skipping non-cacheable key",
+			slog.String("key_id", rec.ID),
+			slog.String("key_type", rec.KeyType),
+		)
+	} else {
+		ki, ok := auth.KeyInfoFromRecord(*rec)
+		if !ok {
+			h.Log.LogAttrs(ctx, slog.LevelWarn, "oidc callback: could not resolve a definite role, defaulting to member",
+				slog.String("key_type", rec.KeyType),
+				slog.String("key_id", rec.ID),
+			)
+		}
+		h.KeyCache.Set(rec.KeyHash, ki)
+	}
 
 	// Step 12: Emit audit event.
 	if h.AuditLogger != nil {

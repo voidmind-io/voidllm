@@ -888,28 +888,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			}, nil
 		},
 		ListKeys: func(ctx context.Context, orgID, role string) ([]map[string]any, error) {
-			// Org admins and system admins see all non-session keys in the org.
-			// Members see only their own keys via the userID filter.
-			var userID string
-			if role != auth.RoleOrgAdmin && role != auth.RoleSystemAdmin {
-				id := mcp.KeyIdentityFromCtx(ctx)
-				userID = id.UserID
-			}
-			keys, err := database.ListAPIKeys(ctx, orgID, userID, "", "", 200, false)
-			if err != nil {
-				return nil, fmt.Errorf("list api keys: %w", err)
-			}
-			result := make([]map[string]any, len(keys))
-			for i, k := range keys {
-				result[i] = map[string]any{
-					"id":         k.ID,
-					"key_hint":   k.KeyHint,
-					"key_type":   k.KeyType,
-					"name":       k.Name,
-					"created_at": k.CreatedAt,
-				}
-			}
-			return result, nil
+			return listKeysForCaller(ctx, database, orgID, role, mcp.KeyIdentityFromCtx(ctx))
 		},
 		CreateKey: func(ctx context.Context, orgID, userID, name string, expiresIn time.Duration) (map[string]any, error) {
 			plaintextKey, err := keygen.Generate(keygen.KeyTypeUser)
@@ -939,24 +918,32 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 				return nil, fmt.Errorf("create api key: %w", err)
 			}
 
-			// Resolve the user's role so the key cache entry is accurate.
-			resolvedRole, roleErr := database.GetUserOrgRole(ctx, userID, orgID)
-			if roleErr == nil && resolvedRole != "" {
-				var expTime *time.Time
-				if apiKey.ExpiresAt != nil {
-					if t, parseErr := time.Parse(time.RFC3339, *apiKey.ExpiresAt); parseErr == nil {
-						expTime = &t
-					}
+			// Populate the cache from a fresh read of the key with its full
+			// org, team, and per-user membership limits resolved via JOIN, so
+			// the key is subject to its complete limit hierarchy immediately
+			// instead of waiting for the next periodic cache reload. A lookup
+			// or mapping failure is logged and the cache write is skipped
+			// rather than failing the request — the key was already created,
+			// and the next reload (at most 30s later) will pick it up.
+			rec, loadErr := database.LoadActiveKey(ctx, apiKey.ID)
+			if loadErr != nil {
+				log.LogAttrs(ctx, slog.LevelError, "mcp create key: load for cache",
+					slog.String("error", loadErr.Error()),
+				)
+			} else if !auth.Cacheable(*rec) {
+				log.LogAttrs(ctx, slog.LevelWarn, "mcp create key: skipping non-cacheable key",
+					slog.String("key_id", rec.ID),
+					slog.String("key_type", rec.KeyType),
+				)
+			} else {
+				ki, ok := auth.KeyInfoFromRecord(*rec)
+				if !ok {
+					log.LogAttrs(ctx, slog.LevelWarn, "mcp create key: could not resolve a definite role, defaulting to member",
+						slog.String("key_type", rec.KeyType),
+						slog.String("key_id", rec.ID),
+					)
 				}
-				keyCache.Set(apiKey.KeyHash, auth.KeyInfo{
-					ID:        apiKey.ID,
-					KeyType:   apiKey.KeyType,
-					Role:      resolvedRole,
-					OrgID:     apiKey.OrgID,
-					UserID:    userID,
-					Name:      apiKey.Name,
-					ExpiresAt: expTime,
-				})
+				keyCache.Set(rec.KeyHash, ki)
 			}
 
 			return map[string]any{
@@ -1422,6 +1409,41 @@ func (a *Application) PrintBootstrapCredentials() {
 // against a different row.
 func deploymentAAD(id string) []byte {
 	return []byte("deployment:" + id)
+}
+
+// listKeysForCaller returns the API keys visible to the calling MCP client,
+// scoped by RBAC role. Org admins and system admins see all non-session keys
+// in the org. Members and team admins see only their own keys via the
+// UserID filter on id.
+//
+// Fail closed: a caller below org_admin with no UserID at all — e.g. a
+// team-scoped or org-scoped service-account key — has no identifier to
+// scope by. Leaving userID empty would otherwise mean "no filter" at the DB
+// layer (see db.ListAPIKeys), returning every non-session key in the org to
+// a caller who should only ever see their own keys.
+func listKeysForCaller(ctx context.Context, database *db.DB, orgID, role string, id mcp.KeyIdentity) ([]map[string]any, error) {
+	var userID string
+	if role != auth.RoleOrgAdmin && role != auth.RoleSystemAdmin {
+		userID = id.UserID
+		if userID == "" {
+			return nil, fmt.Errorf("list keys: forbidden: insufficient scope for role %q", role)
+		}
+	}
+	keys, err := database.ListAPIKeys(ctx, orgID, userID, "", "", 200, false)
+	if err != nil {
+		return nil, fmt.Errorf("list api keys: %w", err)
+	}
+	result := make([]map[string]any, len(keys))
+	for i, k := range keys {
+		result[i] = map[string]any{
+			"id":         k.ID,
+			"key_hint":   k.KeyHint,
+			"key_type":   k.KeyType,
+			"name":       k.Name,
+			"created_at": k.CreatedAt,
+		}
+	}
+	return result, nil
 }
 
 // isCodeModeTimeout reports whether a Code Mode execution error message

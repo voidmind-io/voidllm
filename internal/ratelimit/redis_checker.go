@@ -33,30 +33,40 @@ func NewRedisChecker(client *voidredis.Client, log *slog.Logger) *RedisChecker {
 	return &RedisChecker{client: client, log: log}
 }
 
-// CheckRate verifies rate limits for the key, team (if non-empty), and org
-// scopes against Redis. Each scope/window combination is checked individually;
-// the first exceeded limit causes ErrRateLimitExceeded to be returned. Checks
-// with a zero limit are skipped (unlimited). On Redis error the individual
-// check is skipped and the request is allowed (fail-open).
-func (r *RedisChecker) CheckRate(keyID, teamID, orgID string, keyLimits, teamLimits, orgLimits Limits) error {
+// CheckRate verifies rate limits for the key, user (if non-empty), team (if
+// non-empty), and org scopes against Redis. Each scope/window combination is
+// checked individually; the first exceeded limit causes ErrRateLimitExceeded
+// to be returned. Checks with a zero limit are skipped (unlimited). The user
+// scope uses id OrgID+":"+UserID because per-user limits are defined on the
+// org membership. On Redis error the individual check is skipped and the
+// request is allowed (fail-open).
+func (r *RedisChecker) CheckRate(s Scopes, l ScopeLimits) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	checks := []rateCheck{
-		{"key", keyID, keyLimits.RequestsPerMinute, time.Minute},
-		{"key", keyID, keyLimits.RequestsPerDay, 24 * time.Hour},
+		{"key", s.KeyID, l.Key.RequestsPerMinute, time.Minute},
+		{"key", s.KeyID, l.Key.RequestsPerDay, 24 * time.Hour},
 	}
 
-	if teamID != "" {
+	if s.UserID != "" {
+		userScopeID := s.OrgID + ":" + s.UserID
 		checks = append(checks,
-			rateCheck{"team", teamID, teamLimits.RequestsPerMinute, time.Minute},
-			rateCheck{"team", teamID, teamLimits.RequestsPerDay, 24 * time.Hour},
+			rateCheck{"user", userScopeID, l.User.RequestsPerMinute, time.Minute},
+			rateCheck{"user", userScopeID, l.User.RequestsPerDay, 24 * time.Hour},
+		)
+	}
+
+	if s.TeamID != "" {
+		checks = append(checks,
+			rateCheck{"team", s.TeamID, l.Team.RequestsPerMinute, time.Minute},
+			rateCheck{"team", s.TeamID, l.Team.RequestsPerDay, 24 * time.Hour},
 		)
 	}
 
 	checks = append(checks,
-		rateCheck{"org", orgID, orgLimits.RequestsPerMinute, time.Minute},
-		rateCheck{"org", orgID, orgLimits.RequestsPerDay, 24 * time.Hour},
+		rateCheck{"org", s.OrgID, l.Org.RequestsPerMinute, time.Minute},
+		rateCheck{"org", s.OrgID, l.Org.RequestsPerDay, 24 * time.Hour},
 	)
 
 	for _, c := range checks {

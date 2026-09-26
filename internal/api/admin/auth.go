@@ -198,15 +198,31 @@ func (h *Handler) Login(c fiber.Ctx) error {
 		return apierror.InternalError(c, "authentication failed")
 	}
 
-	h.KeyCache.Set(keyHash, auth.KeyInfo{
-		ID:        apiKey.ID,
-		KeyType:   keygen.KeyTypeSession,
-		Role:      role,
-		OrgID:     orgID,
-		UserID:    userID,
-		Name:      "Login session",
-		ExpiresAt: &expiresAt,
-	})
+	// Populate the cache from a fresh read of the session key with its full
+	// org, team, and per-user membership limits resolved via JOIN, so the
+	// session is subject to its complete limit hierarchy immediately instead
+	// of waiting for the next periodic cache reload. A lookup or mapping
+	// failure is logged and the cache write is skipped rather than failing
+	// the login — the key was already created, and the next reload (at most
+	// 30s later) will pick it up.
+	rec, err := h.DB.LoadActiveKey(ctx, apiKey.ID)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "login: load session key for cache", slog.String("error", err.Error()))
+	} else if !auth.Cacheable(*rec) {
+		h.Log.LogAttrs(ctx, slog.LevelWarn, "login: skipping non-cacheable key",
+			slog.String("key_id", rec.ID),
+			slog.String("key_type", rec.KeyType),
+		)
+	} else {
+		ki, ok := auth.KeyInfoFromRecord(*rec)
+		if !ok {
+			h.Log.LogAttrs(ctx, slog.LevelWarn, "login: could not resolve a definite role, defaulting to member",
+				slog.String("key_type", rec.KeyType),
+				slog.String("key_id", rec.ID),
+			)
+		}
+		h.KeyCache.Set(rec.KeyHash, ki)
+	}
 
 	user, err := h.DB.GetUser(ctx, userID)
 	if err != nil {

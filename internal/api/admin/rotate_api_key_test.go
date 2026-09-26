@@ -698,6 +698,92 @@ func TestRotateAPIKey_NewKeyAddedToCache(t *testing.T) {
 	}
 }
 
+// TestRotateAPIKey_NewKeyCacheHasFullLimitsImmediately verifies that the cache
+// entry for a rotated key already carries the org, team, and per-user limit
+// hierarchy — populated via db.LoadActiveKey + auth.KeyInfoFromRecord — from
+// the moment rotation completes, instead of waiting for the next periodic
+// cache reload (up to 30s later).
+func TestRotateAPIKey_NewKeyCacheHasFullLimitsImmediately(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestRotateAPIKey_CacheFullLimits?mode=memory&cache=private")
+
+	org := mustCreateOrg(t, database, "Acme", "rotate-cache-limits-org")
+	if _, err := database.SQL().ExecContext(context.Background(),
+		"UPDATE organizations SET daily_token_limit = 33000 WHERE id = ?", org.ID); err != nil {
+		t.Fatalf("set org limits: %v", err)
+	}
+
+	user := mustCreateUser(t, database, "rotate-cache-limits@example.com", "Cache Limits User")
+	team := mustCreateTeam(t, database, org.ID, "Dev", "rotate-cache-limits-team")
+	if _, err := database.SQL().ExecContext(context.Background(),
+		"UPDATE teams SET requests_per_minute = 18 WHERE id = ?", team.ID); err != nil {
+		t.Fatalf("set team limits: %v", err)
+	}
+	mustCreateUserMemberships(t, database, org.ID, team.ID, user.ID)
+
+	memberships, err := database.ListOrgMemberships(context.Background(), org.ID, "", 100)
+	if err != nil {
+		t.Fatalf("ListOrgMemberships: %v", err)
+	}
+	var membershipID string
+	for _, m := range memberships {
+		if m.UserID == user.ID {
+			membershipID = m.ID
+		}
+	}
+	if membershipID == "" {
+		t.Fatal("membership not found")
+	}
+	userDaily := int64(4_444)
+	if _, err := database.UpdateOrgMembership(context.Background(), membershipID, db.UpdateOrgMembershipParams{
+		DailyTokenLimit: &userDaily,
+	}); err != nil {
+		t.Fatalf("UpdateOrgMembership: %v", err)
+	}
+
+	callerKey := addTestKeyWithUser(t, keyCache, auth.RoleOrgAdmin, org.ID, user.ID)
+	keyID, _ := mustCreateUserKeyViaAPI(t, app, org.ID, user.ID, team.ID, callerKey)
+
+	req := httptest.NewRequest("POST", rotateKeyURL(org.ID, keyID), nil)
+	req.Header.Set("Authorization", "Bearer "+callerKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, b)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+	newKey, _ := got["new_key"].(map[string]any)
+	if newKey == nil {
+		t.Fatal("new_key missing from response")
+	}
+	newPlaintext, _ := newKey["key"].(string)
+	if newPlaintext == "" {
+		t.Fatal("new_key.key is empty")
+	}
+
+	ki, ok := keyCache.Get(keygen.Hash(newPlaintext, testHMACSecret))
+	if !ok {
+		t.Fatal("rotated key not found in cache")
+	}
+	if ki.OrgDailyTokenLimit != 33_000 {
+		t.Errorf("OrgDailyTokenLimit = %d, want 33000 (must be populated immediately)", ki.OrgDailyTokenLimit)
+	}
+	if ki.TeamRequestsPerMinute != 18 {
+		t.Errorf("TeamRequestsPerMinute = %d, want 18 (must be populated immediately)", ki.TeamRequestsPerMinute)
+	}
+	if ki.UserDailyTokenLimit != 4_444 {
+		t.Errorf("UserDailyTokenLimit = %d, want 4444 (per-user membership limit must be populated immediately)", ki.UserDailyTokenLimit)
+	}
+}
+
 // TestRotateAPIKey_KeyTypeVariants verifies that rotation works for all
 // routable key types: user_key, team_key, and sa_key.
 func TestRotateAPIKey_KeyTypeVariants(t *testing.T) {

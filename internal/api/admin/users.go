@@ -12,6 +12,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/audit"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -440,10 +441,14 @@ func (h *Handler) UpdateUser(c fiber.Ctx) error {
 }
 
 // DeleteUser handles DELETE /api/v1/users/:user_id.
-// Requires system_admin. Deletion is a soft-delete.
+// Requires system_admin. Deletion is a soft-delete. Every API key owned by
+// the user, across every organization, is immediately evicted from the
+// in-memory key cache (and, when Redis is configured, invalidated on other
+// instances) so the user's keys stop authenticating without waiting for the
+// next periodic cache reload.
 //
 // @Summary      Delete a user
-// @Description  Soft-deletes a user. Requires system admin.
+// @Description  Soft-deletes a user and immediately revokes every API key they own. Requires system admin.
 // @Tags         users
 // @Produce      json
 // @Param        user_id  path  string  true  "User ID"
@@ -475,5 +480,30 @@ func (h *Handler) DeleteUser(c fiber.Ctx) error {
 		h.Log.ErrorContext(c.Context(), "delete user", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to delete user")
 	}
+
+	// Evict every cached key owned by this user, across every organization,
+	// so they stop authenticating immediately instead of waiting for the next
+	// periodic cache reload. auth.Cacheable already refuses to cache a
+	// user_key or session_key whose owning user is soft-deleted, but that
+	// only takes effect on the next reload — without this, a key belonging to
+	// a user deleted mid-cycle would remain valid on this instance until
+	// then. The user was already deleted above; a failure here is logged
+	// only and never fails the request.
+	hashes, err := h.DB.ListActiveKeyHashesByUser(c.Context(), id)
+	if err != nil {
+		h.Log.ErrorContext(c.Context(), "delete user: list key hashes for cache eviction", slog.String("error", err.Error()))
+	}
+	for _, keyHash := range hashes {
+		h.KeyCache.Delete(keyHash)
+
+		if h.Redis != nil {
+			if err := h.Redis.PublishInvalidation(c.Context(), voidredis.ChannelKeys, keyHash); err != nil {
+				h.Log.LogAttrs(c.Context(), slog.LevelWarn, "redis: publish key invalidation failed",
+					slog.String("error", err.Error()),
+				)
+			}
+		}
+	}
+
 	return c.SendStatus(fiber.StatusNoContent)
 }

@@ -98,7 +98,12 @@ func (l *Logger) Log(event Event) {
 	// Increment the in-memory token counter immediately so that subsequent
 	// CheckTokens calls reflect this request even before it reaches the DB.
 	if l.tokenCounter != nil && event.TotalTokens > 0 {
-		l.tokenCounter.Add(event.KeyID, event.TeamID, event.OrgID, int64(event.TotalTokens))
+		l.tokenCounter.Add(ratelimit.Scopes{
+			KeyID:  event.KeyID,
+			UserID: event.UserID,
+			TeamID: event.TeamID,
+			OrgID:  event.OrgID,
+		}, int64(event.TotalTokens))
 	}
 
 	if l.dropOnFull {

@@ -11,8 +11,8 @@ import (
 
 // UsageSeeder provides seed data for token counters at startup.
 type UsageSeeder interface {
-	// QueryUsageSeed returns rows of (key_id, team_id, org_id, total_tokens)
-	// for usage events since the given time.
+	// QueryUsageSeed returns rows of (key_id, team_id, org_id, user_id,
+	// total_tokens) for usage events since the given time.
 	QueryUsageSeed(ctx context.Context, since time.Time) (RowScanner, error)
 }
 
@@ -53,66 +53,90 @@ func NewTokenCounter() *TokenCounter {
 
 // Add increments token counters for all applicable scopes. It must be called
 // immediately when a usage event is recorded so that subsequent CheckTokens
-// calls see the up-to-date totals.
-func (tc *TokenCounter) Add(keyID, teamID, orgID string, tokens int64) {
+// calls see the up-to-date totals. The user-scope counter is org-bound
+// ("user:"+OrgID+":"+UserID) because per-user limits are defined on the org
+// membership; it is skipped when UserID is empty.
+func (tc *TokenCounter) Add(s Scopes, tokens int64) {
 	now := time.Now().UTC()
 	dayWindow := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Unix()
 	monthWindow := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).Unix()
 
-	tc.addToScope(&tc.dailyCounters, "key:"+keyID, dayWindow, tokens)
-	tc.addToScope(&tc.monthlyCounters, "key:"+keyID, monthWindow, tokens)
+	tc.addToScope(&tc.dailyCounters, "key:"+s.KeyID, dayWindow, tokens)
+	tc.addToScope(&tc.monthlyCounters, "key:"+s.KeyID, monthWindow, tokens)
 
-	if teamID != "" {
-		tc.addToScope(&tc.dailyCounters, "team:"+teamID, dayWindow, tokens)
-		tc.addToScope(&tc.monthlyCounters, "team:"+teamID, monthWindow, tokens)
+	if s.UserID != "" {
+		userScope := "user:" + s.OrgID + ":" + s.UserID
+		tc.addToScope(&tc.dailyCounters, userScope, dayWindow, tokens)
+		tc.addToScope(&tc.monthlyCounters, userScope, monthWindow, tokens)
 	}
 
-	tc.addToScope(&tc.dailyCounters, "org:"+orgID, dayWindow, tokens)
-	tc.addToScope(&tc.monthlyCounters, "org:"+orgID, monthWindow, tokens)
+	if s.TeamID != "" {
+		tc.addToScope(&tc.dailyCounters, "team:"+s.TeamID, dayWindow, tokens)
+		tc.addToScope(&tc.monthlyCounters, "team:"+s.TeamID, monthWindow, tokens)
+	}
+
+	tc.addToScope(&tc.dailyCounters, "org:"+s.OrgID, dayWindow, tokens)
+	tc.addToScope(&tc.monthlyCounters, "org:"+s.OrgID, monthWindow, tokens)
 }
 
 // CheckTokens verifies that no scope has exceeded its token budget. Each scope
-// is checked against its own limit independently. Returns ErrTokenBudgetExceeded
-// if any scope is over budget.
-func (tc *TokenCounter) CheckTokens(keyID, teamID, orgID string, keyLimits, teamLimits, orgLimits Limits) error {
+// is checked against its own limit independently. The user scope is skipped
+// when UserID is empty. Returns ErrTokenBudgetExceeded if any scope is over
+// budget.
+func (tc *TokenCounter) CheckTokens(s Scopes, l ScopeLimits) error {
 	now := time.Now().UTC()
 	dayWindow := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Unix()
 	monthWindow := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).Unix()
 
 	// Check key limits against key usage.
-	if keyLimits.DailyTokenLimit > 0 {
-		if tc.getCount(&tc.dailyCounters, "key:"+keyID, dayWindow) >= keyLimits.DailyTokenLimit {
+	if l.Key.DailyTokenLimit > 0 {
+		if tc.getCount(&tc.dailyCounters, "key:"+s.KeyID, dayWindow) >= l.Key.DailyTokenLimit {
 			return ErrTokenBudgetExceeded
 		}
 	}
-	if keyLimits.MonthlyTokenLimit > 0 {
-		if tc.getCount(&tc.monthlyCounters, "key:"+keyID, monthWindow) >= keyLimits.MonthlyTokenLimit {
+	if l.Key.MonthlyTokenLimit > 0 {
+		if tc.getCount(&tc.monthlyCounters, "key:"+s.KeyID, monthWindow) >= l.Key.MonthlyTokenLimit {
 			return ErrTokenBudgetExceeded
 		}
 	}
 
-	// Check team limits against team usage.
-	if teamID != "" {
-		if teamLimits.DailyTokenLimit > 0 {
-			if tc.getCount(&tc.dailyCounters, "team:"+teamID, dayWindow) >= teamLimits.DailyTokenLimit {
+	// Check per-user limits against the user's org-bound usage.
+	if s.UserID != "" {
+		userScope := "user:" + s.OrgID + ":" + s.UserID
+		if l.User.DailyTokenLimit > 0 {
+			if tc.getCount(&tc.dailyCounters, userScope, dayWindow) >= l.User.DailyTokenLimit {
 				return ErrTokenBudgetExceeded
 			}
 		}
-		if teamLimits.MonthlyTokenLimit > 0 {
-			if tc.getCount(&tc.monthlyCounters, "team:"+teamID, monthWindow) >= teamLimits.MonthlyTokenLimit {
+		if l.User.MonthlyTokenLimit > 0 {
+			if tc.getCount(&tc.monthlyCounters, userScope, monthWindow) >= l.User.MonthlyTokenLimit {
+				return ErrTokenBudgetExceeded
+			}
+		}
+	}
+
+	// Check team limits against team usage.
+	if s.TeamID != "" {
+		if l.Team.DailyTokenLimit > 0 {
+			if tc.getCount(&tc.dailyCounters, "team:"+s.TeamID, dayWindow) >= l.Team.DailyTokenLimit {
+				return ErrTokenBudgetExceeded
+			}
+		}
+		if l.Team.MonthlyTokenLimit > 0 {
+			if tc.getCount(&tc.monthlyCounters, "team:"+s.TeamID, monthWindow) >= l.Team.MonthlyTokenLimit {
 				return ErrTokenBudgetExceeded
 			}
 		}
 	}
 
 	// Check org limits against org usage.
-	if orgLimits.DailyTokenLimit > 0 {
-		if tc.getCount(&tc.dailyCounters, "org:"+orgID, dayWindow) >= orgLimits.DailyTokenLimit {
+	if l.Org.DailyTokenLimit > 0 {
+		if tc.getCount(&tc.dailyCounters, "org:"+s.OrgID, dayWindow) >= l.Org.DailyTokenLimit {
 			return ErrTokenBudgetExceeded
 		}
 	}
-	if orgLimits.MonthlyTokenLimit > 0 {
-		if tc.getCount(&tc.monthlyCounters, "org:"+orgID, monthWindow) >= orgLimits.MonthlyTokenLimit {
+	if l.Org.MonthlyTokenLimit > 0 {
+		if tc.getCount(&tc.monthlyCounters, "org:"+s.OrgID, monthWindow) >= l.Org.MonthlyTokenLimit {
 			return ErrTokenBudgetExceeded
 		}
 	}
@@ -221,7 +245,8 @@ func (tc *TokenCounter) loadOrCreateToken(m *sync.Map, scope string) *tokenEntry
 
 // seedWindow reads all usage_events rows since the given time and accumulates
 // token totals into counters. The windowStart for all seeded entries is set to
-// since.Unix().
+// since.Unix(). The user-scope counter is org-bound, matching Add and
+// CheckTokens, and is skipped when a row has no user_id (team keys, SA keys).
 func (tc *TokenCounter) seedWindow(ctx context.Context, seeder UsageSeeder, counters *sync.Map, since time.Time) error {
 	rows, err := seeder.QueryUsageSeed(ctx, since)
 	if err != nil {
@@ -231,12 +256,15 @@ func (tc *TokenCounter) seedWindow(ctx context.Context, seeder UsageSeeder, coun
 
 	windowStart := since.Unix()
 	for rows.Next() {
-		var keyID, teamID, orgID string
+		var keyID, teamID, orgID, userID string
 		var tokens int64
-		if err := rows.Scan(&keyID, &teamID, &orgID, &tokens); err != nil {
+		if err := rows.Scan(&keyID, &teamID, &orgID, &userID, &tokens); err != nil {
 			return fmt.Errorf("scan usage_events row: %w", err)
 		}
 		tc.addToScope(counters, "key:"+keyID, windowStart, tokens)
+		if userID != "" {
+			tc.addToScope(counters, "user:"+orgID+":"+userID, windowStart, tokens)
+		}
 		if teamID != "" {
 			tc.addToScope(counters, "team:"+teamID, windowStart, tokens)
 		}

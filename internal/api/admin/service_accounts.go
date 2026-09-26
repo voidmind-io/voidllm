@@ -8,6 +8,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 )
 
 // createServiceAccountRequest is the JSON body accepted by CreateServiceAccount.
@@ -213,6 +214,14 @@ func (h *Handler) ListServiceAccounts(c fiber.Ctx) error {
 	var filterCreatedBy string
 	if !auth.HasRole(keyInfo.Role, auth.RoleOrgAdmin) {
 		filterCreatedBy = keyInfo.UserID
+
+		// Fail closed: a caller below org_admin with no UserID at all — e.g.
+		// a service-account key — has no identifier to scope by. Leaving
+		// filterCreatedBy empty would otherwise mean "no filter" at the DB
+		// layer, returning every service account in the org.
+		if filterCreatedBy == "" {
+			return apierror.Send(c, fiber.StatusForbidden, "forbidden", "insufficient scope to list service accounts")
+		}
 	}
 
 	accounts, err := h.DB.ListServiceAccountsWithCounts(c.Context(), orgID, filterCreatedBy, p.Cursor, p.Limit+1, includeDeleted)
@@ -355,5 +364,41 @@ func (h *Handler) DeleteServiceAccount(c fiber.Ctx) error {
 		h.Log.ErrorContext(c.Context(), "delete service account", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to delete service account")
 	}
+
+	// Evict every cached sa_key belonging to this service account so they stop
+	// authenticating immediately instead of waiting for the next periodic
+	// cache refresh (up to cache.key_ttl). auth.LoadKeysIntoCache already skips
+	// sa_key rows whose service account is soft-deleted (see auth.Cacheable),
+	// but that only takes effect on the next reload — without this, a key
+	// deleted mid-cycle would remain valid on this instance until then.
+	//
+	// The hashes are read from the DB rather than by scanning the in-memory
+	// cache: a Range-based scan only ever finds keys this instance already
+	// had cached, missing any sa_key created on another instance since this
+	// one's last reload. DeleteServiceAccount only sets
+	// service_accounts.deleted_at — it never touches the owning api_keys
+	// rows — so ListActiveKeyHashesByServiceAccount still finds every one of
+	// this service account's keys even though it runs after the soft-delete
+	// above.
+	hashes, err := h.DB.ListActiveKeyHashesByServiceAccount(c.Context(), sa.ID)
+	if err != nil {
+		h.Log.ErrorContext(c.Context(), "delete service account: list key hashes for cache eviction", slog.String("error", err.Error()))
+	}
+	for _, keyHash := range hashes {
+		h.KeyCache.Delete(keyHash)
+
+		// Publish invalidation so other instances evict the same key without
+		// waiting for their own next cache refresh. Failure here never fails
+		// the request — the DB delete already succeeded, and other nodes will
+		// pick up the deletion on their own periodic reload regardless.
+		if h.Redis != nil {
+			if err := h.Redis.PublishInvalidation(c.Context(), voidredis.ChannelKeys, keyHash); err != nil {
+				h.Log.LogAttrs(c.Context(), slog.LevelWarn, "redis: publish key invalidation failed",
+					slog.String("error", err.Error()),
+				)
+			}
+		}
+	}
+
 	return c.SendStatus(fiber.StatusNoContent)
 }

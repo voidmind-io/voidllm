@@ -41,35 +41,44 @@ type scopeLimits struct {
 	rpd   int
 }
 
-// CheckRate verifies rate limits for the key, team (if non-empty), and org
-// scopes. Each scope is checked against its own limits independently; a request
-// must pass all scopes, so the most restrictive limit in the hierarchy
-// effectively wins. Counters are incremented atomically on success via a CAS
-// loop. Scopes already incremented when a later scope fails are not rolled back
-// — the over-count by 1 is self-correcting at the next window reset.
+// CheckRate verifies rate limits for the key, user (if non-empty), team (if
+// non-empty), and org scopes, in that order. Each scope is checked against its
+// own limits independently; a request must pass all scopes, so the most
+// restrictive limit in the hierarchy effectively wins. The user-scope counter
+// is org-bound ("user:"+OrgID+":"+UserID) because per-user limits are defined
+// on the org membership. Counters are incremented atomically on success via a
+// CAS loop. Scopes already incremented when a later scope fails are not rolled
+// back — the over-count by 1 is self-correcting at the next window reset.
 // Returns ErrRateLimitExceeded if any limit is exceeded.
-func (r *RateLimiter) CheckRate(keyID, teamID, orgID string, keyLimits, teamLimits, orgLimits Limits) error {
+func (r *RateLimiter) CheckRate(s Scopes, l ScopeLimits) error {
 	now := time.Now().UTC()
 	minuteWindow := now.Truncate(time.Minute).Unix()
 	dayWindow := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Unix()
 
-	checks := make([]scopeLimits, 0, 3)
+	checks := make([]scopeLimits, 0, 4)
 	checks = append(checks, scopeLimits{
-		scope: "key:" + keyID,
-		rpm:   keyLimits.RequestsPerMinute,
-		rpd:   keyLimits.RequestsPerDay,
+		scope: "key:" + s.KeyID,
+		rpm:   l.Key.RequestsPerMinute,
+		rpd:   l.Key.RequestsPerDay,
 	})
-	if teamID != "" {
+	if s.UserID != "" {
 		checks = append(checks, scopeLimits{
-			scope: "team:" + teamID,
-			rpm:   teamLimits.RequestsPerMinute,
-			rpd:   teamLimits.RequestsPerDay,
+			scope: "user:" + s.OrgID + ":" + s.UserID,
+			rpm:   l.User.RequestsPerMinute,
+			rpd:   l.User.RequestsPerDay,
+		})
+	}
+	if s.TeamID != "" {
+		checks = append(checks, scopeLimits{
+			scope: "team:" + s.TeamID,
+			rpm:   l.Team.RequestsPerMinute,
+			rpd:   l.Team.RequestsPerDay,
 		})
 	}
 	checks = append(checks, scopeLimits{
-		scope: "org:" + orgID,
-		rpm:   orgLimits.RequestsPerMinute,
-		rpd:   orgLimits.RequestsPerDay,
+		scope: "org:" + s.OrgID,
+		rpm:   l.Org.RequestsPerMinute,
+		rpd:   l.Org.RequestsPerDay,
 	})
 
 	for _, c := range checks {
