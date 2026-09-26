@@ -2,6 +2,30 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.26] - 2026-09-26
+
+### Features
+- Per-user limits. Organization admins can set token budgets and request rate limits on a user's organization membership. They apply across every API key the user owns in that organization, alongside the existing organization, team and key limits, with the most restrictive limit winning. Manage them on the Users page or via `PATCH /api/v1/orgs/{org_id}/members/{membership_id}`
+
+### Security
+- Security hardening for API key authorization and the key lifecycle. See the upgrade notes below for behavior changes
+
+### Upgrade notes
+- API key limits can only be set or changed by organization admins, and by organization-level service accounts for keys other than their own. Members and team admins can no longer change them
+- Service account keys follow their service account's team scope: keys of a team-bound service account act with team admin rights, not organization-wide admin rights. Automation that needs organization-wide access should use an organization-level service account
+- Deleting a user, removing a user from an organization, or deleting a service account revokes the affected API keys immediately
+
+### Documentation
+- `server.proxy.max_stream_duration` is documented, and the troubleshooting entry for cut-off streams now names the actual cause and how `write_timeout` and per-model `timeout` interact with it (#224)
+
+### Dependencies
+- Updated gRPC, OpenTelemetry, golang.org/x/crypto, fasthttp, sonic, go-redis, go-oidc, React, React Router, Vitest and GitHub Actions, including fixes for security advisories in gRPC and the frontend router (#234)
+
+### Internal
+- Two timing-dependent tests are deterministic now (#234)
+
+---
+
 ## [0.0.25] - 2026-07-26
 
 ### Features
