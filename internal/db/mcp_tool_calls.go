@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -41,7 +42,10 @@ type MCPToolCall struct {
 	// CodeModeExecutionID groups all tool calls that belong to a single
 	// execute_code invocation. Nil for non-Code-Mode calls.
 	CodeModeExecutionID *string
-	// CreatedAt is the UTC timestamp of the event stored as a string.
+	// CreatedAt is the UTC timestamp of the event, already formatted in the
+	// canonical TimestampLayout shape. Empty means "use the current time";
+	// InsertMCPToolCalls rejects any non-empty value that is not already
+	// canonical rather than attempting to reparse it.
 	CreatedAt string
 }
 
@@ -57,11 +61,11 @@ func (d *DB) InsertMCPToolCalls(ctx context.Context, calls []MCPToolCall) error 
 	p := d.dialect.Placeholder
 	query := "INSERT INTO mcp_tool_calls " +
 		"(id, request_id, key_id, key_type, org_id, team_id, user_id, service_account_id, " +
-		"server_alias, tool_name, duration_ms, status, code_mode, code_mode_execution_id) " +
+		"server_alias, tool_name, duration_ms, status, code_mode, code_mode_execution_id, created_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " +
 		p(6) + ", " + p(7) + ", " + p(8) + ", " +
-		p(9) + ", " + p(10) + ", " + p(11) + ", " + p(12) + ", " + p(13) + ", " + p(14) + ")"
+		p(9) + ", " + p(10) + ", " + p(11) + ", " + p(12) + ", " + p(13) + ", " + p(14) + ", " + p(15) + ")"
 
 	if err := d.WithTx(ctx, func(q Querier) error {
 		for _, call := range calls {
@@ -95,6 +99,13 @@ func (d *DB) InsertMCPToolCalls(ctx context.Context, calls []MCPToolCall) error 
 				executionID = *call.CodeModeExecutionID
 			}
 
+			createdAt := call.CreatedAt
+			if createdAt == "" {
+				createdAt = FormatTimestamp(time.Now())
+			} else if _, parseErr := time.Parse(TimestampLayout, createdAt); parseErr != nil {
+				return fmt.Errorf("insert mcp tool calls: created_at %q is not in canonical format: %w", createdAt, parseErr)
+			}
+
 			_, err := q.ExecContext(ctx, query,
 				id,
 				call.RequestID,
@@ -110,6 +121,7 @@ func (d *DB) InsertMCPToolCalls(ctx context.Context, calls []MCPToolCall) error 
 				call.Status,
 				codeMode,
 				executionID,
+				createdAt,
 			)
 			if err != nil {
 				return fmt.Errorf("insert mcp tool calls: exec: %w", err)

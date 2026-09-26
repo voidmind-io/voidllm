@@ -25,7 +25,7 @@ func insertTestUsageEvent(t *testing.T, d *DB, id, keyID, teamID, orgID string, 
 			 0, %d, %d, 200, '%s')`,
 		id, keyID, orgID, teamVal,
 		totalTokens, totalTokens,
-		createdAt.UTC().Format(time.RFC3339),
+		FormatTimestamp(createdAt),
 	)
 	if _, err := d.sql.ExecContext(context.Background(), query); err != nil {
 		t.Fatalf("insertTestUsageEvent id=%q: %v", id, err)
@@ -87,7 +87,7 @@ func insertUsageEvent(t *testing.T, d *DB, p usageEventParams) {
 		p.promptTokens, p.compTokens, p.totalTokens,
 		p.cachedReadTokens, p.cacheWriteTokens,
 		costVal, durVal,
-		p.createdAt.UTC().Format(time.RFC3339),
+		FormatTimestamp(p.createdAt),
 	)
 	if _, err := d.sql.ExecContext(context.Background(), query); err != nil {
 		t.Fatalf("insertUsageEvent id=%q: %v", p.id, err)

@@ -23,8 +23,39 @@ var migrationsFS embed.FS
 // or on the pool directly (SQLite).
 type migrationRunner interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
+}
+
+// goMigration is a schema migration implemented in Go rather than as a plain
+// SQL file. Go migrations exist for changes that need per-row logic (parsing
+// and reformatting existing data across dialect-specific historical formats)
+// that a single portable SQL statement cannot express.
+type goMigration struct {
+	// name is the identifier recorded in schema_migrations, following the same
+	// "NNNN_description" numbering sequence as the embedded *.up.sql files but
+	// with a ".go" suffix instead of ".up.sql". Because the two file kinds
+	// always end in different suffixes, a Go migration's recorded filename can
+	// never collide with a SQL migration's recorded filename even if a future
+	// SQL file reuses the same numeric prefix — schema_migrations.filename is
+	// compared in full, suffix included. Do not add a "*.up.sql" file with the
+	// same numeric prefix as a registered Go migration; it is confusing even
+	// though it cannot collide in the tracking table.
+	name string
+	// fn performs the migration. It runs directly on runner — not inside the
+	// single transaction applyMigration would normally use for a SQL file —
+	// because normalization work is batched and each batch commits on its own.
+	fn func(ctx context.Context, runner migrationRunner, dialect Dialect, log *slog.Logger) error
+}
+
+// goMigrations lists all Go-implemented schema migrations in registration
+// order. Names are merged with the embedded *.up.sql filenames and the
+// combined set is sorted before being applied, so ordering between the two
+// migration kinds is determined purely by filename — identical to how
+// *.up.sql files are ordered among themselves.
+var goMigrations = []goMigration{
+	{name: "0018_canonical_event_timestamps.go", fn: normalizeEventTimestamps},
 }
 
 // migrationLockKey is the PostgreSQL advisory lock key used to serialize
@@ -32,17 +63,26 @@ type migrationRunner interface {
 // Stable across deployments so all pods contend on the same lock.
 const migrationLockKey int64 = 8370235791
 
-// RunMigrations applies any unapplied migrations from the embedded migrations
-// directory to the given database. It creates the schema_migrations tracking
-// table if it does not exist, reads all "*.up.sql" files in alphabetical order,
-// and skips any migration whose filename is already recorded in that table.
-// Each migration is applied inside its own transaction. This function is
-// idempotent: calling it multiple times on a fully migrated database is safe.
+// RunMigrations applies any unapplied migrations to the given database. Its
+// source of migrations is the union of two kinds, merged and sorted by name
+// into a single ordered sequence:
+//   - every "*.up.sql" file embedded in the migrations directory, executed
+//     verbatim inside its own transaction; and
+//   - every entry in goMigrations, a small registry of migrations implemented
+//     in Go for changes that need per-row logic no single portable SQL
+//     statement can express (see normalizeEventTimestamps).
+//
+// It creates the schema_migrations tracking table if it does not exist, and
+// skips any migration whose filename is already recorded there. A Go
+// migration is recorded in schema_migrations only after its function returns
+// successfully. This function is idempotent: calling it multiple times on a
+// fully migrated database is safe.
 //
 // When the dialect supports advisory locking (PostgreSQL), all migration work
 // runs on a single dedicated *sql.Conn so that the advisory lock remains held
 // for the duration of the migration run. This prevents concurrent pods from
-// applying the same migrations simultaneously during rolling upgrades.
+// applying the same migrations simultaneously during rolling upgrades. Go
+// migrations run on this same connection, so the lock also serializes them.
 func RunMigrations(ctx context.Context, sqlDB *sql.DB, dialect Dialect, log *slog.Logger) error {
 	var runner migrationRunner = sqlDB
 
@@ -84,15 +124,20 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		return fmt.Errorf("read migrations directory: %w", err)
 	}
 
-	var filenames []string
+	goByName := make(map[string]goMigration, len(goMigrations))
+	var names []string
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".up.sql") {
-			filenames = append(filenames, e.Name())
+			names = append(names, e.Name())
 		}
 	}
-	sort.Strings(filenames)
+	for _, gm := range goMigrations {
+		names = append(names, gm.name)
+		goByName[gm.name] = gm
+	}
+	sort.Strings(names)
 
-	for _, name := range filenames {
+	for _, name := range names {
 		applied, err := isMigrationApplied(ctx, runner, dialect, name)
 		if err != nil {
 			return fmt.Errorf("check migration %q: %w", name, err)
@@ -102,9 +147,18 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		}
 
 		log.LogAttrs(ctx, slog.LevelInfo, "applying migration", slog.String("file", name))
-		if err := applyMigration(ctx, runner, dialect, name); err != nil {
+
+		if gm, ok := goByName[name]; ok {
+			if err := gm.fn(ctx, runner, dialect, log); err != nil {
+				return fmt.Errorf("apply migration %q: %w", name, err)
+			}
+			if err := recordMigrationApplied(ctx, runner, dialect, name); err != nil {
+				return fmt.Errorf("record migration %q: %w", name, err)
+			}
+		} else if err := applyMigration(ctx, runner, dialect, name); err != nil {
 			return fmt.Errorf("apply migration %q: %w", name, err)
 		}
+
 		log.LogAttrs(ctx, slog.LevelInfo, "migration applied", slog.String("file", name))
 	}
 
@@ -121,6 +175,19 @@ func isMigrationApplied(ctx context.Context, runner migrationRunner, dialect Dia
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// recordMigrationApplied inserts filename into schema_migrations. It is used
+// after a goMigration's fn returns successfully, outside of any transaction
+// the migration itself may have used internally — mirroring the "record only
+// after success" guarantee applyMigration provides for SQL files via its own
+// transaction.
+func recordMigrationApplied(ctx context.Context, runner migrationRunner, dialect Dialect, filename string) error {
+	insert := "INSERT INTO schema_migrations (filename) VALUES (" + dialect.Placeholder(1) + ")"
+	if _, err := runner.ExecContext(ctx, insert, filename); err != nil {
+		return fmt.Errorf("record migration: %w", err)
+	}
+	return nil
 }
 
 // applyMigration reads the named file from migrationsFS, executes its SQL

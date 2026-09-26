@@ -64,17 +64,17 @@ func (d *DB) GetUsageAggregates(ctx context.Context, orgID string, from, to time
 	case "user":
 		groupCol = "user_id"
 	case "day":
-		groupCol = "DATE(created_at)"
+		groupCol = dayBucketExpr
 	case "hour":
-		groupCol = d.dialect.HourTrunc()
+		groupCol = hourBucketExpr
 	default:
 		return nil, fmt.Errorf("GetUsageAggregates: invalid groupBy %q", groupBy)
 	}
 
 	selectCol := coalesceSelectCol(groupCol)
 
-	fromStr := from.UTC().Format(time.RFC3339)
-	toStr := to.UTC().Format(time.RFC3339)
+	fromStr := FormatTimestamp(from)
+	toStr := FormatTimestamp(to)
 
 	var query string
 	if groupCol != "" {
@@ -177,17 +177,17 @@ func (d *DB) GetScopedUsageAggregates(ctx context.Context, filter UsageFilter, f
 	case "user":
 		groupCol = "user_id"
 	case "day":
-		groupCol = "DATE(created_at)"
+		groupCol = dayBucketExpr
 	case "hour":
-		groupCol = d.dialect.HourTrunc()
+		groupCol = hourBucketExpr
 	default:
 		return nil, fmt.Errorf("GetScopedUsageAggregates: invalid groupBy %q", groupBy)
 	}
 
 	selectCol := coalesceSelectCol(groupCol)
 
-	fromStr := from.UTC().Format(time.RFC3339)
-	toStr := to.UTC().Format(time.RFC3339)
+	fromStr := FormatTimestamp(from)
+	toStr := FormatTimestamp(to)
 
 	// Build the WHERE clause dynamically. User input (filter values) is always
 	// passed as bind parameters — never interpolated into the query string.
@@ -302,17 +302,17 @@ func (d *DB) GetCrossOrgUsageAggregates(ctx context.Context, from, to time.Time,
 	case "user":
 		groupCol = "user_id"
 	case "day":
-		groupCol = "DATE(created_at)"
+		groupCol = dayBucketExpr
 	case "hour":
-		groupCol = d.dialect.HourTrunc()
+		groupCol = hourBucketExpr
 	default:
 		return nil, fmt.Errorf("GetCrossOrgUsageAggregates: invalid groupBy %q", groupBy)
 	}
 
 	selectCol := coalesceSelectCol(groupCol)
 
-	fromStr := from.UTC().Format(time.RFC3339)
-	toStr := to.UTC().Format(time.RFC3339)
+	fromStr := FormatTimestamp(from)
+	toStr := FormatTimestamp(to)
 	p := d.dialect.Placeholder
 
 	var query string
@@ -377,7 +377,7 @@ func (d *DB) GetCrossOrgUsageAggregates(ctx context.Context, from, to time.Time,
 func (d *DB) QueryUsageSeed(ctx context.Context, since time.Time) (*sql.Rows, error) {
 	query := "SELECT key_id, COALESCE(team_id, ''), org_id, COALESCE(user_id, ''), total_tokens " +
 		"FROM usage_events WHERE created_at >= " + d.dialect.Placeholder(1)
-	rows, err := d.sql.QueryContext(ctx, query, since.UTC().Format(time.RFC3339))
+	rows, err := d.sql.QueryContext(ctx, query, FormatTimestamp(since))
 	if err != nil {
 		return nil, fmt.Errorf("QueryUsageSeed: %w", err)
 	}
@@ -396,7 +396,7 @@ func (d *DB) GetMonthlyTokenUsage(ctx context.Context, orgID string) (int64, err
 		" AND bucket_hour >= " + d.dialect.Placeholder(2)
 
 	var total int64
-	err := d.sql.QueryRowContext(ctx, query, orgID, monthStart.Format(time.RFC3339)).Scan(&total)
+	err := d.sql.QueryRowContext(ctx, query, orgID, FormatTimestamp(monthStart)).Scan(&total)
 	if err != nil {
 		return 0, fmt.Errorf("GetMonthlyTokenUsage org %s: %w", orgID, err)
 	}
@@ -426,7 +426,7 @@ func (d *DB) GetTokenUsageSince(ctx context.Context, scope UsageScope, id string
 		" AND created_at > " + d.dialect.Placeholder(2)
 
 	var total int64
-	row := d.sql.QueryRowContext(ctx, query, id, since.UTC().Format(time.RFC3339))
+	row := d.sql.QueryRowContext(ctx, query, id, FormatTimestamp(since))
 	if err := row.Scan(&total); err != nil {
 		return 0, fmt.Errorf("GetTokenUsageSince %s %s: %w", col, id, err)
 	}

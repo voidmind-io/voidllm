@@ -3,9 +3,12 @@
 // in batches by a background goroutine.
 package usage
 
+import "time"
+
 // Event represents a single proxy request for usage tracking. All fields are
 // populated by the proxy handler immediately after the response is sent; none
-// of them are computed inside the logger.
+// of them are computed inside the logger, except CreatedAt which Logger.Log
+// stamps when left zero.
 type Event struct {
 	// KeyID is the unique identifier of the API key that made the request.
 	KeyID string
@@ -52,4 +55,9 @@ type Event struct {
 	// RequestID is the per-request trace ID set by the request ID middleware.
 	// It correlates the usage record with the proxy access log and audit log.
 	RequestID string
+	// CreatedAt is the wall-clock time the request completed, used both as
+	// the stored created_at value and as the basis for the hourly rollup
+	// bucket. Callers do not need to set it — Logger.Log stamps it with the
+	// current UTC time when it is left zero.
+	CreatedAt time.Time
 }

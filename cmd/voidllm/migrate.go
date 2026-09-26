@@ -136,6 +136,17 @@ func runMigrate(args []string) {
 		actionLabel(*dryRun), elapsed.Round(time.Millisecond))
 
 	if !*dryRun {
+		// Safety net: re-run the same normalization RunMigrations applies on
+		// startup, in case any created_at or expires_at value survived the
+		// per-row reformatting above in a non-canonical shape (e.g. a source
+		// dialect quirk migrateTable's parser did not anticipate).
+		fmt.Print("Normalizing timestamps on target... ")
+		if err := db.NormalizeEventTimestamps(ctx, dstDB.SQL(), dstDB.Dialect(), slog.Default()); err != nil {
+			fmt.Fprintf(os.Stderr, "failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("done")
+
 		fmt.Printf("You can now switch database.driver to %q in your config.\n", dstDriver)
 	}
 }
@@ -159,6 +170,14 @@ func batchRows(columnCount int) int {
 // rows counted or copied. On error it returns the number of rows successfully
 // inserted before the failure; the transaction is rolled back automatically
 // via the deferred call.
+//
+// For the usage_events table, the created_at column is reformatted into the
+// canonical UTC timestamp shape (db.FormatTimestamp) as each row is copied,
+// since source and target may use different dialects with different
+// CURRENT_TIMESTAMP text renderings. A value that cannot be parsed is copied
+// unchanged and counted; runMigrate prints a warning with the count once
+// copying finishes, and the caller runs db.NormalizeEventTimestamps on the
+// target afterward as a safety net.
 func migrateTable(ctx context.Context, src, dst *db.DB, table string, dryRun bool) (int, error) {
 	// Table names come from the hardcoded migrationOrder slice, not user input.
 	var count int
@@ -182,6 +201,17 @@ func migrateTable(ctx context.Context, src, dst *db.DB, table string, dryRun boo
 	}
 
 	batchSize := batchRows(len(columns))
+
+	createdAtIdx := -1
+	if table == "usage_events" {
+		for i, c := range columns {
+			if c == "created_at" {
+				createdAtIdx = i
+				break
+			}
+		}
+	}
+	unparseableCreatedAt := 0
 
 	tx, err := dst.SQL().BeginTx(ctx, nil)
 	if err != nil {
@@ -228,6 +258,17 @@ func migrateTable(ctx context.Context, src, dst *db.DB, table string, dryRun boo
 		// overwritten on each Scan call.
 		rowCopy := make([]any, len(columns))
 		copy(rowCopy, values)
+
+		if createdAtIdx >= 0 {
+			if raw, ok := rowCopy[createdAtIdx].(string); ok {
+				if t, parseErr := db.ParseStoredTimestamp(raw); parseErr == nil {
+					rowCopy[createdAtIdx] = db.FormatTimestamp(t)
+				} else {
+					unparseableCreatedAt++
+				}
+			}
+		}
+
 		batch = append(batch, rowCopy...)
 		batchCount++
 
@@ -248,6 +289,11 @@ func migrateTable(ctx context.Context, src, dst *db.DB, table string, dryRun boo
 
 	if err := tx.Commit(); err != nil {
 		return inserted, fmt.Errorf("commit: %w", err)
+	}
+
+	if unparseableCreatedAt > 0 {
+		fmt.Printf("  warning: %s.created_at could not be reformatted for %d row(s); copied as-is\n",
+			table, unparseableCreatedAt)
 	}
 
 	return inserted, nil

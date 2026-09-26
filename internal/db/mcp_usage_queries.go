@@ -49,9 +49,9 @@ func (d *DB) GetMCPUsageAggregates(ctx context.Context, orgID string, from, to t
 	case "user":
 		groupCol = "user_id"
 	case "day":
-		groupCol = "DATE(created_at)"
+		groupCol = dayBucketExpr
 	case "hour":
-		groupCol = d.dialect.HourTrunc()
+		groupCol = hourBucketExpr
 	case "status":
 		groupCol = "status"
 	default:
@@ -60,12 +60,12 @@ func (d *DB) GetMCPUsageAggregates(ctx context.Context, orgID string, from, to t
 
 	selectCol := coalesceSelectCol(groupCol)
 
-	fromStr := from.UTC().Format(time.RFC3339)
-	toStr := to.UTC().Format(time.RFC3339)
+	fromStr := FormatTimestamp(from)
+	toStr := FormatTimestamp(to)
 	p := d.dialect.Placeholder
 
 	orderClause := " ORDER BY COUNT(*) DESC"
-	if groupCol == "DATE(created_at)" || groupCol == d.dialect.HourTrunc() {
+	if groupCol == dayBucketExpr || groupCol == hourBucketExpr {
 		orderClause = " ORDER BY " + groupCol
 	}
 
@@ -157,9 +157,9 @@ func (d *DB) GetScopedMCPUsageAggregates(ctx context.Context, filter MCPUsageFil
 	case "user":
 		groupCol = "user_id"
 	case "day":
-		groupCol = "DATE(created_at)"
+		groupCol = dayBucketExpr
 	case "hour":
-		groupCol = d.dialect.HourTrunc()
+		groupCol = hourBucketExpr
 	case "status":
 		groupCol = "status"
 	default:
@@ -168,8 +168,8 @@ func (d *DB) GetScopedMCPUsageAggregates(ctx context.Context, filter MCPUsageFil
 
 	selectCol := coalesceSelectCol(groupCol)
 
-	fromStr := from.UTC().Format(time.RFC3339)
-	toStr := to.UTC().Format(time.RFC3339)
+	fromStr := FormatTimestamp(from)
+	toStr := FormatTimestamp(to)
 
 	// Build the WHERE clause dynamically. User input (filter values) is always
 	// passed as bind parameters — never interpolated into the query string.
@@ -211,7 +211,7 @@ func (d *DB) GetScopedMCPUsageAggregates(ctx context.Context, filter MCPUsageFil
 	where := "WHERE " + strings.Join(conditions, " AND ")
 
 	orderClause := " ORDER BY COUNT(*) DESC"
-	if groupCol == "DATE(created_at)" || groupCol == d.dialect.HourTrunc() {
+	if groupCol == dayBucketExpr || groupCol == hourBucketExpr {
 		orderClause = " ORDER BY " + groupCol
 	}
 
@@ -289,9 +289,9 @@ func (d *DB) GetCrossOrgMCPUsageAggregates(ctx context.Context, from, to time.Ti
 	case "user":
 		groupCol = "user_id"
 	case "day":
-		groupCol = "DATE(created_at)"
+		groupCol = dayBucketExpr
 	case "hour":
-		groupCol = d.dialect.HourTrunc()
+		groupCol = hourBucketExpr
 	case "status":
 		groupCol = "status"
 	default:
@@ -300,12 +300,12 @@ func (d *DB) GetCrossOrgMCPUsageAggregates(ctx context.Context, from, to time.Ti
 
 	selectCol := coalesceSelectCol(groupCol)
 
-	fromStr := from.UTC().Format(time.RFC3339)
-	toStr := to.UTC().Format(time.RFC3339)
+	fromStr := FormatTimestamp(from)
+	toStr := FormatTimestamp(to)
 	p := d.dialect.Placeholder
 
 	orderClause := " ORDER BY COUNT(*) DESC"
-	if groupCol == "DATE(created_at)" || groupCol == d.dialect.HourTrunc() {
+	if groupCol == dayBucketExpr || groupCol == hourBucketExpr {
 		orderClause = " ORDER BY " + groupCol
 	}
 
