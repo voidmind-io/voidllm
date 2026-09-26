@@ -26,7 +26,7 @@ func (d *DB) CountActiveKeys(ctx context.Context, orgID string) (int, error) {
 	err := d.sql.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM api_keys WHERE org_id = "+d.dialect.Placeholder(1)+
 			" AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > "+d.dialect.Placeholder(2)+")",
-		orgID, time.Now().UTC().Format(time.RFC3339),
+		orgID, FormatTimestamp(time.Now()),
 	).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("CountActiveKeys org %s: %w", orgID, translateError(err))
@@ -67,7 +67,7 @@ func (d *DB) CountTeamKeys(ctx context.Context, teamID string) (int, error) {
 	err := d.sql.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM api_keys WHERE team_id = "+p(1)+
 			" AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > "+p(2)+")",
-		teamID, time.Now().UTC().Format(time.RFC3339),
+		teamID, FormatTimestamp(time.Now()),
 	).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("CountTeamKeys team %s: %w", teamID, translateError(err))
@@ -97,7 +97,7 @@ func (d *DB) CountUserKeys(ctx context.Context, orgID, userID string) (int, erro
 		"SELECT COUNT(*) FROM api_keys WHERE org_id = "+p(1)+
 			" AND user_id = "+p(2)+
 			" AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > "+p(3)+")",
-		orgID, userID, time.Now().UTC().Format(time.RFC3339),
+		orgID, userID, FormatTimestamp(time.Now()),
 	).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("CountUserKeys org %s user %s: %w", orgID, userID, translateError(err))

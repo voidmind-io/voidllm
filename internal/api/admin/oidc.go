@@ -335,7 +335,7 @@ func (h *Handler) OIDCCallback(c fiber.Ctx) error {
 	keyHash := keygen.Hash(key, h.HMACSecret)
 	keyHint := keygen.Hint(key)
 	expiresAt := time.Now().UTC().Add(24 * time.Hour)
-	expiresAtStr := expiresAt.Format(time.RFC3339)
+	expiresAtStr := db.FormatTimestamp(expiresAt)
 
 	apiKey, err := h.DB.CreateAPIKey(ctx, db.CreateAPIKeyParams{
 		KeyHash:   keyHash,

@@ -237,7 +237,7 @@ func (d *DB) UpdateServiceAccountWithCounts(ctx context.Context, id string, para
 		" WHERE id = " + p(argN) + " AND deleted_at IS NULL"
 	args = append(args, id)
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := FormatTimestamp(time.Now())
 	// p(1)=expires_at threshold, p(2)=service account id for the WithCounts SELECT.
 	selectQuery := fmt.Sprintf(saWithCountsBase, p(1)) +
 		" WHERE sa.id = " + p(2) + " AND sa.deleted_at IS NULL" +
@@ -334,7 +334,7 @@ func scanServiceAccountWithCounts(rows interface {
 func (d *DB) ListServiceAccountsWithCounts(ctx context.Context, orgID, createdBy, cursor string, limit int, includeDeleted bool) ([]ServiceAccountWithCounts, error) {
 	p := d.dialect.Placeholder
 	argN := 1
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := FormatTimestamp(time.Now())
 
 	// p(1) is always the expires_at threshold used inside the CASE expression.
 	args := []any{now}
@@ -392,7 +392,7 @@ func (d *DB) ListServiceAccountsWithCounts(ctx context.Context, orgID, createdBy
 // It returns ErrNotFound if the service account does not exist or has been soft-deleted.
 func (d *DB) GetServiceAccountWithCounts(ctx context.Context, id string) (*ServiceAccountWithCounts, error) {
 	p := d.dialect.Placeholder
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := FormatTimestamp(time.Now())
 
 	// p(1)=expires_at threshold, p(2)=service account id.
 	query := fmt.Sprintf(saWithCountsBase, p(1)) +

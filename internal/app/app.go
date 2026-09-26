@@ -900,7 +900,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 
 			var expiresAt *string
 			if expiresIn > 0 {
-				t := time.Now().UTC().Add(expiresIn).Format(time.RFC3339)
+				t := db.FormatTimestamp(time.Now().Add(expiresIn))
 				expiresAt = &t
 			}
 

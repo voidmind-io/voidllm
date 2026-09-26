@@ -871,7 +871,7 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 	// Set the old key to expire after the grace period. If it already has an
 	// expiry that is sooner than the grace period deadline, keep that shorter expiry.
 	graceDeadline := time.Now().UTC().Add(rotateKeyGracePeriod)
-	oldExpiresAt := graceDeadline.Format(time.RFC3339)
+	oldExpiresAt := db.FormatTimestamp(graceDeadline)
 	if existing.ExpiresAt != nil {
 		if t, parseErr := time.Parse(time.RFC3339, *existing.ExpiresAt); parseErr == nil && t.Before(graceDeadline) {
 			oldExpiresAt = *existing.ExpiresAt

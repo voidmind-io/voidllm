@@ -784,6 +784,71 @@ func TestRotateAPIKey_NewKeyCacheHasFullLimitsImmediately(t *testing.T) {
 	}
 }
 
+// TestRotateAPIKey_GraceExpiresAtIsCanonical verifies that the old key's
+// grace-period expires_at — both as rendered in the JSON response and as
+// stored in the database — is in the exact canonical db.TimestampLayout
+// shape ("YYYY-MM-DDTHH:MM:SSZ": UTC, second precision, no fractional
+// seconds, no numeric offset), not merely some RFC3339-parseable variant.
+func TestRotateAPIKey_GraceExpiresAtIsCanonical(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestRotateAPIKey_GraceCanonical?mode=memory&cache=private")
+
+	org := mustCreateOrg(t, database, "Acme", "rotate-grace-canonical-org")
+	user := mustCreateUser(t, database, "rotate-grace-canonical@example.com", "Grace Canonical User")
+	team := mustCreateTeam(t, database, org.ID, "Dev", "rotate-grace-canonical-team")
+	mustCreateUserMemberships(t, database, org.ID, team.ID, user.ID)
+	callerKey := addTestKeyWithUser(t, keyCache, auth.RoleOrgAdmin, org.ID, user.ID)
+
+	keyID, _ := mustCreateUserKeyViaAPI(t, app, org.ID, user.ID, team.ID, callerKey)
+
+	req := httptest.NewRequest("POST", rotateKeyURL(org.ID, keyID), nil)
+	req.Header.Set("Authorization", "Bearer "+callerKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, b)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+
+	oldKey, _ := got["old_key"].(map[string]any)
+	if oldKey == nil {
+		t.Fatalf("old_key missing from response")
+	}
+	oldKeyID, _ := oldKey["id"].(string)
+	if oldKeyID == "" {
+		t.Fatalf("old_key.id missing from response")
+	}
+	respExpiresAt, ok := oldKey["expires_at"].(string)
+	if !ok || respExpiresAt == "" {
+		t.Fatalf("old_key.expires_at is absent or empty; got: %v", oldKey)
+	}
+	if _, err := time.Parse(db.TimestampLayout, respExpiresAt); err != nil {
+		t.Errorf("old_key.expires_at in response = %q, not canonical db.TimestampLayout shape: %v", respExpiresAt, err)
+	}
+
+	var storedExpiresAt string
+	if err := database.SQL().QueryRowContext(context.Background(),
+		"SELECT expires_at FROM api_keys WHERE id = ?", oldKeyID,
+	).Scan(&storedExpiresAt); err != nil {
+		t.Fatalf("read stored expires_at: %v", err)
+	}
+	if _, err := time.Parse(db.TimestampLayout, storedExpiresAt); err != nil {
+		t.Errorf("old_key expires_at stored in DB = %q, not canonical db.TimestampLayout shape: %v", storedExpiresAt, err)
+	}
+	if storedExpiresAt != respExpiresAt {
+		t.Errorf("stored expires_at %q does not match response expires_at %q", storedExpiresAt, respExpiresAt)
+	}
+}
+
 // TestRotateAPIKey_KeyTypeVariants verifies that rotation works for all
 // routable key types: user_key, team_key, and sa_key.
 func TestRotateAPIKey_KeyTypeVariants(t *testing.T) {

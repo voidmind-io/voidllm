@@ -10,10 +10,12 @@ package db
 // exported NormalizeEventTimestamps entry point is invoked again directly.
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -420,6 +422,133 @@ func TestNormalizeAPIKeyExpiresAt(t *testing.T) {
 		}
 		if nilExpiresAt.Valid {
 			t.Errorf("nil expires_at after normalize = %q, want still NULL", nilExpiresAt.String)
+		}
+	})
+}
+
+// TestNormalizeAPIKeyExpiresAt_ShapeValidButCalendricallyInvalid covers the
+// case normalizeAPIKeyExpiresAt's doc comment calls out explicitly: a value
+// that is shape-valid RFC3339 (so a LIKE-based canonical check alone would
+// wrongly treat it as already normalized) but calendrically nonsensical —
+// "9999-99-99T99:99:99Z" has month 99, day 99, hour/minute/second 99 — and so
+// fails every layout in ParseStoredTimestamp. Because normalizeAPIKeyExpiresAt
+// always parses every non-NULL value in Go regardless of its shape, this row
+// is caught and left untouched rather than being mistaken for canonical.
+func TestNormalizeAPIKeyExpiresAt_ShapeValidButCalendricallyInvalid(t *testing.T) {
+	t.Parallel()
+
+	forEachDialect(t, func(t *testing.T, d *DB) {
+		ctx := context.Background()
+		org := mustCreateOrg(t, d, CreateOrgParams{Name: "Invalid Shape Org", Slug: "invalid-shape-" + newSortableID(t)})
+		user := mustCreateUser(t, d, CreateUserParams{
+			Email:        "invalid-shape-" + newSortableID(t) + "@example.com",
+			DisplayName:  "Invalid Shape Tester",
+			PasswordHash: testPasswordHash(t),
+		})
+
+		const insane = "9999-99-99T99:99:99Z"
+		key, err := d.CreateAPIKey(ctx, CreateAPIKeyParams{
+			KeyHash:   "hash-" + newSortableID(t),
+			KeyHint:   "vl_uk_test",
+			KeyType:   "user_key",
+			Name:      "invalid shape test key",
+			OrgID:     org.ID,
+			UserID:    &user.ID,
+			ExpiresAt: ptr(insane),
+			CreatedBy: user.ID,
+		})
+		if err != nil {
+			t.Fatalf("CreateAPIKey: %v", err)
+		}
+
+		if err := NormalizeEventTimestamps(ctx, d.SQL(), d.Dialect(), slog.Default()); err != nil {
+			t.Fatalf("NormalizeEventTimestamps() error = %v, want nil", err)
+		}
+
+		if got := rawColumnValue(t, d, "api_keys", "expires_at", key.ID); got != insane {
+			t.Errorf("shape-valid-but-invalid expires_at after normalize = %q, want untouched %q", got, insane)
+		}
+	})
+}
+
+// TestNormalizeAPIKeyExpiresAt_OffsetRewrittenAndLogHygiene seeds a key whose
+// expires_at is a valid RFC3339 value with a non-UTC offset (the shape a
+// caller who bypassed FormatTimestamp might have written) alongside a
+// canonical value and several unparseable ones, confirms the offset value is
+// rewritten to the exact expected canonical UTC rendering and the canonical
+// one is left byte-for-byte unchanged, and confirms none of the raw invalid
+// values ever appear in the log output.
+func TestNormalizeAPIKeyExpiresAt_OffsetRewrittenAndLogHygiene(t *testing.T) {
+	t.Parallel()
+
+	forEachDialect(t, func(t *testing.T, d *DB) {
+		ctx := context.Background()
+		org := mustCreateOrg(t, d, CreateOrgParams{Name: "Offset Log Org", Slug: "offset-log-" + newSortableID(t)})
+		user := mustCreateUser(t, d, CreateUserParams{
+			Email:        "offset-log-" + newSortableID(t) + "@example.com",
+			DisplayName:  "Offset Log Tester",
+			PasswordHash: testPasswordHash(t),
+		})
+
+		mustCreateTestKey := func(expiresAt *string) *APIKey {
+			t.Helper()
+			key, err := d.CreateAPIKey(ctx, CreateAPIKeyParams{
+				KeyHash:   "hash-" + newSortableID(t),
+				KeyHint:   "vl_uk_test",
+				KeyType:   "user_key",
+				Name:      "offset log test key",
+				OrgID:     org.ID,
+				UserID:    &user.ID,
+				ExpiresAt: expiresAt,
+				CreatedBy: user.ID,
+			})
+			if err != nil {
+				t.Fatalf("CreateAPIKey: %v", err)
+			}
+			return key
+		}
+
+		const offsetRaw = "2026-09-27T01:00:00+02:00"
+		const wantCanonical = "2026-09-26T23:00:00Z"
+		const alreadyCanonical = "2026-09-26T23:00:00Z"
+		const insane = "9999-99-99T99:99:99Z"
+		const empty = ""
+		const garbage = "garbage"
+
+		offsetKey := mustCreateTestKey(ptr(offsetRaw))
+		canonicalKey := mustCreateTestKey(ptr(alreadyCanonical))
+		insaneKey := mustCreateTestKey(ptr(insane))
+		emptyKey := mustCreateTestKey(ptr(empty))
+		garbageKey := mustCreateTestKey(ptr(garbage))
+
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+		if err := NormalizeEventTimestamps(ctx, d.SQL(), d.Dialect(), logger); err != nil {
+			t.Fatalf("NormalizeEventTimestamps() error = %v, want nil", err)
+		}
+
+		if got := rawColumnValue(t, d, "api_keys", "expires_at", offsetKey.ID); got != wantCanonical {
+			t.Errorf("offset expires_at after normalize = %q, want %q", got, wantCanonical)
+		}
+		if got := rawColumnValue(t, d, "api_keys", "expires_at", canonicalKey.ID); got != alreadyCanonical {
+			t.Errorf("already-canonical expires_at changed by normalize: got %q, want unchanged %q", got, alreadyCanonical)
+		}
+		if got := rawColumnValue(t, d, "api_keys", "expires_at", insaneKey.ID); got != insane {
+			t.Errorf("insane expires_at after normalize = %q, want untouched %q", got, insane)
+		}
+		if got := rawColumnValue(t, d, "api_keys", "expires_at", emptyKey.ID); got != empty {
+			t.Errorf("empty expires_at after normalize = %q, want untouched (empty)", got)
+		}
+		if got := rawColumnValue(t, d, "api_keys", "expires_at", garbageKey.ID); got != garbage {
+			t.Errorf("garbage expires_at after normalize = %q, want untouched %q", got, garbage)
+		}
+
+		output := buf.String()
+		for _, raw := range []string{insane, garbage} {
+			if strings.Contains(output, raw) {
+				t.Errorf("log output contains raw invalid expires_at value %q; log must never carry stored values:\n%s", raw, output)
+			}
 		}
 	})
 }

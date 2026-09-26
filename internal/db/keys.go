@@ -200,7 +200,7 @@ WHERE k.deleted_at IS NULL
   AND (k.expires_at IS NULL OR k.expires_at > %s)
 ORDER BY k.id ASC`, d.dialect.Placeholder(1))
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := FormatTimestamp(time.Now())
 	rows, err := d.sql.QueryContext(ctx, q, now)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load all active keys: query: %w", err)
@@ -240,7 +240,7 @@ WHERE k.deleted_at IS NULL
   AND k.id = %s
   AND (k.expires_at IS NULL OR k.expires_at > %s)`, p(1), p(2))
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := FormatTimestamp(time.Now())
 	row := d.sql.QueryRowContext(ctx, q, keyID, now)
 	r, err := scanKeyRecord(row)
 	if err != nil {
