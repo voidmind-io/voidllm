@@ -468,6 +468,14 @@ func TestPII_Stage0c_ClientDisconnect_NoBreakerFailure(t *testing.T) {
 			return
 		}
 		// Send many chunks; the client will disconnect after reading the first.
+		// Pacing below is load-bearing: the handler writes into fiber's
+		// SendStreamWriter, whose bufio.Writer feeds an in-process
+		// fasthttputil.PipeConns drained by a separate goroutine, so a client
+		// disconnect only surfaces on a later socket write. Without pacing,
+		// all chunks get flushed into the pipe before the RST is observed,
+		// the stream ends without [DONE], and it is (correctly) classified
+		// as incomplete, which trips the breaker and masks the disconnect.
+		// Real upstreams stream with inter-token latency; this mirrors that.
 		for i := 0; i < 100; i++ {
 			chunk := fmt.Sprintf(
 				`data: {"id":"dc1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"chunk_%d "},"finish_reason":null}]}`,
@@ -478,6 +486,7 @@ func TestPII_Stage0c_ClientDisconnect_NoBreakerFailure(t *testing.T) {
 			}
 			fmt.Fprintln(w)
 			flusher.Flush()
+			time.Sleep(5 * time.Millisecond)
 		}
 	}))
 	t.Cleanup(upstream.Close)
