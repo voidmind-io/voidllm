@@ -1144,3 +1144,170 @@ func TestPII_ExternalProvider_StopFieldAnonymised(t *testing.T) {
 		t.Errorf("upstream body missing PII pseudonym for stop field; body: %s", upstreamBody)
 	}
 }
+
+// ── unknown top-level fields (documents, chat_template_kwargs), end-to-end ──
+
+// unknownFieldsBody builds a chat request carrying an email inside two
+// top-level fields that are neither explicitly covered nor exempt in
+// anonymizeWithDetectors: "documents" (rerank-shaped) and
+// "chat_template_kwargs" (vLLM-shaped, nested object).
+func unknownFieldsBody(model string) string {
+	return fmt.Sprintf(
+		`{"model":%q,"messages":[{"role":"user","content":"hi"}],"documents":["contact %s"],"chat_template_kwargs":{"note":"reach %s"}}`,
+		model, piiTestEmail, piiTestEmail,
+	)
+}
+
+// TestPII_ExternalProvider_UnknownFieldsAnonymised verifies that the default
+// unknown-field scan reaches an external (public) upstream end-to-end through
+// the full handler: an email placed in "documents" and in the nested
+// "chat_template_kwargs" object must arrive at the upstream only as
+// pseudonyms, never as the original value.
+func TestPII_ExternalProvider_UnknownFieldsAnonymised(t *testing.T) {
+	t.Parallel()
+
+	upstream, lastBody, _ := captureUpstream(t,
+		http.StatusOK,
+		`{"id":"cmp-unknown","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
+		map[string]string{"Content-Type": "application/json"},
+	)
+
+	reg := piiRegistryExternal(t, upstream.URL)
+	handler := piiHandler(t, reg)
+	app := testApp(t, handler)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(unknownFieldsBody("ext-model")))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, testTimeout)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, b)
+	}
+
+	upstreamBody := string(*lastBody)
+	if strings.Contains(upstreamBody, piiTestEmail) {
+		t.Errorf("SECURITY: upstream received original PII email %q in documents/chat_template_kwargs; expected pseudonyms only; body: %s", piiTestEmail, upstreamBody)
+	}
+	if !piiPseudonymPattern.MatchString(upstreamBody) {
+		t.Errorf("upstream body missing PII pseudonym for documents/chat_template_kwargs; body: %s", upstreamBody)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(*lastBody, &doc); err != nil {
+		t.Fatalf("upstream body is not valid JSON: %v; body: %s", err, upstreamBody)
+	}
+	if _, ok := doc["documents"]; !ok {
+		t.Errorf("upstream body lost the documents field entirely; body: %s", upstreamBody)
+	}
+	if _, ok := doc["chat_template_kwargs"]; !ok {
+		t.Errorf("upstream body lost the chat_template_kwargs field entirely; body: %s", upstreamBody)
+	}
+}
+
+// TestPII_InternalProvider_UnknownFieldsUntouched verifies that the same
+// request sent to an internal (private-destination) upstream passes through
+// with the original email in "documents" and "chat_template_kwargs" intact:
+// the default unknown-field scan only anonymizes when shouldAnonymize
+// decides the destination requires it.
+func TestPII_InternalProvider_UnknownFieldsUntouched(t *testing.T) {
+	t.Parallel()
+
+	upstream, lastBody, _ := captureUpstream(t,
+		http.StatusOK,
+		`{"id":"cmp-unknown-int","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
+		map[string]string{"Content-Type": "application/json"},
+	)
+
+	reg := piiRegistryInternal(t, upstream.URL)
+	handler := piiHandler(t, reg)
+	app := testApp(t, handler)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(unknownFieldsBody("int-model")))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, testTimeout)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, b)
+	}
+
+	upstreamBody := string(*lastBody)
+	if !strings.Contains(upstreamBody, piiTestEmail) {
+		t.Errorf("internal upstream did not receive original email %q in documents/chat_template_kwargs; body: %s", piiTestEmail, upstreamBody)
+	}
+	if piiPseudonymPattern.MatchString(upstreamBody) {
+		t.Errorf("internal upstream body has a pseudonym but destination is private; body: %s", upstreamBody)
+	}
+}
+
+// TestPII_RestoreOnNon2xx_UnknownField verifies that when an external
+// provider responds with a 4xx status that echoes the pseudonym generated
+// for an email placed in an unknown field ("documents"), the client sees the
+// restored original value, not the raw pseudonym, and the response remains
+// valid JSON.
+func TestPII_RestoreOnNon2xx_UnknownField(t *testing.T) {
+	t.Parallel()
+
+	// Pre-compute the pseudonym for piiTestEmail with orgID "" (the handler
+	// uses PIIEngine.NewFilter("") because no auth.KeyInfo is set in this
+	// test — no auth middleware is wired into piiHandler/testApp).
+	engine := newTestPIIEngine(t)
+	sampleFilter := engine.NewFilter("")
+	sampleBody := []byte(unknownFieldsBody("ext-model"))
+	anonBody, err := sampleFilter.AnonymizeJSON(sampleBody)
+	if err != nil {
+		t.Fatalf("pre-compute AnonymizeJSON: %v", err)
+	}
+	pseudo := piiPseudonymPattern.FindString(string(anonBody))
+	if pseudo == "" {
+		t.Fatal("could not derive pseudonym for piiTestEmail via sample filter")
+	}
+
+	// Mock upstream returns 400 with the pseudonym echoed in the error message.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"error":{"message":"invalid document value %s in request"}}`, pseudo)
+	}))
+	t.Cleanup(upstream.Close)
+
+	reg := piiRegistryExternal(t, upstream.URL)
+	handler := NewProxyHandler(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler.PIIEngine = engine
+	app := testApp(t, handler)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(unknownFieldsBody("ext-model")))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, testTimeout)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+
+	clientBody, _ := io.ReadAll(resp.Body)
+
+	if strings.Contains(string(clientBody), pseudo) {
+		t.Errorf("client response contains raw pseudonym %q; expected restored original; body: %s", pseudo, clientBody)
+	}
+	if !strings.Contains(string(clientBody), piiTestEmail) {
+		t.Errorf("client response missing restored email %q; body: %s", piiTestEmail, clientBody)
+	}
+	if !json.Valid(clientBody) {
+		t.Errorf("restored client response is not valid JSON: %s", clientBody)
+	}
+}

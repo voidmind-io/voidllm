@@ -76,6 +76,18 @@ Names are only detected if they appear in a loaded list. A name that is not in a
 
 Not detected, by design: free-form facts, diagnoses, addresses, dates of birth, non-German identifier formats, and anything else without a pattern or list entry.
 
+## Field coverage
+
+Detection runs at the JSON field level, not on the raw request body. Chat, completion, embedding, rerank, and score requests are all supported: `messages[].content`, `messages[].name`, tool-call and function-call arguments, `tools[].function.description` and its `parameters` schema, and the top-level `user`, `stop`, `prompt`, and `input` fields each get shape-validated scanning.
+
+Every other top-level field in the request body is scanned by default. Every string value in it - whether the field is a plain string, an array, or a nested object - is checked for PII and pseudonymized independently; array elements and object fields are never concatenated before scanning. This is what covers rerank and score requests (`query`, `documents`, `texts`, `text_1`, `text_2`, `queries`, `items`, `instruction`, in any of the shapes different providers use - plain strings, arrays of strings, `{"text": ...}` objects, Cohere-style documents, vLLM content parts) and any provider-specific field such as vLLM's `chat_template_kwargs`, without needing a field added to an allowlist first. A field is only exempt from this default scan if it is purely structural - see below.
+
+**Exempt from scanning** (values are routing or sampling parameters, not text, and must reach the upstream byte-identical): `model`, `stream`, `stream_options`, `n`, `temperature`, `top_p`, `top_k`, `max_tokens`, `max_completion_tokens`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `seed`, `logprobs`, `top_logprobs`, `parallel_tool_calls`, `tool_choice`, `encoding_format`, `dimensions`, `top_n`, `return_documents`, `return_text`, `truncate`, `raw_scores`, `service_tier`, `store`, `modalities`, `reasoning_effort`.
+
+If a field's value is an object and one of its keys itself looks like PII (rather than a value), the request is rejected (fail-closed) instead of silently forwarding an unscanned or corrupted key.
+
+A single request can hold at most 10,000 unique PII-to-pseudonym mappings. A request that exceeds this - a very large rerank batch, for example - is rejected (HTTP 422) rather than partially anonymized.
+
 ## Configuration
 
 ```yaml

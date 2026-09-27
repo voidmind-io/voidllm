@@ -24,6 +24,58 @@ var knownContentPartTypes = map[string]bool{
 	"video":       true,
 }
 
+// coveredTopLevelFields lists the top-level request-body fields that
+// anonymizeWithDetectors handles with dedicated shape validation above (user,
+// stop, prompt, input, tools, messages). They are excluded from the default
+// unknown-field scan to avoid processing them twice.
+var coveredTopLevelFields = map[string]bool{
+	"user":     true,
+	"stop":     true,
+	"prompt":   true,
+	"input":    true,
+	"tools":    true,
+	"messages": true,
+}
+
+// exemptTopLevelFields lists structural top-level request-body fields that
+// are exempt from the default unknown-field scan: they carry no free text,
+// or their value must remain byte-identical for routing or sampling
+// semantics to keep working (e.g. a pseudonymized "model" would break
+// routing; a rewritten "logit_bias" numeric-string key would corrupt the
+// token bias map). Every top-level field NOT in this set and NOT in
+// coveredTopLevelFields is treated as potential content and scanned.
+var exemptTopLevelFields = map[string]bool{
+	"model":                 true,
+	"stream":                true,
+	"stream_options":        true,
+	"n":                     true,
+	"temperature":           true,
+	"top_p":                 true,
+	"top_k":                 true,
+	"max_tokens":            true,
+	"max_completion_tokens": true,
+	"presence_penalty":      true,
+	"frequency_penalty":     true,
+	"repetition_penalty":    true,
+	"logit_bias":            true,
+	"seed":                  true,
+	"logprobs":              true,
+	"top_logprobs":          true,
+	"parallel_tool_calls":   true,
+	"tool_choice":           true,
+	"encoding_format":       true,
+	"dimensions":            true,
+	"top_n":                 true,
+	"return_documents":      true,
+	"return_text":           true,
+	"truncate":              true,
+	"raw_scores":            true,
+	"service_tier":          true,
+	"store":                 true,
+	"modalities":            true,
+	"reasoning_effort":      true,
+}
+
 // hasDuplicateKeys reports whether body contains a JSON object (at any level of
 // nesting) that has at least one duplicated key. It uses encoding/json's
 // token-streaming decoder (stdlib, no CGO). Duplicate keys are rejected because
@@ -107,7 +159,8 @@ func scanForDuplicateKeys(dec *json.Decoder) (bool, error) {
 
 // anonymizeWithDetectors replaces PII in all PII-bearing string fields of an
 // OpenAI-shaped request body. It handles chat completion, legacy completion,
-// and embeddings request shapes. Covered fields:
+// embeddings, and rerank/score request shapes. Explicitly covered fields (each
+// with dedicated shape validation):
 //
 // Chat completions:
 //   - messages[].content (string or array-of-parts "text" field)
@@ -128,6 +181,21 @@ func scanForDuplicateKeys(dec *json.Decoder) (bool, error) {
 // All request shapes:
 //   - top-level "stop" (string or array-of-strings; each string is
 //     pseudonymized independently, never concatenated)
+//
+// Every other top-level key — anything not listed above — is scanned by
+// default: it is treated as potential free-text content and passed through
+// scanStringLeaves, which pseudonymizes every string leaf independently
+// (never concatenating array elements or object fields), leaves numbers,
+// booleans, and null untouched, rejects PII found in an object key
+// fail-closed, and bounds recursion at maxScanDepth. This covers rerank and
+// score request fields (e.g. "query", "documents", "texts", "text_1",
+// "text_2", "queries", "items", "instruction") and any current or future
+// provider-specific field (e.g. vLLM's "chat_template_kwargs") without
+// endpoint-specific code — no client-supplied text reaches an upstream
+// unscanned through any top-level field. A small set of structural fields
+// (see exemptTopLevelFields) is exempt from this default scan because their
+// values carry no free text or must stay byte-identical for routing and
+// sampling semantics.
 //
 // detectors are called for each string value to locate PII spans. replace
 // is called once per unique (type, originalValue) to obtain the pseudonym;
@@ -784,6 +852,29 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 				return nil, errors.New("pii: request body could not be processed for anonymization")
 			}
 			doc["messages"] = jsonx.RawMessage(newMessagesJSON)
+		}
+	}
+
+	// ── every other top-level field: scanned by default ─────────────────────
+	// Any top-level key that is neither explicitly covered above nor in the
+	// structural exempt set is potential free-text content. Scan it with
+	// scanStringLeaves: every string leaf is pseudonymized independently
+	// (never concatenated), object keys are checked for PII and rejected
+	// fail-closed, recursion is bounded by maxScanDepth, and numbers, booleans,
+	// and null are left untouched. This is what covers rerank/score fields
+	// (query, documents, texts, text_1, text_2, ...) and any other current or
+	// future field without endpoint-specific code.
+	for key, raw := range doc {
+		if coveredTopLevelFields[key] || exemptTopLevelFields[key] {
+			continue
+		}
+		scanned, did, err := scanStringLeaves(raw, detect)
+		if err != nil {
+			return nil, errors.New("pii: request body could not be processed for anonymization")
+		}
+		if did {
+			doc[key] = scanned
+			touched = true
 		}
 	}
 
