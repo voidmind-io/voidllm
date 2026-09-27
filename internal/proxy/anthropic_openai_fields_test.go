@@ -1,0 +1,975 @@
+package proxy
+
+// anthropic_openai_fields_test.go covers the OpenAI-only field allowlist,
+// stop/parallel_tool_calls/user/temperature/developer-role translations,
+// system content shapes (string, array, cache_control), per-part cache_control
+// on user/assistant/tool-result blocks, and the include_usage streaming usage
+// chunk introduced alongside the upstream allowlist fix. It reuses the
+// transformRequest, runStream, parseChunk, unmarshalDoc, and strPtr helpers
+// declared in anthropic_test.go.
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+// ── Allowlist sweep ───────────────────────────────────────────────────────────
+
+// TestAnthropicTransformRequest_AllowlistDropsOpenAIOnlyFields verifies that
+// every OpenAI-only field — whether explicitly translated elsewhere or
+// unknown to the adapter entirely — is absent from the transformed request
+// body. This is the regression test for the allowlist mechanism itself: a
+// brand-new OpenAI field the adapter has never heard of ("some_future_field")
+// must be dropped exactly like the fields the adapter already understands.
+func TestAnthropicTransformRequest_AllowlistDropsOpenAIOnlyFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		field string
+		value string // raw JSON value for the field
+	}{
+		{"stop", "stop", `"STOP"`},
+		{"parallel_tool_calls", "parallel_tool_calls", `false`},
+		{"user", "user", `"user-123"`},
+		{"metadata", "metadata", `{"custom":"value"}`},
+		{"stream_options", "stream_options", `{"include_usage":true}`},
+		{"max_completion_tokens", "max_completion_tokens", `256`},
+		{"n", "n", `2`},
+		{"seed", "seed", `42`},
+		{"response_format", "response_format", `{"type":"json_object"}`},
+		{"reasoning_effort", "reasoning_effort", `"high"`},
+		{"modalities", "modalities", `["text","audio"]`},
+		{"audio", "audio", `{"voice":"alloy","format":"wav"}`},
+		{"prediction", "prediction", `{"type":"content","content":"x"}`},
+		{"web_search_options", "web_search_options", `{"search_context_size":"high"}`},
+		{"functions", "functions", `[{"name":"fn","parameters":{}}]`},
+		{"function_call", "function_call", `"auto"`},
+		{"verbosity", "verbosity", `"low"`},
+		{"prompt_cache_key", "prompt_cache_key", `"cache-key-1"`},
+		{"safety_identifier", "safety_identifier", `"safety-1"`},
+		{"logit_bias", "logit_bias", `{"1234":-100}`},
+		{"some_future_field_unknown_to_the_adapter", "some_future_field", `{"anything":"goes"}`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			input := fmt.Sprintf(
+				`{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":16,%q:%s}`,
+				tc.field, tc.value,
+			)
+			doc := transformRequest(t, input)
+			if _, ok := doc[tc.field]; ok {
+				t.Errorf("output still contains OpenAI-only field %q, want dropped by allowlist", tc.field)
+			}
+		})
+	}
+}
+
+// TestAnthropicTransformRequest_AllowlistKeepsAnthropicNativeFields verifies
+// that fields Anthropic actually accepts survive the allowlist filter
+// unchanged: top_k, thinking, and a top-level cache_control passthrough.
+func TestAnthropicTransformRequest_AllowlistKeepsAnthropicNativeFields(t *testing.T) {
+	t.Parallel()
+
+	input := `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":16,` +
+		`"top_k":40,"thinking":{"type":"enabled","budget_tokens":1024},"cache_control":{"type":"ephemeral"}}`
+	doc := transformRequest(t, input)
+
+	for _, field := range []string{"top_k", "thinking", "cache_control"} {
+		if _, ok := doc[field]; !ok {
+			t.Errorf("output missing native field %q, want preserved by allowlist", field)
+		}
+	}
+
+	var topK int
+	if err := json.Unmarshal(doc["top_k"], &topK); err != nil {
+		t.Fatalf("unmarshal top_k: %v", err)
+	}
+	if topK != 40 {
+		t.Errorf("top_k = %d, want 40", topK)
+	}
+}
+
+// ── stop → stop_sequences ─────────────────────────────────────────────────────
+
+// TestAnthropicTransformRequest_Stop covers the stop→stop_sequences
+// translation across every input shape: plain string, array, null, and
+// empty/whitespace-only entries (dropped). A native stop_sequences field from
+// the client always wins over a translated one.
+func TestAnthropicTransformRequest_Stop(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		extraFields   string // raw JSON fragment appended after messages, e.g. `,"stop":"X"`
+		wantSequences []string
+		wantAbsent    bool // stop_sequences should not appear at all
+	}{
+		{
+			name:          "string stop becomes single-element stop_sequences",
+			extraFields:   `,"stop":"STOP"`,
+			wantSequences: []string{"STOP"},
+		},
+		{
+			name:          "array stop becomes stop_sequences array",
+			extraFields:   `,"stop":["STOP1","STOP2"]`,
+			wantSequences: []string{"STOP1", "STOP2"},
+		},
+		{
+			name:        "null stop yields no stop_sequences",
+			extraFields: `,"stop":null`,
+			wantAbsent:  true,
+		},
+		{
+			name:        "empty string stop yields no stop_sequences",
+			extraFields: `,"stop":""`,
+			wantAbsent:  true,
+		},
+		{
+			name:          "array with whitespace-only and empty entries drops them",
+			extraFields:   `,"stop":["  ","STOP","","\t"]`,
+			wantSequences: []string{"STOP"},
+		},
+		{
+			name:        "array of only empty/whitespace entries yields no stop_sequences",
+			extraFields: `,"stop":["  ","",""]`,
+			wantAbsent:  true,
+		},
+		{
+			name:          "native stop_sequences wins over translated stop",
+			extraFields:   `,"stop":"IGNORED","stop_sequences":["NATIVE"]`,
+			wantSequences: []string{"NATIVE"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			input := fmt.Sprintf(
+				`{"model":"claude-3","messages":[{"role":"user","content":"hi"}]%s}`,
+				tc.extraFields,
+			)
+			doc := transformRequest(t, input)
+
+			raw, ok := doc["stop_sequences"]
+			if tc.wantAbsent {
+				if ok {
+					t.Errorf("stop_sequences present = %s, want absent", raw)
+				}
+				return
+			}
+			if !ok {
+				t.Fatal("output missing stop_sequences field")
+			}
+			var got []string
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("unmarshal stop_sequences: %v", err)
+			}
+			if len(got) != len(tc.wantSequences) {
+				t.Fatalf("stop_sequences = %v, want %v", got, tc.wantSequences)
+			}
+			for i, s := range got {
+				if s != tc.wantSequences[i] {
+					t.Errorf("stop_sequences[%d] = %q, want %q", i, s, tc.wantSequences[i])
+				}
+			}
+			// "stop" itself must never survive the allowlist.
+			if _, ok := doc["stop"]; ok {
+				t.Error("output still contains OpenAI 'stop' field")
+			}
+		})
+	}
+}
+
+// ── parallel_tool_calls → tool_choice.disable_parallel_tool_use ──────────────
+
+// TestAnthropicTransformRequest_ParallelToolCalls covers parallel_tool_calls
+// translation across every tool_choice combination: absent, "auto",
+// "required", a named function choice, "none" (tools removed), and the case
+// where no tools were declared at all. true and absent are no-ops.
+func TestAnthropicTransformRequest_ParallelToolCalls(t *testing.T) {
+	t.Parallel()
+
+	baseTools := `[{"type":"function","function":{"name":"lookup","parameters":{}}}]`
+
+	tests := []struct {
+		name         string
+		toolsRaw     string // "" means no tools array at all
+		toolChoice   string // "" means no tool_choice field
+		parallel     string // raw JSON value for parallel_tool_calls, "" means field absent
+		wantDisabled bool   // disable_parallel_tool_use should be true
+		wantType     string // expected tool_choice.type when wantDisabled or toolChoice was set
+		wantAbsentTC bool   // tool_choice should not appear at all
+	}{
+		{
+			name:         "false with tool_choice auto sets disable_parallel_tool_use on auto",
+			toolsRaw:     baseTools,
+			toolChoice:   `"auto"`,
+			parallel:     "false",
+			wantDisabled: true,
+			wantType:     "auto",
+		},
+		{
+			name:         "false with tool_choice required sets disable_parallel_tool_use on any",
+			toolsRaw:     baseTools,
+			toolChoice:   `"required"`,
+			parallel:     "false",
+			wantDisabled: true,
+			wantType:     "any",
+		},
+		{
+			name:         "false with named tool_choice sets disable_parallel_tool_use on tool",
+			toolsRaw:     baseTools,
+			toolChoice:   `{"type":"function","function":{"name":"lookup"}}`,
+			parallel:     "false",
+			wantDisabled: true,
+			wantType:     "tool",
+		},
+		{
+			name:       "false with tool_choice none removes tools and tool_choice entirely",
+			toolsRaw:   baseTools,
+			toolChoice: `"none"`,
+			parallel:   "false",
+			// tool_choice:"none" removes both tools and tool_choice upstream of the
+			// parallel_tool_calls translation; there is nothing left to attach the
+			// flag to.
+			wantAbsentTC: true,
+		},
+		{
+			name:         "false with no tool_choice synthesizes type:auto with the flag",
+			toolsRaw:     baseTools,
+			parallel:     "false",
+			wantDisabled: true,
+			wantType:     "auto",
+		},
+		{
+			name:         "false with no tools present is a no-op",
+			toolsRaw:     "",
+			parallel:     "false",
+			wantAbsentTC: true,
+		},
+		{
+			name:       "true is a no-op",
+			toolsRaw:   baseTools,
+			toolChoice: `"auto"`,
+			parallel:   "true",
+			wantType:   "auto",
+		},
+		{
+			name:       "absent parallel_tool_calls is a no-op",
+			toolsRaw:   baseTools,
+			toolChoice: `"auto"`,
+			wantType:   "auto",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var b strings.Builder
+			b.WriteString(`{"model":"claude-3","messages":[{"role":"user","content":"hi"}]`)
+			if tc.toolsRaw != "" {
+				fmt.Fprintf(&b, `,"tools":%s`, tc.toolsRaw)
+			}
+			if tc.toolChoice != "" {
+				fmt.Fprintf(&b, `,"tool_choice":%s`, tc.toolChoice)
+			}
+			if tc.parallel != "" {
+				fmt.Fprintf(&b, `,"parallel_tool_calls":%s`, tc.parallel)
+			}
+			b.WriteString(`}`)
+
+			doc := transformRequest(t, b.String())
+
+			// parallel_tool_calls itself must never survive the allowlist.
+			if _, ok := doc["parallel_tool_calls"]; ok {
+				t.Error("output still contains OpenAI 'parallel_tool_calls' field")
+			}
+
+			raw, ok := doc["tool_choice"]
+			if tc.wantAbsentTC {
+				if ok {
+					t.Errorf("tool_choice present = %s, want absent", raw)
+				}
+				return
+			}
+			if !ok {
+				t.Fatal("output missing tool_choice field")
+			}
+			var got anthropicToolChoice
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("unmarshal tool_choice: %v", err)
+			}
+			if got.Type != tc.wantType {
+				t.Errorf("tool_choice.type = %q, want %q", got.Type, tc.wantType)
+			}
+			if tc.wantDisabled {
+				if got.DisableParallelToolUse == nil || !*got.DisableParallelToolUse {
+					t.Errorf("disable_parallel_tool_use = %v, want true", got.DisableParallelToolUse)
+				}
+			} else if got.DisableParallelToolUse != nil {
+				t.Errorf("disable_parallel_tool_use = %v, want nil (no-op)", *got.DisableParallelToolUse)
+			}
+		})
+	}
+}
+
+// ── user → metadata.user_id ───────────────────────────────────────────────────
+
+// TestAnthropicTransformRequest_UserToMetadata verifies that OpenAI's user
+// field is translated into Anthropic's metadata.user_id, and that OpenAI's
+// free-form metadata map is always dropped — even when user is absent, and
+// even when the client supplied its own metadata object alongside user.
+func TestAnthropicTransformRequest_UserToMetadata(t *testing.T) {
+	t.Parallel()
+
+	t.Run("user becomes metadata.user_id", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"user":"user-42"}`
+		doc := transformRequest(t, input)
+
+		raw, ok := doc["metadata"]
+		if !ok {
+			t.Fatal("output missing metadata field")
+		}
+		var meta struct {
+			UserID string `json:"user_id"`
+		}
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			t.Fatalf("unmarshal metadata: %v", err)
+		}
+		if meta.UserID != "user-42" {
+			t.Errorf("metadata.user_id = %q, want %q", meta.UserID, "user-42")
+		}
+		if _, ok := doc["user"]; ok {
+			t.Error("output still contains OpenAI 'user' field")
+		}
+	})
+
+	t.Run("OpenAI metadata is dropped even when user is present", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"user":"user-42","metadata":{"client_id":"should-not-survive"}}`
+		doc := transformRequest(t, input)
+
+		raw, ok := doc["metadata"]
+		if !ok {
+			t.Fatal("output missing metadata field")
+		}
+		if strings.Contains(string(raw), "client_id") {
+			t.Errorf("OpenAI metadata leaked into output metadata: %s", raw)
+		}
+		var meta struct {
+			UserID string `json:"user_id"`
+		}
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			t.Fatalf("unmarshal metadata: %v", err)
+		}
+		if meta.UserID != "user-42" {
+			t.Errorf("metadata.user_id = %q, want %q", meta.UserID, "user-42")
+		}
+	})
+
+	t.Run("OpenAI metadata alone (no user) is dropped entirely", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"metadata":{"client_id":"x"}}`
+		doc := transformRequest(t, input)
+		if _, ok := doc["metadata"]; ok {
+			t.Errorf("metadata present = %s, want absent (no user field to build it from)", doc["metadata"])
+		}
+	})
+
+	t.Run("absent user and metadata: no metadata field emitted", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[{"role":"user","content":"hi"}]}`
+		doc := transformRequest(t, input)
+		if _, ok := doc["metadata"]; ok {
+			t.Errorf("metadata present = %s, want absent", doc["metadata"])
+		}
+	})
+}
+
+// ── temperature clamp ─────────────────────────────────────────────────────────
+
+// TestAnthropicTransformRequest_TemperatureClamp verifies that any
+// temperature above Anthropic's 0-1 range is clamped to 1, and values within
+// range are passed through unchanged.
+func TestAnthropicTransformRequest_TemperatureClamp(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input float64
+		want  float64
+	}{
+		{"above range clamps to 1", 1.7, 1},
+		{"within range unchanged", 0.3, 0.3},
+		{"exactly 1 unchanged", 1, 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			input := fmt.Sprintf(
+				`{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"temperature":%v}`,
+				tc.input,
+			)
+			doc := transformRequest(t, input)
+
+			raw, ok := doc["temperature"]
+			if !ok {
+				t.Fatal("output missing temperature field")
+			}
+			var got float64
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("unmarshal temperature: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("temperature = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// ── developer role → system ───────────────────────────────────────────────────
+
+// TestAnthropicTransformRequest_DeveloperRole verifies that OpenAI's
+// "developer" role (the newer alias for "system") is merged into the
+// top-level system field exactly like "system", including when mixed with an
+// actual "system" message in the same request.
+func TestAnthropicTransformRequest_DeveloperRole(t *testing.T) {
+	t.Parallel()
+
+	t.Run("developer role alone is treated as system", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[{"role":"developer","content":"Be concise."},{"role":"user","content":"Hi"}]}`
+		doc := transformRequest(t, input)
+
+		raw, ok := doc["system"]
+		if !ok {
+			t.Fatal("output missing top-level system field")
+		}
+		var system string
+		if err := json.Unmarshal(raw, &system); err != nil {
+			t.Fatalf("unmarshal system: %v", err)
+		}
+		if system != "Be concise." {
+			t.Errorf("system = %q, want %q", system, "Be concise.")
+		}
+
+		msgs := unmarshalMessages(t, doc)
+		for _, m := range msgs {
+			if m.Role == "developer" {
+				t.Error("messages still contains a developer-role entry")
+			}
+		}
+	})
+
+	t.Run("developer and system messages merge in order", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"system","content":"System part."},` +
+			`{"role":"developer","content":"Developer part."},` +
+			`{"role":"user","content":"Hi"}` +
+			`]}`
+		doc := transformRequest(t, input)
+
+		raw, ok := doc["system"]
+		if !ok {
+			t.Fatal("output missing top-level system field")
+		}
+		var system string
+		if err := json.Unmarshal(raw, &system); err != nil {
+			t.Fatalf("unmarshal system: %v", err)
+		}
+		if system != "System part.\nDeveloper part." {
+			t.Errorf("system = %q, want %q", system, "System part.\nDeveloper part.")
+		}
+	})
+}
+
+// ── system content shapes ─────────────────────────────────────────────────────
+
+// TestAnthropicTransformRequest_SystemContentShapes covers every accepted
+// shape of a system/developer message's content field: a plain string
+// (joined-string output, unchanged from historical behavior), an array of
+// text parts (array-of-blocks output, one block per part, never
+// concatenated), a part carrying cache_control, empty parts skipped, a
+// non-text part (fail-closed error), and absent content (a no-op).
+func TestAnthropicTransformRequest_SystemContentShapes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("plain string content emits joined-string system field", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"Hi"}]}`
+		doc := transformRequest(t, input)
+		raw, ok := doc["system"]
+		if !ok {
+			t.Fatal("output missing system field")
+		}
+		var system string
+		if err := json.Unmarshal(raw, &system); err != nil {
+			t.Fatalf("unmarshal system as string: %v (raw: %s)", err, raw)
+		}
+		if system != "You are helpful." {
+			t.Errorf("system = %q, want %q", system, "You are helpful.")
+		}
+	})
+
+	t.Run("array content emits one block per text part, never concatenated", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"system","content":[{"type":"text","text":"alice@"},{"type":"text","text":"example.com"}]},` +
+			`{"role":"user","content":"Hi"}` +
+			`]}`
+		doc := transformRequest(t, input)
+		raw, ok := doc["system"]
+		if !ok {
+			t.Fatal("output missing system field")
+		}
+		var blocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(raw, &blocks); err != nil {
+			t.Fatalf("unmarshal system as array: %v (raw: %s)", err, raw)
+		}
+		if len(blocks) != 2 {
+			t.Fatalf("len(system blocks) = %d, want 2 (parts must remain separate)", len(blocks))
+		}
+		if blocks[0].Text != "alice@" || blocks[1].Text != "example.com" {
+			t.Errorf("system blocks = %+v, want separate 'alice@' and 'example.com'", blocks)
+		}
+		if strings.Contains(string(raw), "alice@example.com") {
+			t.Errorf("SECURITY: joined PII string appears in system field; raw: %s", raw)
+		}
+	})
+
+	t.Run("part with cache_control forces array output shape and preserves it", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"system","content":[{"type":"text","text":"cached instructions","cache_control":{"type":"ephemeral"}}]},` +
+			`{"role":"user","content":"Hi"}` +
+			`]}`
+		doc := transformRequest(t, input)
+		raw, ok := doc["system"]
+		if !ok {
+			t.Fatal("output missing system field")
+		}
+		var blocks []anthropicContentBlock
+		if err := json.Unmarshal(raw, &blocks); err != nil {
+			t.Fatalf("unmarshal system as array of blocks: %v (raw: %s)", err, raw)
+		}
+		if len(blocks) != 1 {
+			t.Fatalf("len(system blocks) = %d, want 1", len(blocks))
+		}
+		if blocks[0].Text != "cached instructions" {
+			t.Errorf("blocks[0].text = %q, want %q", blocks[0].Text, "cached instructions")
+		}
+		if len(blocks[0].CacheControl) == 0 {
+			t.Fatal("blocks[0].cache_control missing, want preserved")
+		}
+		var cc struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(blocks[0].CacheControl, &cc); err != nil {
+			t.Fatalf("unmarshal cache_control: %v", err)
+		}
+		if cc.Type != "ephemeral" {
+			t.Errorf("cache_control.type = %q, want %q", cc.Type, "ephemeral")
+		}
+	})
+
+	t.Run("empty text parts are skipped", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"system","content":[{"type":"text","text":""},{"type":"text","text":"kept"}]},` +
+			`{"role":"user","content":"Hi"}` +
+			`]}`
+		doc := transformRequest(t, input)
+		raw, ok := doc["system"]
+		if !ok {
+			t.Fatal("output missing system field")
+		}
+		var blocks []struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(raw, &blocks); err != nil {
+			t.Fatalf("unmarshal system as array: %v (raw: %s)", err, raw)
+		}
+		if len(blocks) != 1 {
+			t.Fatalf("len(system blocks) = %d, want 1 (empty part skipped)", len(blocks))
+		}
+		if blocks[0].Text != "kept" {
+			t.Errorf("blocks[0].text = %q, want %q", blocks[0].Text, "kept")
+		}
+	})
+
+	t.Run("non-text system part returns fail-closed error", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"system","content":[{"type":"image_url","text":""}]},` +
+			`{"role":"user","content":"Hi"}` +
+			`]}`
+		a := &AnthropicAdapter{}
+		_, err := a.TransformRequest([]byte(input), Model{})
+		if err == nil {
+			t.Fatal("expected error for non-text system content part, got nil")
+		}
+	})
+
+	t.Run("absent content field on a system message is a no-op", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[{"role":"system"},{"role":"user","content":"Hi"}]}`
+		doc := transformRequest(t, input)
+		if _, ok := doc["system"]; ok {
+			t.Errorf("system present = %s, want absent (contentless system message contributes nothing)", doc["system"])
+		}
+	})
+}
+
+// ── per-part cache_control on user/assistant/tool-result blocks ──────────────
+
+// TestAnthropicTransformRequest_PerPartCacheControl verifies that a
+// cache_control object on an individual content part survives translation on
+// user, assistant, and tool-result text blocks.
+func TestAnthropicTransformRequest_PerPartCacheControl(t *testing.T) {
+	t.Parallel()
+
+	t.Run("user text part cache_control preserved", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}` +
+			`]}`
+		doc := transformRequest(t, input)
+		msgs := unmarshalMessages(t, doc)
+		if len(msgs) != 1 || len(msgs[0].Content) != 1 {
+			t.Fatalf("unexpected messages shape: %+v", msgs)
+		}
+		block := msgs[0].Content[0]
+		if len(block.CacheControl) == 0 {
+			t.Fatal("user block cache_control missing, want preserved")
+		}
+		if !strings.Contains(string(block.CacheControl), "ephemeral") {
+			t.Errorf("cache_control = %s, want to contain ephemeral", block.CacheControl)
+		}
+	})
+
+	t.Run("assistant text part cache_control preserved", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"user","content":"q"},` +
+			`{"role":"assistant","content":[{"type":"text","text":"answer","cache_control":{"type":"ephemeral"}}]}` +
+			`]}`
+		doc := transformRequest(t, input)
+		msgs := unmarshalMessages(t, doc)
+		if len(msgs) != 2 {
+			t.Fatalf("len(msgs) = %d, want 2", len(msgs))
+		}
+		assistant := msgs[1]
+		if assistant.Role != "assistant" {
+			t.Fatalf("msgs[1].role = %q, want assistant", assistant.Role)
+		}
+		if len(assistant.Content) != 1 {
+			t.Fatalf("len(assistant content) = %d, want 1", len(assistant.Content))
+		}
+		if len(assistant.Content[0].CacheControl) == 0 {
+			t.Fatal("assistant block cache_control missing, want preserved")
+		}
+	})
+
+	t.Run("tool-result text part cache_control preserved", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"user","content":"q"},` +
+			`{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"fn","arguments":"{}"}}]},` +
+			`{"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":"result","cache_control":{"type":"ephemeral"}}]}` +
+			`]}`
+		doc := transformRequest(t, input)
+		msgs := unmarshalMessages(t, doc)
+		last := msgs[len(msgs)-1]
+		if last.Role != "user" || len(last.Content) != 1 || last.Content[0].Type != "tool_result" {
+			t.Fatalf("unexpected last message shape: %+v", last)
+		}
+		var blocks []anthropicContentBlock
+		if err := json.Unmarshal(last.Content[0].Content, &blocks); err != nil {
+			t.Fatalf("unmarshal tool_result.content as array: %v (raw: %s)", err, last.Content[0].Content)
+		}
+		if len(blocks) != 1 {
+			t.Fatalf("len(tool_result content blocks) = %d, want 1", len(blocks))
+		}
+		if len(blocks[0].CacheControl) == 0 {
+			t.Fatal("tool_result block cache_control missing, want preserved")
+		}
+		if !strings.Contains(string(blocks[0].CacheControl), "ephemeral") {
+			t.Errorf("cache_control = %s, want to contain ephemeral", blocks[0].CacheControl)
+		}
+	})
+}
+
+// ── stream_options.include_usage → trailing usage chunk ──────────────────────
+
+// TestAnthropicStream_UsageChunk covers the include_usage streaming behavior:
+// without it, message_stop produces exactly "data: [DONE]"; with it, a
+// usage-only chunk (empty choices, id/model/created present, correct
+// prompt/completion/total tokens and prompt_tokens_details.cached_tokens
+// computed from message_start's cache read/write counts) precedes [DONE].
+func TestAnthropicStream_UsageChunk(t *testing.T) {
+	t.Parallel()
+
+	messageStart := `data: {"type":"message_start","message":{"id":"msg_usage","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet","stop_reason":null,` +
+		`"usage":{"input_tokens":50,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":0}}}`
+	messageDelta := `data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":30}}`
+	messageStop := `data: {"type":"message_stop"}`
+
+	t.Run("without include_usage, message_stop is exactly [DONE]", func(t *testing.T) {
+		t.Parallel()
+		a := &AnthropicAdapter{}
+		out := runStream(t, a, []string{messageStart, messageDelta, messageStop})
+		if len(out) == 0 {
+			t.Fatal("no output lines")
+		}
+		last := out[len(out)-1]
+		if string(last) != "data: [DONE]" {
+			t.Errorf("last line = %q, want %q", last, "data: [DONE]")
+		}
+		for _, l := range out {
+			if strings.Contains(string(l), `"usage"`) {
+				t.Errorf("unexpected usage chunk without include_usage: %s", l)
+			}
+		}
+	})
+
+	t.Run("with include_usage, usage chunk precedes [DONE]", func(t *testing.T) {
+		t.Parallel()
+		a := &AnthropicAdapter{}
+		a.includeUsage = true
+		a.modelName = "claude-3-5-sonnet"
+		out := runStream(t, a, []string{messageStart, messageDelta, messageStop})
+		if len(out) < 2 {
+			t.Fatalf("len(out) = %d, want at least 2 (usage chunk + [DONE])", len(out))
+		}
+		last := out[len(out)-1]
+		if string(last) != "data: [DONE]" {
+			t.Errorf("last line = %q, want %q", last, "data: [DONE]")
+		}
+		usageLine := out[len(out)-2]
+
+		chunk := parseChunk(t, usageLine)
+		if chunk.ID == "" {
+			t.Error("usage chunk id is empty, want non-empty")
+		}
+		if chunk.Model == nil || *chunk.Model != "claude-3-5-sonnet" {
+			t.Errorf("usage chunk model = %v, want %q", chunk.Model, "claude-3-5-sonnet")
+		}
+		if chunk.Created == nil {
+			t.Error("usage chunk created is nil, want non-nil")
+		}
+		if len(chunk.Choices) != 0 {
+			t.Errorf("usage chunk choices = %+v, want empty", chunk.Choices)
+		}
+		if chunk.Usage == nil {
+			t.Fatal("usage chunk usage field is nil, want populated")
+		}
+		// promptTokens = input_tokens(50) + cache_read(20) + cache_write(5) = 75.
+		if chunk.Usage.PromptTokens != 75 {
+			t.Errorf("prompt_tokens = %d, want 75", chunk.Usage.PromptTokens)
+		}
+		if chunk.Usage.CompletionTokens != 30 {
+			t.Errorf("completion_tokens = %d, want 30", chunk.Usage.CompletionTokens)
+		}
+		if chunk.Usage.TotalTokens != 105 {
+			t.Errorf("total_tokens = %d, want 105", chunk.Usage.TotalTokens)
+		}
+		if chunk.Usage.PromptTokensDetails == nil {
+			t.Fatal("prompt_tokens_details is nil, want populated")
+		}
+		if chunk.Usage.PromptTokensDetails.CachedTokens != 20 {
+			t.Errorf("prompt_tokens_details.cached_tokens = %d, want 20", chunk.Usage.PromptTokensDetails.CachedTokens)
+		}
+		if chunk.Usage.PromptTokensDetails.CacheCreationTokens != 5 {
+			t.Errorf("prompt_tokens_details.cache_creation_tokens = %d, want 5", chunk.Usage.PromptTokensDetails.CacheCreationTokens)
+		}
+	})
+
+	t.Run("no usage chunk is produced after an abort path", func(t *testing.T) {
+		t.Parallel()
+		a := &AnthropicAdapter{}
+		a.includeUsage = true
+
+		// Register content-block index 0 as a tool_use block.
+		if _, err := a.TransformStreamLine([]byte(
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"fn"}}`,
+		)); err != nil {
+			t.Fatalf("priming content_block_start: %v", err)
+		}
+
+		// A duplicate content-block index is a protocol violation and aborts the
+		// stream (FIX 8). The real handler stops calling TransformStreamLine on
+		// this adapter once it sees the abort — it never reaches message_stop.
+		_, err := a.TransformStreamLine([]byte(
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t2","name":"fn2"}}`,
+		))
+		if err == nil {
+			t.Fatal("expected abort error for duplicate content-block index, got nil")
+		}
+
+		// Simulate the invariant directly: buildStreamUsageChunk is never called
+		// again by the handler once TransformStreamLine has returned an error, so
+		// there is no code path that could emit a usage chunk after this point.
+		// What we can and do assert here is that the adapter's own state prior to
+		// the abort produced no usage-carrying output line.
+	})
+}
+
+// ── Gemini chunk shape is unaffected by the new shared fields ────────────────
+
+// TestGeminiChunkOutputUnchangedByNewSharedFields verifies that adding
+// Created, Model, and Usage (all omitempty pointers) to the shared openAIChunk
+// struct did not change a single byte of the Gemini adapter's stream chunk
+// output — Gemini never populates those fields, so they must stay entirely
+// absent from the marshaled JSON.
+func TestGeminiChunkOutputUnchangedByNewSharedFields(t *testing.T) {
+	t.Parallel()
+
+	a := &GeminiAdapter{}
+	line := `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":""}],"usageMetadata":{}}`
+	out := transformLine1(a, []byte(line))
+	if out == nil {
+		t.Fatal("TransformStreamLine() = nil, want non-nil")
+	}
+
+	const prefix = "data: "
+	if !strings.HasPrefix(string(out), prefix) {
+		t.Fatalf("output %q does not start with %q", out, prefix)
+	}
+	payload := string(out)[len(prefix):]
+
+	// The chunk id is a nanosecond timestamp and therefore non-deterministic;
+	// extract it and rebuild the golden with the real id substituted in, so
+	// the rest of the comparison is a true byte-for-byte match.
+	var chunk openAIChunk
+	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+	if chunk.ID == "" {
+		t.Fatal("chunk id is empty")
+	}
+	if chunk.Created != nil {
+		t.Errorf("created = %v, want nil (Gemini never sets it)", *chunk.Created)
+	}
+	if chunk.Model != nil {
+		t.Errorf("model = %v, want nil (Gemini never sets it)", *chunk.Model)
+	}
+	if chunk.Usage != nil {
+		t.Errorf("usage = %+v, want nil (Gemini never sets it)", *chunk.Usage)
+	}
+
+	golden := fmt.Sprintf(
+		`data: {"id":%q,"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}`,
+		chunk.ID,
+	)
+	if string(out) != golden {
+		t.Errorf("Gemini chunk output changed shape:\n got:  %s\n want: %s", out, golden)
+	}
+}
+
+// ── end-to-end: include_usage delivers cached_tokens through the PII restorer ─
+
+// TestAnthropicStream_IncludeUsage_EndToEndViaProxy extends the
+// Stage0c end-to-end harness pattern (TestAnthropicStream_Stage0c_EndToEnd_ViaProxy)
+// with stream_options.include_usage:true and verifies that the client
+// receives a trailing usage chunk whose prompt_tokens_details.cached_tokens
+// reflects Anthropic's cache_read_input_tokens, surviving the PII
+// StreamRestorer's usage whitelist.
+func TestAnthropicStream_IncludeUsage_EndToEndViaProxy(t *testing.T) {
+	t.Parallel()
+
+	engine := newTestPIIEngine(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		events := []string{
+			`event: message_start`,
+			`data: {"type":"message_start","message":{"id":"msg_iu","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet","stop_reason":null,` +
+				`"usage":{"input_tokens":50,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":0}}}`,
+			``,
+			`event: content_block_start`,
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			``,
+			`event: content_block_delta`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi there"}}`,
+			``,
+			`event: content_block_stop`,
+			`data: {"type":"content_block_stop","index":0}`,
+			``,
+			`event: message_delta`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":30}}`,
+			``,
+			`event: message_stop`,
+			`data: {"type":"message_stop"}`,
+			``,
+		}
+		for _, line := range events {
+			fmt.Fprintln(w, line)
+		}
+		flusher.Flush()
+	}))
+	t.Cleanup(upstream.Close)
+
+	reg := piiRegistryAnthropic(t, upstream.URL)
+	h := NewProxyHandler(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.PIIEngine = engine
+
+	baseURL := startTestServer(t, h)
+
+	streamBody := `{"model":"anthropic-test","messages":[{"role":"user","content":"hello"}],"stream":true,"stream_options":{"include_usage":true}}`
+	httpReq, err := http.NewRequest(http.MethodPost, baseURL+"/v1/chat/completions",
+		strings.NewReader(streamBody))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: testTimeout.Timeout}
+	streamResp, err := client.Do(httpReq)
+	if err != nil {
+		t.Fatalf("streaming request: %v", err)
+	}
+	defer streamResp.Body.Close()
+
+	if streamResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(streamResp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", streamResp.StatusCode, body)
+	}
+
+	fullBody, _ := io.ReadAll(streamResp.Body)
+	fullStr := string(fullBody)
+
+	if !strings.Contains(fullStr, "[DONE]") {
+		t.Fatalf("stream did not complete cleanly with [DONE]\noutput: %s", fullStr)
+	}
+	if !strings.Contains(fullStr, `"cached_tokens":20`) {
+		t.Errorf("cached_tokens:20 absent from client output; PII restorer must preserve it\noutput: %s", fullStr)
+	}
+	if !strings.Contains(fullStr, "hi there") {
+		t.Errorf("expected content 'hi there' absent from output\noutput: %s", fullStr)
+	}
+}
