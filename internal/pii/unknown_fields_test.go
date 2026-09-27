@@ -237,11 +237,14 @@ func TestFilter_AnonymizeJSON_InstructionChatTemplateKwargsMetadata_Scanned(t *t
 // ── exempt fields stay byte-identical, even when PII-shaped ─────────────────
 
 // TestFilter_AnonymizeJSON_ExemptFields_UntouchedEvenWhenPIIShaped verifies
-// that every field in exemptTopLevelFields is skipped entirely by the default
-// scan — its value reaches the output byte-identical — even when the value
-// looks exactly like PII the detectors would otherwise flag. Each body
-// contains no PII anywhere else, so the whole body must come back
-// byte-for-byte identical to the input and Touched() must stay false.
+// that fields whose exemption does not depend on scanning them at all
+// ("model", the routing field) or whose shape validation classifies them as
+// exempt ("logit_bias" with a valid numeric-string-keyed shape) are skipped
+// entirely by the default scan — their value reaches the output
+// byte-identical — even when the value looks exactly like PII the detectors
+// would otherwise flag. Each body contains no PII anywhere else, so the
+// whole body must come back byte-for-byte identical to the input and
+// Touched() must stay false.
 func TestFilter_AnonymizeJSON_ExemptFields_UntouchedEvenWhenPIIShaped(t *testing.T) {
 	t.Parallel()
 
@@ -254,20 +257,8 @@ func TestFilter_AnonymizeJSON_ExemptFields_UntouchedEvenWhenPIIShaped(t *testing
 			body: `{"model":"alice@example.com","messages":[{"role":"user","content":"hi"}]}`,
 		},
 		{
-			name: "tool_choice with a function name containing an email",
-			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tool_choice":{"type":"function","function":{"name":"alice@example.com"}}}`,
-		},
-		{
-			name: "logit_bias with a 13-digit numeric-string key",
-			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"logit_bias":{"1234567890123":-100}}`,
-		},
-		{
-			name: "reasoning_effort containing an email",
-			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"alice@example.com"}`,
-		},
-		{
-			name: "stream_options with a nested field containing an email",
-			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream_options":{"note":"alice@example.com"}}`,
+			name: "logit_bias with a 7-digit numeric-string key",
+			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"logit_bias":{"1234567":-100}}`,
 		},
 	}
 
@@ -286,6 +277,236 @@ func TestFilter_AnonymizeJSON_ExemptFields_UntouchedEvenWhenPIIShaped(t *testing
 			}
 		})
 	}
+}
+
+// ── formerly-exempt fields are now scanned by default ───────────────────────
+
+// TestFilter_AnonymizeJSON_FormerlyExemptFields_NowPseudonymized verifies
+// that "reasoning_effort", "service_tier", "modalities", and "stream_options"
+// — previously in the structural exempt set, now reduced out of it — are
+// scanned like any other unknown top-level field: an email inside each is
+// pseudonymized, Touched() is true, and Restore round-trips the original
+// value.
+func TestFilter_AnonymizeJSON_FormerlyExemptFields_NowPseudonymized(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "reasoning_effort containing an email",
+			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"alice@example.com"}`,
+		},
+		{
+			name: "service_tier containing an email",
+			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"service_tier":"alice@example.com"}`,
+		},
+		{
+			name: "modalities containing an email",
+			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"modalities":["text","alice@example.com"]}`,
+		},
+		{
+			name: "stream_options with a nested field containing an email",
+			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream_options":{"note":"alice@example.com"}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newTestFilter(t)
+			out := mustAnonymize(t, f, []byte(tc.body))
+
+			if strings.Contains(string(out), "alice@example.com") {
+				t.Errorf("anonymized body still contains original email: %s", out)
+			}
+			if !f.Touched() {
+				t.Error("Touched() = false, want true: formerly-exempt field must now be scanned")
+			}
+
+			restored := f.Restore(out)
+			if !strings.Contains(string(restored), "alice@example.com") {
+				t.Errorf("restored body missing original email: %s", restored)
+			}
+		})
+	}
+}
+
+// ── logit_bias shape validation ──────────────────────────────────────────────
+
+// TestFilter_AnonymizeJSON_LogitBias_ShapeValidation verifies that
+// "logit_bias" is exempt (untouched, byte-identical) only when it is a JSON
+// object whose keys are all 1-to-7-digit ASCII-digit strings (token IDs —
+// tokenizer vocabularies stay below 10 million entries) and whose values
+// are all JSON numbers, or is JSON null — and is rejected fail-closed for
+// any other shape, including a numeric-string key longer than 7 digits
+// (which could carry a card or phone number instead of a token ID), with
+// the fixed, caller-content-free error message.
+func TestFilter_AnonymizeJSON_LogitBias_ShapeValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("null is untouched", func(t *testing.T) {
+		t.Parallel()
+
+		f := newTestFilter(t)
+		body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"logit_bias":null}`)
+		out := mustAnonymize(t, f, body)
+
+		if f.Touched() {
+			t.Errorf("Touched() = true, want false: logit_bias:null must be a no-op; body: %s", out)
+		}
+		if string(out) != string(body) {
+			t.Errorf("AnonymizeJSON(logit_bias:null) = %s, want byte-identical to input %s", out, body)
+		}
+	})
+
+	untouchedTests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "6-digit key untouched",
+			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"logit_bias":{"100257":-100}}`,
+		},
+		{
+			name: "7-digit key untouched",
+			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"logit_bias":{"1234567":-100}}`,
+		},
+	}
+
+	for _, tc := range untouchedTests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newTestFilter(t)
+			out := mustAnonymize(t, f, []byte(tc.body))
+
+			if f.Touched() {
+				t.Errorf("Touched() = true, want false: valid logit_bias shape must not be scanned; body: %s", out)
+			}
+			if string(out) != tc.body {
+				t.Errorf("AnonymizeJSON(logit_bias) = %s, want byte-identical to input %s", out, tc.body)
+			}
+		})
+	}
+
+	failClosedTests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "non-digit key",
+			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"logit_bias":{"12ab3":-100}}`,
+		},
+		{
+			name: "string value",
+			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"logit_bias":{"12345":"-100"}}`,
+		},
+		{
+			name: "8-digit key exceeds the token-ID length bound",
+			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"logit_bias":{"12345678":-100}}`,
+		},
+		{
+			name: "13-digit key exceeds the token-ID length bound",
+			body: `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"logit_bias":{"1234567890123":-100}}`,
+		},
+	}
+
+	for _, tc := range failClosedTests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newTestFilter(t)
+			_, err := f.AnonymizeJSON([]byte(tc.body))
+			if err == nil {
+				t.Fatal("expected fail-closed error for invalid logit_bias shape, got nil")
+			}
+			if err.Error() != errAnonymizeMsg {
+				t.Errorf("error = %q, want static message %q", err.Error(), errAnonymizeMsg)
+			}
+		})
+	}
+}
+
+// ── tool_choice shape validation ─────────────────────────────────────────────
+
+// TestFilter_AnonymizeJSON_ToolChoice_ShapeValidation verifies that
+// "tool_choice" is handled per its runtime shape: a plain string is scanned
+// like any other string field (and left byte-identical when it carries no
+// PII), an object's "function.name" is validated against the function-name
+// charset and left untouched, any other string leaf in the object is
+// scanned normally, and a name outside the charset is rejected fail-closed.
+func TestFilter_AnonymizeJSON_ToolChoice_ShapeValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run(`string "auto" untouched`, func(t *testing.T) {
+		t.Parallel()
+
+		f := newTestFilter(t)
+		body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tool_choice":"auto"}`)
+		out := mustAnonymize(t, f, body)
+
+		if f.Touched() {
+			t.Errorf("Touched() = true, want false: tool_choice:\"auto\" carries no PII; body: %s", out)
+		}
+		if string(out) != string(body) {
+			t.Errorf("AnonymizeJSON(tool_choice:\"auto\") = %s, want byte-identical to input %s", out, body)
+		}
+	})
+
+	t.Run("object with valid name untouched", func(t *testing.T) {
+		t.Parallel()
+
+		f := newTestFilter(t)
+		body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tool_choice":{"type":"function","function":{"name":"get_weather"}}}`)
+		out := mustAnonymize(t, f, body)
+
+		if f.Touched() {
+			t.Errorf("Touched() = true, want false: valid function.name must not be scanned; body: %s", out)
+		}
+		if string(out) != string(body) {
+			t.Errorf("AnonymizeJSON(valid tool_choice object) = %s, want byte-identical to input %s", out, body)
+		}
+	})
+
+	t.Run("name with @ fails closed", func(t *testing.T) {
+		t.Parallel()
+
+		f := newTestFilter(t)
+		body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tool_choice":{"type":"function","function":{"name":"alice@example.com"}}}`)
+		_, err := f.AnonymizeJSON(body)
+		if err == nil {
+			t.Fatal("expected fail-closed error for tool_choice.function.name outside the allowed charset, got nil")
+		}
+		if err.Error() != errAnonymizeMsg {
+			t.Errorf("error = %q, want static message %q", err.Error(), errAnonymizeMsg)
+		}
+	})
+
+	t.Run("other string leaf in object scanned", func(t *testing.T) {
+		t.Parallel()
+
+		f := newTestFilter(t)
+		body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tool_choice":{"type":"function","function":{"name":"get_weather","note":"contact alice@example.com"}}}`)
+		out := mustAnonymize(t, f, body)
+
+		if strings.Contains(string(out), "alice@example.com") {
+			t.Errorf("anonymized body still contains original email: %s", out)
+		}
+		if !strings.Contains(string(out), `"name":"get_weather"`) {
+			t.Errorf("function.name was altered even though it was already valid: %s", out)
+		}
+		if !f.Touched() {
+			t.Error("Touched() = false, want true: sibling string leaf carries PII")
+		}
+
+		restored := f.Restore(out)
+		if !strings.Contains(string(restored), "alice@example.com") {
+			t.Errorf("restored body missing original email: %s", restored)
+		}
+	})
 }
 
 // ── unknown field with PII in an object key: fail-closed ────────────────────
@@ -364,5 +585,42 @@ func TestFilter_AnonymizeJSON_CoveredFieldsOnly_RegressionGuard(t *testing.T) {
 	}
 	if !strings.Contains(string(restored), "DE12345678901234567890") {
 		t.Errorf("restored body does not contain original IBAN; got: %s", restored)
+	}
+}
+
+// ── deterministic first-seen spelling across case variants ──────────────────
+
+// TestFilter_AnonymizeJSON_UnknownFields_DeterministicAcrossRuns verifies
+// that the default unknown-field scan iterates top-level (and nested) keys
+// in a fixed order rather than Go's randomized map order. A body with two
+// unknown top-level fields carrying case variants of the same email —
+// "User@Example.com" in field "a" and "user@example.com" in field "b" —
+// normalizes both to the same pseudonym (case-insensitive EMAIL
+// normalization), and pseudonymFor records only the first-seen spelling for
+// Restore. Because "a" sorts before "b", the field "a" spelling must win on
+// every run: 50 independent Filters must all restore to the exact same
+// original string.
+func TestFilter_AnonymizeJSON_UnknownFields_DeterministicAcrossRuns(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"a":"User@Example.com","b":"user@example.com"}`)
+
+	const runs = 50
+	var want string
+	for i := 0; i < runs; i++ {
+		f := newTestFilter(t)
+		out := mustAnonymize(t, f, body)
+		restored := string(f.Restore(out))
+
+		if i == 0 {
+			want = restored
+			if !strings.Contains(want, "User@Example.com") {
+				t.Fatalf("run 0: restored body does not contain the expected first-seen spelling %q: %s", "User@Example.com", want)
+			}
+			continue
+		}
+		if restored != want {
+			t.Fatalf("run %d: restored body is not deterministic:\nfirst run: %s\nthis run:  %s", i, want, restored)
+		}
 	}
 }

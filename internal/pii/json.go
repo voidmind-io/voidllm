@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -26,54 +27,32 @@ var knownContentPartTypes = map[string]bool{
 
 // coveredTopLevelFields lists the top-level request-body fields that
 // anonymizeWithDetectors handles with dedicated shape validation above (user,
-// stop, prompt, input, tools, messages). They are excluded from the default
-// unknown-field scan to avoid processing them twice.
+// stop, prompt, input, tools, messages, logit_bias, tool_choice). They are
+// excluded from the default unknown-field scan to avoid processing them
+// twice.
 var coveredTopLevelFields = map[string]bool{
-	"user":     true,
-	"stop":     true,
-	"prompt":   true,
-	"input":    true,
-	"tools":    true,
-	"messages": true,
+	"user":        true,
+	"stop":        true,
+	"prompt":      true,
+	"input":       true,
+	"tools":       true,
+	"messages":    true,
+	"logit_bias":  true,
+	"tool_choice": true,
 }
 
-// exemptTopLevelFields lists structural top-level request-body fields that
-// are exempt from the default unknown-field scan: they carry no free text,
-// or their value must remain byte-identical for routing or sampling
-// semantics to keep working (e.g. a pseudonymized "model" would break
-// routing; a rewritten "logit_bias" numeric-string key would corrupt the
-// token bias map). Every top-level field NOT in this set and NOT in
-// coveredTopLevelFields is treated as potential content and scanned.
+// exemptTopLevelFields lists structural top-level request-body fields whose
+// value must remain byte-identical for routing semantics to keep working —
+// a pseudonymized "model" would break routing to the correct upstream — and
+// which are skipped entirely, with no shape validation, because their value
+// is never free text. Every top-level field NOT in this set and NOT in
+// coveredTopLevelFields is treated as potential content and scanned by
+// default. Fields whose exemption depends on their value having a specific
+// shape (logit_bias, tool_choice) are handled with dedicated shape
+// validation above instead of living in this set — see
+// coveredTopLevelFields.
 var exemptTopLevelFields = map[string]bool{
-	"model":                 true,
-	"stream":                true,
-	"stream_options":        true,
-	"n":                     true,
-	"temperature":           true,
-	"top_p":                 true,
-	"top_k":                 true,
-	"max_tokens":            true,
-	"max_completion_tokens": true,
-	"presence_penalty":      true,
-	"frequency_penalty":     true,
-	"repetition_penalty":    true,
-	"logit_bias":            true,
-	"seed":                  true,
-	"logprobs":              true,
-	"top_logprobs":          true,
-	"parallel_tool_calls":   true,
-	"tool_choice":           true,
-	"encoding_format":       true,
-	"dimensions":            true,
-	"top_n":                 true,
-	"return_documents":      true,
-	"return_text":           true,
-	"truncate":              true,
-	"raw_scores":            true,
-	"service_tier":          true,
-	"store":                 true,
-	"modalities":            true,
-	"reasoning_effort":      true,
+	"model": true,
 }
 
 // hasDuplicateKeys reports whether body contains a JSON object (at any level of
@@ -181,6 +160,19 @@ func scanForDuplicateKeys(dec *json.Decoder) (bool, error) {
 // All request shapes:
 //   - top-level "stop" (string or array-of-strings; each string is
 //     pseudonymized independently, never concatenated)
+//   - top-level "logit_bias": exempt (untouched) only when it is a JSON
+//     object whose keys are all 1-to-7-digit ASCII-digit strings (token
+//     IDs — tokenizer vocabularies stay below 10 million entries) and whose
+//     values are all JSON numbers, or is JSON null. Any other shape,
+//     including a longer digit string that could carry a card or phone
+//     number, is rejected fail-closed — the value is never scanned, because
+//     a pseudonymized token-ID key would corrupt the bias map.
+//   - top-level "tool_choice": a JSON string is scanned like any other
+//     string field; JSON null is a no-op; a JSON object's
+//     "function.name" is validated against the charset OpenAI restricts
+//     function names to (^[A-Za-z0-9_-]{1,64}$) and left untouched — every
+//     other string leaf in the object is scanned normally via
+//     scanStringLeaves. Any other shape is rejected fail-closed.
 //
 // Every other top-level key — anything not listed above — is scanned by
 // default: it is treated as potential free-text content and passed through
@@ -189,13 +181,14 @@ func scanForDuplicateKeys(dec *json.Decoder) (bool, error) {
 // booleans, and null untouched, rejects PII found in an object key
 // fail-closed, and bounds recursion at maxScanDepth. This covers rerank and
 // score request fields (e.g. "query", "documents", "texts", "text_1",
-// "text_2", "queries", "items", "instruction") and any current or future
+// "text_2", "queries", "items", "instruction"), sampling and shape knobs
+// that carry no routing semantics (e.g. "reasoning_effort", "service_tier",
+// "modalities", "stream_options"), and any current or future
 // provider-specific field (e.g. vLLM's "chat_template_kwargs") without
 // endpoint-specific code — no client-supplied text reaches an upstream
-// unscanned through any top-level field. A small set of structural fields
-// (see exemptTopLevelFields) is exempt from this default scan because their
-// values carry no free text or must stay byte-identical for routing and
-// sampling semantics.
+// unscanned through any top-level field. Only "model" (see
+// exemptTopLevelFields) is exempt from this default scan unconditionally,
+// because its value must stay byte-identical for routing.
 //
 // detectors are called for each string value to locate PII spans. replace
 // is called once per unique (type, originalValue) to obtain the pseudonym;
@@ -353,6 +346,152 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 					// "stop" is present but is neither a string, an array, nor null:
 					// unsupported shape for a covered field → fail-closed.
 					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+			}
+		}
+	}
+
+	// ── top-level "logit_bias" field ─────────────────────────────────────────
+	// logit_bias maps token IDs (numeric-string object keys) to a bias value
+	// applied by the upstream sampler. The keys are structural (a token ID,
+	// not text) and must remain byte-identical for the bias to apply to the
+	// intended token; rewriting a key would silently corrupt sampling. JSON
+	// null is OpenAI's "no bias" default and is a no-op. A key must be 1 to
+	// maxLogitBiasKeyDigits ASCII digits — tokenizer vocabularies stay below
+	// 10 million entries, so a legitimate token ID never needs more digits
+	// than that, and a longer digit string could be smuggling a card or
+	// phone number through this field instead. Any shape that is not an
+	// object of such keys mapped to JSON numbers is rejected fail-closed
+	// rather than scanned or forwarded.
+	if rawLogitBias, ok := doc["logit_bias"]; ok {
+		if !bytes.Equal(bytes.TrimSpace(rawLogitBias), []byte("null")) {
+			var logitBias map[string]jsonx.RawMessage
+			if err := jsonx.Unmarshal(rawLogitBias, &logitBias); err != nil || logitBias == nil {
+				return nil, errors.New("pii: request body could not be processed for anonymization")
+			}
+			for key, val := range logitBias {
+				if !isLogitBiasTokenIDKey(key) || !isJSONNumberLiteral(val) {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+			}
+			// Valid shape: left untouched, byte-identical — never scanned.
+		}
+	}
+
+	// ── top-level "tool_choice" field ────────────────────────────────────────
+	// tool_choice selects how the model should call tools. A plain JSON
+	// string ("auto", "none", "required", or any other value) carries no
+	// routing semantics beyond its literal value and is scanned like any
+	// other string field. JSON null is OpenAI's "unset" default and is a
+	// no-op. An object selects a specific function: its "function.name" is a
+	// structural identifier the upstream must receive byte-identical to
+	// route the call correctly, so it is validated against the charset
+	// OpenAI restricts function names to and left untouched — never passed
+	// to detect — while every other string leaf in the object (including
+	// "type" and any sibling of "function") is potential free text and is
+	// scanned normally via scanStringLeaves. Any other shape (number, bool,
+	// array) is rejected fail-closed.
+	if rawToolChoice, ok := doc["tool_choice"]; ok {
+		if !bytes.Equal(bytes.TrimSpace(rawToolChoice), []byte("null")) {
+			var toolChoiceStr string
+			if err := jsonx.Unmarshal(rawToolChoice, &toolChoiceStr); err == nil {
+				replaced, did, err := detect(toolChoiceStr)
+				if err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				if did {
+					newJSON, err := jsonx.Marshal(replaced)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					doc["tool_choice"] = jsonx.RawMessage(newJSON)
+					touched = true
+				}
+			} else {
+				var toolChoice map[string]jsonx.RawMessage
+				if err2 := jsonx.Unmarshal(rawToolChoice, &toolChoice); err2 != nil || toolChoice == nil {
+					// Neither a string, an object, nor null: unsupported shape → fail-closed.
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+
+				tcTouched := false
+				tcKeys := make([]string, 0, len(toolChoice))
+				for k := range toolChoice {
+					tcKeys = append(tcKeys, k)
+				}
+				sort.Strings(tcKeys)
+
+				for _, k := range tcKeys {
+					if k == "function" {
+						continue
+					}
+					scanned, did, err := scanStringLeaves(toolChoice[k], detect)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					if did {
+						toolChoice[k] = scanned
+						tcTouched = true
+					}
+				}
+
+				if rawFn, hasFn := toolChoice["function"]; hasFn {
+					var fn map[string]jsonx.RawMessage
+					if err := jsonx.Unmarshal(rawFn, &fn); err != nil || fn == nil {
+						// tool_choice.function present but not an object (or is JSON null): unsupported shape.
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+
+					if rawName, hasName := fn["name"]; hasName {
+						var name string
+						if err := jsonx.Unmarshal(rawName, &name); err != nil {
+							// "name" present but is not a string: unsupported shape.
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						if !toolChoiceFunctionNamePattern.MatchString(name) {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						// Valid name: left untouched, never passed to detect.
+					}
+
+					fnTouched := false
+					fnKeys := make([]string, 0, len(fn))
+					for k := range fn {
+						if k == "name" {
+							continue
+						}
+						fnKeys = append(fnKeys, k)
+					}
+					sort.Strings(fnKeys)
+
+					for _, k := range fnKeys {
+						scanned, did, err := scanStringLeaves(fn[k], detect)
+						if err != nil {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						if did {
+							fn[k] = scanned
+							fnTouched = true
+						}
+					}
+
+					if fnTouched {
+						newFnJSON, err := jsonx.Marshal(fn)
+						if err != nil {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						toolChoice["function"] = jsonx.RawMessage(newFnJSON)
+						tcTouched = true
+					}
+				}
+
+				if tcTouched {
+					newTCJSON, err := jsonx.Marshal(toolChoice)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					doc["tool_choice"] = jsonx.RawMessage(newTCJSON)
+					touched = true
 				}
 			}
 		}
@@ -864,10 +1003,23 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 	// and null are left untouched. This is what covers rerank/score fields
 	// (query, documents, texts, text_1, text_2, ...) and any other current or
 	// future field without endpoint-specific code.
-	for key, raw := range doc {
+	//
+	// Keys are collected and sorted before iterating, rather than ranged over
+	// directly, so that processing order is deterministic across runs — Go's
+	// map iteration order is randomized, and pseudonymFor records the
+	// first-seen spelling of a case-normalized value (e.g. "User@Example.com"
+	// vs. "user@example.com") for Restore. Without a fixed order, which
+	// spelling wins would vary run to run.
+	unknownKeys := make([]string, 0, len(doc))
+	for key := range doc {
 		if coveredTopLevelFields[key] || exemptTopLevelFields[key] {
 			continue
 		}
+		unknownKeys = append(unknownKeys, key)
+	}
+	sort.Strings(unknownKeys)
+	for _, key := range unknownKeys {
+		raw := doc[key]
 		scanned, did, err := scanStringLeaves(raw, detect)
 		if err != nil {
 			return nil, errors.New("pii: request body could not be processed for anonymization")
@@ -982,6 +1134,57 @@ func deOverlap(spans []Span) []Span {
 	return result
 }
 
+// toolChoiceFunctionNamePattern is the charset OpenAI restricts function
+// names to: 1-64 characters drawn from letters, digits, underscore, and
+// hyphen. tool_choice.function.name is validated against this pattern and,
+// when it matches, left untouched rather than scanned — the name is a
+// structural identifier the upstream must receive byte-identical to route
+// the tool call correctly.
+var toolChoiceFunctionNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// maxLogitBiasKeyDigits is the maximum length of a logit_bias object key
+// that isLogitBiasTokenIDKey accepts as a token ID. Tokenizer vocabularies
+// are well below 10 million entries (7 digits), so a legitimate token ID
+// never needs more than maxLogitBiasKeyDigits digits. Longer digit strings
+// could carry a card number, phone number, or similar unscanned free-text
+// value smuggled through a structurally-exempt field, so they are rejected
+// fail-closed rather than treated as a token ID.
+const maxLogitBiasKeyDigits = 7
+
+// isLogitBiasTokenIDKey reports whether s is a valid logit_bias object key:
+// 1 to maxLogitBiasKeyDigits ASCII digit characters ('0'-'9'), with no other
+// characters allowed. It is used to validate logit_bias object keys, which
+// must be token IDs (numeric strings within the tokenizer's vocabulary
+// range) for the field to be exempt from scanning.
+func isLogitBiasTokenIDKey(s string) bool {
+	if len(s) == 0 || len(s) > maxLogitBiasKeyDigits {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isJSONNumberLiteral reports whether raw is a JSON number literal — not a
+// string, boolean, null, object, or array. It is used to validate
+// logit_bias object values, which must be bias numbers for the field to be
+// exempt from scanning.
+func isJSONNumberLiteral(raw jsonx.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return false
+	}
+	switch trimmed[0] {
+	case '"', '{', '[', 't', 'f', 'n':
+		return false
+	}
+	var n float64
+	return jsonx.Unmarshal(trimmed, &n) == nil
+}
+
 // isTokenElement reports whether raw is a valid OpenAI token-ID element: either
 // a JSON integer (single token ID) or a JSON array whose every element is itself
 // a valid token-ID element (int[][]). Floats, objects, booleans, null, and
@@ -1094,10 +1297,21 @@ func scanStringLeavesDepth(raw jsonx.RawMessage, detect func(string) (string, bo
 	// (the upstream model expects the original field names). Therefore, if any
 	// key matches a PII pattern we fail-closed rather than forwarding unscanned
 	// or corrupted content.
+	//
+	// Keys are collected and sorted before iterating, rather than ranged over
+	// directly, so that nested traversal order is deterministic across runs —
+	// see the identical rationale on the top-level unknown-field scan loop in
+	// anonymizeWithDetectors.
 	var obj map[string]jsonx.RawMessage
 	if err := jsonx.Unmarshal(raw, &obj); err == nil {
 		objTouched := false
-		for k, v := range obj {
+		keys := make([]string, 0, len(obj))
+		for k := range obj {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := obj[k]
 			// Scan the key for PII. If the key contains PII, fail-closed:
 			// rewriting a structural key would corrupt the schema.
 			_, keyHasPII, err := detect(k)
