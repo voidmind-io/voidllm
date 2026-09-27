@@ -55,6 +55,13 @@ type AnthropicAdapter struct {
 	// blockToToolCall maps Anthropic content-block-index → OpenAI tool-call-index.
 	// Allocated lazily on first tool_use block.
 	blockToToolCall map[int]int
+
+	// includeUsage is set from stream_options.include_usage during
+	// TransformRequest, before that field is dropped by the allowlist filter
+	// (Anthropic has no stream_options equivalent). When true, message_stop
+	// emits a trailing usage-only chunk before [DONE], mirroring OpenAI's
+	// include_usage behavior.
+	includeUsage bool
 }
 
 // anthropicIncomingMessage is the parsed form of a single message in the
@@ -85,6 +92,12 @@ type anthropicContentBlock struct {
 	// results) or a JSON array of Anthropic text blocks (for structured
 	// tool results). Omitted when nil.
 	Content jsonx.RawMessage `json:"content,omitempty"`
+	// CacheControl, when present, is forwarded verbatim as the raw Anthropic
+	// cache_control object (e.g. {"type":"ephemeral"}) on a text block. It is
+	// carried through unexamined from the corresponding OpenAI content part —
+	// the proxy does not interpret prompt-caching semantics, only preserves
+	// per-part opt-in.
+	CacheControl jsonx.RawMessage `json:"cache_control,omitempty"`
 }
 
 // anthropicOutboundMessage is the Anthropic Messages API message shape sent
@@ -105,6 +118,11 @@ type anthropicToolDefinition struct {
 type anthropicToolChoice struct {
 	Type string `json:"type"`
 	Name string `json:"name,omitempty"`
+	// DisableParallelToolUse translates OpenAI's parallel_tool_calls:false.
+	// Anthropic has no top-level request field for this; it is only settable
+	// inside tool_choice. nil (omitted) leaves Anthropic's default (parallel
+	// tool calls allowed) unchanged.
+	DisableParallelToolUse *bool `json:"disable_parallel_tool_use,omitempty"`
 }
 
 // openAIToolFunction is the function field inside an OpenAI tool definition.
@@ -238,11 +256,20 @@ func cacheUsageDetails(cachedRead, cacheWrite int) *openAIPromptTokensDetails {
 	}
 }
 
-// openAIChunk is the shape of a single OpenAI streaming chunk.
+// openAIChunk is the shape of a single OpenAI streaming chunk. Created,
+// Model, and Usage are only populated for the trailing usage-only chunk that
+// Anthropic's adapter emits when stream_options.include_usage was requested
+// (see AnthropicAdapter.buildStreamUsageChunk); every other producer of this
+// type (Anthropic's per-event chunks, Gemini's chunks) leaves them nil, so
+// the omitempty pointers keep their JSON output byte-identical to before
+// these fields existed.
 type openAIChunk struct {
 	ID      string              `json:"id"`
 	Object  string              `json:"object"`
+	Created *int64              `json:"created,omitempty"`
+	Model   *string             `json:"model,omitempty"`
 	Choices []openAIChunkChoice `json:"choices"`
+	Usage   *openAIUsage        `json:"usage,omitempty"`
 }
 
 // openAIChunkChoice is a single choice entry within a streaming chunk.
@@ -261,43 +288,64 @@ type openAIChunkDelta struct {
 	ToolCalls []openAIToolCall `json:"tool_calls,omitempty"`
 }
 
-// openAIOnlyFields lists request fields that Anthropic rejects; they are
-// stripped from the body before forwarding. max_completion_tokens is handled
-// specially (converted to max_tokens) before this strip runs; it is included
-// here as defense-in-depth so any residual reference is removed.
-var openAIOnlyFields = []string{
-	"n",
-	"frequency_penalty",
-	"presence_penalty",
-	"logprobs",
-	"top_logprobs",
-	"logit_bias",
-	"response_format",
-	"seed",
-	"service_tier",
-	"store",
-	"user",
-	"stream_options",
-	"max_completion_tokens",
+// anthropicAllowedFields is the exhaustive set of top-level fields the
+// Anthropic Messages API accepts. After every translation in TransformRequest
+// has run, any field not in this set is dropped — including any current or
+// future OpenAI-only field. This replaces a maintain-a-blocklist approach
+// (every new OpenAI request field previously had to be added to a strip
+// list or it reached Anthropic verbatim and produced a 400).
+var anthropicAllowedFields = map[string]struct{}{
+	"model":          {},
+	"messages":       {},
+	"system":         {},
+	"max_tokens":     {},
+	"stream":         {},
+	"temperature":    {},
+	"top_p":          {},
+	"top_k":          {},
+	"stop_sequences": {},
+	"tools":          {},
+	"tool_choice":    {},
+	"metadata":       {},
+	"thinking":       {},
+	"cache_control":  {},
 }
 
 // TransformRequest converts an OpenAI chat completion request body into the
 // Anthropic Messages API format. It:
-//   - Extracts system messages and merges them into a top-level "system" field.
+//   - Extracts system and developer messages (role "developer" is OpenAI's
+//     alias for "system") and merges them into a top-level "system" field, as
+//     a plain joined string when every source message was a plain string and
+//     no part carried cache_control, or otherwise as an array of Anthropic
+//     text blocks — one per non-empty text part, never concatenated, with
+//     per-part cache_control preserved.
 //   - Translates tool definitions from OpenAI format to Anthropic format.
 //   - Validates tool definitions (type must be "function", name must be non-empty
 //     and match a conservative charset, parameters if present must be a JSON object).
 //   - Translates tool_choice from OpenAI format to Anthropic format, failing closed
 //     on unknown values.
+//   - Translates parallel_tool_calls:false (with tools surviving) into
+//     tool_choice.disable_parallel_tool_use:true, synthesizing {type:"auto"}
+//     when no tool_choice was given. true, absent, or no surviving tools →
+//     no-op.
+//   - Translates stop (string, array, or null) into stop_sequences, dropping
+//     empty/whitespace-only entries; a native stop_sequences from the client
+//     wins over a translated one.
+//   - Translates user into metadata.user_id; OpenAI's free-form metadata map
+//     has no Anthropic equivalent and is never forwarded.
+//   - Clamps temperature above 1 down to 1 (Anthropic's range is 0-1).
 //   - Validates and charset-checks all forwarded tool ids and function names.
 //   - Translates assistant tool_calls and tool-result messages into Anthropic
 //     tool_use and tool_result content blocks, merging consecutive tool_result
 //     messages into a single Anthropic user turn.
 //   - Preserves array-of-parts tool_result content as an array of Anthropic text
-//     blocks rather than concatenating parts (zero-knowledge preservation).
-//   - Removes system messages from the messages array.
+//     blocks rather than concatenating parts (zero-knowledge preservation),
+//     keeping per-part cache_control.
+//   - Removes system and developer messages from the messages array.
 //   - Injects a default max_tokens of 4096 when the field is absent.
-//   - Removes fields that Anthropic does not accept.
+//   - Captures stream_options.include_usage for use by TransformStreamLine
+//     before the field is dropped (Anthropic has no equivalent).
+//   - Drops every field not in anthropicAllowedFields (the upstream allowlist).
 func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error) {
 	var doc map[string]jsonx.RawMessage
 	if err := jsonx.Unmarshal(body, &doc); err != nil {
@@ -380,6 +428,89 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 		}
 	}
 
+	// Translate parallel_tool_calls:false into tool_choice.disable_parallel_tool_use.
+	// true or absent is Anthropic's default (parallel calls allowed) — no-op.
+	// When tools were removed above (tool_choice:"none") or were never declared,
+	// there is no tool_choice to attach the flag to, so nothing is emitted either.
+	if raw, ok := doc["parallel_tool_calls"]; ok {
+		var parallel bool
+		if err := jsonx.Unmarshal(raw, &parallel); err == nil && !parallel {
+			if _, toolsPresent := doc["tools"]; toolsPresent {
+				disable := true
+				if existing, ok := doc["tool_choice"]; ok {
+					var tc anthropicToolChoice
+					if err := jsonx.Unmarshal(existing, &tc); err != nil {
+						return nil, fmt.Errorf("anthropic transform request: parallel_tool_calls: unmarshal tool_choice: %w", err)
+					}
+					tc.DisableParallelToolUse = &disable
+					tcJSON, err := jsonx.Marshal(tc)
+					if err != nil {
+						return nil, fmt.Errorf("anthropic transform request: marshal tool_choice: %w", err)
+					}
+					doc["tool_choice"] = jsonx.RawMessage(tcJSON)
+				} else {
+					tcJSON, err := jsonx.Marshal(anthropicToolChoice{Type: "auto", DisableParallelToolUse: &disable})
+					if err != nil {
+						return nil, fmt.Errorf("anthropic transform request: marshal tool_choice: %w", err)
+					}
+					doc["tool_choice"] = jsonx.RawMessage(tcJSON)
+				}
+			}
+		}
+	}
+
+	// Translate stop (string, array, or null) into stop_sequences. A native
+	// stop_sequences sent by the client wins over the translated one.
+	if raw, ok := doc["stop"]; ok {
+		if _, hasNative := doc["stop_sequences"]; !hasNative {
+			if seqs := parseStopSequences(raw); len(seqs) > 0 {
+				seqJSON, err := jsonx.Marshal(seqs)
+				if err != nil {
+					return nil, fmt.Errorf("anthropic transform request: marshal stop_sequences: %w", err)
+				}
+				doc["stop_sequences"] = jsonx.RawMessage(seqJSON)
+			}
+		}
+	}
+
+	// Clamp temperature to Anthropic's 0-1 range; OpenAI allows up to 2.
+	if raw, ok := doc["temperature"]; ok {
+		var temp float64
+		if err := jsonx.Unmarshal(raw, &temp); err == nil && temp > 1 {
+			doc["temperature"] = jsonx.RawMessage("1")
+		}
+	}
+
+	// Translate user into metadata.user_id. Anthropic's metadata object only
+	// has a user_id field; OpenAI's free-form metadata map has no equivalent
+	// and is deliberately never forwarded — metadata is always rebuilt from
+	// user alone, discarding whatever the client sent in metadata itself.
+	delete(doc, "metadata")
+	if raw, ok := doc["user"]; ok {
+		var userID string
+		if err := jsonx.Unmarshal(raw, &userID); err == nil && userID != "" {
+			metaJSON, err := jsonx.Marshal(struct {
+				UserID string `json:"user_id"`
+			}{UserID: userID})
+			if err != nil {
+				return nil, fmt.Errorf("anthropic transform request: marshal metadata: %w", err)
+			}
+			doc["metadata"] = jsonx.RawMessage(metaJSON)
+		}
+	}
+
+	// Capture stream_options.include_usage before the allowlist filter drops
+	// the field (Anthropic has no stream_options equivalent). When set,
+	// TransformStreamLine emits a trailing usage-only chunk at message_stop.
+	if raw, ok := doc["stream_options"]; ok {
+		var so struct {
+			IncludeUsage bool `json:"include_usage"`
+		}
+		if err := jsonx.Unmarshal(raw, &so); err == nil {
+			a.includeUsage = so.IncludeUsage
+		}
+	}
+
 	// Extract and rewrite messages.
 	if raw, ok := doc["messages"]; ok {
 		var msgs []anthropicIncomingMessage
@@ -387,7 +518,13 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 			return nil, fmt.Errorf("anthropic transform request: unmarshal messages: %w", err)
 		}
 
-		var systemParts []string
+		// systemBlocks accumulates text blocks from every system/developer
+		// message, in order, across the whole conversation. systemAllStrings
+		// stays true only while every source message's content was a plain
+		// JSON string; a single array-shaped message content flips it false
+		// for the whole request, forcing the array-of-blocks output shape.
+		var systemBlocks []anthropicContentBlock
+		systemAllStrings := true
 		var outMsgs []anthropicOutboundMessage
 
 		// pendingToolResults accumulates consecutive role:"tool" messages so they
@@ -408,14 +545,19 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 
 		for _, m := range msgs {
 			switch m.Role {
-			case "system":
+			case "system", "developer":
 				// Flush any pending tool results before processing a system message
-				// (should not occur in practice, but be safe).
+				// (should not occur in practice, but be safe). Role "developer" is
+				// OpenAI's newer alias for "system" and is treated identically.
 				flushToolResults()
-				// Only plain-string content is valid as a system prompt.
-				var textContent string
-				if err := jsonx.Unmarshal(m.Content, &textContent); err == nil {
-					systemParts = append(systemParts, textContent)
+				var wasString bool
+				var err error
+				systemBlocks, wasString, err = collectSystemBlocks(systemBlocks, m.Content)
+				if err != nil {
+					return nil, fmt.Errorf("anthropic transform request: %w", err)
+				}
+				if !wasString {
+					systemAllStrings = false
 				}
 
 			case "tool":
@@ -445,23 +587,22 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 					} else {
 						// Not a plain string — try array of content parts.
 						var parts []struct {
-							Type string `json:"type"`
-							Text string `json:"text"`
+							Type         string           `json:"type"`
+							Text         string           `json:"text"`
+							CacheControl jsonx.RawMessage `json:"cache_control,omitempty"`
 						}
 						if jsonx.Unmarshal(m.Content, &parts) == nil {
 							// Build an array of Anthropic text blocks, one per text part.
 							// Non-text part types are skipped (zero-knowledge: we only
-							// forward what we understand).
-							type anthropicTextBlock struct {
-								Type string `json:"type"`
-								Text string `json:"text"`
-							}
-							blocks := make([]anthropicTextBlock, 0, len(parts))
+							// forward what we understand). Per-part cache_control is
+							// preserved.
+							blocks := make([]anthropicContentBlock, 0, len(parts))
 							for _, p := range parts {
 								if p.Type == "text" {
-									blocks = append(blocks, anthropicTextBlock{
-										Type: "text",
-										Text: p.Text,
+									blocks = append(blocks, anthropicContentBlock{
+										Type:         "text",
+										Text:         p.Text,
+										CacheControl: p.CacheControl,
 									})
 								}
 							}
@@ -545,9 +686,32 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 		// Flush any trailing tool results.
 		flushToolResults()
 
-		if len(systemParts) > 0 {
-			systemText := strings.Join(systemParts, "\n")
-			systemJSON, err := jsonx.Marshal(systemText)
+		if len(systemBlocks) > 0 {
+			// A block can only carry cache_control when its source message's
+			// content was an array (the string branch of collectSystemBlocks
+			// never sets it), so this check is redundant with systemAllStrings
+			// today; it is kept explicit per the emission rule so the two
+			// conditions cannot silently drift apart.
+			hasCacheControl := false
+			for _, b := range systemBlocks {
+				if len(b.CacheControl) > 0 {
+					hasCacheControl = true
+					break
+				}
+			}
+			var systemJSON []byte
+			var err error
+			if systemAllStrings && !hasCacheControl {
+				// Every source message was a plain string: emit the historical
+				// joined-string shape (byte-identical to prior behavior).
+				texts := make([]string, len(systemBlocks))
+				for i, b := range systemBlocks {
+					texts[i] = b.Text
+				}
+				systemJSON, err = jsonx.Marshal(strings.Join(texts, "\n"))
+			} else {
+				systemJSON, err = jsonx.Marshal(systemBlocks)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("anthropic transform request: marshal system: %w", err)
 			}
@@ -577,9 +741,15 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 		delete(doc, "max_completion_tokens")
 	}
 
-	// Remove fields Anthropic does not accept.
-	for _, field := range openAIOnlyFields {
-		delete(doc, field)
+	// Drop every field not on the upstream allowlist. This runs last so it
+	// catches every OpenAI-only field regardless of whether a translation
+	// above handled it explicitly (stop, user, parallel_tool_calls,
+	// stream_options, max_completion_tokens, and any future field Anthropic
+	// has never heard of).
+	for field := range doc {
+		if _, ok := anthropicAllowedFields[field]; !ok {
+			delete(doc, field)
+		}
 	}
 
 	out, err := jsonx.Marshal(doc)
@@ -965,6 +1135,17 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 		return [][]byte{appendDataPrefix(chunk)}, nil
 
 	case "message_stop":
+		// When the client requested stream_options.include_usage, emit a
+		// trailing usage-only chunk before [DONE], mirroring OpenAI's final
+		// streaming chunk. This is the last event of a clean stream — an
+		// aborted stream never reaches this case, since an earlier
+		// errStreamTransformAborted return stops the handler from calling
+		// TransformStreamLine again.
+		if a.includeUsage {
+			if usageLine := a.buildStreamUsageChunk(); usageLine != nil {
+				return [][]byte{appendDataPrefix(usageLine), []byte("data: [DONE]")}, nil
+			}
+		}
 		return [][]byte{[]byte("data: [DONE]")}, nil
 
 	case "ping", "content_block_stop":
@@ -1010,6 +1191,41 @@ func (a *AnthropicAdapter) buildChunk(delta openAIChunkDelta, finishReason *stri
 				FinishReason: finishReason,
 			},
 		},
+	}
+	out, err := jsonx.Marshal(chunk)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// buildStreamUsageChunk assembles the trailing usage-only chunk emitted at
+// message_stop when the client requested stream_options.include_usage. Its
+// usage numbers are computed identically to StreamUsage (reusing
+// cacheUsageDetails for the cached/cache-write breakdown), and its choices
+// array is present but empty, matching OpenAI's final streaming chunk shape.
+// Returns nil on a marshal failure so the caller falls back to a bare [DONE].
+func (a *AnthropicAdapter) buildStreamUsageChunk() []byte {
+	id := a.msgID
+	if id == "" {
+		id = "chatcmpl-proxy"
+	}
+	ui := a.StreamUsage()
+	created := time.Now().Unix()
+	model := a.modelName
+	usage := openAIUsage{
+		PromptTokens:        ui.PromptTokens,
+		CompletionTokens:    ui.CompletionTokens,
+		TotalTokens:         ui.TotalTokens,
+		PromptTokensDetails: cacheUsageDetails(ui.CachedReadTokens, ui.CacheWriteTokens),
+	}
+	chunk := openAIChunk{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: &created,
+		Model:   &model,
+		Choices: []openAIChunkChoice{},
+		Usage:   &usage,
 	}
 	out, err := jsonx.Marshal(chunk)
 	if err != nil {
@@ -1160,6 +1376,9 @@ func serializeInputToArguments(input jsonx.RawMessage) (string, error) {
 // PR #136 compatibility: a JSON null content value is treated as empty content
 // and emits a message with a single empty text block. Only genuinely unsupported
 // shapes (a number, or an array with unknown part types) return an error.
+//
+// Per-part cache_control, when present on an array content part, is carried
+// through onto the corresponding Anthropic text block unexamined.
 func buildTextMessage(role string, content jsonx.RawMessage) (anthropicOutboundMessage, error) {
 	// nil RawMessage or JSON null both mean "no content" — treat as empty.
 	if content == nil || bytes.Equal(bytes.TrimSpace([]byte(content)), []byte("null")) {
@@ -1185,6 +1404,7 @@ func buildTextMessage(role string, content jsonx.RawMessage) (anthropicOutboundM
 		ImageURL *struct {
 			URL string `json:"url"`
 		} `json:"image_url,omitempty"`
+		CacheControl jsonx.RawMessage `json:"cache_control,omitempty"`
 	}
 	if err := jsonx.Unmarshal(content, &parts); err == nil {
 		var blocks []anthropicContentBlock
@@ -1192,8 +1412,9 @@ func buildTextMessage(role string, content jsonx.RawMessage) (anthropicOutboundM
 			switch p.Type {
 			case "text":
 				blocks = append(blocks, anthropicContentBlock{
-					Type: "text",
-					Text: p.Text,
+					Type:         "text",
+					Text:         p.Text,
+					CacheControl: p.CacheControl,
 				})
 			default:
 				// Fail-closed for unsupported part types to avoid silent corruption.
@@ -1211,4 +1432,91 @@ func buildTextMessage(role string, content jsonx.RawMessage) (anthropicOutboundM
 
 	// Neither plain string, null, nor array — return an error rather than corrupting.
 	return anthropicOutboundMessage{}, errors.New("unrecognised content shape")
+}
+
+// parseStopSequences converts an OpenAI "stop" field (a plain string, an
+// array of strings, or null) into an Anthropic stop_sequences array. Empty
+// or whitespace-only entries are dropped. A null value, an empty string, or
+// an array that reduces to zero entries after dropping empties all yield a
+// nil (empty) result, signalling the caller to leave stop_sequences unset.
+func parseStopSequences(raw jsonx.RawMessage) []string {
+	var single string
+	if err := jsonx.Unmarshal(raw, &single); err == nil {
+		if strings.TrimSpace(single) == "" {
+			return nil
+		}
+		return []string{single}
+	}
+
+	var arr []string
+	if err := jsonx.Unmarshal(raw, &arr); err == nil {
+		out := make([]string, 0, len(arr))
+		for _, s := range arr {
+			if strings.TrimSpace(s) == "" {
+				continue
+			}
+			out = append(out, s)
+		}
+		return out
+	}
+
+	return nil
+}
+
+// systemContentPart is a single array-content part accepted on a system or
+// developer message. Only type:"text" parts are meaningful to Anthropic;
+// any other type is rejected fail-closed by collectSystemBlocks.
+type systemContentPart struct {
+	Type         string           `json:"type"`
+	Text         string           `json:"text"`
+	CacheControl jsonx.RawMessage `json:"cache_control,omitempty"`
+}
+
+// collectSystemBlocks appends the Anthropic text block(s) for one system or
+// developer message's content onto blocks, and reports whether that
+// message's content was a plain JSON string (as opposed to an array of
+// parts). The caller uses the returned bool, ANDed across every system/
+// developer message in the request, to decide whether the final "system"
+// field can be emitted as a plain joined string.
+//
+// A nil content field (the key was absent) contributes nothing. A plain
+// string (including JSON null, which unmarshals as the empty string)
+// produces exactly one block, byte-identical to the adapter's historical
+// behavior. An array of content parts produces one block per non-empty
+// type:"text" part — empty parts are skipped, and per-part cache_control is
+// preserved. A non-text part type is rejected fail-closed, matching
+// buildTextMessage's contract for user/assistant array content: forwarding a
+// part type we don't understand risks silently corrupting the message.
+// Any other content shape (e.g. a bare number) is also rejected fail-closed.
+func collectSystemBlocks(blocks []anthropicContentBlock, content jsonx.RawMessage) ([]anthropicContentBlock, bool, error) {
+	if content == nil {
+		// No content field at all: contribute nothing, matching the adapter's
+		// historical behavior of silently skipping a contentless system
+		// message rather than treating absence the same as an explicit null.
+		return blocks, true, nil
+	}
+
+	var textContent string
+	if err := jsonx.Unmarshal(content, &textContent); err == nil {
+		return append(blocks, anthropicContentBlock{Type: "text", Text: textContent}), true, nil
+	}
+
+	var parts []systemContentPart
+	if err := jsonx.Unmarshal(content, &parts); err != nil {
+		return blocks, false, errors.New("unrecognised system content shape")
+	}
+	for _, p := range parts {
+		if p.Type != "text" {
+			return blocks, false, errors.New("unsupported content part type")
+		}
+		if p.Text == "" {
+			continue
+		}
+		blocks = append(blocks, anthropicContentBlock{
+			Type:         "text",
+			Text:         p.Text,
+			CacheControl: p.CacheControl,
+		})
+	}
+	return blocks, false, nil
 }
