@@ -2,6 +2,24 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.27] - 2026-09-27
+
+### Fixes
+- Daily token budgets are enforced across restarts. Usage events were stored with a timestamp format that range queries compared as text, so the startup seed missed all of today's usage and daily budgets started from zero after every restart or deploy. The same mismatch dropped the whole start date from usage reports and included events after the end time (#226, #237)
+- Usage and MCP usage events are stored in one canonical UTC format and hourly rollups use the event time; `group_by=hour` works on PostgreSQL (#237)
+- Common OpenAI request fields work with Anthropic upstreams: `stop`, `parallel_tool_calls`, `user`, the `developer` role and `temperature` above 1 are translated instead of causing a 400. A system message with array content is no longer dropped, and per-part `cache_control` is kept (#238)
+- Anthropic streams send a usage chunk, including cached tokens, when the client requests `stream_options.include_usage` (#238)
+
+### Security
+- Security hardening for request handling and key expiry validation (#237, #238)
+
+### Upgrade notes
+- The first start after upgrading rewrites historical usage timestamps once; progress is logged. On PostgreSQL with multiple replicas, upgrade all instances promptly.
+- `expires_at` on API key create and update must be an RFC3339 timestamp; other values are rejected with 400.
+- Requests to Anthropic models that send a top-level `system` or `stop_sequences` field are rejected with a 400 asking for a system message or `stop` instead. Malformed values for translated fields are rejected by the proxy with a specific message.
+
+---
+
 ## [0.0.26] - 2026-09-26
 
 ### Features
