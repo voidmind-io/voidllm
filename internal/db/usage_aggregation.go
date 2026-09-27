@@ -47,7 +47,7 @@ func (d *DB) GetHourlyUsageTotals(ctx context.Context, filter UsageFilter, since
 
 	conditions := []string{"bucket_hour >= " + p(argN)}
 	truncated := since.UTC().Truncate(time.Hour)
-	args := []any{truncated.Format(time.RFC3339)}
+	args := []any{FormatTimestamp(truncated)}
 	argN++
 
 	conditions = append(conditions, "org_id = "+p(argN))

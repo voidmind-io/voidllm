@@ -129,6 +129,31 @@ func derefStr(s *string) string {
 	return *s
 }
 
+// errInvalidExpiresAt is returned by normalizeExpiresAt when the supplied
+// value cannot be parsed as RFC3339. Its message is sent verbatim as the 400
+// response body.
+var errInvalidExpiresAt = errors.New("expires_at must be a valid RFC3339 timestamp")
+
+// normalizeExpiresAt validates and canonicalizes a client-supplied expires_at
+// value. A nil raw (the field was omitted from the request) returns nil,
+// nil — the column is left unchanged. Any non-nil value, including an empty
+// string, must parse as RFC3339(Nano); on success it is reformatted into the
+// canonical UTC storage format (db.FormatTimestamp) so every stored expiry
+// compares correctly as plain TEXT against other canonical timestamps. Past
+// dates are accepted — setting expires_at to an already-past time is a valid
+// way to revoke a key immediately.
+func normalizeExpiresAt(raw *string) (*string, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, *raw)
+	if err != nil {
+		return nil, errInvalidExpiresAt
+	}
+	formatted := db.FormatTimestamp(t)
+	return &formatted, nil
+}
+
 // canSetKeyLimits reports whether the caller is permitted to set rate and
 // token limits on the given key. Only org admins and system admins may set
 // limits — team admins are never permitted, even on keys scoped to their own
@@ -194,7 +219,7 @@ func apiKeyVisibleToCallerKey(key *db.APIKey, caller *auth.KeyInfo) bool {
 // The plaintext key is returned exactly once in the response body.
 //
 // @Summary      Create an API key
-// @Description  Creates a new API key for the organization. Members may only create user keys for themselves. Rate and token limit fields may only be set by org admins or system admins; non-admin callers must omit or zero these fields. The plaintext key is returned exactly once.
+// @Description  Creates a new API key for the organization. Members may only create user keys for themselves. Rate and token limit fields may only be set by org admins or system admins; non-admin callers must omit or zero these fields. expires_at, when set, must be a valid RFC3339 timestamp; it is stored normalized to UTC. The plaintext key is returned exactly once.
 // @Tags         keys
 // @Accept       json
 // @Produce      json
@@ -233,6 +258,11 @@ func (h *Handler) CreateAPIKey(c fiber.Ctx) error {
 	if req.DailyTokenLimit < 0 || req.MonthlyTokenLimit < 0 || req.RequestsPerMinute < 0 || req.RequestsPerDay < 0 {
 		return apierror.BadRequest(c, "limit fields must be >= 0")
 	}
+	normalizedExpiresAt, err := normalizeExpiresAt(req.ExpiresAt)
+	if err != nil {
+		return apierror.BadRequest(c, err.Error())
+	}
+	req.ExpiresAt = normalizedExpiresAt
 
 	// Members may only create user_key for themselves.
 	if !auth.HasRole(keyInfo.Role, auth.RoleOrgAdmin) {
@@ -570,7 +600,7 @@ func (h *Handler) ListAPIKeys(c fiber.Ctx) error {
 // Returns 404 if the key belongs to a different org or the caller lacks access.
 //
 // @Summary      Update an API key
-// @Description  Updates name, rate limits, token limits, or expiry of an API key. Only provided fields are changed. Rate and token limit fields may only be changed by org admins or system admins — team admins can never change them, even on keys scoped to their own team. A machine caller (org-level service-account key) may set limits on other keys in the org but never on its own key or another key belonging to the same service account. Submitting a limit value unchanged from the current stored value is always allowed.
+// @Description  Updates name, rate limits, token limits, or expiry of an API key. Only provided fields are changed. Rate and token limit fields may only be changed by org admins or system admins — team admins can never change them, even on keys scoped to their own team. A machine caller (org-level service-account key) may set limits on other keys in the org but never on its own key or another key belonging to the same service account. Submitting a limit value unchanged from the current stored value is always allowed. expires_at, when set, must be a valid RFC3339 timestamp (including in the past, to revoke a key immediately) and is stored normalized to UTC.
 // @Tags         keys
 // @Accept       json
 // @Produce      json
@@ -628,6 +658,11 @@ func (h *Handler) UpdateAPIKey(c fiber.Ctx) error {
 	if req.RequestsPerDay != nil && *req.RequestsPerDay < 0 {
 		return apierror.BadRequest(c, "requests_per_day must be >= 0")
 	}
+	normalizedExpiresAt, err := normalizeExpiresAt(req.ExpiresAt)
+	if err != nil {
+		return apierror.BadRequest(c, err.Error())
+	}
+	req.ExpiresAt = normalizedExpiresAt
 
 	// Only admins (see canSetKeyLimits) may change a limit field's stored
 	// value. Submitting the unchanged value back is always allowed so
@@ -834,12 +869,20 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 	rotatedName := strings.TrimSuffix(existing.Name, " (rotated)") + " (rotated)"
 
 	// Set the old key to expire after the grace period. If it already has an
-	// expiry that is sooner than the grace period deadline, keep that shorter expiry.
+	// expiry that is sooner than the grace period deadline, keep that shorter
+	// expiry. existing.ExpiresAt may be stored in a non-canonical RFC3339
+	// variant (e.g. a numeric UTC offset instead of Z); normalize it here so
+	// both the retained old-key expiry and the new key's copied expiry below
+	// are always written in canonical form.
 	graceDeadline := time.Now().UTC().Add(rotateKeyGracePeriod)
-	oldExpiresAt := graceDeadline.Format(time.RFC3339)
+	oldExpiresAt := db.FormatTimestamp(graceDeadline)
 	if existing.ExpiresAt != nil {
-		if t, parseErr := time.Parse(time.RFC3339, *existing.ExpiresAt); parseErr == nil && t.Before(graceDeadline) {
-			oldExpiresAt = *existing.ExpiresAt
+		if t, parseErr := time.Parse(time.RFC3339, *existing.ExpiresAt); parseErr == nil {
+			canonical := db.FormatTimestamp(t)
+			existing.ExpiresAt = &canonical
+			if t.Before(graceDeadline) {
+				oldExpiresAt = canonical
+			}
 		}
 	}
 

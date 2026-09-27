@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/voidmind-io/voidllm/internal/api/health"
+	dbtimestamp "github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
@@ -166,7 +167,7 @@ func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL, instan
 	// response processing outcome.
 	if db != nil {
 		defer func() {
-			_ = db.SetSetting(ctx, "heartbeat_last_sent", time.Now().UTC().Format(time.RFC3339))
+			_ = db.SetSetting(ctx, "heartbeat_last_sent", dbtimestamp.FormatTimestamp(time.Now()))
 		}()
 	}
 

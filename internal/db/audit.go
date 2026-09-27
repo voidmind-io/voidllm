@@ -108,12 +108,12 @@ func (d *DB) QueryAuditLogs(ctx context.Context, filter AuditLogFilter) (*AuditL
 	}
 	if !filter.From.IsZero() {
 		conditions = append(conditions, "timestamp >= "+p(n))
-		args = append(args, filter.From.UTC().Format(time.RFC3339))
+		args = append(args, FormatTimestamp(filter.From))
 		n++
 	}
 	if !filter.To.IsZero() {
 		conditions = append(conditions, "timestamp <= "+p(n))
-		args = append(args, filter.To.UTC().Format(time.RFC3339))
+		args = append(args, FormatTimestamp(filter.To))
 		n++
 	}
 	if filter.Cursor != "" {

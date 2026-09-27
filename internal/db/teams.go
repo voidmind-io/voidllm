@@ -359,7 +359,7 @@ func scanTeamWithCounts(rows interface {
 func (d *DB) ListTeamsWithCounts(ctx context.Context, orgID string, cursor string, limit int, includeDeleted bool) ([]TeamWithCounts, error) {
 	p := d.dialect.Placeholder
 	argN := 1
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := FormatTimestamp(time.Now())
 
 	// p(1) is always the expires_at threshold used inside the CASE expression.
 	args := []any{now}
@@ -410,7 +410,7 @@ func (d *DB) ListTeamsWithCounts(ctx context.Context, orgID string, cursor strin
 // It returns ErrNotFound if the team does not exist or has been soft-deleted.
 func (d *DB) GetTeamWithCounts(ctx context.Context, id string) (*TeamWithCounts, error) {
 	p := d.dialect.Placeholder
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := FormatTimestamp(time.Now())
 
 	// p(1)=expires_at threshold, p(2)=team id.
 	query := fmt.Sprintf(teamWithCountsBase, p(1)) +
@@ -430,7 +430,7 @@ func (d *DB) GetTeamWithCounts(ctx context.Context, id string) (*TeamWithCounts,
 // It is used to enforce team-scoped visibility for team_admin callers.
 func (d *DB) ListUserTeams(ctx context.Context, orgID, userID string) ([]TeamWithCounts, error) {
 	p := d.dialect.Placeholder
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := FormatTimestamp(time.Now())
 
 	// p(1)=expires_at threshold, p(2)=org_id, p(3)=user_id.
 	query := fmt.Sprintf(teamWithCountsBase, p(1)) +

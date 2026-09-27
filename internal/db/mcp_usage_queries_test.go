@@ -31,7 +31,7 @@ func insertMCPToolCall(t *testing.T, d *DB, id, orgID, teamID, userID, serverAli
 			 '%s', '%s', %d, '%s', %d, '%s')`,
 		id, orgID, teamVal, userVal,
 		serverAlias, toolName, durationMS, status, codeModeVal,
-		createdAt.UTC().Format(time.RFC3339),
+		FormatTimestamp(createdAt),
 	)
 	if _, err := d.sql.ExecContext(context.Background(), query); err != nil {
 		t.Fatalf("insertMCPToolCall id=%q: %v", id, err)

@@ -177,7 +177,7 @@ func (h *Handler) CreateInvite(c fiber.Ctx) error {
 
 	tokenHash := keygen.Hash(plaintextToken, h.HMACSecret)
 	tokenHint := keygen.Hint(plaintextToken)
-	expiresAt := time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339)
+	expiresAt := db.FormatTimestamp(time.Now().Add(7 * 24 * time.Hour))
 
 	invite, err := h.DB.CreateInviteToken(ctx, db.CreateInviteTokenParams{
 		TokenHash: tokenHash,

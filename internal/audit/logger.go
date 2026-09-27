@@ -153,7 +153,7 @@ func (l *Logger) flush(events []Event) error {
 				return fmt.Errorf("audit flush: generate id: %w", err)
 			}
 
-			ts := ev.Timestamp.UTC().Format(time.RFC3339)
+			ts := db.FormatTimestamp(ev.Timestamp)
 
 			_, err = q.ExecContext(ctx, query,
 				id.String(),

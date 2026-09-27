@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/voidmind-io/voidllm/internal/db"
 )
 
 const (
@@ -164,7 +166,7 @@ func (c *Checker) check() {
 	}
 
 	version := strings.TrimPrefix(release.TagName, "v")
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := db.FormatTimestamp(time.Now())
 
 	if err := c.db.SetSetting(ctx, "update_checked_at", now); err != nil {
 		c.log.LogAttrs(ctx, slog.LevelDebug, "failed to store update_checked_at", slog.String("error", err.Error()))
