@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -781,11 +782,20 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 									})
 								}
 							}
-							encoded, merr := jsonx.Marshal(blocks)
-							if merr != nil {
-								return nil, fmt.Errorf("anthropic transform request: marshal tool result content array: %w", merr)
+							// If every part was skipped (all-empty text after the
+							// cache_control check above), leave contentRaw nil so the
+							// tool_result block omits "content" entirely rather than
+							// emitting an empty array — Anthropic's tool_result schema
+							// treats an absent content the same as an empty one, and
+							// omitting matches the plain-string-content path's
+							// contentRaw-stays-nil behavior for an unrecognised shape.
+							if len(blocks) > 0 {
+								encoded, merr := jsonx.Marshal(blocks)
+								if merr != nil {
+									return nil, fmt.Errorf("anthropic transform request: marshal tool result content array: %w", merr)
+								}
+								contentRaw = jsonx.RawMessage(encoded)
 							}
-							contentRaw = jsonx.RawMessage(encoded)
 						}
 						// If neither shape unmarshals, contentRaw stays nil (omitted).
 					}
@@ -1597,20 +1607,53 @@ func isJSONNull(raw jsonx.RawMessage) bool {
 	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
-// parseJSONInt reports whether raw is a JSON integer literal — no decimal
-// point or exponent — and returns its int64 value. Floats, strings, objects,
-// arrays, booleans, and null all return (0, false).
+// parseJSONInt reports whether raw is a JSON number literal whose exact
+// mathematical value is an integer within the int64 range, and returns that
+// value. This accepts not just plain-digit literals ("1024") but any
+// integral decimal or exponent form ("1024.0", "1.024e3", "4e1", "-0.0") —
+// the JSON number grammar allows a fractional part and/or exponent on any
+// number, and a value like 1.024e3 is exactly 1024. The literal is parsed as
+// an exact rational (big.Rat, no binary floating-point rounding) so a huge
+// exact integer such as 1e400 is still recognised as integral and then
+// correctly rejected for being outside the int64 range, rather than being
+// silently misjudged by rounding. Non-integral numbers (1.5), strings,
+// objects, arrays, booleans, and null all return (0, false).
+//
+// Before big.Rat.SetString runs — its cost scales with the literal's
+// length, and a digit string a few hundred KB long is trivially cheap to
+// send but not to parse — two cheap guards reject pathological input up
+// front, both failing the same way as an ordinary parse failure: the
+// trimmed literal must be at most 40 bytes, and if it contains an exponent
+// (e/E), the exponent's magnitude (parsed with strconv.Atoi after stripping
+// the optional leading sign; anything that fails to parse counts as
+// exceeding the limit) must be at most 20. This turns something like
+// "1e1000000" — tens of milliseconds and a few hundred KB of allocation in
+// big.Rat before the int64 range check would reject it anyway — into a
+// handful of string operations.
 func parseJSONInt(raw jsonx.RawMessage) (int64, bool) {
-	var n int64
-	if jsonx.Unmarshal(raw, &n) != nil {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || len(trimmed) > 40 {
 		return 0, false
 	}
-	for _, ch := range string(raw) {
-		if ch == '.' || ch == 'e' || ch == 'E' {
-			return 0, false // float-shaped literal, not an integer
+	if idx := strings.IndexAny(trimmed, "eE"); idx >= 0 {
+		exp := trimmed[idx+1:]
+		if exp != "" && (exp[0] == '+' || exp[0] == '-') {
+			exp = exp[1:]
+		}
+		expVal, err := strconv.Atoi(exp)
+		if err != nil || expVal > 20 {
+			return 0, false
 		}
 	}
-	return n, true
+	r, ok := new(big.Rat).SetString(trimmed)
+	if !ok || !r.IsInt() {
+		return 0, false
+	}
+	n := r.Num()
+	if !n.IsInt64() {
+		return 0, false
+	}
+	return n.Int64(), true
 }
 
 // anthropicThinkingTypeRe is the charset for thinking.type: lowercase ASCII
@@ -1618,31 +1661,36 @@ func parseJSONInt(raw jsonx.RawMessage) (int64, bool) {
 var anthropicThinkingTypeRe = regexp.MustCompile(`^[a-z_]{1,32}$`)
 
 // anthropicThinking is the closed schema for the Anthropic "thinking" request
-// field. Only "type" and the optional "budget_tokens" are accepted; the
-// struct is re-marshaled from validated, typed values so the client's raw
-// bytes are never forwarded verbatim.
+// field. Only "type", the optional "budget_tokens", and the optional
+// "display" are accepted (adaptive thinking sends {"type":"adaptive",
+// "display":"..."}, and "enabled" may carry a "display" too); the struct is
+// re-marshaled from validated, typed values so the client's raw bytes are
+// never forwarded verbatim.
 type anthropicThinking struct {
 	Type         string `json:"type"`
 	BudgetTokens *int64 `json:"budget_tokens,omitempty"`
+	Display      string `json:"display,omitempty"`
 }
 
 // errInvalidThinking is the client-safe, static error returned for every
 // thinking validation failure. The message is a fixed literal — it never
 // echoes the caller-supplied shape.
-var errInvalidThinking = newClientRequestError(`thinking must be an object with "type" (lowercase letters/underscores, 1-32 chars) and optional positive-integer "budget_tokens"`)
+var errInvalidThinking = newClientRequestError(`thinking must be an object with "type" (lowercase letters/underscores, 1-32 chars), optional positive-integer "budget_tokens", and optional "display" (lowercase letters/underscores, 1-32 chars)`)
 
 // validateThinking parses raw against the closed thinking schema
 // (anthropicThinking) and returns the validated, typed value. raw must
 // already be known non-null (callers check isJSONNull first). Any key other
-// than "type" and "budget_tokens", a missing or malformed "type", or a
-// non-positive "budget_tokens" is rejected fail-closed.
+// than "type", "budget_tokens", and "display", a missing or malformed
+// "type", a non-positive "budget_tokens", or a malformed "display" is
+// rejected fail-closed. The per-type union of which fields belong together
+// (e.g. "adaptive" pairing with "display") is left to Anthropic to enforce.
 func validateThinking(raw jsonx.RawMessage) (anthropicThinking, error) {
 	var fields map[string]jsonx.RawMessage
 	if err := jsonx.Unmarshal(raw, &fields); err != nil || fields == nil {
 		return anthropicThinking{}, errInvalidThinking
 	}
 	for k := range fields {
-		if k != "type" && k != "budget_tokens" {
+		if k != "type" && k != "budget_tokens" && k != "display" {
 			return anthropicThinking{}, errInvalidThinking
 		}
 	}
@@ -1663,6 +1711,14 @@ func validateThinking(raw jsonx.RawMessage) (anthropicThinking, error) {
 			return anthropicThinking{}, errInvalidThinking
 		}
 		th.BudgetTokens = &budget
+	}
+
+	if rawDisplay, ok := fields["display"]; ok {
+		var display string
+		if err := jsonx.Unmarshal(rawDisplay, &display); err != nil || !anthropicThinkingTypeRe.MatchString(display) {
+			return anthropicThinking{}, errInvalidThinking
+		}
+		th.Display = display
 	}
 
 	return th, nil

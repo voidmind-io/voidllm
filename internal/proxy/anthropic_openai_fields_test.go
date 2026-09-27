@@ -1962,27 +1962,32 @@ func TestAnthropicTransformRequest_TopKValidation(t *testing.T) {
 }
 
 // TestAnthropicTransformRequest_ThinkingValidation covers thinking
-// validation: a closed schema of "type" (matching ^[a-z_]{1,32}$) and an
-// optional positive-integer "budget_tokens", re-encoded from the typed
+// validation: a closed schema of "type" (matching ^[a-z_]{1,32}$), an
+// optional positive-integer "budget_tokens", and an optional "display"
+// (matching the same charset — current Anthropic adaptive thinking sends
+// {"type":"adaptive","display":"..."}), re-encoded from the typed
 // anthropicThinking struct. Every other shape — an extra key (including one
-// carrying an email value), a malformed type or budget_tokens, or a
-// non-object thinking value — is rejected fail-closed, and a JSON null is
+// carrying an email value), a malformed type, budget_tokens, or display, or
+// a non-object thinking value — is rejected fail-closed, and a JSON null is
 // treated as absent.
 func TestAnthropicTransformRequest_ThinkingValidation(t *testing.T) {
 	t.Parallel()
 
-	const wantMsg = `thinking must be an object with "type" (lowercase letters/underscores, 1-32 chars) and optional positive-integer "budget_tokens"`
+	const wantMsg = `thinking must be an object with "type" (lowercase letters/underscores, 1-32 chars), optional positive-integer "budget_tokens", and optional "display" (lowercase letters/underscores, 1-32 chars)`
 
 	t.Run("valid shapes are re-encoded from the closed schema", func(t *testing.T) {
 		t.Parallel()
 		tests := []struct {
-			name       string
-			raw        string
-			wantType   string
-			wantBudget *int64
+			name        string
+			raw         string
+			wantType    string
+			wantBudget  *int64
+			wantDisplay string
 		}{
-			{"type only", `{"type":"enabled"}`, "enabled", nil},
-			{"type and budget_tokens", `{"type":"enabled","budget_tokens":1024}`, "enabled", int64Ptr(1024)},
+			{"type only", `{"type":"enabled"}`, "enabled", nil, ""},
+			{"type and budget_tokens", `{"type":"enabled","budget_tokens":1024}`, "enabled", int64Ptr(1024), ""},
+			{"adaptive with display", `{"type":"adaptive","display":"brief"}`, "adaptive", nil, "brief"},
+			{"enabled with display and budget_tokens", `{"type":"enabled","budget_tokens":512,"display":"brief"}`, "enabled", int64Ptr(512), "brief"},
 		}
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
@@ -2003,6 +2008,9 @@ func TestAnthropicTransformRequest_ThinkingValidation(t *testing.T) {
 				}
 				if tc.wantBudget != nil && *got.BudgetTokens != *tc.wantBudget {
 					t.Errorf("thinking.budget_tokens = %d, want %d", *got.BudgetTokens, *tc.wantBudget)
+				}
+				if got.Display != tc.wantDisplay {
+					t.Errorf("thinking.display = %q, want %q", got.Display, tc.wantDisplay)
 				}
 			})
 		}
@@ -2029,6 +2037,11 @@ func TestAnthropicTransformRequest_ThinkingValidation(t *testing.T) {
 			{"thinking as string", `"enabled"`},
 			{"thinking as array", `["enabled"]`},
 			{"thinking as number", "42"},
+			{"display with email", fmt.Sprintf(`{"type":"adaptive","display":%q}`, leakEmail)},
+			{"display with space", `{"type":"adaptive","display":"not valid"}`},
+			{"display uppercase", `{"type":"adaptive","display":"BRIEF"}`},
+			{"display empty", `{"type":"adaptive","display":""}`},
+			{"display too long", fmt.Sprintf(`{"type":"adaptive","display":%q}`, strings.Repeat("a", 33))},
 		}
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
@@ -2171,12 +2184,285 @@ func TestAnthropicTransformRequest_EmptyPartCacheControlValidation(t *testing.T)
 		if last.Role != "user" || len(last.Content) != 1 || last.Content[0].Type != "tool_result" {
 			t.Fatalf("unexpected last message shape: %+v", last)
 		}
-		var blocks []anthropicContentBlock
-		if err := json.Unmarshal(last.Content[0].Content, &blocks); err != nil {
-			t.Fatalf("unmarshal tool_result content: %v (raw: %s)", err, last.Content[0].Content)
+		if last.Content[0].Content != nil {
+			t.Errorf("tool_result content = %s, want omitted (no key) once every part reduces to zero text blocks", last.Content[0].Content)
 		}
-		if len(blocks) != 0 {
-			t.Errorf("tool_result content blocks = %+v, want empty (empty text dropped)", blocks)
+	})
+}
+
+// TestAnthropicTransformRequest_ToolResultEmptyContentOmitsKey verifies that
+// a tool-result message whose content reduces to zero text blocks — every
+// part is either non-text or empty text — omits the "content" key on the
+// resulting tool_result block entirely, rather than emitting "content":[].
+// This is checked at the raw-JSON level (not just via a struct field that
+// would treat missing and empty-array identically) so a regression back to
+// "content":[] is caught.
+func TestAnthropicTransformRequest_ToolResultEmptyContentOmitsKey(t *testing.T) {
+	t.Parallel()
+
+	input := `{"model":"claude-3","messages":[` +
+		`{"role":"user","content":"q"},` +
+		`{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"fn","arguments":"{}"}}]},` +
+		`{"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":""},{"type":"image_url","image_url":{"url":"https://example.com/x.png"}}]}` +
+		`]}`
+	doc := transformRequest(t, input)
+	remaining, ok := doc["messages"]
+	if !ok {
+		t.Fatal("messages missing from transformed document")
+	}
+	var rawMsgs []map[string]json.RawMessage
+	if err := json.Unmarshal(remaining, &rawMsgs); err != nil {
+		t.Fatalf("unmarshal messages: %v", err)
+	}
+	last := rawMsgs[len(rawMsgs)-1]
+	var rawContent []map[string]json.RawMessage
+	if err := json.Unmarshal(last["content"], &rawContent); err != nil {
+		t.Fatalf("unmarshal message content: %v", err)
+	}
+	if len(rawContent) != 1 {
+		t.Fatalf("len(content blocks) = %d, want 1", len(rawContent))
+	}
+	if _, ok := rawContent[0]["content"]; ok {
+		t.Errorf(`tool_result block has "content" key = %s, want key absent entirely`, rawContent[0]["content"])
+	}
+}
+
+// TestParseJSONInt covers parseJSONInt directly: any JSON number literal
+// whose exact mathematical value is an integer within the int64 range is
+// accepted regardless of surface form (plain digits, a decimal point, or an
+// exponent), while a non-integral number and every non-number JSON shape are
+// rejected.
+func TestParseJSONInt(t *testing.T) {
+	t.Parallel()
+
+	t.Run("accepts integral values in any surface form", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name string
+			raw  string
+			want int64
+		}{
+			{"plain integer", "1024", 1024},
+			{"decimal with trailing zero", "1024.0", 1024},
+			{"small exponent", "1.024e3", 1024},
+			{"bare exponent", "4e1", 40},
+			{"negative signed zero", "-0.0", 0},
+			{"max int64", "9223372036854775807", 9223372036854775807},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				got, ok := parseJSONInt(json.RawMessage(tc.raw))
+				if !ok {
+					t.Fatalf("parseJSONInt(%s) ok = false, want true", tc.raw)
+				}
+				if got != tc.want {
+					t.Errorf("parseJSONInt(%s) = %d, want %d", tc.raw, got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("rejects non-integral numbers and non-number shapes", func(t *testing.T) {
+		t.Parallel()
+		tests := []string{"1.5", "1e400", `"5"`, "true", "false", "null", "{}", "[]", ""}
+		for _, raw := range tests {
+			raw := raw
+			t.Run(raw, func(t *testing.T) {
+				t.Parallel()
+				if _, ok := parseJSONInt(json.RawMessage(raw)); ok {
+					t.Errorf("parseJSONInt(%s) ok = true, want false", raw)
+				}
+			})
+		}
+	})
+
+	// These reject before big.Rat.SetString ever runs — the pre-check guards
+	// on literal length and exponent magnitude catch them. There is no
+	// timing assertion here (that would be flaky); correctness of the
+	// rejection is all this verifies. BenchmarkParseJSONIntPathological
+	// below is the evidence that the guard actually keeps the cost cheap.
+	t.Run("rejects oversized or pathological literals", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name string
+			raw  string
+		}{
+			{"huge positive exponent", "1e1000000"},
+			{"exponent just over the limit", "1e21"},
+			{"41-byte digit string", strings.Repeat("9", 41)},
+			{"huge signed exponent", "1e+99999999999999999999"},
+		}
+		for _, tc := range tests {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				if _, ok := parseJSONInt(json.RawMessage(tc.raw)); ok {
+					t.Errorf("parseJSONInt(%s) ok = true, want false", tc.raw)
+				}
+			})
+		}
+	})
+}
+
+// BenchmarkParseJSONIntPathological benchmarks parseJSONInt on a literal
+// designed to be maximally expensive for big.Rat.SetString ("1e1000000")
+// while being cheap to send. It exists to catch a regression of the
+// pre-check guard in parseJSONInt: if the guard were ever removed or
+// weakened, this benchmark's allocations and ns/op would jump by orders of
+// magnitude.
+func BenchmarkParseJSONIntPathological(b *testing.B) {
+	raw := json.RawMessage("1e1000000")
+	for i := 0; i < b.N; i++ {
+		parseJSONInt(raw)
+	}
+}
+
+// TestAnthropicTransformRequest_IntegralNumberFormsCanonicalized verifies
+// end-to-end that every parseJSONInt call site — max_tokens,
+// max_completion_tokens, top_k, and thinking.budget_tokens — accepts an
+// integral JSON number regardless of its decimal or exponent surface form
+// and canonicalizes it to a plain integer literal on the wire, and that a
+// non-integral (1.5) or out-of-int64-range-but-integral (1e400) literal is
+// still rejected fail-closed for every one of those fields.
+func TestAnthropicTransformRequest_IntegralNumberFormsCanonicalized(t *testing.T) {
+	t.Parallel()
+
+	// acceptedForms carries only values that also satisfy each field's own
+	// positivity rule (max_tokens and budget_tokens require > 0; top_k
+	// requires >= 0), so a rejection here can only be attributed to
+	// parseJSONInt itself, never to the field's separate range check.
+	acceptedForms := []struct {
+		name string
+		raw  string
+		want int64
+	}{
+		{"decimal with trailing zero", "1024.0", 1024},
+		{"small exponent", "1.024e3", 1024},
+		{"bare exponent", "4e1", 40},
+	}
+
+	t.Run("max_tokens", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range acceptedForms {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				doc, err := runFieldValidationCase(t, "max_tokens", tc.raw)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var got int64
+				if err := json.Unmarshal(doc["max_tokens"], &got); err != nil {
+					t.Fatalf("unmarshal max_tokens: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("max_tokens = %d, want %d", got, tc.want)
+				}
+			})
+		}
+		for _, raw := range []string{"1.5", "1e400"} {
+			raw := raw
+			t.Run(raw, func(t *testing.T) {
+				t.Parallel()
+				_, err := runFieldValidationCase(t, "max_tokens", raw)
+				wantClientRequestError(t, err, "max_tokens must be a positive integer")
+			})
+		}
+	})
+
+	t.Run("max_completion_tokens", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range acceptedForms {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				doc, err := runFieldValidationCase(t, "max_completion_tokens", tc.raw)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var got int64
+				if err := json.Unmarshal(doc["max_tokens"], &got); err != nil {
+					t.Fatalf("unmarshal max_tokens: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("max_tokens = %d, want %d", got, tc.want)
+				}
+			})
+		}
+		for _, raw := range []string{"1.5", "1e400"} {
+			raw := raw
+			t.Run(raw, func(t *testing.T) {
+				t.Parallel()
+				_, err := runFieldValidationCase(t, "max_completion_tokens", raw)
+				wantClientRequestError(t, err, "max_tokens must be a positive integer")
+			})
+		}
+	})
+
+	t.Run("top_k", func(t *testing.T) {
+		t.Parallel()
+		forms := append([]struct {
+			name string
+			raw  string
+			want int64
+		}{{"negative signed zero", "-0.0", 0}}, acceptedForms...)
+		for _, tc := range forms {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				doc, err := runFieldValidationCase(t, "top_k", tc.raw)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var got int64
+				if err := json.Unmarshal(doc["top_k"], &got); err != nil {
+					t.Fatalf("unmarshal top_k: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("top_k = %d, want %d", got, tc.want)
+				}
+			})
+		}
+		for _, raw := range []string{"1.5", "1e400"} {
+			raw := raw
+			t.Run(raw, func(t *testing.T) {
+				t.Parallel()
+				_, err := runFieldValidationCase(t, "top_k", raw)
+				wantClientRequestError(t, err, "top_k must be a non-negative integer")
+			})
+		}
+	})
+
+	t.Run("thinking.budget_tokens", func(t *testing.T) {
+		t.Parallel()
+		const wantMsg = `thinking must be an object with "type" (lowercase letters/underscores, 1-32 chars), optional positive-integer "budget_tokens", and optional "display" (lowercase letters/underscores, 1-32 chars)`
+		for _, tc := range acceptedForms {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				raw := fmt.Sprintf(`{"type":"enabled","budget_tokens":%s}`, tc.raw)
+				doc, err := runFieldValidationCase(t, "thinking", raw)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var got anthropicThinking
+				if err := json.Unmarshal(doc["thinking"], &got); err != nil {
+					t.Fatalf("unmarshal thinking: %v", err)
+				}
+				if got.BudgetTokens == nil || *got.BudgetTokens != tc.want {
+					t.Errorf("thinking.budget_tokens = %v, want %d", got.BudgetTokens, tc.want)
+				}
+			})
+		}
+		for _, raw := range []string{"1.5", "1e400"} {
+			raw := raw
+			t.Run(raw, func(t *testing.T) {
+				t.Parallel()
+				thinking := fmt.Sprintf(`{"type":"enabled","budget_tokens":%s}`, raw)
+				_, err := runFieldValidationCase(t, "thinking", thinking)
+				wantClientRequestError(t, err, wantMsg)
+			})
 		}
 	})
 }
