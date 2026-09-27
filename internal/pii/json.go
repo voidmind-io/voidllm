@@ -27,18 +27,20 @@ var knownContentPartTypes = map[string]bool{
 
 // coveredTopLevelFields lists the top-level request-body fields that
 // anonymizeWithDetectors handles with dedicated shape validation above (user,
-// stop, prompt, input, tools, messages, logit_bias, tool_choice). They are
-// excluded from the default unknown-field scan to avoid processing them
-// twice.
+// stop, prompt, input, tools, messages, logit_bias, tool_choice, and the
+// legacy pre-"tools" fields functions, function_call). They are excluded
+// from the default unknown-field scan to avoid processing them twice.
 var coveredTopLevelFields = map[string]bool{
-	"user":        true,
-	"stop":        true,
-	"prompt":      true,
-	"input":       true,
-	"tools":       true,
-	"messages":    true,
-	"logit_bias":  true,
-	"tool_choice": true,
+	"user":          true,
+	"stop":          true,
+	"prompt":        true,
+	"input":         true,
+	"tools":         true,
+	"messages":      true,
+	"logit_bias":    true,
+	"tool_choice":   true,
+	"functions":     true,
+	"function_call": true,
 }
 
 // exemptTopLevelFields lists structural top-level request-body fields whose
@@ -145,7 +147,10 @@ func scanForDuplicateKeys(dec *json.Decoder) (bool, error) {
 //   - messages[].content (string or array-of-parts "text" field)
 //   - messages[].name
 //   - messages[].tool_calls[].function.arguments (JSON string, scanned as text)
+//   - messages[].tool_calls[].function.name (function-name policy, see below)
 //   - messages[].function_call.arguments (legacy, JSON string, scanned as text)
+//   - messages[].function_call.name (legacy, function-name policy, see below)
+//   - tools[].function.name (function-name policy, see below)
 //   - tools[].function.description
 //   - tools[].function.parameters: string leaf values only (description, default,
 //     enum strings, title, etc.); object structure and keys are never modified.
@@ -169,10 +174,33 @@ func scanForDuplicateKeys(dec *json.Decoder) (bool, error) {
 //     a pseudonymized token-ID key would corrupt the bias map.
 //   - top-level "tool_choice": a JSON string is scanned like any other
 //     string field; JSON null is a no-op; a JSON object's
-//     "function.name" is validated against the charset OpenAI restricts
-//     function names to (^[A-Za-z0-9_-]{1,64}$) and left untouched — every
+//     "function.name" gets the function-name policy (see below) — every
 //     other string leaf in the object is scanned normally via
 //     scanStringLeaves. Any other shape is rejected fail-closed.
+//   - top-level "functions" (legacy, deprecated in favor of "tools"): each
+//     element is {"name", "description", "parameters"} with "name" getting
+//     the function-name policy and "description"/"parameters" scanned
+//     exactly like their tools[].function counterparts. Present but not an
+//     array (or JSON null) is rejected fail-closed.
+//   - top-level "function_call" (legacy, deprecated in favor of
+//     "tool_choice"): a JSON string is scanned like tool_choice's string
+//     form; JSON null is a no-op; an object selects a function by "name"
+//     directly (no nested "function" key) — "name" gets the function-name
+//     policy and every other string leaf is scanned normally. Any other
+//     shape is rejected fail-closed.
+//
+// Function-name policy (tools[].function.name, tool_choice.function.name,
+// messages[].tool_calls[].function.name, messages[].function_call.name, and
+// the legacy top-level functions[].name / function_call.name): the name is
+// validated against functionNamePattern and, only if it matches, run through
+// the same detectors used for free text. A declared function/tool name must
+// reach the upstream byte-identical to the name a later tool_choice or
+// tool_call selects it by, so it is never pseudonymized — if the charset
+// check fails, or the charset check passes but a detector still flags the
+// name as PII, the request is rejected fail-closed rather than rewriting the
+// name. See validateFunctionName. Each location's handling of a JSON null or
+// absent name preserves that location's prior behavior; see the comment at
+// each call site for specifics.
 //
 // Every other top-level key — anything not listed above — is scanned by
 // default: it is treated as potential free-text content and passed through
@@ -443,13 +471,14 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 					}
 
 					if rawName, hasName := fn["name"]; hasName {
-						var name string
-						if err := jsonx.Unmarshal(rawName, &name); err != nil {
-							// "name" present but is not a string: unsupported shape.
-							return nil, errors.New("pii: request body could not be processed for anonymization")
-						}
-						if !toolChoiceFunctionNamePattern.MatchString(name) {
-							return nil, errors.New("pii: request body could not be processed for anonymization")
+						// "name" present but not a string, or a valid-charset name
+						// that a detector flags as PII, is rejected fail-closed by
+						// validateFunctionName. JSON null unmarshals into an empty
+						// string, which fails functionNamePattern's 1-character
+						// minimum, so a null "name" is rejected here exactly as
+						// before this policy was shared across locations.
+						if err := validateFunctionName(rawName, detect); err != nil {
+							return nil, err
 						}
 						// Valid name: left untouched, never passed to detect.
 					}
@@ -673,6 +702,21 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 			}
 			fnTouched := false
 
+			// tools[].function.name
+			// Validated against the shared function-name policy (charset +
+			// detector) and left untouched when valid — a declared tool name
+			// must reach the upstream byte-identical so a later tool_call can
+			// reference it. JSON null keeps this location's prior behavior
+			// (this field was previously unvalidated and passed through
+			// unchanged): it is left as-is rather than validated or rejected.
+			if rawName, hasName := fn["name"]; hasName {
+				if !bytes.Equal(bytes.TrimSpace(rawName), []byte("null")) {
+					if err := validateFunctionName(rawName, detect); err != nil {
+						return nil, err
+					}
+				}
+			}
+
 			// tools[].function.description
 			// Fail-closed: when "description" is present but is not a string,
 			// reject rather than silently forwarding unscanned content.
@@ -728,6 +772,171 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 			}
 			doc["tools"] = jsonx.RawMessage(newToolsJSON)
 			touched = true
+		}
+	}
+
+	// ── legacy top-level "functions" field (deprecated in favor of "tools") ──
+	// functions[] predates tools[] and mirrors tools[].function directly: each
+	// element is {"name", "description", "parameters"} with no nested
+	// "function" wrapper. "name" gets the shared function-name policy
+	// (validated and left untouched, never scanned) for the same reason as
+	// tools[].function.name; "description" and "parameters" get the same
+	// shape-validated scanning as their tools[].function counterparts.
+	// "functions" present but not an array (or JSON null): unsupported shape
+	// → fail-closed.
+	if rawFunctions, ok := doc["functions"]; ok {
+		var functions []jsonx.RawMessage
+		if err := jsonx.Unmarshal(rawFunctions, &functions); err != nil || functions == nil {
+			return nil, errors.New("pii: request body could not be processed for anonymization")
+		}
+		functionsTouched := false
+		for i, rawFn := range functions {
+			var fn map[string]jsonx.RawMessage
+			if err := jsonx.Unmarshal(rawFn, &fn); err != nil || fn == nil {
+				// functions[] element is not a JSON object (or is JSON null): unsupported shape → fail-closed.
+				return nil, errors.New("pii: request body could not be processed for anonymization")
+			}
+			fnTouched := false
+
+			// functions[].name
+			// JSON null keeps this location's prior behavior: before this
+			// field was moved out of the default unknown-field scan, a null
+			// "name" was a scalar leaf left untouched by scanStringLeaves.
+			if rawName, hasName := fn["name"]; hasName {
+				if !bytes.Equal(bytes.TrimSpace(rawName), []byte("null")) {
+					if err := validateFunctionName(rawName, detect); err != nil {
+						return nil, err
+					}
+				}
+			}
+
+			// functions[].description
+			if rawDesc, hasDesc := fn["description"]; hasDesc {
+				var desc string
+				if err := jsonx.Unmarshal(rawDesc, &desc); err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				replaced, did, err := detect(desc)
+				if err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				if did {
+					newJSON, err := jsonx.Marshal(replaced)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					fn["description"] = jsonx.RawMessage(newJSON)
+					fnTouched = true
+				}
+			}
+
+			// functions[].parameters: scan string leaf values only.
+			if rawParams, hasParams := fn["parameters"]; hasParams {
+				scanned, paramsTouched, err := scanStringLeaves(rawParams, detect)
+				if err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				if paramsTouched {
+					fn["parameters"] = scanned
+					fnTouched = true
+				}
+			}
+
+			if fnTouched {
+				newFnJSON, err := jsonx.Marshal(fn)
+				if err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				functions[i] = jsonx.RawMessage(newFnJSON)
+				functionsTouched = true
+			}
+		}
+		if functionsTouched {
+			newFunctionsJSON, err := jsonx.Marshal(functions)
+			if err != nil {
+				return nil, errors.New("pii: request body could not be processed for anonymization")
+			}
+			doc["functions"] = jsonx.RawMessage(newFunctionsJSON)
+			touched = true
+		}
+	}
+
+	// ── legacy top-level "function_call" field (deprecated in favor of
+	// "tool_choice") ─────────────────────────────────────────────────────────
+	// function_call predates tool_choice and mirrors it directly, minus the
+	// nested "function" wrapper: a JSON string ("auto", "none", or any other
+	// value) carries no routing semantics beyond its literal value and is
+	// scanned like any other string field; JSON null is a no-op; an object
+	// selects a specific function by "name" directly (no "function" key), so
+	// "name" gets the shared function-name policy and every other string
+	// leaf in the object is scanned normally via scanStringLeaves. Any other
+	// shape is rejected fail-closed.
+	if rawFunctionCall, ok := doc["function_call"]; ok {
+		if !bytes.Equal(bytes.TrimSpace(rawFunctionCall), []byte("null")) {
+			var fcStr string
+			if err := jsonx.Unmarshal(rawFunctionCall, &fcStr); err == nil {
+				replaced, did, err := detect(fcStr)
+				if err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				if did {
+					newJSON, err := jsonx.Marshal(replaced)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					doc["function_call"] = jsonx.RawMessage(newJSON)
+					touched = true
+				}
+			} else {
+				var fc map[string]jsonx.RawMessage
+				if err2 := jsonx.Unmarshal(rawFunctionCall, &fc); err2 != nil || fc == nil {
+					// Neither a string, an object, nor null: unsupported shape → fail-closed.
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+
+				fcTouched := false
+				fcKeys := make([]string, 0, len(fc))
+				for k := range fc {
+					if k == "name" {
+						continue
+					}
+					fcKeys = append(fcKeys, k)
+				}
+				sort.Strings(fcKeys)
+
+				for _, k := range fcKeys {
+					scanned, did, err := scanStringLeaves(fc[k], detect)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					if did {
+						fc[k] = scanned
+						fcTouched = true
+					}
+				}
+
+				// function_call.name
+				// JSON null keeps this location's prior behavior: before this
+				// field was moved out of the default unknown-field scan, a
+				// null "name" was a scalar leaf left untouched by
+				// scanStringLeaves.
+				if rawName, hasName := fc["name"]; hasName {
+					if !bytes.Equal(bytes.TrimSpace(rawName), []byte("null")) {
+						if err := validateFunctionName(rawName, detect); err != nil {
+							return nil, err
+						}
+					}
+				}
+
+				if fcTouched {
+					newFCJSON, err := jsonx.Marshal(fc)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					doc["function_call"] = jsonx.RawMessage(newFCJSON)
+					touched = true
+				}
+			}
 		}
 	}
 
@@ -882,6 +1091,20 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 					// "function_call" present but not an object (or is JSON null): unsupported shape.
 					return nil, errors.New("pii: request body could not be processed for anonymization")
 				}
+
+				// messages[].function_call.name
+				// Same shared function-name policy as the other three
+				// locations: validated and left untouched when valid. JSON
+				// null keeps this location's prior behavior (previously
+				// unvalidated and passed through unchanged).
+				if rawName, ok := fc["name"]; ok {
+					if !bytes.Equal(bytes.TrimSpace(rawName), []byte("null")) {
+						if err := validateFunctionName(rawName, detect); err != nil {
+							return nil, err
+						}
+					}
+				}
+
 				if rawArgs, ok := fc["arguments"]; ok {
 					var args string
 					if err := jsonx.Unmarshal(rawArgs, &args); err != nil {
@@ -933,6 +1156,21 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 						// tool_calls[].function is not a JSON object (or is JSON null) → fail-closed.
 						return nil, errors.New("pii: request body could not be processed for anonymization")
 					}
+
+					// tool_calls[].function.name
+					// Same shared function-name policy as tools[].function.name:
+					// validated and left untouched when valid, because the model's
+					// declared call must match a tool name byte-identical. JSON
+					// null keeps this location's prior behavior (previously
+					// unvalidated and passed through unchanged).
+					if rawName, hasName := callFn["name"]; hasName {
+						if !bytes.Equal(bytes.TrimSpace(rawName), []byte("null")) {
+							if err := validateFunctionName(rawName, detect); err != nil {
+								return nil, err
+							}
+						}
+					}
+
 					rawArgs, hasArgs := callFn["arguments"]
 					if !hasArgs {
 						continue
@@ -1134,13 +1372,43 @@ func deOverlap(spans []Span) []Span {
 	return result
 }
 
-// toolChoiceFunctionNamePattern is the charset OpenAI restricts function
-// names to: 1-64 characters drawn from letters, digits, underscore, and
-// hyphen. tool_choice.function.name is validated against this pattern and,
-// when it matches, left untouched rather than scanned — the name is a
-// structural identifier the upstream must receive byte-identical to route
-// the tool call correctly.
-var toolChoiceFunctionNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+// functionNamePattern is the shared charset for every function/tool name
+// that appears in a request: 1 to 128 characters drawn from letters, digits,
+// underscore, period, plus, and hyphen. This mirrors the charset the
+// provider adapters already enforce on tool/function identifiers (see
+// anthropicToolIDRe in internal/proxy/anthropic.go), bounded to a maximum
+// length so a name cannot be used to smuggle an arbitrarily long string
+// through this policy. It is applied wherever a function/tool name appears
+// in the request: tools[].function.name, tool_choice.function.name,
+// messages[].tool_calls[].function.name, messages[].function_call.name, and
+// the legacy top-level functions[].name and function_call.name.
+var functionNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.+\-]{1,128}$`)
+
+// validateFunctionName applies the shared function-name policy to raw, which
+// must decode as a JSON string. The name is validated against
+// functionNamePattern and then run through detect: because a declared
+// function/tool name and its later selection (by tool_choice or a model's
+// tool call) must stay byte-identical, a name is never pseudonymized — if it
+// matches functionNamePattern but detect finds PII in it anyway, or if raw is
+// not a JSON string at all, the request is rejected fail-closed rather than
+// silently forwarding or rewriting the name.
+func validateFunctionName(raw jsonx.RawMessage, detect func(string) (string, bool, error)) error {
+	var name string
+	if err := jsonx.Unmarshal(raw, &name); err != nil {
+		return errors.New("pii: request body could not be processed for anonymization")
+	}
+	if !functionNamePattern.MatchString(name) {
+		return errors.New("pii: request body could not be processed for anonymization")
+	}
+	_, matched, err := detect(name)
+	if err != nil {
+		return errors.New("pii: request body could not be processed for anonymization")
+	}
+	if matched {
+		return errors.New("pii: request body could not be processed for anonymization")
+	}
+	return nil
+}
 
 // maxLogitBiasKeyDigits is the maximum length of a logit_bias object key
 // that isLogitBiasTokenIDKey accepts as a token ID. Tokenizer vocabularies
