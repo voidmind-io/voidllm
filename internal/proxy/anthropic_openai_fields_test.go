@@ -1565,3 +1565,618 @@ func TestAnthropicTransformRequest_NonClientSafeErrorSurfacesGenericMessage(t *t
 		t.Errorf("SECURITY: generic error message leaked adapter-internal detail: %q", envelope.Error.Message)
 	}
 }
+
+// ── B1/B2/B3: allowlisted scalar/object fields are validated and re-encoded ──
+
+// int64Ptr is a helper to obtain a pointer to an int64 literal.
+func int64Ptr(n int64) *int64 { return &n }
+
+// wantClientRequestError asserts that err unwraps (via errors.As) to a
+// clientRequestError carrying exactly wantMsg, and that none of the given
+// caller-supplied values (e.g. an email used as an attack payload) appear
+// anywhere in the error's own text.
+func wantClientRequestError(t *testing.T, err error, wantMsg string, mustNotLeak ...string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var clientErr *clientRequestError
+	if !errors.As(err, &clientErr) {
+		t.Fatalf("error does not unwrap to a clientRequestError: %v", err)
+	}
+	if clientErr.Error() != wantMsg {
+		t.Errorf("client-safe message = %q, want %q", clientErr.Error(), wantMsg)
+	}
+	for _, s := range mustNotLeak {
+		if strings.Contains(err.Error(), s) {
+			t.Errorf("SECURITY: error leaks caller-supplied value %q: %v", s, err)
+		}
+	}
+}
+
+// runFieldValidationCase builds a minimal Anthropic request carrying field:rawValue
+// alongside a single user message, runs it through a fresh AnthropicAdapter, and
+// returns the transformed document (or the TransformRequest error, unparsed).
+func runFieldValidationCase(t *testing.T, field, rawValue string) (map[string]json.RawMessage, error) {
+	t.Helper()
+	input := fmt.Sprintf(
+		`{"model":"claude-3","messages":[{"role":"user","content":"hi"}],%q:%s}`,
+		field, rawValue,
+	)
+	a := &AnthropicAdapter{}
+	out, err := a.TransformRequest([]byte(input), Model{})
+	if err != nil {
+		return nil, err
+	}
+	return unmarshalDoc(t, out), nil
+}
+
+// TestAnthropicTransformRequest_MaxTokensValidation covers max_tokens (and its
+// max_completion_tokens alias) validation: valid positive integers are
+// re-encoded from the typed int64 value, every wrong-typed or non-positive
+// shape is rejected fail-closed with a static message that never echoes the
+// caller-supplied value (including an email embedded in a string value), and
+// a JSON null on either field is treated as absent for alias/default
+// resolution purposes.
+func TestAnthropicTransformRequest_MaxTokensValidation(t *testing.T) {
+	t.Parallel()
+
+	const wantMsg = "max_tokens must be a positive integer"
+
+	t.Run("valid values are re-encoded as integers", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name  string
+			field string
+			raw   string
+			want  int64
+		}{
+			{"max_tokens 1", "max_tokens", "1", 1},
+			{"max_tokens 16", "max_tokens", "16", 16},
+			{"max_completion_tokens alone", "max_completion_tokens", "512", 512},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				doc, err := runFieldValidationCase(t, tc.field, tc.raw)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var got int64
+				if err := json.Unmarshal(doc["max_tokens"], &got); err != nil {
+					t.Fatalf("unmarshal max_tokens: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("max_tokens = %d, want %d", got, tc.want)
+				}
+				if _, ok := doc["max_completion_tokens"]; ok {
+					t.Error("max_completion_tokens still present, want dropped")
+				}
+			})
+		}
+	})
+
+	t.Run("invalid values are rejected fail-closed", func(t *testing.T) {
+		t.Parallel()
+		const leakEmail = "alice@example.com"
+		tests := []struct {
+			name  string
+			field string
+			raw   string
+		}{
+			{"zero", "max_tokens", "0"},
+			{"negative", "max_tokens", "-5"},
+			{"float", "max_tokens", "1.5"},
+			{"string", "max_tokens", `"16"`},
+			{"array", "max_tokens", "[16]"},
+			{"object", "max_tokens", "{}"},
+			{"bool", "max_tokens", "true"},
+			{"string containing email", "max_tokens", fmt.Sprintf(`"tokens for %s"`, leakEmail)},
+			{"max_completion_tokens negative", "max_completion_tokens", "-1"},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				_, err := runFieldValidationCase(t, tc.field, tc.raw)
+				wantClientRequestError(t, err, wantMsg, leakEmail)
+			})
+		}
+	})
+
+	t.Run("null is treated as absent", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name  string
+			input string
+			want  int64
+		}{
+			{
+				name:  "max_tokens null alone defaults to 4096",
+				input: `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":null}`,
+				want:  4096,
+			},
+			{
+				name:  "max_tokens null with max_completion_tokens uses the alias",
+				input: `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":null,"max_completion_tokens":512}`,
+				want:  512,
+			},
+			{
+				name:  "max_completion_tokens null alone defaults to 4096",
+				input: `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":null}`,
+				want:  4096,
+			},
+			{
+				name:  "both null defaults to 4096",
+				input: `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":null,"max_completion_tokens":null}`,
+				want:  4096,
+			},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				doc := transformRequest(t, tc.input)
+				var got int64
+				if err := json.Unmarshal(doc["max_tokens"], &got); err != nil {
+					t.Fatalf("unmarshal max_tokens: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("max_tokens = %d, want %d", got, tc.want)
+				}
+			})
+		}
+	})
+}
+
+// TestAnthropicTransformRequest_StreamValidation covers stream field
+// validation: true/false are re-encoded from the typed bool value, every
+// non-boolean shape (including a string carrying an email) is rejected
+// fail-closed with a static message, and a JSON null is treated as absent.
+func TestAnthropicTransformRequest_StreamValidation(t *testing.T) {
+	t.Parallel()
+
+	const wantMsg = "stream must be a boolean"
+
+	t.Run("valid booleans are re-encoded", func(t *testing.T) {
+		t.Parallel()
+		for _, want := range []bool{true, false} {
+			want := want
+			t.Run(fmt.Sprintf("%v", want), func(t *testing.T) {
+				t.Parallel()
+				doc, err := runFieldValidationCase(t, "stream", fmt.Sprintf("%v", want))
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var got bool
+				if err := json.Unmarshal(doc["stream"], &got); err != nil {
+					t.Fatalf("unmarshal stream: %v", err)
+				}
+				if got != want {
+					t.Errorf("stream = %v, want %v", got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("invalid values are rejected fail-closed", func(t *testing.T) {
+		t.Parallel()
+		const leakEmail = "bob@example.com"
+		tests := []struct {
+			name string
+			raw  string
+		}{
+			{"string true", `"true"`},
+			{"number", "1"},
+			{"object", "{}"},
+			{"array", "[]"},
+			{"string containing email", fmt.Sprintf(`"stream for %s"`, leakEmail)},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				_, err := runFieldValidationCase(t, "stream", tc.raw)
+				wantClientRequestError(t, err, wantMsg, leakEmail)
+			})
+		}
+	})
+
+	t.Run("null is treated as absent", func(t *testing.T) {
+		t.Parallel()
+		doc, err := runFieldValidationCase(t, "stream", "null")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := doc["stream"]; ok {
+			t.Error("stream present, want absent for null input")
+		}
+	})
+}
+
+// TestAnthropicTransformRequest_TemperatureInvalidAndNull extends
+// TestAnthropicTransformRequest_TemperatureClamp with the fail-closed
+// invalid-shape and null-as-absent cases: a negative value, a non-number
+// (including a string carrying an email), and a JSON null.
+func TestAnthropicTransformRequest_TemperatureInvalidAndNull(t *testing.T) {
+	t.Parallel()
+
+	t.Run("invalid values are rejected fail-closed", func(t *testing.T) {
+		t.Parallel()
+		const leakEmail = "carol@example.com"
+		tests := []struct {
+			name    string
+			raw     string
+			wantMsg string
+		}{
+			{"negative", "-0.1", "temperature must be between 0 and 2"},
+			{"string", `"high"`, "temperature must be a number"},
+			{"object", "{}", "temperature must be a number"},
+			{"array", "[]", "temperature must be a number"},
+			{"string containing email", fmt.Sprintf(`"warm, %s"`, leakEmail), "temperature must be a number"},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				_, err := runFieldValidationCase(t, "temperature", tc.raw)
+				wantClientRequestError(t, err, tc.wantMsg, leakEmail)
+			})
+		}
+	})
+
+	t.Run("null is treated as absent", func(t *testing.T) {
+		t.Parallel()
+		doc, err := runFieldValidationCase(t, "temperature", "null")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := doc["temperature"]; ok {
+			t.Error("temperature present, want absent for null input")
+		}
+	})
+}
+
+// TestAnthropicTransformRequest_TopPValidation covers top_p validation:
+// values within Anthropic's 0-1 range are re-encoded from the typed float64
+// value, values outside that range or non-numbers (including a string
+// carrying an email) are rejected fail-closed, and a JSON null is treated as
+// absent.
+func TestAnthropicTransformRequest_TopPValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid values in range are re-encoded", func(t *testing.T) {
+		t.Parallel()
+		for _, want := range []float64{0, 0.5, 1} {
+			want := want
+			t.Run(fmt.Sprintf("%v", want), func(t *testing.T) {
+				t.Parallel()
+				doc, err := runFieldValidationCase(t, "top_p", fmt.Sprintf("%v", want))
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var got float64
+				if err := json.Unmarshal(doc["top_p"], &got); err != nil {
+					t.Fatalf("unmarshal top_p: %v", err)
+				}
+				if got != want {
+					t.Errorf("top_p = %v, want %v", got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("invalid values are rejected fail-closed", func(t *testing.T) {
+		t.Parallel()
+		const leakEmail = "dave@example.com"
+		tests := []struct {
+			name    string
+			raw     string
+			wantMsg string
+		}{
+			{"below range", "-0.1", "top_p must be between 0 and 1"},
+			{"above range", "1.1", "top_p must be between 0 and 1"},
+			{"string", `"high"`, "top_p must be a number"},
+			{"object", "{}", "top_p must be a number"},
+			{"string containing email", fmt.Sprintf(`"%s"`, leakEmail), "top_p must be a number"},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				_, err := runFieldValidationCase(t, "top_p", tc.raw)
+				wantClientRequestError(t, err, tc.wantMsg, leakEmail)
+			})
+		}
+	})
+
+	t.Run("null is treated as absent", func(t *testing.T) {
+		t.Parallel()
+		doc, err := runFieldValidationCase(t, "top_p", "null")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := doc["top_p"]; ok {
+			t.Error("top_p present, want absent for null input")
+		}
+	})
+}
+
+// TestAnthropicTransformRequest_TopKValidation covers top_k validation:
+// non-negative integers are re-encoded from the typed int64 value, negative
+// values, floats, and non-numbers (including a string carrying an email) are
+// rejected fail-closed, and a JSON null is treated as absent.
+func TestAnthropicTransformRequest_TopKValidation(t *testing.T) {
+	t.Parallel()
+
+	const wantMsg = "top_k must be a non-negative integer"
+
+	t.Run("valid values are re-encoded as integers", func(t *testing.T) {
+		t.Parallel()
+		for _, want := range []int64{0, 40} {
+			want := want
+			t.Run(fmt.Sprintf("%d", want), func(t *testing.T) {
+				t.Parallel()
+				doc, err := runFieldValidationCase(t, "top_k", fmt.Sprintf("%d", want))
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var got int64
+				if err := json.Unmarshal(doc["top_k"], &got); err != nil {
+					t.Fatalf("unmarshal top_k: %v", err)
+				}
+				if got != want {
+					t.Errorf("top_k = %d, want %d", got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("invalid values are rejected fail-closed", func(t *testing.T) {
+		t.Parallel()
+		const leakEmail = "erin@example.com"
+		tests := []struct {
+			name string
+			raw  string
+		}{
+			{"negative", "-1"},
+			{"float", "1.5"},
+			{"string", `"40"`},
+			{"object", "{}"},
+			{"string containing email", fmt.Sprintf(`"%s"`, leakEmail)},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				_, err := runFieldValidationCase(t, "top_k", tc.raw)
+				wantClientRequestError(t, err, wantMsg, leakEmail)
+			})
+		}
+	})
+
+	t.Run("null is treated as absent", func(t *testing.T) {
+		t.Parallel()
+		doc, err := runFieldValidationCase(t, "top_k", "null")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := doc["top_k"]; ok {
+			t.Error("top_k present, want absent for null input")
+		}
+	})
+}
+
+// TestAnthropicTransformRequest_ThinkingValidation covers thinking
+// validation: a closed schema of "type" (matching ^[a-z_]{1,32}$) and an
+// optional positive-integer "budget_tokens", re-encoded from the typed
+// anthropicThinking struct. Every other shape — an extra key (including one
+// carrying an email value), a malformed type or budget_tokens, or a
+// non-object thinking value — is rejected fail-closed, and a JSON null is
+// treated as absent.
+func TestAnthropicTransformRequest_ThinkingValidation(t *testing.T) {
+	t.Parallel()
+
+	const wantMsg = `thinking must be an object with "type" (lowercase letters/underscores, 1-32 chars) and optional positive-integer "budget_tokens"`
+
+	t.Run("valid shapes are re-encoded from the closed schema", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name       string
+			raw        string
+			wantType   string
+			wantBudget *int64
+		}{
+			{"type only", `{"type":"enabled"}`, "enabled", nil},
+			{"type and budget_tokens", `{"type":"enabled","budget_tokens":1024}`, "enabled", int64Ptr(1024)},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				doc, err := runFieldValidationCase(t, "thinking", tc.raw)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var got anthropicThinking
+				if err := json.Unmarshal(doc["thinking"], &got); err != nil {
+					t.Fatalf("unmarshal thinking: %v", err)
+				}
+				if got.Type != tc.wantType {
+					t.Errorf("thinking.type = %q, want %q", got.Type, tc.wantType)
+				}
+				if (tc.wantBudget == nil) != (got.BudgetTokens == nil) {
+					t.Fatalf("thinking.budget_tokens = %v, want %v", got.BudgetTokens, tc.wantBudget)
+				}
+				if tc.wantBudget != nil && *got.BudgetTokens != *tc.wantBudget {
+					t.Errorf("thinking.budget_tokens = %d, want %d", *got.BudgetTokens, *tc.wantBudget)
+				}
+			})
+		}
+	})
+
+	t.Run("invalid shapes are rejected fail-closed", func(t *testing.T) {
+		t.Parallel()
+		const leakEmail = "frank@example.com"
+		tests := []struct {
+			name string
+			raw  string
+		}{
+			{"extra key", `{"type":"enabled","extra":"x"}`},
+			{"extra key with email value", fmt.Sprintf(`{"type":"enabled","note":%q}`, leakEmail)},
+			{"uppercase type", `{"type":"ENABLED"}`},
+			{"type with digits", `{"type":"think1"}`},
+			{"empty type", `{"type":""}`},
+			{"type too long", fmt.Sprintf(`{"type":%q}`, strings.Repeat("a", 33))},
+			{"missing type", `{"budget_tokens":10}`},
+			{"budget_tokens zero", `{"type":"enabled","budget_tokens":0}`},
+			{"budget_tokens negative", `{"type":"enabled","budget_tokens":-1}`},
+			{"budget_tokens float", `{"type":"enabled","budget_tokens":1.5}`},
+			{"budget_tokens string", `{"type":"enabled","budget_tokens":"10"}`},
+			{"thinking as string", `"enabled"`},
+			{"thinking as array", `["enabled"]`},
+			{"thinking as number", "42"},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				_, err := runFieldValidationCase(t, "thinking", tc.raw)
+				wantClientRequestError(t, err, wantMsg, leakEmail)
+			})
+		}
+	})
+
+	t.Run("null is treated as absent", func(t *testing.T) {
+		t.Parallel()
+		doc, err := runFieldValidationCase(t, "thinking", "null")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := doc["thinking"]; ok {
+			t.Error("thinking present, want absent for null input")
+		}
+	})
+}
+
+// TestAnthropicTransformRequest_StopArrayNullElementRejected verifies that a
+// JSON null element inside the "stop" array is rejected fail-closed rather
+// than silently coerced to an empty string and dropped (Go's json package
+// unmarshals a null array element into a string as "" without an error).
+func TestAnthropicTransformRequest_StopArrayNullElementRejected(t *testing.T) {
+	t.Parallel()
+
+	input := `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"stop":["A",null]}`
+	a := &AnthropicAdapter{}
+	_, err := a.TransformRequest([]byte(input), Model{})
+	wantClientRequestError(t, err, "stop must be a string or an array of strings")
+}
+
+// TestAnthropicTransformRequest_ParallelToolCallsNullRejected verifies that
+// parallel_tool_calls:null is rejected fail-closed rather than silently
+// treated as false (Go's json package unmarshals a JSON null into a
+// non-pointer bool as false without an error).
+func TestAnthropicTransformRequest_ParallelToolCallsNullRejected(t *testing.T) {
+	t.Parallel()
+
+	input := `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"parallel_tool_calls":null}`
+	a := &AnthropicAdapter{}
+	_, err := a.TransformRequest([]byte(input), Model{})
+	wantClientRequestError(t, err, "parallel_tool_calls must be a boolean")
+}
+
+// TestAnthropicTransformRequest_EmptyPartCacheControlValidation verifies that
+// validateCacheControl runs before the empty-text skip at every position that
+// parses text content parts (user/assistant array content via
+// parseTextContentParts, system/developer content via collectSystemBlocks,
+// and the tool-result content loop in TransformRequest): an empty text part
+// with an invalid cache_control is still rejected fail-closed, while an empty
+// text part with a valid cache_control is silently dropped (Anthropic
+// rejects empty text blocks) without error.
+func TestAnthropicTransformRequest_EmptyPartCacheControlValidation(t *testing.T) {
+	t.Parallel()
+
+	const wantMsg = `cache_control must be {"type":"ephemeral"} with optional ttl "5m" or "1h"`
+
+	t.Run("user empty text part with invalid cache_control is rejected", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"user","content":[{"type":"text","text":"","cache_control":{"type":"persistent"}}]}` +
+			`]}`
+		a := &AnthropicAdapter{}
+		_, err := a.TransformRequest([]byte(input), Model{})
+		wantClientRequestError(t, err, wantMsg)
+	})
+
+	t.Run("user empty text part with valid cache_control is dropped without error", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"user","content":[{"type":"text","text":"","cache_control":{"type":"ephemeral"}}]}` +
+			`]}`
+		doc := transformRequest(t, input)
+		msgs := unmarshalMessages(t, doc)
+		if len(msgs) != 1 {
+			t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+		}
+		// The one (empty, cache_control-carrying) part is dropped by
+		// parseTextContentParts without error; buildTextMessage then falls
+		// back to its own single synthetic empty text block (PR #136
+		// compatibility — a message must carry at least one content block),
+		// which carries no cache_control of its own.
+		if len(msgs[0].Content) != 1 || msgs[0].Content[0].Type != "text" || msgs[0].Content[0].Text != "" {
+			t.Errorf("user content blocks = %+v, want a single synthetic empty text block", msgs[0].Content)
+		}
+		if len(msgs[0].Content[0].CacheControl) != 0 {
+			t.Errorf("synthetic fallback block cache_control = %s, want absent", msgs[0].Content[0].CacheControl)
+		}
+	})
+
+	t.Run("system empty text part with invalid cache_control is rejected", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"system","content":[{"type":"text","text":"","cache_control":{"type":"persistent"}}]},` +
+			`{"role":"user","content":"hi"}` +
+			`]}`
+		a := &AnthropicAdapter{}
+		_, err := a.TransformRequest([]byte(input), Model{})
+		wantClientRequestError(t, err, wantMsg)
+	})
+
+	t.Run("system empty text part with valid cache_control is dropped without error", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"system","content":[{"type":"text","text":"","cache_control":{"type":"ephemeral"}}]},` +
+			`{"role":"user","content":"hi"}` +
+			`]}`
+		doc := transformRequest(t, input)
+		if _, ok := doc["system"]; ok {
+			t.Errorf("system present = %s, want absent (only block was empty and dropped)", doc["system"])
+		}
+	})
+
+	t.Run("tool-result empty text part with invalid cache_control is rejected", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"user","content":"q"},` +
+			`{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"fn","arguments":"{}"}}]},` +
+			`{"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":"","cache_control":{"type":"persistent"}}]}` +
+			`]}`
+		a := &AnthropicAdapter{}
+		_, err := a.TransformRequest([]byte(input), Model{})
+		wantClientRequestError(t, err, wantMsg)
+	})
+
+	t.Run("tool-result empty text part with valid cache_control is dropped without error", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"user","content":"q"},` +
+			`{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"fn","arguments":"{}"}}]},` +
+			`{"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":"","cache_control":{"type":"ephemeral"}}]}` +
+			`]}`
+		doc := transformRequest(t, input)
+		msgs := unmarshalMessages(t, doc)
+		last := msgs[len(msgs)-1]
+		if last.Role != "user" || len(last.Content) != 1 || last.Content[0].Type != "tool_result" {
+			t.Fatalf("unexpected last message shape: %+v", last)
+		}
+		var blocks []anthropicContentBlock
+		if err := json.Unmarshal(last.Content[0].Content, &blocks); err != nil {
+			t.Fatalf("unmarshal tool_result content: %v (raw: %s)", err, last.Content[0].Content)
+		}
+		if len(blocks) != 0 {
+			t.Errorf("tool_result content blocks = %+v, want empty (empty text dropped)", blocks)
+		}
+	})
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -343,7 +344,15 @@ var anthropicAllowedFields = map[string]struct{}{
 //     fail-closed.
 //   - Translates user into metadata.user_id; OpenAI's free-form metadata map
 //     has no Anthropic equivalent and is never forwarded.
-//   - Clamps temperature above 1 down to 1 (Anthropic's range is 0-1).
+//   - Validates and re-encodes every allowlisted scalar/object field from its
+//     typed Go value rather than forwarding the client's raw bytes: stream
+//     must be a JSON boolean; temperature and top_p must be JSON numbers
+//     (temperature is clamped above 1 down to 1, both reject a negative
+//     value); top_k must be a non-negative JSON integer; thinking must be an
+//     object with only "type" (matching ^[a-z_]{1,32}$) and an optional
+//     positive-integer "budget_tokens". A JSON null value for any of these
+//     fields is treated as if the field were absent; a wrong-shaped value is
+//     rejected fail-closed with a static message.
 //   - Validates and charset-checks all forwarded tool ids and function names.
 //   - Translates assistant tool_calls and tool-result messages into Anthropic
 //     tool_use and tool_result content blocks, merging consecutive tool_result
@@ -355,7 +364,10 @@ var anthropicAllowedFields = map[string]struct{}{
 //     blocks rather than concatenating parts (zero-knowledge preservation),
 //     keeping per-part cache_control.
 //   - Removes system and developer messages from the messages array.
-//   - Injects a default max_tokens of 4096 when the field is absent.
+//   - Injects a default max_tokens of 4096 when the field (and its
+//     max_completion_tokens alias) is absent; otherwise validates and
+//     re-encodes the resolved value as a JSON integer greater than 0,
+//     rejecting fail-closed otherwise.
 //   - Captures stream_options.include_usage for use by TransformStreamLine
 //     before the field is dropped (Anthropic has no equivalent).
 //   - Drops every field not in anthropicAllowedFields (the upstream allowlist).
@@ -477,10 +489,17 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 	// When tools were removed above (tool_choice:"none") or were never declared,
 	// there is no tool_choice to attach the flag to, so nothing is emitted either.
 	if raw, ok := doc["parallel_tool_calls"]; ok {
-		var parallel bool
-		if err := jsonx.Unmarshal(raw, &parallel); err != nil {
+		// Check the raw token explicitly rather than unmarshaling into bool:
+		// unmarshaling a JSON null into a non-pointer bool silently zeroes it
+		// to false instead of erroring, which would let parallel_tool_calls:
+		// null pass through as if it had been false.
+		trimmed := bytes.TrimSpace(raw)
+		isTrue := bytes.Equal(trimmed, []byte("true"))
+		isFalse := bytes.Equal(trimmed, []byte("false"))
+		if !isTrue && !isFalse {
 			return nil, newClientRequestError("parallel_tool_calls must be a boolean")
 		}
+		parallel := isTrue
 		if !parallel {
 			if _, toolsPresent := doc["tools"]; toolsPresent {
 				disable := true
@@ -525,11 +544,102 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 		}
 	}
 
-	// Clamp temperature to Anthropic's 0-1 range; OpenAI allows up to 2.
+	// Validate and re-encode stream, temperature, top_p, top_k, and thinking.
+	// None of these values is ever forwarded as the client's raw bytes: each
+	// is decoded into a typed Go value, checked against its schema, and
+	// re-marshaled from that typed value before being written back into doc.
+	// A JSON null for any of these fields is treated as absent.
+	if raw, ok := doc["stream"]; ok {
+		if isJSONNull(raw) {
+			delete(doc, "stream")
+		} else {
+			var stream bool
+			if err := jsonx.Unmarshal(raw, &stream); err != nil {
+				return nil, newClientRequestError("stream must be a boolean")
+			}
+			encoded, err := jsonx.Marshal(stream)
+			if err != nil {
+				return nil, fmt.Errorf("anthropic transform request: marshal stream: %w", err)
+			}
+			doc["stream"] = jsonx.RawMessage(encoded)
+		}
+	}
+
+	// Temperature must be a JSON number; Anthropic's range is 0-1 while
+	// OpenAI allows up to 2, so a value above 1 is clamped rather than
+	// rejected. A negative value is rejected fail-closed.
 	if raw, ok := doc["temperature"]; ok {
-		var temp float64
-		if err := jsonx.Unmarshal(raw, &temp); err == nil && temp > 1 {
-			doc["temperature"] = jsonx.RawMessage("1")
+		if isJSONNull(raw) {
+			delete(doc, "temperature")
+		} else {
+			var temp float64
+			if err := jsonx.Unmarshal(raw, &temp); err != nil {
+				return nil, newClientRequestError("temperature must be a number")
+			}
+			if temp < 0 {
+				return nil, newClientRequestError("temperature must be between 0 and 2")
+			}
+			if temp > 1 {
+				temp = 1
+			}
+			encoded, err := jsonx.Marshal(temp)
+			if err != nil {
+				return nil, fmt.Errorf("anthropic transform request: marshal temperature: %w", err)
+			}
+			doc["temperature"] = jsonx.RawMessage(encoded)
+		}
+	}
+
+	// top_p must be a JSON number in Anthropic's 0-1 range.
+	if raw, ok := doc["top_p"]; ok {
+		if isJSONNull(raw) {
+			delete(doc, "top_p")
+		} else {
+			var topP float64
+			if err := jsonx.Unmarshal(raw, &topP); err != nil {
+				return nil, newClientRequestError("top_p must be a number")
+			}
+			if topP < 0 || topP > 1 {
+				return nil, newClientRequestError("top_p must be between 0 and 1")
+			}
+			encoded, err := jsonx.Marshal(topP)
+			if err != nil {
+				return nil, fmt.Errorf("anthropic transform request: marshal top_p: %w", err)
+			}
+			doc["top_p"] = jsonx.RawMessage(encoded)
+		}
+	}
+
+	// top_k must be a non-negative JSON integer.
+	if raw, ok := doc["top_k"]; ok {
+		if isJSONNull(raw) {
+			delete(doc, "top_k")
+		} else {
+			topK, ok := parseJSONInt(raw)
+			if !ok || topK < 0 {
+				return nil, newClientRequestError("top_k must be a non-negative integer")
+			}
+			doc["top_k"] = jsonx.RawMessage(strconv.FormatInt(topK, 10))
+		}
+	}
+
+	// thinking must be an object with only "type" (a string matching
+	// anthropicThinkingTypeRe) and an optional positive-integer
+	// "budget_tokens". Re-encoded from the closed anthropicThinking struct —
+	// any other key or shape is rejected fail-closed.
+	if raw, ok := doc["thinking"]; ok {
+		if isJSONNull(raw) {
+			delete(doc, "thinking")
+		} else {
+			th, err := validateThinking(raw)
+			if err != nil {
+				return nil, err
+			}
+			encoded, err := jsonx.Marshal(th)
+			if err != nil {
+				return nil, fmt.Errorf("anthropic transform request: marshal thinking: %w", err)
+			}
+			doc["thinking"] = jsonx.RawMessage(encoded)
 		}
 	}
 
@@ -644,17 +754,25 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 							CacheControl jsonx.RawMessage `json:"cache_control,omitempty"`
 						}
 						if jsonx.Unmarshal(m.Content, &parts) == nil {
-							// Build an array of Anthropic text blocks, one per text part.
-							// Non-text part types are skipped (zero-knowledge: we only
-							// forward what we understand). Per-part cache_control is
-							// validated against the closed schema (see validateCacheControl)
-							// and re-marshaled.
+							// Build an array of Anthropic text blocks, one per non-empty
+							// text part. Non-text part types are skipped (zero-knowledge:
+							// we only forward what we understand). Per-part cache_control
+							// is validated against the closed schema (see
+							// validateCacheControl) and re-marshaled — validation runs
+							// before the empty-text skip below, so an invalid
+							// cache_control on an otherwise-empty part is still rejected
+							// fail-closed rather than silently dropped along with the
+							// empty text.
 							blocks := make([]anthropicContentBlock, 0, len(parts))
 							for _, p := range parts {
 								if p.Type == "text" {
 									cc, err := validateCacheControl(p.CacheControl)
 									if err != nil {
 										return nil, fmt.Errorf("anthropic transform request: tool result content: %w", err)
+									}
+									if p.Text == "" {
+										// Anthropic rejects empty text blocks.
+										continue
 									}
 									blocks = append(blocks, anthropicContentBlock{
 										Type:         "text",
@@ -795,20 +913,36 @@ func (a *AnthropicAdapter) TransformRequest(body []byte, _ Model) ([]byte, error
 	}
 
 	// Anthropic requires max_tokens. Accept max_completion_tokens as an
-	// OpenAI-compatible alias and convert it. If neither field is present,
-	// inject a safe default of 4096.
-	if _, ok := doc["max_tokens"]; !ok {
-		if mct, ok := doc["max_completion_tokens"]; ok {
-			doc["max_tokens"] = mct
-			delete(doc, "max_completion_tokens")
-		} else {
-			doc["max_tokens"] = jsonx.RawMessage("4096")
-		}
-	} else {
-		// max_tokens already present; remove max_completion_tokens if it
-		// was also sent to avoid confusing Anthropic.
-		delete(doc, "max_completion_tokens")
+	// OpenAI-compatible alias and convert it. A JSON null on either field is
+	// treated as absent. If neither field is present after that, inject a
+	// safe default of 4096. The resolved value — whichever field it came
+	// from — must be a JSON integer greater than 0; it is validated and
+	// re-encoded from the typed int64 value rather than forwarded as raw
+	// client bytes.
+	maxTokensRaw, hasMaxTokens := doc["max_tokens"]
+	if hasMaxTokens && isJSONNull(maxTokensRaw) {
+		delete(doc, "max_tokens")
+		hasMaxTokens = false
 	}
+	mctRaw, hasMCT := doc["max_completion_tokens"]
+	if hasMCT && isJSONNull(mctRaw) {
+		hasMCT = false
+	}
+	// max_completion_tokens never survives to the upstream request, whether
+	// or not it was used to resolve max_tokens.
+	delete(doc, "max_completion_tokens")
+	if !hasMaxTokens {
+		if hasMCT {
+			maxTokensRaw = mctRaw
+		} else {
+			maxTokensRaw = jsonx.RawMessage("4096")
+		}
+	}
+	maxTokens, ok := parseJSONInt(maxTokensRaw)
+	if !ok || maxTokens <= 0 {
+		return nil, newClientRequestError("max_tokens must be a positive integer")
+	}
+	doc["max_tokens"] = jsonx.RawMessage(strconv.FormatInt(maxTokens, 10))
 
 	// Drop every field not on the upstream allowlist. This runs last so it
 	// catches every OpenAI-only field regardless of whether a translation
@@ -1454,6 +1588,86 @@ func validateCacheControl(raw jsonx.RawMessage) (jsonx.RawMessage, error) {
 	return jsonx.RawMessage(out), nil
 }
 
+// isJSONNull reports whether raw is exactly the JSON literal null (ignoring
+// surrounding whitespace). TransformRequest treats a client-supplied null on
+// any of its validated scalar/object fields (stream, temperature, top_p,
+// top_k, thinking, max_tokens, max_completion_tokens) the same as an absent
+// field.
+func isJSONNull(raw jsonx.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+// parseJSONInt reports whether raw is a JSON integer literal — no decimal
+// point or exponent — and returns its int64 value. Floats, strings, objects,
+// arrays, booleans, and null all return (0, false).
+func parseJSONInt(raw jsonx.RawMessage) (int64, bool) {
+	var n int64
+	if jsonx.Unmarshal(raw, &n) != nil {
+		return 0, false
+	}
+	for _, ch := range string(raw) {
+		if ch == '.' || ch == 'e' || ch == 'E' {
+			return 0, false // float-shaped literal, not an integer
+		}
+	}
+	return n, true
+}
+
+// anthropicThinkingTypeRe is the charset for thinking.type: lowercase ASCII
+// letters and underscores only, 1-32 characters (e.g. "enabled", "disabled").
+var anthropicThinkingTypeRe = regexp.MustCompile(`^[a-z_]{1,32}$`)
+
+// anthropicThinking is the closed schema for the Anthropic "thinking" request
+// field. Only "type" and the optional "budget_tokens" are accepted; the
+// struct is re-marshaled from validated, typed values so the client's raw
+// bytes are never forwarded verbatim.
+type anthropicThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens *int64 `json:"budget_tokens,omitempty"`
+}
+
+// errInvalidThinking is the client-safe, static error returned for every
+// thinking validation failure. The message is a fixed literal — it never
+// echoes the caller-supplied shape.
+var errInvalidThinking = newClientRequestError(`thinking must be an object with "type" (lowercase letters/underscores, 1-32 chars) and optional positive-integer "budget_tokens"`)
+
+// validateThinking parses raw against the closed thinking schema
+// (anthropicThinking) and returns the validated, typed value. raw must
+// already be known non-null (callers check isJSONNull first). Any key other
+// than "type" and "budget_tokens", a missing or malformed "type", or a
+// non-positive "budget_tokens" is rejected fail-closed.
+func validateThinking(raw jsonx.RawMessage) (anthropicThinking, error) {
+	var fields map[string]jsonx.RawMessage
+	if err := jsonx.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return anthropicThinking{}, errInvalidThinking
+	}
+	for k := range fields {
+		if k != "type" && k != "budget_tokens" {
+			return anthropicThinking{}, errInvalidThinking
+		}
+	}
+
+	rawType, ok := fields["type"]
+	if !ok {
+		return anthropicThinking{}, errInvalidThinking
+	}
+	var typ string
+	if err := jsonx.Unmarshal(rawType, &typ); err != nil || !anthropicThinkingTypeRe.MatchString(typ) {
+		return anthropicThinking{}, errInvalidThinking
+	}
+	th := anthropicThinking{Type: typ}
+
+	if rawBudget, ok := fields["budget_tokens"]; ok {
+		budget, ok := parseJSONInt(rawBudget)
+		if !ok || budget <= 0 {
+			return anthropicThinking{}, errInvalidThinking
+		}
+		th.BudgetTokens = &budget
+	}
+
+	return th, nil
+}
+
 // parseArgumentsToObject converts an OpenAI function.arguments JSON string
 // into a jsonx.RawMessage object suitable for the Anthropic input field.
 // OpenAI stores arguments as a JSON-encoded string (e.g. `"{\"key\":\"val\"}"`);
@@ -1516,10 +1730,13 @@ var errUnsupportedContentPart = newClientRequestError("only text content parts a
 // parseTextContentParts parses a raw JSON array of OpenAI content parts into
 // Anthropic text content blocks — one block per non-empty type:"text" part,
 // in order, never concatenated. Per-part cache_control is validated against
-// the closed schema (validateCacheControl) and re-marshaled; the raw client
-// bytes are never forwarded verbatim. Empty text parts are skipped. Any other
-// part type is rejected fail-closed. Returns an error if content does not
-// unmarshal as an array of objects shaped like anthropicTextContentPart.
+// the closed schema (validateCacheControl) and re-marshaled before the
+// empty-text check, so an invalid cache_control on an otherwise-empty part
+// is still rejected fail-closed rather than silently dropped along with the
+// empty text; the raw client bytes are never forwarded verbatim. Empty text
+// parts (with a valid cache_control, or none) are skipped without error. Any
+// other part type is rejected fail-closed. Returns an error if content does
+// not unmarshal as an array of objects shaped like anthropicTextContentPart.
 func parseTextContentParts(content jsonx.RawMessage) ([]anthropicContentBlock, error) {
 	var parts []anthropicTextContentPart
 	if err := jsonx.Unmarshal(content, &parts); err != nil {
@@ -1531,12 +1748,15 @@ func parseTextContentParts(content jsonx.RawMessage) ([]anthropicContentBlock, e
 			// Fail-closed for unsupported part types to avoid silent corruption.
 			return nil, errUnsupportedContentPart
 		}
-		if p.Text == "" {
-			continue
-		}
+		// Validate cache_control before the empty-text skip below, so an
+		// invalid cache_control on an otherwise-empty part is still rejected
+		// fail-closed rather than silently dropped along with the empty text.
 		cc, err := validateCacheControl(p.CacheControl)
 		if err != nil {
 			return nil, err
+		}
+		if p.Text == "" {
+			continue
 		}
 		blocks = append(blocks, anthropicContentBlock{
 			Type:         "text",
@@ -1613,10 +1833,23 @@ func parseStopSequences(raw jsonx.RawMessage) ([]string, error) {
 		return []string{single}, nil
 	}
 
-	var arr []string
+	// Decode elements as raw JSON rather than []string: unmarshaling a JSON
+	// null element directly into a string silently zeroes it to "" instead
+	// of erroring, which would let a null element pass through as if it were
+	// an (empty, dropped) string. Checking the raw token explicitly catches
+	// null and every other non-string element (number, object, array, bool).
+	var arr []jsonx.RawMessage
 	if err := jsonx.Unmarshal(raw, &arr); err == nil {
 		out := make([]string, 0, len(arr))
-		for _, s := range arr {
+		for _, elem := range arr {
+			trimmed := bytes.TrimSpace(elem)
+			if len(trimmed) == 0 || trimmed[0] != '"' {
+				return nil, newClientRequestError("stop must be a string or an array of strings")
+			}
+			var s string
+			if err := jsonx.Unmarshal(elem, &s); err != nil {
+				return nil, newClientRequestError("stop must be a string or an array of strings")
+			}
 			if strings.TrimSpace(s) == "" {
 				continue
 			}
@@ -1648,12 +1881,16 @@ type systemContentPart struct {
 // string (including JSON null, which unmarshals as the empty string)
 // produces exactly one block, byte-identical to the adapter's historical
 // behavior. An array of content parts produces one block per non-empty
-// type:"text" part — empty parts are skipped, and per-part cache_control is
-// validated against the closed schema (see validateCacheControl) and
-// re-marshaled. A non-text part type is rejected fail-closed, matching
-// buildTextMessage's contract for user/assistant array content: forwarding a
-// part type we don't understand risks silently corrupting the message.
-// Any other content shape (e.g. a bare number) is also rejected fail-closed.
+// type:"text" part — per-part cache_control is validated against the closed
+// schema (see validateCacheControl) and re-marshaled before the empty-text
+// check, so an invalid cache_control on an otherwise-empty part is still
+// rejected fail-closed rather than silently dropped along with the empty
+// text; a part with an empty (or absent) text and a valid cache_control is
+// then skipped without error. A non-text part type is rejected fail-closed,
+// matching buildTextMessage's contract for user/assistant array content:
+// forwarding a part type we don't understand risks silently corrupting the
+// message. Any other content shape (e.g. a bare number) is also rejected
+// fail-closed.
 func collectSystemBlocks(blocks []anthropicContentBlock, content jsonx.RawMessage) ([]anthropicContentBlock, bool, error) {
 	if content == nil {
 		// No content field at all: contribute nothing, matching the adapter's
@@ -1675,12 +1912,15 @@ func collectSystemBlocks(blocks []anthropicContentBlock, content jsonx.RawMessag
 		if p.Type != "text" {
 			return blocks, false, errUnsupportedContentPart
 		}
-		if p.Text == "" {
-			continue
-		}
+		// Validate cache_control before the empty-text skip below, so an
+		// invalid cache_control on an otherwise-empty part is still rejected
+		// fail-closed rather than silently dropped along with the empty text.
 		cc, err := validateCacheControl(p.CacheControl)
 		if err != nil {
 			return blocks, false, err
+		}
+		if p.Text == "" {
+			continue
 		}
 		blocks = append(blocks, anthropicContentBlock{
 			Type:         "text",

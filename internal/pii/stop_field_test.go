@@ -96,9 +96,10 @@ func TestFilter_AnonymizeJSON_StopField_NullIsNoOp(t *testing.T) {
 
 // TestFilter_AnonymizeJSON_StopField_FailClosedShapes verifies that every
 // shape "stop" has no defined meaning for — a bare number, an object, or an
-// array containing a non-string element — is rejected fail-closed with the
-// fixed, caller-content-free error message rather than being silently
-// forwarded or dropped.
+// array containing a non-string element (including a JSON null, which
+// unmarshaling into a plain string would otherwise silently coerce to "" and
+// let pass) — is rejected fail-closed with the fixed, caller-content-free
+// error message rather than being silently forwarded or dropped.
 func TestFilter_AnonymizeJSON_StopField_FailClosedShapes(t *testing.T) {
 	t.Parallel()
 
@@ -109,6 +110,7 @@ func TestFilter_AnonymizeJSON_StopField_FailClosedShapes(t *testing.T) {
 		{"number", `{"model":"gpt-4","messages":[],"stop":42}`},
 		{"object", `{"model":"gpt-4","messages":[],"stop":{"x":1}}`},
 		{"array with a number element", `{"model":"gpt-4","messages":[],"stop":["STOP",1]}`},
+		{"array with a null element", `{"model":"gpt-4","messages":[],"stop":["STOP",null]}`},
 	}
 
 	for _, tc := range cases {

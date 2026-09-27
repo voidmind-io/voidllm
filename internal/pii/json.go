@@ -243,6 +243,17 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 				if err2 := jsonx.Unmarshal(rawStop, &stopArr); err2 == nil {
 					arrTouched := false
 					for i, elem := range stopArr {
+						// Check the raw token explicitly rather than unmarshaling
+						// straight into a string: unmarshaling a JSON null element
+						// into a non-pointer string silently zeroes it to "" instead
+						// of erroring, which would let a null element pass through
+						// as if it were an (empty) string. Requiring the token to
+						// start with '"' rejects null and every other non-string
+						// element (number, object, array, bool) fail-closed.
+						trimmed := bytes.TrimSpace(elem)
+						if len(trimmed) == 0 || trimmed[0] != '"' {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
 						var s string
 						if err := jsonx.Unmarshal(elem, &s); err != nil {
 							// Non-string element: "stop" has no token-ID array variant
