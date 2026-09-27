@@ -10,6 +10,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -103,8 +104,10 @@ func TestAnthropicTransformRequest_AllowlistKeepsAnthropicNativeFields(t *testin
 
 // TestAnthropicTransformRequest_Stop covers the stop→stop_sequences
 // translation across every input shape: plain string, array, null, and
-// empty/whitespace-only entries (dropped). A native stop_sequences field from
-// the client always wins over a translated one.
+// empty/whitespace-only entries (dropped). A client-supplied top-level
+// stop_sequences is rejected fail-closed (see
+// TestAnthropicTransformRequest_ClientSuppliedNativeFieldsRejected) since it
+// is a native Anthropic field never scanned by internal/pii.
 func TestAnthropicTransformRequest_Stop(t *testing.T) {
 	t.Parallel()
 
@@ -143,11 +146,6 @@ func TestAnthropicTransformRequest_Stop(t *testing.T) {
 			name:        "array of only empty/whitespace entries yields no stop_sequences",
 			extraFields: `,"stop":["  ","",""]`,
 			wantAbsent:  true,
-		},
-		{
-			name:          "native stop_sequences wins over translated stop",
-			extraFields:   `,"stop":"IGNORED","stop_sequences":["NATIVE"]`,
-			wantSequences: []string{"NATIVE"},
 		},
 	}
 
@@ -188,6 +186,170 @@ func TestAnthropicTransformRequest_Stop(t *testing.T) {
 				t.Error("output still contains OpenAI 'stop' field")
 			}
 		})
+	}
+}
+
+// TestAnthropicTransformRequest_ClientSuppliedNativeFieldsRejected verifies
+// that a client-supplied top-level "system" or "stop_sequences" field is
+// rejected fail-closed: both are native Anthropic fields the adapter emits
+// internally after translation, and neither is scanned by internal/pii. It
+// also covers the malformed-shape fail-closed cases for "stop",
+// "parallel_tool_calls", cache_control, and non-text content parts that
+// replace the previous silent-drop behavior.
+//
+// Every case asserts that the returned error unwraps (via errors.As) to a
+// clientRequestError carrying the exact static, caller-content-free message
+// that buildUpstreamRequest (handler.go) sends to the client as the 400 body
+// — the underlying error is never surfaced generically for these cases.
+func TestAnthropicTransformRequest_ClientSuppliedNativeFieldsRejected(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		input   string
+		wantMsg string
+	}{
+		{
+			name:    "client-supplied top-level system is rejected",
+			input:   `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"system":"client system"}`,
+			wantMsg: `top-level system is not supported; send a message with role "system" instead`,
+		},
+		{
+			name:    "client-supplied top-level stop_sequences is rejected",
+			input:   `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"stop_sequences":["X"]}`,
+			wantMsg: "stop_sequences is not supported; use stop instead",
+		},
+		{
+			name:    "stop as a number is rejected",
+			input:   `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"stop":42}`,
+			wantMsg: "stop must be a string or an array of strings",
+		},
+		{
+			name:    "stop as an array containing a non-string is rejected",
+			input:   `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"stop":["A",1]}`,
+			wantMsg: "stop must be a string or an array of strings",
+		},
+		{
+			name:    "parallel_tool_calls as a non-boolean is rejected",
+			input:   `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"parallel_tool_calls":"false"}`,
+			wantMsg: "parallel_tool_calls must be a boolean",
+		},
+		{
+			name:    "invalid top-level cache_control is rejected",
+			input:   `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"cache_control":{"type":"persistent"}}`,
+			wantMsg: `cache_control must be {"type":"ephemeral"} with optional ttl "5m" or "1h"`,
+		},
+		{
+			name: "invalid per-part cache_control is rejected",
+			input: `{"model":"claude-3","messages":[` +
+				`{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","extra":"x"}}]}` +
+				`]}`,
+			wantMsg: `cache_control must be {"type":"ephemeral"} with optional ttl "5m" or "1h"`,
+		},
+		{
+			name: "non-text content part on a user message is rejected",
+			input: `{"model":"claude-3","messages":[` +
+				`{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://example.com/img.png"}}]}` +
+				`]}`,
+			wantMsg: "only text content parts are supported for this model",
+		},
+		{
+			name: "non-text content part on a system message is rejected",
+			input: `{"model":"claude-3","messages":[` +
+				`{"role":"system","content":[{"type":"image_url","image_url":{"url":"http://example.com/img.png"}}]},` +
+				`{"role":"user","content":"hi"}` +
+				`]}`,
+			wantMsg: "only text content parts are supported for this model",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			a := &AnthropicAdapter{}
+			_, err := a.TransformRequest([]byte(tc.input), Model{})
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			var clientErr *clientRequestError
+			if !errors.As(err, &clientErr) {
+				t.Fatalf("error does not unwrap to a clientRequestError: %v", err)
+			}
+			if clientErr.Error() != tc.wantMsg {
+				t.Errorf("client-safe message = %q, want %q", clientErr.Error(), tc.wantMsg)
+			}
+		})
+	}
+}
+
+// anthropicClientErrorRegistry builds a Registry with a single Anthropic-
+// provider model, so ProxyHandler.Handle routes through AnthropicAdapter.
+// TransformRequest. No upstream server is needed: every case here is
+// expected to fail transformation before any upstream request is built.
+func anthropicClientErrorRegistry(t *testing.T) *Registry {
+	t.Helper()
+	m := &Model{
+		Name:     "claude-handler-test",
+		Provider: "anthropic",
+		Type:     "chat",
+		BaseURL:  "http://unused.invalid",
+		APIKey:   "key-unused",
+	}
+	r := &Registry{
+		models:  map[string]*Model{"claude-handler-test": m},
+		aliases: make(map[string]string),
+	}
+	r.rebuildSorted()
+	return r
+}
+
+// TestAnthropicTransformRequest_ClientSafeErrorSurfacesThroughHandler is the
+// end-to-end counterpart of
+// TestAnthropicTransformRequest_ClientSuppliedNativeFieldsRejected: it drives
+// a client-safe TransformRequest failure through the full ProxyHandler.Handle
+// pipeline and asserts that the HTTP response is 400 bad_request with the
+// exact static message, rather than the generic "failed to transform request
+// for provider" fallback.
+func TestAnthropicTransformRequest_ClientSafeErrorSurfacesThroughHandler(t *testing.T) {
+	t.Parallel()
+
+	reg := anthropicClientErrorRegistry(t)
+	handler := NewProxyHandler(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app := testApp(t, handler)
+
+	body := `{"model":"claude-handler-test","messages":[{"role":"user","content":"hi"}],"system":"client system"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, testTimeout)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	var envelope struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(respBody, &envelope); err != nil {
+		t.Fatalf("unmarshal response body: %v (body: %s)", err, respBody)
+	}
+	if envelope.Error.Code != "bad_request" {
+		t.Errorf("error.code = %q, want %q", envelope.Error.Code, "bad_request")
+	}
+	wantMsg := `top-level system is not supported; send a message with role "system" instead`
+	if envelope.Error.Message != wantMsg {
+		t.Errorf("error.message = %q, want %q", envelope.Error.Message, wantMsg)
 	}
 }
 
