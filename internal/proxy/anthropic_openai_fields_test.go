@@ -1968,8 +1968,9 @@ func TestAnthropicTransformRequest_TopKValidation(t *testing.T) {
 // {"type":"adaptive","display":"..."}), re-encoded from the typed
 // anthropicThinking struct. Every other shape — an extra key (including one
 // carrying an email value), a malformed type, budget_tokens, or display, or
-// a non-object thinking value — is rejected fail-closed, and a JSON null is
-// treated as absent.
+// a non-object thinking value — is rejected fail-closed. A JSON null is
+// treated as absent, both for the thinking value itself and for its
+// "budget_tokens"/"display" sub-fields.
 func TestAnthropicTransformRequest_ThinkingValidation(t *testing.T) {
 	t.Parallel()
 
@@ -1988,6 +1989,8 @@ func TestAnthropicTransformRequest_ThinkingValidation(t *testing.T) {
 			{"type and budget_tokens", `{"type":"enabled","budget_tokens":1024}`, "enabled", int64Ptr(1024), ""},
 			{"adaptive with display", `{"type":"adaptive","display":"brief"}`, "adaptive", nil, "brief"},
 			{"enabled with display and budget_tokens", `{"type":"enabled","budget_tokens":512,"display":"brief"}`, "enabled", int64Ptr(512), "brief"},
+			{"adaptive with null display", `{"type":"adaptive","display":null}`, "adaptive", nil, ""},
+			{"enabled with budget_tokens and null display", `{"type":"enabled","budget_tokens":1024,"display":null}`, "enabled", int64Ptr(1024), ""},
 		}
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
@@ -2060,6 +2063,30 @@ func TestAnthropicTransformRequest_ThinkingValidation(t *testing.T) {
 		}
 		if _, ok := doc["thinking"]; ok {
 			t.Error("thinking present, want absent for null input")
+		}
+	})
+
+	t.Run("null budget_tokens and display sub-fields are treated as absent", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name string
+			raw  string
+			want string
+		}{
+			{"null display", `{"type":"adaptive","display":null}`, `{"type":"adaptive"}`},
+			{"null display alongside budget_tokens", `{"type":"enabled","budget_tokens":1024,"display":null}`, `{"type":"enabled","budget_tokens":1024}`},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				doc, err := runFieldValidationCase(t, "thinking", tc.raw)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got := string(doc["thinking"]); got != tc.want {
+					t.Errorf("thinking = %s, want %s", got, tc.want)
+				}
+			})
 		}
 	})
 }

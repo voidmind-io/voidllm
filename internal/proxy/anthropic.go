@@ -1619,6 +1619,15 @@ func isJSONNull(raw jsonx.RawMessage) bool {
 // silently misjudged by rounding. Non-integral numbers (1.5), strings,
 // objects, arrays, booleans, and null all return (0, false).
 //
+// raw must be a single JSON number token as produced by the JSON decoder
+// when it unmarshals the request body into a jsonx.RawMessage: the decoder
+// has already rejected any spelling outside the JSON number grammar, such
+// as hex ("0x10"), a lone fraction with no leading digit (".5"), or a
+// leading '+' ("+1"). big.Rat.SetString accepts a wider grammar than JSON
+// numbers (for example it also parses fractions written as "n/d"), but
+// since raw is guaranteed to already be a valid JSON number token, the
+// extra syntax big.Rat.SetString would otherwise accept never reaches it.
+//
 // Before big.Rat.SetString runs — its cost scales with the literal's
 // length, and a digit string a few hundred KB long is trivially cheap to
 // send but not to parse — two cheap guards reject pathological input up
@@ -1626,7 +1635,10 @@ func isJSONNull(raw jsonx.RawMessage) bool {
 // trimmed literal must be at most 40 bytes, and if it contains an exponent
 // (e/E), the exponent's magnitude (parsed with strconv.Atoi after stripping
 // the optional leading sign; anything that fails to parse counts as
-// exceeding the limit) must be at most 20. This turns something like
+// exceeding the limit) must be at most 20. These are cost bounds, not a
+// grammar check — they exist purely to keep big.Rat.SetString's input
+// small and cheap; the JSON decoder is what already guarantees raw is
+// syntactically a valid JSON number. This turns something like
 // "1e1000000" — tens of milliseconds and a few hundred KB of allocation in
 // big.Rat before the int64 range check would reject it anyway — into a
 // handful of string operations.
@@ -1682,8 +1694,11 @@ var errInvalidThinking = newClientRequestError(`thinking must be an object with 
 // already be known non-null (callers check isJSONNull first). Any key other
 // than "type", "budget_tokens", and "display", a missing or malformed
 // "type", a non-positive "budget_tokens", or a malformed "display" is
-// rejected fail-closed. The per-type union of which fields belong together
-// (e.g. "adaptive" pairing with "display") is left to Anthropic to enforce.
+// rejected fail-closed. A JSON null on "budget_tokens" or "display" is
+// treated the same as the field being absent, so the corresponding field is
+// omitted from the re-encoded output rather than rejected. The per-type
+// union of which fields belong together (e.g. "adaptive" pairing with
+// "display") is left to Anthropic to enforce.
 func validateThinking(raw jsonx.RawMessage) (anthropicThinking, error) {
 	var fields map[string]jsonx.RawMessage
 	if err := jsonx.Unmarshal(raw, &fields); err != nil || fields == nil {
@@ -1705,7 +1720,7 @@ func validateThinking(raw jsonx.RawMessage) (anthropicThinking, error) {
 	}
 	th := anthropicThinking{Type: typ}
 
-	if rawBudget, ok := fields["budget_tokens"]; ok {
+	if rawBudget, ok := fields["budget_tokens"]; ok && !isJSONNull(rawBudget) {
 		budget, ok := parseJSONInt(rawBudget)
 		if !ok || budget <= 0 {
 			return anthropicThinking{}, errInvalidThinking
@@ -1713,7 +1728,7 @@ func validateThinking(raw jsonx.RawMessage) (anthropicThinking, error) {
 		th.BudgetTokens = &budget
 	}
 
-	if rawDisplay, ok := fields["display"]; ok {
+	if rawDisplay, ok := fields["display"]; ok && !isJSONNull(rawDisplay) {
 		var display string
 		if err := jsonx.Unmarshal(rawDisplay, &display); err != nil || !anthropicThinkingTypeRe.MatchString(display) {
 			return anthropicThinking{}, errInvalidThinking
