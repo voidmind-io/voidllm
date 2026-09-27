@@ -2,6 +2,20 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.28] - 2026-09-28
+
+### Security
+- Security hardening of the PII filter: request fields beyond the standard chat, completion and embedding fields are now covered, and function names are validated (#240)
+
+### Upgrade notes
+- With the PII filter enabled, every request field except `model` is scanned and pseudonymized where PII is detected (restored in responses as before). This includes provider-specific fields such as `chat_template_kwargs` or `metadata` and the inputs of rerank and score requests.
+- Function and tool names must be identifiers (`A-Z a-z 0-9 _ . + -`, up to 128 characters) and must not look like PII; a name that looks like an email address or contains a phone, tax or card number is rejected with 422. `logit_bias` must map token IDs of up to seven digits to numbers.
+
+### Dependencies
+- gRPC 1.83.2 with the fix for an upstream security advisory, plus golang.org/x patch updates (#235)
+
+---
+
 ## [0.0.27] - 2026-09-27
 
 ### Fixes
