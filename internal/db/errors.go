@@ -29,6 +29,12 @@ var ErrForeignKey = errors.New("foreign key violation")
 // for, a tombstoned one. See tombstone.go and #172.
 var ErrReservedValue = errors.New("reserved value")
 
+// ErrInvalidTimestamp is returned when a stored expires_at value cannot be
+// parsed as RFC3339. The underlying time.ParseError is deliberately not
+// wrapped: its Error() message embeds the raw input value, which would
+// otherwise leak into logs via the key cache loader's skipErrors.
+var ErrInvalidTimestamp = errors.New("invalid timestamp")
+
 // translateError maps low-level driver errors to domain sentinels.
 // sql.ErrNoRows becomes ErrNotFound, UNIQUE constraint violations become ErrConflict,
 // FOREIGN KEY constraint violations become ErrForeignKey,

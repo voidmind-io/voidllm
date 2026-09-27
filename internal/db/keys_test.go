@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/voidmind-io/voidllm/pkg/keygen"
@@ -494,5 +495,55 @@ func TestLoadAllActiveKeys_UserLimits(t *testing.T) {
 	}
 	if sk.UserDailyTokenLimit != 0 || sk.UserMonthlyTokenLimit != 0 || sk.UserRequestsPerMinute != 0 || sk.UserRequestsPerDay != 0 {
 		t.Errorf("sa_key user limits = %+v, want all zero (no owning user)", sk)
+	}
+}
+
+// ---- LoadAllActiveKeys — corrupt expires_at ------------------------------------
+
+// TestLoadAllActiveKeys_InvalidExpiresAtOmitsRawValue verifies that a row
+// whose stored expires_at cannot be parsed as RFC3339 is skipped rather than
+// aborting the whole load, and that the collected error identifies the key by
+// ID without embedding the raw stored value — the error text ends up in logs
+// via the key cache loader's skipErrors, and the raw value must not leak there.
+func TestLoadAllActiveKeys_InvalidExpiresAtOmitsRawValue(t *testing.T) {
+	t.Parallel()
+	d := openMigratedDB(t)
+	ctx := context.Background()
+
+	org := mustCreateOrg(t, d, CreateOrgParams{Name: "O", Slug: "loadall-badexpiry-org"})
+	user := mustCreateUser(t, d, CreateUserParams{Email: "loadall-badexpiry@example.com", DisplayName: "U"})
+
+	const rawValue = "not-a-real-timestamp-marker"
+	plainBad := "vl_uk_loadallbadexpirykeytest00000000000000000000000"
+	badKey := mustCreateAPIKey(t, d, CreateAPIKeyParams{
+		KeyHash: keygen.Hash(plainBad, testHMACSecret), KeyHint: keygen.Hint(plainBad),
+		KeyType: keygen.KeyTypeUser, Name: "bad-expiry-key",
+		OrgID: org.ID, UserID: ptr(user.ID),
+		ExpiresAt: ptr(rawValue),
+		CreatedBy: user.ID,
+	})
+
+	records, skipErrors, err := d.LoadAllActiveKeys(ctx)
+	if err != nil {
+		t.Fatalf("LoadAllActiveKeys() error = %v", err)
+	}
+	if len(skipErrors) != 1 {
+		t.Fatalf("LoadAllActiveKeys() skipErrors = %v, want exactly 1", skipErrors)
+	}
+	for _, r := range records {
+		if r.ID == badKey.ID {
+			t.Fatalf("bad-expiry key %s should have been skipped, not returned", badKey.ID)
+		}
+	}
+
+	msg := skipErrors[0].Error()
+	if strings.Contains(msg, rawValue) {
+		t.Errorf("skip error = %q, must not contain the raw expires_at value %q", msg, rawValue)
+	}
+	if !strings.Contains(msg, badKey.ID) {
+		t.Errorf("skip error = %q, want it to include the key id %q", msg, badKey.ID)
+	}
+	if !errors.Is(skipErrors[0], ErrInvalidTimestamp) {
+		t.Errorf("skip error = %v, want errors.Is(err, ErrInvalidTimestamp)", skipErrors[0])
 	}
 }

@@ -174,7 +174,7 @@ func scanKeyRecord(row interface {
 	if expiresAtRaw != nil {
 		t, err := time.Parse(time.RFC3339, *expiresAtRaw)
 		if err != nil {
-			return KeyRecord{}, fmt.Errorf("parse expires_at %q: %w", *expiresAtRaw, err)
+			return KeyRecord{}, fmt.Errorf("parse expires_at for key %s: %w", r.ID, ErrInvalidTimestamp)
 		}
 		r.ExpiresAt = &t
 	}

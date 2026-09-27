@@ -869,12 +869,20 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 	rotatedName := strings.TrimSuffix(existing.Name, " (rotated)") + " (rotated)"
 
 	// Set the old key to expire after the grace period. If it already has an
-	// expiry that is sooner than the grace period deadline, keep that shorter expiry.
+	// expiry that is sooner than the grace period deadline, keep that shorter
+	// expiry. existing.ExpiresAt may be stored in a non-canonical RFC3339
+	// variant (e.g. a numeric UTC offset instead of Z); normalize it here so
+	// both the retained old-key expiry and the new key's copied expiry below
+	// are always written in canonical form.
 	graceDeadline := time.Now().UTC().Add(rotateKeyGracePeriod)
 	oldExpiresAt := db.FormatTimestamp(graceDeadline)
 	if existing.ExpiresAt != nil {
-		if t, parseErr := time.Parse(time.RFC3339, *existing.ExpiresAt); parseErr == nil && t.Before(graceDeadline) {
-			oldExpiresAt = *existing.ExpiresAt
+		if t, parseErr := time.Parse(time.RFC3339, *existing.ExpiresAt); parseErr == nil {
+			canonical := db.FormatTimestamp(t)
+			existing.ExpiresAt = &canonical
+			if t.Before(graceDeadline) {
+				oldExpiresAt = canonical
+			}
 		}
 	}
 
