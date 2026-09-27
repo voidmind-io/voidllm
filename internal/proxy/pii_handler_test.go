@@ -1100,3 +1100,47 @@ func TestPII_PickBody_ByDestPrivate(t *testing.T) {
 		})
 	}
 }
+
+// ── stop field, end-to-end through the OpenAI-passthrough path ──────────────
+
+// TestPII_ExternalProvider_StopFieldAnonymised verifies that the top-level
+// "stop" field is covered by the PII filter for every provider (see
+// anonymizeWithDetectors's doc): an email in "stop" must reach an external
+// OpenAI-passthrough upstream (provider "openai", no adapter transform)
+// pseudonymized, never as the original value.
+func TestPII_ExternalProvider_StopFieldAnonymised(t *testing.T) {
+	t.Parallel()
+
+	upstream, lastBody, _ := captureUpstream(t,
+		http.StatusOK,
+		`{"id":"cmp-stop","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
+		map[string]string{"Content-Type": "application/json"},
+	)
+
+	reg := piiRegistryExternal(t, upstream.URL)
+	handler := piiHandler(t, reg)
+	app := testApp(t, handler)
+
+	body := fmt.Sprintf(`{"model":"ext-model","messages":[{"role":"user","content":"hi"}],"stop":%q}`, piiTestEmail)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, testTimeout)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, b)
+	}
+
+	upstreamBody := string(*lastBody)
+	if strings.Contains(upstreamBody, piiTestEmail) {
+		t.Errorf("SECURITY: upstream received original PII email %q in stop field; expected pseudonym", piiTestEmail)
+	}
+	if !piiPseudonymPattern.MatchString(upstreamBody) {
+		t.Errorf("upstream body missing PII pseudonym for stop field; body: %s", upstreamBody)
+	}
+}

@@ -1135,3 +1135,433 @@ func TestAnthropicStream_IncludeUsage_EndToEndViaProxy(t *testing.T) {
 		t.Errorf("expected content 'hi there' absent from output\noutput: %s", fullStr)
 	}
 }
+
+// ── cache_control validation table (all positions) ───────────────────────────
+
+// ccPosition describes one place in an Anthropic request where a client can
+// supply a cache_control value: build constructs a full request body with the
+// given raw cache_control value substituted in, and extract locates the
+// (possibly re-marshaled) cache_control bytes in the transformed output,
+// reporting whether the field is present at all.
+type ccPosition struct {
+	name    string
+	build   func(ccValue string) string
+	extract func(t *testing.T, doc map[string]json.RawMessage) (json.RawMessage, bool)
+}
+
+// ccPositions enumerates every position cache_control validation must hold
+// for: top-level, and per-part on user, assistant (with and without
+// tool_calls), tool-result, and system content blocks.
+func ccPositions() []ccPosition {
+	return []ccPosition{
+		{
+			name: "top-level",
+			build: func(cc string) string {
+				return fmt.Sprintf(
+					`{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":16,"cache_control":%s}`,
+					cc)
+			},
+			extract: func(t *testing.T, doc map[string]json.RawMessage) (json.RawMessage, bool) {
+				raw, ok := doc["cache_control"]
+				return raw, ok
+			},
+		},
+		{
+			name: "user text part",
+			build: func(cc string) string {
+				return fmt.Sprintf(
+					`{"model":"claude-3","messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":%s}]}]}`,
+					cc)
+			},
+			extract: func(t *testing.T, doc map[string]json.RawMessage) (json.RawMessage, bool) {
+				msgs := unmarshalMessages(t, doc)
+				if len(msgs) != 1 || len(msgs[0].Content) != 1 {
+					t.Fatalf("unexpected messages shape: %+v", msgs)
+				}
+				cc := msgs[0].Content[0].CacheControl
+				return cc, len(cc) > 0
+			},
+		},
+		{
+			name: "assistant text part (no tool_calls)",
+			build: func(cc string) string {
+				return fmt.Sprintf(
+					`{"model":"claude-3","messages":[{"role":"user","content":"q"},`+
+						`{"role":"assistant","content":[{"type":"text","text":"answer","cache_control":%s}]}]}`,
+					cc)
+			},
+			extract: func(t *testing.T, doc map[string]json.RawMessage) (json.RawMessage, bool) {
+				msgs := unmarshalMessages(t, doc)
+				if len(msgs) != 2 || len(msgs[1].Content) != 1 {
+					t.Fatalf("unexpected messages shape: %+v", msgs)
+				}
+				cc := msgs[1].Content[0].CacheControl
+				return cc, len(cc) > 0
+			},
+		},
+		{
+			name: "assistant text part with tool_calls",
+			build: func(cc string) string {
+				return fmt.Sprintf(
+					`{"model":"claude-3","messages":[{"role":"user","content":"q"},`+
+						`{"role":"assistant","content":[{"type":"text","text":"part1","cache_control":%s}],`+
+						`"tool_calls":[{"id":"c1","type":"function","function":{"name":"fn","arguments":"{}"}}]}]}`,
+					cc)
+			},
+			extract: func(t *testing.T, doc map[string]json.RawMessage) (json.RawMessage, bool) {
+				msgs := unmarshalMessages(t, doc)
+				if len(msgs) != 2 || len(msgs[1].Content) < 1 {
+					t.Fatalf("unexpected messages shape: %+v", msgs)
+				}
+				cc := msgs[1].Content[0].CacheControl
+				return cc, len(cc) > 0
+			},
+		},
+		{
+			name: "tool-result text part",
+			build: func(cc string) string {
+				return fmt.Sprintf(
+					`{"model":"claude-3","messages":[{"role":"user","content":"q"},`+
+						`{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"fn","arguments":"{}"}}]},`+
+						`{"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":"result","cache_control":%s}]}]}`,
+					cc)
+			},
+			extract: func(t *testing.T, doc map[string]json.RawMessage) (json.RawMessage, bool) {
+				msgs := unmarshalMessages(t, doc)
+				last := msgs[len(msgs)-1]
+				if last.Role != "user" || len(last.Content) != 1 || last.Content[0].Type != "tool_result" {
+					t.Fatalf("unexpected last message shape: %+v", last)
+				}
+				var blocks []anthropicContentBlock
+				if err := json.Unmarshal(last.Content[0].Content, &blocks); err != nil {
+					t.Fatalf("unmarshal tool_result content: %v (raw: %s)", err, last.Content[0].Content)
+				}
+				if len(blocks) != 1 {
+					t.Fatalf("len(tool_result blocks) = %d, want 1", len(blocks))
+				}
+				cc := blocks[0].CacheControl
+				return cc, len(cc) > 0
+			},
+		},
+		{
+			name: "system text part",
+			build: func(cc string) string {
+				return fmt.Sprintf(
+					`{"model":"claude-3","messages":[`+
+						`{"role":"system","content":[{"type":"text","text":"instr","cache_control":%s}]},`+
+						`{"role":"user","content":"hi"}]}`,
+					cc)
+			},
+			extract: func(t *testing.T, doc map[string]json.RawMessage) (json.RawMessage, bool) {
+				raw, ok := doc["system"]
+				if !ok {
+					t.Fatal("output missing system field")
+				}
+				var blocks []anthropicContentBlock
+				if err := json.Unmarshal(raw, &blocks); err != nil {
+					t.Fatalf("unmarshal system as array: %v (raw: %s)", err, raw)
+				}
+				if len(blocks) != 1 {
+					t.Fatalf("len(system blocks) = %d, want 1", len(blocks))
+				}
+				cc := blocks[0].CacheControl
+				return cc, len(cc) > 0
+			},
+		},
+	}
+}
+
+// TestAnthropicTransformRequest_CacheControlValid verifies that every valid
+// cache_control shape — {"type":"ephemeral"} with no ttl, ttl "5m", or ttl
+// "1h" — is accepted at every position and re-encoded to the exact canonical
+// form (only the "type" and "ttl" keys, nothing else), never forwarding the
+// client-supplied bytes verbatim.
+func TestAnthropicTransformRequest_CacheControlValid(t *testing.T) {
+	t.Parallel()
+
+	validCases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"type only", `{"type":"ephemeral"}`, `{"type":"ephemeral"}`},
+		{"ttl 5m", `{"type":"ephemeral","ttl":"5m"}`, `{"type":"ephemeral","ttl":"5m"}`},
+		{"ttl 1h", `{"type":"ephemeral","ttl":"1h"}`, `{"type":"ephemeral","ttl":"1h"}`},
+	}
+
+	for _, pos := range ccPositions() {
+		pos := pos
+		for _, vc := range validCases {
+			vc := vc
+			t.Run(pos.name+"/"+vc.name, func(t *testing.T) {
+				t.Parallel()
+				doc := transformRequest(t, pos.build(vc.raw))
+				got, ok := pos.extract(t, doc)
+				if !ok {
+					t.Fatalf("cache_control absent, want present with canonical %s", vc.want)
+				}
+				if string(got) != vc.want {
+					t.Errorf("cache_control = %s, want canonical %s", got, vc.want)
+				}
+			})
+		}
+	}
+}
+
+// TestAnthropicTransformRequest_CacheControlNullTreatedAsAbsent verifies that
+// a JSON null cache_control value is treated as if the field were absent
+// entirely, at every position, rather than being rejected or forwarded.
+func TestAnthropicTransformRequest_CacheControlNullTreatedAsAbsent(t *testing.T) {
+	t.Parallel()
+
+	for _, pos := range ccPositions() {
+		pos := pos
+		t.Run(pos.name, func(t *testing.T) {
+			t.Parallel()
+			doc := transformRequest(t, pos.build("null"))
+			_, ok := pos.extract(t, doc)
+			if ok {
+				t.Error("cache_control present, want absent for a JSON null input")
+			}
+		})
+	}
+}
+
+// TestAnthropicTransformRequest_CacheControlInvalidRejected verifies that
+// every malformed cache_control shape is rejected fail-closed at every
+// position with the exact static, caller-content-free message — including an
+// extra key whose value is an email address, which must never appear in the
+// returned error.
+func TestAnthropicTransformRequest_CacheControlInvalidRejected(t *testing.T) {
+	t.Parallel()
+
+	const wantMsg = `cache_control must be {"type":"ephemeral"} with optional ttl "5m" or "1h"`
+	const leakEmail = "attacker@example.com"
+
+	invalidCases := []struct {
+		name string
+		raw  string
+	}{
+		{"extra key with email value", fmt.Sprintf(`{"type":"ephemeral","note":%q}`, leakEmail)},
+		{"type persistent", `{"type":"persistent"}`},
+		{"ttl 10m", `{"type":"ephemeral","ttl":"10m"}`},
+		{"ttl as number", `{"type":"ephemeral","ttl":5}`},
+		{"cache_control as string", `"ephemeral"`},
+		{"cache_control as array", `["ephemeral"]`},
+		{"cache_control as number", `42`},
+	}
+
+	for _, pos := range ccPositions() {
+		pos := pos
+		for _, ic := range invalidCases {
+			ic := ic
+			t.Run(pos.name+"/"+ic.name, func(t *testing.T) {
+				t.Parallel()
+				input := pos.build(ic.raw)
+				a := &AnthropicAdapter{}
+				_, err := a.TransformRequest([]byte(input), Model{})
+				if err == nil {
+					t.Fatalf("expected error for input %s, got nil", input)
+				}
+				var clientErr *clientRequestError
+				if !errors.As(err, &clientErr) {
+					t.Fatalf("error does not unwrap to a clientRequestError: %v", err)
+				}
+				if clientErr.Error() != wantMsg {
+					t.Errorf("client-safe message = %q, want %q", clientErr.Error(), wantMsg)
+				}
+				if strings.Contains(err.Error(), leakEmail) {
+					t.Errorf("SECURITY: error leaks caller-supplied email: %v", err)
+				}
+			})
+		}
+	}
+}
+
+// ── assistant tool_calls: content shapes ──────────────────────────────────────
+
+// TestAnthropicTransformRequest_AssistantToolCallsContentShapes covers an
+// assistant message that carries both tool_calls and array-of-parts content:
+// each text part becomes its own content block (never concatenated),
+// per-part cache_control survives, empty parts are skipped, a non-text part
+// is rejected fail-closed, string content still works unchanged, and no
+// content at all yields only the tool_use blocks. Null/string content plus a
+// single tool_call is also covered by TestAnthropicTransformRequest_AssistantToolCalls
+// in anthropic_test.go; this test focuses on the array-content shape.
+func TestAnthropicTransformRequest_AssistantToolCallsContentShapes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("two text parts stay separate, cache_control kept, tool_use blocks follow", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"user","content":"go"},` +
+			`{"role":"assistant","content":[{"type":"text","text":"alice@"},{"type":"text","text":"example.com","cache_control":{"type":"ephemeral"}}],` +
+			`"tool_calls":[{"id":"c1","type":"function","function":{"name":"fn","arguments":"{}"}}]}` +
+			`]}`
+		doc := transformRequest(t, input)
+		msgs := unmarshalMessages(t, doc)
+
+		var assistant *anthropicOutboundMessage
+		for i := range msgs {
+			if msgs[i].Role == "assistant" {
+				assistant = &msgs[i]
+				break
+			}
+		}
+		if assistant == nil {
+			t.Fatal("no assistant message in output")
+		}
+		if len(assistant.Content) != 3 {
+			t.Fatalf("len(content) = %d, want 3 (two text blocks + one tool_use); blocks: %+v", len(assistant.Content), assistant.Content)
+		}
+		if assistant.Content[0].Type != "text" || assistant.Content[0].Text != "alice@" {
+			t.Errorf("content[0] = %+v, want text %q", assistant.Content[0], "alice@")
+		}
+		if assistant.Content[1].Type != "text" || assistant.Content[1].Text != "example.com" {
+			t.Errorf("content[1] = %+v, want text %q", assistant.Content[1], "example.com")
+		}
+		if len(assistant.Content[1].CacheControl) == 0 {
+			t.Error("content[1].cache_control missing, want preserved")
+		}
+		if assistant.Content[2].Type != "tool_use" {
+			t.Errorf("content[2].type = %q, want tool_use", assistant.Content[2].Type)
+		}
+		if strings.Contains(string(doc["messages"]), "alice@example.com") {
+			t.Errorf("SECURITY: joined PII string appears in assistant content; raw: %s", doc["messages"])
+		}
+	})
+
+	t.Run("string content still works alongside tool_calls", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"user","content":"go"},` +
+			`{"role":"assistant","content":"Sure, calling tool.","tool_calls":[{"id":"c2","type":"function","function":{"name":"fn","arguments":"{}"}}]}` +
+			`]}`
+		doc := transformRequest(t, input)
+		msgs := unmarshalMessages(t, doc)
+		assistant := msgs[len(msgs)-1]
+		if len(assistant.Content) != 2 {
+			t.Fatalf("len(content) = %d, want 2; blocks: %+v", len(assistant.Content), assistant.Content)
+		}
+		if assistant.Content[0].Type != "text" || assistant.Content[0].Text != "Sure, calling tool." {
+			t.Errorf("content[0] = %+v, want text %q", assistant.Content[0], "Sure, calling tool.")
+		}
+		if assistant.Content[1].Type != "tool_use" {
+			t.Errorf("content[1].type = %q, want tool_use", assistant.Content[1].Type)
+		}
+	})
+
+	t.Run("empty parts are skipped", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"user","content":"go"},` +
+			`{"role":"assistant","content":[{"type":"text","text":""},{"type":"text","text":"kept"}],` +
+			`"tool_calls":[{"id":"c3","type":"function","function":{"name":"fn","arguments":"{}"}}]}` +
+			`]}`
+		doc := transformRequest(t, input)
+		msgs := unmarshalMessages(t, doc)
+		assistant := msgs[len(msgs)-1]
+		if len(assistant.Content) != 2 {
+			t.Fatalf("len(content) = %d, want 2 (empty part skipped + tool_use); blocks: %+v", len(assistant.Content), assistant.Content)
+		}
+		if assistant.Content[0].Type != "text" || assistant.Content[0].Text != "kept" {
+			t.Errorf("content[0] = %+v, want text %q", assistant.Content[0], "kept")
+		}
+		if assistant.Content[1].Type != "tool_use" {
+			t.Errorf("content[1].type = %q, want tool_use", assistant.Content[1].Type)
+		}
+	})
+
+	t.Run("non-text part is rejected fail-closed", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"user","content":"go"},` +
+			`{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"http://example.com/img.png"}}],` +
+			`"tool_calls":[{"id":"c4","type":"function","function":{"name":"fn","arguments":"{}"}}]}` +
+			`]}`
+		a := &AnthropicAdapter{}
+		_, err := a.TransformRequest([]byte(input), Model{})
+		if err == nil {
+			t.Fatal("expected error for non-text assistant content part, got nil")
+		}
+		var clientErr *clientRequestError
+		if !errors.As(err, &clientErr) {
+			t.Fatalf("error does not unwrap to a clientRequestError: %v", err)
+		}
+		const wantMsg = "only text content parts are supported for this model"
+		if clientErr.Error() != wantMsg {
+			t.Errorf("client-safe message = %q, want %q", clientErr.Error(), wantMsg)
+		}
+	})
+
+	t.Run("no content at all yields only tool_use blocks", func(t *testing.T) {
+		t.Parallel()
+		input := `{"model":"claude-3","messages":[` +
+			`{"role":"user","content":"go"},` +
+			`{"role":"assistant","tool_calls":[{"id":"c5","type":"function","function":{"name":"fn","arguments":"{}"}}]}` +
+			`]}`
+		doc := transformRequest(t, input)
+		msgs := unmarshalMessages(t, doc)
+		assistant := msgs[len(msgs)-1]
+		if len(assistant.Content) != 1 {
+			t.Fatalf("len(content) = %d, want 1 (tool_use only); blocks: %+v", len(assistant.Content), assistant.Content)
+		}
+		if assistant.Content[0].Type != "tool_use" {
+			t.Errorf("content[0].type = %q, want tool_use", assistant.Content[0].Type)
+		}
+	})
+}
+
+// ── handler: non-client-safe adapter errors ───────────────────────────────────
+
+// TestAnthropicTransformRequest_NonClientSafeErrorSurfacesGenericMessage is the
+// counterpart to TestAnthropicTransformRequest_ClientSafeErrorSurfacesThroughHandler:
+// a TransformRequest failure that is NOT a clientRequestError (an unrecognized
+// tool_choice string, a plain adapter error rather than a client-safe one) must
+// surface as the generic "failed to transform request for provider" message,
+// never the underlying adapter error text.
+func TestAnthropicTransformRequest_NonClientSafeErrorSurfacesGenericMessage(t *testing.T) {
+	t.Parallel()
+
+	reg := anthropicClientErrorRegistry(t)
+	handler := NewProxyHandler(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app := testApp(t, handler)
+
+	body := `{"model":"claude-handler-test","messages":[{"role":"user","content":"hi"}],"tool_choice":"not-a-valid-choice"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, testTimeout)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	var envelope struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(respBody, &envelope); err != nil {
+		t.Fatalf("unmarshal response body: %v (body: %s)", err, respBody)
+	}
+	if envelope.Error.Code != "bad_request" {
+		t.Errorf("error.code = %q, want %q", envelope.Error.Code, "bad_request")
+	}
+	const wantMsg = "failed to transform request for provider"
+	if envelope.Error.Message != wantMsg {
+		t.Errorf("error.message = %q, want %q", envelope.Error.Message, wantMsg)
+	}
+	if strings.Contains(envelope.Error.Message, "not-a-valid-choice") {
+		t.Errorf("SECURITY: generic error message leaked adapter-internal detail: %q", envelope.Error.Message)
+	}
+}
