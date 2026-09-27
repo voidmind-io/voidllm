@@ -1071,7 +1071,18 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "adapter transform request failed",
 				slog.String("error", transformErr.Error()),
 			)
-			if err := apierror.Send(c, fiber.StatusBadRequest, "bad_request", "failed to transform request for provider"); err != nil {
+			// A clientRequestError carries a fixed, caller-content-free message
+			// describing what the client sent wrong; surface it directly so the
+			// client can fix its request. Every other TransformRequest error keeps
+			// the generic message — the underlying cause may reference an
+			// internal detail or (in principle) adapter state derived from the
+			// request, and is never safe to echo verbatim.
+			var clientErr *clientRequestError
+			message := "failed to transform request for provider"
+			if errors.As(transformErr, &clientErr) {
+				message = clientErr.Error()
+			}
+			if err := apierror.Send(c, fiber.StatusBadRequest, "bad_request", message); err != nil {
 				return nil, nil, nil, err
 			}
 			return nil, nil, nil, errResponseSent

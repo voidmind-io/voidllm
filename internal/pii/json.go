@@ -125,6 +125,10 @@ func scanForDuplicateKeys(dec *json.Decoder) (bool, error) {
 // Embeddings:
 //   - top-level "input" (string or array-of-strings; array-of-ints/token-arrays left unchanged)
 //
+// All request shapes:
+//   - top-level "stop" (string or array-of-strings; each string is
+//     pseudonymized independently, never concatenated)
+//
 // detectors are called for each string value to locate PII spans. replace
 // is called once per unique (type, originalValue) to obtain the pseudonym;
 // it returns an error if the per-request mapping cap is exceeded.
@@ -205,6 +209,84 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 			}
 			doc["user"] = jsonx.RawMessage(newJSON)
 			touched = true
+		}
+	}
+
+	// ── top-level "stop" field ───────────────────────────────────────────────
+	// Applies to every provider: "stop" is part of the OpenAI request surface
+	// regardless of endpoint. It may be a plain string, an array of strings,
+	// or JSON null (OpenAI's default, meaning "no stop sequences"); null is a
+	// no-op, not a covered-field violation. Unlike "prompt" and "input", an
+	// array element that is not a string (e.g. a token ID) is unsupported —
+	// "stop" has no token-array variant — and is rejected fail-closed. Each
+	// string is pseudonymized independently; array elements are never
+	// concatenated.
+	if rawStop, ok := doc["stop"]; ok {
+		if !bytes.Equal(bytes.TrimSpace(rawStop), []byte("null")) {
+			var stopStr string
+			if err := jsonx.Unmarshal(rawStop, &stopStr); err == nil {
+				replaced, did, err := detect(stopStr)
+				if err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				if did {
+					newJSON, err := jsonx.Marshal(replaced)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					doc["stop"] = jsonx.RawMessage(newJSON)
+					touched = true
+				}
+			} else {
+				// Not a string: try array of strings.
+				var stopArr []jsonx.RawMessage
+				if err2 := jsonx.Unmarshal(rawStop, &stopArr); err2 == nil {
+					arrTouched := false
+					for i, elem := range stopArr {
+						// Check the raw token explicitly rather than unmarshaling
+						// straight into a string: unmarshaling a JSON null element
+						// into a non-pointer string silently zeroes it to "" instead
+						// of erroring, which would let a null element pass through
+						// as if it were an (empty) string. Requiring the token to
+						// start with '"' rejects null and every other non-string
+						// element (number, object, array, bool) fail-closed.
+						trimmed := bytes.TrimSpace(elem)
+						if len(trimmed) == 0 || trimmed[0] != '"' {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						var s string
+						if err := jsonx.Unmarshal(elem, &s); err != nil {
+							// Non-string element: "stop" has no token-ID array variant
+							// like "prompt"/"input" — unsupported shape → fail-closed.
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						replaced, did, err := detect(s)
+						if err != nil {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						if did {
+							newJSON, err := jsonx.Marshal(replaced)
+							if err != nil {
+								return nil, errors.New("pii: request body could not be processed for anonymization")
+							}
+							stopArr[i] = jsonx.RawMessage(newJSON)
+							arrTouched = true
+						}
+					}
+					if arrTouched {
+						newJSON, err := jsonx.Marshal(stopArr)
+						if err != nil {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						doc["stop"] = jsonx.RawMessage(newJSON)
+						touched = true
+					}
+				} else {
+					// "stop" is present but is neither a string, an array, nor null:
+					// unsupported shape for a covered field → fail-closed.
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+			}
 		}
 	}
 
