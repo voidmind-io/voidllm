@@ -9,7 +9,6 @@ import (
 
 	"github.com/voidmind-io/voidllm/internal/cache"
 	"github.com/voidmind-io/voidllm/internal/db"
-	"github.com/voidmind-io/voidllm/pkg/keygen"
 )
 
 // LoadKeysIntoCache queries all active (non-deleted) API keys from the database
@@ -31,65 +30,21 @@ func LoadKeysIntoCache(ctx context.Context, database *db.DB, keyCache *cache.Cac
 	entries := make(map[string]KeyInfo, len(records))
 
 	for _, r := range records {
-		ki := KeyInfo{
-			ID:                    r.ID,
-			KeyType:               r.KeyType,
-			Name:                  r.Name,
-			OrgID:                 r.OrgID,
-			DailyTokenLimit:       r.DailyTokenLimit,
-			MonthlyTokenLimit:     r.MonthlyTokenLimit,
-			RequestsPerMinute:     r.RequestsPerMinute,
-			RequestsPerDay:        r.RequestsPerDay,
-			OrgDailyTokenLimit:    r.OrgDailyTokenLimit,
-			OrgMonthlyTokenLimit:  r.OrgMonthlyTokenLimit,
-			OrgRequestsPerMinute:  r.OrgRequestsPerMinute,
-			OrgRequestsPerDay:     r.OrgRequestsPerDay,
-			TeamDailyTokenLimit:   r.TeamDailyTokenLimit,
-			TeamMonthlyTokenLimit: r.TeamMonthlyTokenLimit,
-			TeamRequestsPerMinute: r.TeamRequestsPerMinute,
-			TeamRequestsPerDay:    r.TeamRequestsPerDay,
-			ExpiresAt:             r.ExpiresAt,
-		}
-
-		if r.TeamID != nil {
-			ki.TeamID = *r.TeamID
-		}
-		if r.UserID != nil {
-			ki.UserID = *r.UserID
-		}
-		if r.ServiceAccountID != nil {
-			ki.ServiceAccountID = *r.ServiceAccountID
-		}
-
-		// Resolve role inline from JOIN columns — no secondary DB query needed.
-		switch r.KeyType {
-		case keygen.KeyTypeUser, keygen.KeyTypeSession:
-			if r.IsSystemAdmin == 1 {
-				ki.Role = RoleSystemAdmin
-			} else if r.MembershipRole != "" {
-				ki.Role = r.MembershipRole
-			} else {
-				log.LogAttrs(ctx, slog.LevelWarn, "load keys: user has no org membership, defaulting to member",
-					slog.String("user_id", ki.UserID),
-					slog.String("org_id", ki.OrgID),
-				)
-				ki.Role = RoleMember
-			}
-		case keygen.KeyTypeTeam:
-			ki.Role = RoleTeamAdmin
-		case keygen.KeyTypeSA:
-			if ki.TeamID != "" {
-				ki.Role = RoleTeamAdmin
-			} else {
-				ki.Role = RoleOrgAdmin
-			}
-		default:
-			log.LogAttrs(ctx, slog.LevelWarn, "load keys: unknown key type, defaulting to member",
+		if !Cacheable(r) {
+			log.LogAttrs(ctx, slog.LevelWarn, "load keys: skipping non-cacheable key",
+				slog.String("key_id", r.ID),
 				slog.String("key_type", r.KeyType),
 			)
-			ki.Role = RoleMember
+			continue
 		}
-
+		ki, ok := KeyInfoFromRecord(r)
+		if !ok {
+			log.LogAttrs(ctx, slog.LevelWarn, "load keys: could not resolve a definite role, defaulting to member",
+				slog.String("key_type", r.KeyType),
+				slog.String("user_id", derefStr(r.UserID)),
+				slog.String("org_id", r.OrgID),
+			)
+		}
 		entries[r.KeyHash] = ki
 	}
 

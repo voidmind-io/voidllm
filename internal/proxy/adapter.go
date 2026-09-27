@@ -13,6 +13,31 @@ import (
 // converts it into a content-free SSE error event for the client.
 var errStreamTransformAborted = errors.New("stream transform aborted")
 
+// clientRequestError is returned by an Adapter's TransformRequest when the
+// request itself — not an internal adapter bug — is invalid in a way the
+// client can fix, and the message is safe to return verbatim: msg is always
+// a fixed string literal supplied by the adapter, never built from
+// caller-supplied content. buildUpstreamRequest (handler.go) uses errors.As
+// to detect this type and, when found, sends msg to the client as the 400
+// response body instead of the generic "failed to transform request for
+// provider" message used for every other TransformRequest error.
+type clientRequestError struct {
+	msg string
+}
+
+// Error returns the static, caller-content-free message.
+func (e *clientRequestError) Error() string {
+	return e.msg
+}
+
+// newClientRequestError wraps a fixed message string as a client-safe
+// TransformRequest error. Callers must only pass string literals (or
+// constants built from them) — never a value derived from request content —
+// so that the message can always be sent to the client unfiltered.
+func newClientRequestError(msg string) error {
+	return &clientRequestError{msg: msg}
+}
+
 // forwardedPseudonymRe matches the canonical PII pseudonym shape produced by
 // the PII pipeline: PII_ followed by exactly 2 alphanumeric characters, then
 // _, then exactly 24 lowercase hex characters. This is an intentional local

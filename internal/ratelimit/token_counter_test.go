@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -25,12 +26,13 @@ func TestTokenCounter_AddAndCheckTokens(t *testing.T) {
 	t.Parallel()
 
 	tc := NewTokenCounter()
-	tc.Add("key1", "", "org1", 500)
+	scopes := Scopes{KeyID: "key1", OrgID: "org1"}
+	tc.Add(scopes, 500)
 
 	keyLimits := Limits{DailyTokenLimit: 1000}
 	noLimits := Limits{}
 
-	if err := tc.CheckTokens("key1", "", "org1", keyLimits, noLimits, noLimits); err != nil {
+	if err := tc.CheckTokens(scopes, ScopeLimits{Key: keyLimits, Team: noLimits, Org: noLimits}); err != nil {
 		t.Errorf("CheckTokens() = %v, want nil (500 tokens < 1000 limit)", err)
 	}
 }
@@ -41,12 +43,13 @@ func TestTokenCounter_CheckTokens_ExceedsKeyDailyLimit(t *testing.T) {
 	t.Parallel()
 
 	tc := NewTokenCounter()
-	tc.Add("key-exceed-daily", "", "org-exceed-daily", 1000)
+	scopes := Scopes{KeyID: "key-exceed-daily", OrgID: "org-exceed-daily"}
+	tc.Add(scopes, 1000)
 
 	keyLimits := Limits{DailyTokenLimit: 1000}
 	noLimits := Limits{}
 
-	err := tc.CheckTokens("key-exceed-daily", "", "org-exceed-daily", keyLimits, noLimits, noLimits)
+	err := tc.CheckTokens(scopes, ScopeLimits{Key: keyLimits, Team: noLimits, Org: noLimits})
 	if !errors.Is(err, ErrTokenBudgetExceeded) {
 		t.Errorf("CheckTokens() = %v, want ErrTokenBudgetExceeded (1000 >= limit 1000)", err)
 	}
@@ -58,12 +61,13 @@ func TestTokenCounter_CheckTokens_ExceedsKeyMonthlyLimit(t *testing.T) {
 	t.Parallel()
 
 	tc := NewTokenCounter()
-	tc.Add("key-exceed-monthly", "", "org-exceed-monthly", 5000)
+	scopes := Scopes{KeyID: "key-exceed-monthly", OrgID: "org-exceed-monthly"}
+	tc.Add(scopes, 5000)
 
 	keyLimits := Limits{MonthlyTokenLimit: 5000}
 	noLimits := Limits{}
 
-	err := tc.CheckTokens("key-exceed-monthly", "", "org-exceed-monthly", keyLimits, noLimits, noLimits)
+	err := tc.CheckTokens(scopes, ScopeLimits{Key: keyLimits, Team: noLimits, Org: noLimits})
 	if !errors.Is(err, ErrTokenBudgetExceeded) {
 		t.Errorf("CheckTokens() = %v, want ErrTokenBudgetExceeded", err)
 	}
@@ -75,14 +79,15 @@ func TestTokenCounter_KeyLimitExceeded_OrgFine(t *testing.T) {
 	t.Parallel()
 
 	tc := NewTokenCounter()
+	scopes := Scopes{KeyID: "key-tight", OrgID: "org-spacious"}
 	// Add 600 tokens for one key in the org — key limit 500, org limit 10000.
-	tc.Add("key-tight", "", "org-spacious", 600)
+	tc.Add(scopes, 600)
 
 	keyLimits := Limits{DailyTokenLimit: 500}
 	noLimits := Limits{}
 	orgLimits := Limits{DailyTokenLimit: 10000}
 
-	err := tc.CheckTokens("key-tight", "", "org-spacious", keyLimits, noLimits, orgLimits)
+	err := tc.CheckTokens(scopes, ScopeLimits{Key: keyLimits, Team: noLimits, Org: orgLimits})
 	if !errors.Is(err, ErrTokenBudgetExceeded) {
 		t.Errorf("CheckTokens() = %v, want ErrTokenBudgetExceeded (key 600 >= limit 500, org fine)", err)
 	}
@@ -97,15 +102,15 @@ func TestTokenCounter_OrgLimitExceeded_KeyFine(t *testing.T) {
 
 	// Simulate traffic from two different keys that belong to the same org.
 	// keyA and keyB each contribute 300 tokens → org total = 600, org limit = 500.
-	tc.Add("key-a-shared", "", "tight-org", 300)
-	tc.Add("key-b-shared", "", "tight-org", 300)
+	tc.Add(Scopes{KeyID: "key-a-shared", OrgID: "tight-org"}, 300)
+	tc.Add(Scopes{KeyID: "key-b-shared", OrgID: "tight-org"}, 300)
 
 	// The next request comes from key-c: key limit is generous, but org is over.
 	keyLimits := Limits{DailyTokenLimit: 10000}
 	noLimits := Limits{}
 	orgLimits := Limits{DailyTokenLimit: 500}
 
-	err := tc.CheckTokens("key-c-shared", "", "tight-org", keyLimits, noLimits, orgLimits)
+	err := tc.CheckTokens(Scopes{KeyID: "key-c-shared", OrgID: "tight-org"}, ScopeLimits{Key: keyLimits, Team: noLimits, Org: orgLimits})
 	if !errors.Is(err, ErrTokenBudgetExceeded) {
 		t.Errorf("CheckTokens() = %v, want ErrTokenBudgetExceeded (org 600 >= limit 500)", err)
 	}
@@ -117,14 +122,15 @@ func TestTokenCounter_TeamLimitExceeded(t *testing.T) {
 	t.Parallel()
 
 	tc := NewTokenCounter()
+	scopes := Scopes{KeyID: "key-team-member", TeamID: "tight-team", OrgID: "org-team-test"}
 	// Add 400 tokens attributed to team "tight-team".
-	tc.Add("key-team-member", "tight-team", "org-team-test", 400)
+	tc.Add(scopes, 400)
 
 	keyLimits := Limits{DailyTokenLimit: 1000}
 	teamLimits := Limits{DailyTokenLimit: 300}
 	orgLimits := Limits{DailyTokenLimit: 1000}
 
-	err := tc.CheckTokens("key-team-member", "tight-team", "org-team-test", keyLimits, teamLimits, orgLimits)
+	err := tc.CheckTokens(scopes, ScopeLimits{Key: keyLimits, Team: teamLimits, Org: orgLimits})
 	if !errors.Is(err, ErrTokenBudgetExceeded) {
 		t.Errorf("CheckTokens() = %v, want ErrTokenBudgetExceeded (team 400 >= limit 300)", err)
 	}
@@ -136,14 +142,94 @@ func TestTokenCounter_TeamLimitFine(t *testing.T) {
 	t.Parallel()
 
 	tc := NewTokenCounter()
-	tc.Add("key-team-ok", "ok-team", "org-team-ok", 100)
+	scopes := Scopes{KeyID: "key-team-ok", TeamID: "ok-team", OrgID: "org-team-ok"}
+	tc.Add(scopes, 100)
 
 	keyLimits := Limits{DailyTokenLimit: 1000}
 	teamLimits := Limits{DailyTokenLimit: 300}
 	orgLimits := Limits{DailyTokenLimit: 1000}
 
-	if err := tc.CheckTokens("key-team-ok", "ok-team", "org-team-ok", keyLimits, teamLimits, orgLimits); err != nil {
+	if err := tc.CheckTokens(scopes, ScopeLimits{Key: keyLimits, Team: teamLimits, Org: orgLimits}); err != nil {
 		t.Errorf("CheckTokens() = %v, want nil (team 100 < limit 300)", err)
+	}
+}
+
+// TestTokenCounter_UserLimitExceeded verifies that a per-user limit, sourced
+// from the org membership, is enforced across every key that user owns in
+// that org, even when the key and org limits have plenty of headroom.
+func TestTokenCounter_UserLimitExceeded(t *testing.T) {
+	t.Parallel()
+
+	tc := NewTokenCounter()
+	// Two keys owned by the same user in the same org contribute to the same
+	// user-scope budget.
+	tc.Add(Scopes{KeyID: "key-user-a", UserID: "tight-user", OrgID: "org-user-test"}, 250)
+	tc.Add(Scopes{KeyID: "key-user-b", UserID: "tight-user", OrgID: "org-user-test"}, 250)
+
+	keyLimits := Limits{DailyTokenLimit: 1000}
+	userLimits := Limits{DailyTokenLimit: 400}
+	orgLimits := Limits{DailyTokenLimit: 1000}
+
+	err := tc.CheckTokens(Scopes{KeyID: "key-user-a", UserID: "tight-user", OrgID: "org-user-test"},
+		ScopeLimits{Key: keyLimits, User: userLimits, Org: orgLimits})
+	if !errors.Is(err, ErrTokenBudgetExceeded) {
+		t.Errorf("CheckTokens() = %v, want ErrTokenBudgetExceeded (user 500 >= limit 400)", err)
+	}
+}
+
+// TestTokenCounter_UserLimitIsolatedPerOrg verifies that the user-scope
+// counter is org-bound: the same user ID in two different orgs gets
+// independent budgets.
+func TestTokenCounter_UserLimitIsolatedPerOrg(t *testing.T) {
+	t.Parallel()
+
+	tc := NewTokenCounter()
+	userLimits := Limits{DailyTokenLimit: 300}
+	noLimits := Limits{}
+
+	tc.Add(Scopes{KeyID: "shared-user-key-a", UserID: "shared-user", OrgID: "org-a"}, 300)
+	err := tc.CheckTokens(Scopes{KeyID: "shared-user-key-a", UserID: "shared-user", OrgID: "org-a"},
+		ScopeLimits{Key: noLimits, User: userLimits, Org: noLimits})
+	if !errors.Is(err, ErrTokenBudgetExceeded) {
+		t.Errorf("org A CheckTokens() = %v, want ErrTokenBudgetExceeded", err)
+	}
+
+	// Same user ID, different org — must not inherit org A's usage.
+	err = tc.CheckTokens(Scopes{KeyID: "shared-user-key-b", UserID: "shared-user", OrgID: "org-b"},
+		ScopeLimits{Key: noLimits, User: userLimits, Org: noLimits})
+	if err != nil {
+		t.Errorf("org B CheckTokens() = %v, want nil (must not share org A's user budget)", err)
+	}
+}
+
+// TestTokenCounter_EmptyUserID_NoUserEntry verifies that passing an empty
+// UserID to Add does not create a user-scoped counter entry and that
+// CheckTokens with an empty UserID ignores the user limit.
+func TestTokenCounter_EmptyUserID_NoUserEntry(t *testing.T) {
+	t.Parallel()
+
+	tc := NewTokenCounter()
+	scopes := Scopes{KeyID: "key-no-user", OrgID: "org-no-user"}
+	tc.Add(scopes, 300)
+
+	keyLimits := Limits{DailyTokenLimit: 1000}
+	userLimits := Limits{DailyTokenLimit: 1} // would block if the user scope was checked
+	orgLimits := Limits{DailyTokenLimit: 1000}
+
+	if err := tc.CheckTokens(scopes, ScopeLimits{Key: keyLimits, User: userLimits, Org: orgLimits}); err != nil {
+		t.Errorf("CheckTokens() = %v, want nil (empty UserID skips user limit check)", err)
+	}
+
+	found := false
+	tc.dailyCounters.Range(func(k, _ any) bool {
+		if len(k.(string)) >= 5 && k.(string)[:5] == "user:" {
+			found = true
+			return false
+		}
+		return true
+	})
+	if found {
+		t.Error("user-scoped entry was created despite empty UserID")
 	}
 }
 
@@ -154,11 +240,12 @@ func TestTokenCounter_ZeroLimit_Unlimited(t *testing.T) {
 
 	tc := NewTokenCounter()
 	// Add a very large number of tokens.
-	tc.Add("key-unlimited", "team-unlimited", "org-unlimited", 1_000_000)
+	tc.Add(Scopes{KeyID: "key-unlimited", TeamID: "team-unlimited", OrgID: "org-unlimited"}, 1_000_000)
 
 	noLimits := Limits{} // all zeroes = unlimited
 
-	if err := tc.CheckTokens("key-unlimited", "team-unlimited", "org-unlimited", noLimits, noLimits, noLimits); err != nil {
+	if err := tc.CheckTokens(Scopes{KeyID: "key-unlimited", TeamID: "team-unlimited", OrgID: "org-unlimited"},
+		ScopeLimits{Key: noLimits, Team: noLimits, Org: noLimits}); err != nil {
 		t.Errorf("CheckTokens() = %v, want nil (all limits zero = unlimited)", err)
 	}
 }
@@ -215,9 +302,10 @@ func TestTokenCounter_ZeroLimitOnOneScope(t *testing.T) {
 			t.Parallel()
 
 			counter := NewTokenCounter()
-			counter.Add("key-mixed", "", "org-mixed-"+tc.name, tc.tokens)
+			scopes := Scopes{KeyID: "key-mixed", OrgID: "org-mixed-" + tc.name}
+			counter.Add(scopes, tc.tokens)
 
-			err := counter.CheckTokens("key-mixed", "", "org-mixed-"+tc.name, tc.keyLimit, tc.teamLimit, tc.orgLimit)
+			err := counter.CheckTokens(scopes, ScopeLimits{Key: tc.keyLimit, Team: tc.teamLimit, Org: tc.orgLimit})
 			if tc.wantErr && !errors.Is(err, ErrTokenBudgetExceeded) {
 				t.Errorf("CheckTokens() = %v, want ErrTokenBudgetExceeded", err)
 			}
@@ -251,7 +339,8 @@ func TestTokenCounter_DailyWindowReset(t *testing.T) {
 	keyLimits := Limits{DailyTokenLimit: 1000}
 	noLimits := Limits{}
 
-	if err := tc.CheckTokens("key-stale-daily", "", "org-stale-daily", keyLimits, noLimits, noLimits); err != nil {
+	if err := tc.CheckTokens(Scopes{KeyID: "key-stale-daily", OrgID: "org-stale-daily"},
+		ScopeLimits{Key: keyLimits, Team: noLimits, Org: noLimits}); err != nil {
 		t.Errorf("CheckTokens() = %v, want nil (stale window should read as 0 tokens)", err)
 	}
 }
@@ -275,7 +364,8 @@ func TestTokenCounter_MonthlyWindowReset(t *testing.T) {
 	keyLimits := Limits{MonthlyTokenLimit: 5000}
 	noLimits := Limits{}
 
-	if err := tc.CheckTokens("key-stale-monthly", "", "org-stale-monthly", keyLimits, noLimits, noLimits); err != nil {
+	if err := tc.CheckTokens(Scopes{KeyID: "key-stale-monthly", OrgID: "org-stale-monthly"},
+		ScopeLimits{Key: keyLimits, Team: noLimits, Org: noLimits}); err != nil {
 		t.Errorf("CheckTokens() = %v, want nil (stale monthly window should read as 0 tokens)", err)
 	}
 }
@@ -297,12 +387,13 @@ func TestTokenCounter_AddResetsOnWindowRollover(t *testing.T) {
 	tc.dailyCounters.Store("key:key-rollover", stale)
 
 	// Add tokens today — this should claim the new window and reset the count.
-	tc.Add("key-rollover", "", "org-rollover", 100)
+	tc.Add(Scopes{KeyID: "key-rollover", OrgID: "org-rollover"}, 100)
 
 	keyLimits := Limits{DailyTokenLimit: 500}
 	noLimits := Limits{}
 
-	if err := tc.CheckTokens("key-rollover", "", "org-rollover", keyLimits, noLimits, noLimits); err != nil {
+	if err := tc.CheckTokens(Scopes{KeyID: "key-rollover", OrgID: "org-rollover"},
+		ScopeLimits{Key: keyLimits, Team: noLimits, Org: noLimits}); err != nil {
 		t.Errorf("CheckTokens() = %v, want nil (100 tokens after rollover, limit 500)", err)
 	}
 }
@@ -331,7 +422,7 @@ func TestTokenCounter_EvictStale(t *testing.T) {
 	tc.monthlyCounters.Store("key:stale-monthly-key", staleMonthly)
 
 	// Add a current-window entry that must survive eviction.
-	tc.Add("key-current", "", "org-current", 50)
+	tc.Add(Scopes{KeyID: "key-current", OrgID: "org-current"}, 50)
 
 	tc.EvictStale()
 
@@ -359,14 +450,15 @@ func TestTokenCounter_NoTeamID_NoTeamEntry(t *testing.T) {
 	t.Parallel()
 
 	tc := NewTokenCounter()
-	tc.Add("key-no-team", "", "org-no-team", 300)
+	scopes := Scopes{KeyID: "key-no-team", OrgID: "org-no-team"}
+	tc.Add(scopes, 300)
 
 	// Team limits set to very low — but teamID is empty so they must be ignored.
 	keyLimits := Limits{DailyTokenLimit: 1000}
 	teamLimits := Limits{DailyTokenLimit: 1} // would block if team was checked
 	orgLimits := Limits{DailyTokenLimit: 1000}
 
-	if err := tc.CheckTokens("key-no-team", "", "org-no-team", keyLimits, teamLimits, orgLimits); err != nil {
+	if err := tc.CheckTokens(scopes, ScopeLimits{Key: keyLimits, Team: teamLimits, Org: orgLimits}); err != nil {
 		t.Errorf("CheckTokens() = %v, want nil (empty teamID skips team limit check)", err)
 	}
 
@@ -396,13 +488,14 @@ func TestTokenCounter_ConcurrentAdd(t *testing.T) {
 	)
 
 	tc := NewTokenCounter()
+	scopes := Scopes{KeyID: "concurrent-key", OrgID: "concurrent-org"}
 
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
 	for range goroutines {
 		go func() {
 			defer wg.Done()
-			tc.Add("concurrent-key", "", "concurrent-org", tokensEach)
+			tc.Add(scopes, tokensEach)
 		}()
 	}
 	wg.Wait()
@@ -432,14 +525,14 @@ func TestTokenCounter_ConcurrentAddAndCheck(t *testing.T) {
 
 	for i := range 50 {
 		wg.Add(2)
-		key := fmt.Sprintf("race-key-%d", i%5) // reuse 5 keys to create contention
+		scopes := Scopes{KeyID: fmt.Sprintf("race-key-%d", i%5), OrgID: "race-org"} // reuse 5 keys to create contention
 		go func() {
 			defer wg.Done()
-			tc.Add(key, "", "race-org", 10)
+			tc.Add(scopes, 10)
 		}()
 		go func() {
 			defer wg.Done()
-			if err := tc.CheckTokens(key, "", "race-org", keyLimits, noLimits, noLimits); err != nil {
+			if err := tc.CheckTokens(scopes, ScopeLimits{Key: keyLimits, Team: noLimits, Org: noLimits}); err != nil {
 				checkErrors.Add(1)
 			}
 		}()
@@ -452,14 +545,182 @@ func TestTokenCounter_ConcurrentAddAndCheck(t *testing.T) {
 	}
 }
 
+// ---- Seed ---------------------------------------------------------------------
+
+// seedRow is one (key_id, team_id, org_id, user_id, total_tokens) tuple
+// returned by a fakeUsageSeeder, matching the column order of
+// db.QueryUsageSeed / ratelimit.UsageSeeder.
+type seedRow struct {
+	keyID, teamID, orgID, userID string
+	tokens                       int64
+}
+
+// fakeUsageSeeder is an in-memory UsageSeeder for testing TokenCounter.Seed
+// without a real database.
+type fakeUsageSeeder struct {
+	rows []seedRow
+}
+
+func (f *fakeUsageSeeder) QueryUsageSeed(_ context.Context, _ time.Time) (RowScanner, error) {
+	return &fakeRowScanner{rows: f.rows, idx: -1}, nil
+}
+
+// fakeRowScanner implements ratelimit.RowScanner over an in-memory slice.
+type fakeRowScanner struct {
+	rows []seedRow
+	idx  int
+}
+
+func (f *fakeRowScanner) Next() bool {
+	f.idx++
+	return f.idx < len(f.rows)
+}
+
+func (f *fakeRowScanner) Scan(dest ...any) error {
+	r := f.rows[f.idx]
+	*dest[0].(*string) = r.keyID
+	*dest[1].(*string) = r.teamID
+	*dest[2].(*string) = r.orgID
+	*dest[3].(*string) = r.userID
+	*dest[4].(*int64) = r.tokens
+	return nil
+}
+
+func (f *fakeRowScanner) Close() error { return nil }
+func (f *fakeRowScanner) Err() error   { return nil }
+
+// TestTokenCounter_Seed_PopulatesUserScope verifies that Seed loads rows with
+// a non-empty user_id into the org-bound user-scope counter, alongside the
+// key, team, and org scopes, so that a freshly started process immediately
+// enforces per-user limits against already-persisted usage.
+func TestTokenCounter_Seed_PopulatesUserScope(t *testing.T) {
+	t.Parallel()
+
+	tc := NewTokenCounter()
+	seeder := &fakeUsageSeeder{rows: []seedRow{
+		{keyID: "seed-key-1", teamID: "seed-team-1", orgID: "seed-org-1", userID: "seed-user-1", tokens: 300},
+		{keyID: "seed-key-2", teamID: "seed-team-1", orgID: "seed-org-1", userID: "seed-user-1", tokens: 200},
+	}}
+
+	if err := tc.Seed(context.Background(), seeder); err != nil {
+		t.Fatalf("Seed() error = %v", err)
+	}
+
+	userLimits := Limits{DailyTokenLimit: 400}
+	noLimits := Limits{}
+
+	// Two keys owned by seed-user-1 contributed 300+200=500 tokens — over the
+	// 400 limit — even though a fresh CheckTokens call for a third key by the
+	// same user never called Add directly.
+	err := tc.CheckTokens(Scopes{KeyID: "seed-key-3", UserID: "seed-user-1", OrgID: "seed-org-1"},
+		ScopeLimits{Key: noLimits, User: userLimits, Team: noLimits, Org: noLimits})
+	if !errors.Is(err, ErrTokenBudgetExceeded) {
+		t.Errorf("CheckTokens() after Seed = %v, want ErrTokenBudgetExceeded (seeded user total 500 >= limit 400)", err)
+	}
+}
+
+// TestTokenCounter_Seed_UserScopeIsolatedPerOrg verifies that Seed keys the
+// user-scope counter by org, matching Add/CheckTokens: two rows with the same
+// user_id but different org_id must not share a budget.
+func TestTokenCounter_Seed_UserScopeIsolatedPerOrg(t *testing.T) {
+	t.Parallel()
+
+	tc := NewTokenCounter()
+	seeder := &fakeUsageSeeder{rows: []seedRow{
+		{keyID: "seed-iso-key-a", orgID: "seed-iso-org-a", userID: "seed-iso-user", tokens: 500},
+		{keyID: "seed-iso-key-b", orgID: "seed-iso-org-b", userID: "seed-iso-user", tokens: 50},
+	}}
+
+	if err := tc.Seed(context.Background(), seeder); err != nil {
+		t.Fatalf("Seed() error = %v", err)
+	}
+
+	userLimits := Limits{DailyTokenLimit: 400}
+	noLimits := Limits{}
+
+	// Org A: seeded 500 >= limit 400 → exceeded.
+	err := tc.CheckTokens(Scopes{KeyID: "seed-iso-key-a", UserID: "seed-iso-user", OrgID: "seed-iso-org-a"},
+		ScopeLimits{Key: noLimits, User: userLimits, Org: noLimits})
+	if !errors.Is(err, ErrTokenBudgetExceeded) {
+		t.Errorf("org A CheckTokens() = %v, want ErrTokenBudgetExceeded", err)
+	}
+
+	// Org B: seeded only 50 < limit 400 → fine, must not inherit org A's total.
+	err = tc.CheckTokens(Scopes{KeyID: "seed-iso-key-b", UserID: "seed-iso-user", OrgID: "seed-iso-org-b"},
+		ScopeLimits{Key: noLimits, User: userLimits, Org: noLimits})
+	if err != nil {
+		t.Errorf("org B CheckTokens() = %v, want nil (must not share org A's seeded user budget)", err)
+	}
+}
+
+// TestTokenCounter_Seed_EmptyUserID_NoUserEntry verifies that Seed does not
+// create a user-scoped counter for rows with an empty user_id (team_key and
+// sa_key usage events have no owning user).
+func TestTokenCounter_Seed_EmptyUserID_NoUserEntry(t *testing.T) {
+	t.Parallel()
+
+	tc := NewTokenCounter()
+	seeder := &fakeUsageSeeder{rows: []seedRow{
+		{keyID: "seed-noUser-key", teamID: "seed-noUser-team", orgID: "seed-noUser-org", userID: "", tokens: 900},
+	}}
+
+	if err := tc.Seed(context.Background(), seeder); err != nil {
+		t.Fatalf("Seed() error = %v", err)
+	}
+
+	found := false
+	tc.dailyCounters.Range(func(k, _ any) bool {
+		if key, ok := k.(string); ok && len(key) >= 5 && key[:5] == "user:" {
+			found = true
+			return false
+		}
+		return true
+	})
+	if found {
+		t.Error("user-scoped entry was created for a seed row with empty user_id")
+	}
+
+	// Key and team and org scopes must still be seeded normally.
+	teamLimits := Limits{DailyTokenLimit: 800}
+	noLimits := Limits{}
+	err := tc.CheckTokens(Scopes{KeyID: "seed-noUser-key", TeamID: "seed-noUser-team", OrgID: "seed-noUser-org"},
+		ScopeLimits{Key: noLimits, Team: teamLimits, Org: noLimits})
+	if !errors.Is(err, ErrTokenBudgetExceeded) {
+		t.Errorf("CheckTokens() = %v, want ErrTokenBudgetExceeded (team seeded 900 >= limit 800)", err)
+	}
+}
+
+// TestTokenCounter_Seed_QueryError propagates a query error from the seeder.
+func TestTokenCounter_Seed_QueryError(t *testing.T) {
+	t.Parallel()
+
+	tc := NewTokenCounter()
+	wantErr := errors.New("boom")
+	err := tc.Seed(context.Background(), &erroringSeeder{err: wantErr})
+	if err == nil {
+		t.Fatal("Seed() error = nil, want non-nil")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("Seed() error = %v, want it to wrap %v", err, wantErr)
+	}
+}
+
+// erroringSeeder always fails QueryUsageSeed.
+type erroringSeeder struct{ err error }
+
+func (e *erroringSeeder) QueryUsageSeed(_ context.Context, _ time.Time) (RowScanner, error) {
+	return nil, e.err
+}
+
 // BenchmarkTokenCounter_Add benchmarks the hot-path token addition.
 func BenchmarkTokenCounter_Add(b *testing.B) {
 	tc := NewTokenCounter()
+	scopes := Scopes{KeyID: "bench-key", TeamID: "bench-team", OrgID: "bench-org"}
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			tc.Add("bench-key", "bench-team", "bench-org", 100)
+			tc.Add(scopes, 100)
 		}
 	})
 }
@@ -467,14 +728,15 @@ func BenchmarkTokenCounter_Add(b *testing.B) {
 // BenchmarkTokenCounter_CheckTokens benchmarks token budget checking.
 func BenchmarkTokenCounter_CheckTokens(b *testing.B) {
 	tc := NewTokenCounter()
-	tc.Add("bench-key", "bench-team", "bench-org", 100)
+	scopes := Scopes{KeyID: "bench-key", TeamID: "bench-team", OrgID: "bench-org"}
+	tc.Add(scopes, 100)
 	keyLimits := Limits{DailyTokenLimit: 1_000_000, MonthlyTokenLimit: 10_000_000}
 	noLimits := Limits{}
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if err := tc.CheckTokens("bench-key", "bench-team", "bench-org", keyLimits, noLimits, noLimits); err != nil {
+			if err := tc.CheckTokens(scopes, ScopeLimits{Key: keyLimits, Team: noLimits, Org: noLimits}); err != nil {
 				b.Fatal(err)
 			}
 		}

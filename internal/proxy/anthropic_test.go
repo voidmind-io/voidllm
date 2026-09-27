@@ -1274,7 +1274,7 @@ func TestAnthropicTransformRequest_ToolResultArrayContent(t *testing.T) {
 		}
 	})
 
-	t.Run("array with only non-text parts emits empty array", func(t *testing.T) {
+	t.Run("array with only non-text parts omits the content key", func(t *testing.T) {
 		t.Parallel()
 		input := `{"model":"claude-3","messages":[` +
 			`{"role":"user","content":"q"},` +
@@ -1288,20 +1288,11 @@ func TestAnthropicTransformRequest_ToolResultArrayContent(t *testing.T) {
 		if block.Type != "tool_result" {
 			t.Errorf("type = %q, want tool_result", block.Type)
 		}
-		// Must be literally "[]", not "null" — a nil Go slice marshals to null,
-		// but we want an explicit empty array for consistency with Gemini adapter.
-		if string(block.Content) == "null" {
-			t.Fatalf("tool_result.content is null; want [] (use make([]T, 0) not var []T)")
-		}
-		var blocks []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal(block.Content, &blocks); err != nil {
-			t.Fatalf("unmarshal content as array: %v (raw: %s)", err, block.Content)
-		}
-		if len(blocks) != 0 {
-			t.Errorf("len(content array) = %d, want 0 (non-text parts skipped)", len(blocks))
+		// Once every part reduces to zero text blocks (non-text parts skipped,
+		// no empty text left), the tool_result block omits "content" entirely
+		// rather than emitting "content":[].
+		if block.Content != nil {
+			t.Errorf("tool_result.content = %s, want omitted (no key)", block.Content)
 		}
 	})
 }

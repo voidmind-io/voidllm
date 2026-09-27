@@ -23,11 +23,13 @@ import (
 // rawColumnValue reads a single column's current stored value for the row
 // identified by id, bypassing all "deleted_at IS NULL" filtering that the
 // store's normal getters apply. It is used to assert on the raw, possibly
-// tombstone-mangled, value written by a soft-delete.
+// tombstone-mangled, value written by a soft-delete. The placeholder is
+// dialect-specific ("?" for SQLite, "$1" for PostgreSQL) so this helper works
+// unchanged against either database when called via forEachDialect.
 func rawColumnValue(t *testing.T, d *DB, table, column, id string) string {
 	t.Helper()
 	var got string
-	query := "SELECT " + column + " FROM " + table + " WHERE id = ?"
+	query := "SELECT " + column + " FROM " + table + " WHERE id = " + d.dialect.Placeholder(1)
 	if err := d.sql.QueryRowContext(context.Background(), query, id).Scan(&got); err != nil {
 		t.Fatalf("rawColumnValue(%s.%s, id=%s): %v", table, column, id, err)
 	}

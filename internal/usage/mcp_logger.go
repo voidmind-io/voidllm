@@ -39,6 +39,10 @@ type MCPToolCallEvent struct {
 	// CodeModeExecutionID groups all tool calls from a single execute_code
 	// invocation. Empty for non-Code-Mode calls.
 	CodeModeExecutionID string
+	// CreatedAt is the wall-clock time the tool call completed. Callers do
+	// not need to set it — Log stamps it with the current UTC time when it
+	// is left zero.
+	CreatedAt time.Time
 }
 
 // MCPToolCallLogger logs MCP tool call events asynchronously.
@@ -79,6 +83,9 @@ func NewMCPLogger(database *db.DB, bufferSize int, log *slog.Logger) *MCPLogger 
 // Log enqueues an event for async persistence. If the internal buffer is full
 // the event is silently dropped to avoid blocking the proxy hot path.
 func (l *MCPLogger) Log(event MCPToolCallEvent) {
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = time.Now().UTC()
+	}
 	select {
 	case l.events <- event:
 	default:
@@ -133,6 +140,7 @@ func (l *MCPLogger) run() {
 				Status:           event.Status,
 				RequestID:        event.RequestID,
 				CodeMode:         event.CodeMode,
+				CreatedAt:        db.FormatTimestamp(event.CreatedAt),
 			}
 			if event.CodeModeExecutionID != "" {
 				call.CodeModeExecutionID = &event.CodeModeExecutionID

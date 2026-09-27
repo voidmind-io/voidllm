@@ -13,6 +13,7 @@ import (
 
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/pkg/keygen"
 )
 
 // mustCreateUserWithPassword creates a user with a known bcrypt password hash
@@ -340,4 +341,85 @@ func slugFor(name string) string {
 		s = s[:40]
 	}
 	return s
+}
+
+// TestLogin_CacheHasFullLimitsImmediately verifies that the session key cache
+// entry written on a successful login already carries the org, team, and
+// per-user limit hierarchy — populated via db.LoadActiveKey +
+// auth.KeyInfoFromRecord — rather than a stale or partial entry that would
+// only pick up limits on the next periodic cache reload (up to 30s later).
+func TestLogin_CacheHasFullLimitsImmediately(t *testing.T) {
+	t.Parallel()
+
+	const testPassword = "correcthorsebatterystaple"
+	app, database, keyCache := setupTestApp(t, "file:TestLogin_CacheFullLimits?mode=memory&cache=private")
+
+	org := mustCreateOrg(t, database, "Login Limits Org", "login-limits-org")
+	// Give the org non-zero limits so we can distinguish "populated" from the zero value.
+	_, err := database.SQL().ExecContext(context.Background(),
+		"UPDATE organizations SET daily_token_limit = 50000, requests_per_minute = 40 WHERE id = ?", org.ID)
+	if err != nil {
+		t.Fatalf("set org limits: %v", err)
+	}
+
+	user := mustCreateUserWithPassword(t, database, "login-limits@example.com", "Login Limits User", testPassword)
+	mustCreateOrgMembership(t, database, org.ID, user.ID, auth.RoleMember)
+
+	// Set the per-user limit on the membership so the login path must resolve
+	// it via the JOIN, not just org/team limits.
+	memberships, err := database.ListOrgMemberships(context.Background(), org.ID, "", 100)
+	if err != nil {
+		t.Fatalf("ListOrgMemberships: %v", err)
+	}
+	var membershipID string
+	for _, m := range memberships {
+		if m.UserID == user.ID {
+			membershipID = m.ID
+		}
+	}
+	if membershipID == "" {
+		t.Fatal("membership not found")
+	}
+	rpm := 12
+	if _, err := database.UpdateOrgMembership(context.Background(), membershipID, db.UpdateOrgMembershipParams{
+		RequestsPerMinute: &rpm,
+	}); err != nil {
+		t.Fatalf("UpdateOrgMembership: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/api/v1/auth/login",
+		bodyJSON(t, map[string]any{"email": "login-limits@example.com", "password": testPassword}))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+	token, _ := got["token"].(string)
+	if token == "" {
+		t.Fatal("login response missing token")
+	}
+
+	hash := keygen.Hash(token, testHMACSecret)
+	ki, ok := keyCache.Get(hash)
+	if !ok {
+		t.Fatal("session key not found in cache after login")
+	}
+	if ki.OrgDailyTokenLimit != 50_000 {
+		t.Errorf("OrgDailyTokenLimit = %d, want 50000 (must be populated immediately, not after reload)", ki.OrgDailyTokenLimit)
+	}
+	if ki.OrgRequestsPerMinute != 40 {
+		t.Errorf("OrgRequestsPerMinute = %d, want 40", ki.OrgRequestsPerMinute)
+	}
+	if ki.UserRequestsPerMinute != 12 {
+		t.Errorf("UserRequestsPerMinute = %d, want 12 (per-user membership limit must be populated immediately)", ki.UserRequestsPerMinute)
+	}
 }

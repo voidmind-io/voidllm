@@ -52,13 +52,25 @@ If you missed them, delete the database and restart to re-bootstrap.
 
 ### 429 Rate limit exceeded
 - The caller has exceeded their rate limit (RPM/RPD) or token budget
-- Check limits on the key, team, and org level
+- Check limits on the org, team, user, and key level
 - Most-restrictive-wins: the tightest limit anywhere in the hierarchy applies
+- The user-level limit is set on the caller's org membership (`PATCH /api/v1/orgs/{org_id}/members/{membership_id}`) and applies across every API key that user owns in that org, even if each individual key has a higher or no limit
+- Only org admins and system admins can set org-, team-, and user-level limits; key-level limits can also only be set by org admins and system admins (a `team_admin` can never set or raise limits on any key, even one scoped to their own team) — an org-level service account key may set limits on other keys but never on its own key or another key of the same service account
 
 ### Streaming responses cut off
+- Check the logs for `stream timeout exceeded, aborting upstream connection`. This log
+  identifies the effective stream-duration cap as the cause: the model's `timeout` when one is
+  configured, otherwise `server.proxy.max_stream_duration` (default 5m, maximum 1h). Note that
+  a per-model `timeout` replaces the global cap rather than combining with it, so a low
+  per-model value overrides a high global one.
+- `write_timeout` is a separate absolute write deadline, and it can truncate an active stream
+  on its own. Raising it does not lift the duration cap, and raising that cap does not help
+  while `write_timeout` is shorter, so a long stream needs both to be large enough.
 - Reverse proxy may be buffering responses - set `proxy_buffering off` in Nginx
-- Upstream timeout may be too short - increase `write_timeout` in server config
-- Check per-model timeout if set
+
+When a stream is cut this way the upstream request is cancelled, so depending on the provider
+its logs may show only a client cancellation or no error at all, which can make the cutoff
+look like a model failure.
 
 ## MCP Issues
 

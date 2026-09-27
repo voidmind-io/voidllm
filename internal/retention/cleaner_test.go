@@ -379,8 +379,20 @@ func TestCleanupTable_BatchSizePlusOne(t *testing.T) {
 	}
 }
 
-// TestRunOnce_CutoffBoundary verifies strict less-than semantics: a row whose
-// created_at equals the exact cutoff is KEPT; a row 1 second older is deleted.
+// TestRunOnce_CutoffBoundary approximates strict less-than semantics around
+// the retention cutoff: a row safely inside the retention window is KEPT; a
+// row safely outside it is deleted.
+//
+// The Cleaner has no injectable clock (runTable calls time.Now() directly),
+// so the exact instant of the cutoff cannot be observed or controlled from
+// the test. Rather than placing a row exactly "at" the cutoff computed here
+// -- which raced against the cleaner's own, slightly later, time.Now() call
+// and made the row nondeterministically older or younger than the real
+// cutoff -- both rows are placed a margin (30s) away from the approximate
+// cutoff, comfortably larger than any plausible scheduling delay between the
+// two time.Now() calls. This still exercises the boundary logic (row near
+// but inside the window survives, row near but outside it is deleted)
+// without asserting on the unobservable exact-equality case.
 func TestRunOnce_CutoffBoundary(t *testing.T) {
 	t.Parallel()
 
@@ -394,15 +406,15 @@ func TestRunOnce_CutoffBoundary(t *testing.T) {
 
 	// Compute what the cleaner will use as the cutoff string. The cleaner does:
 	//   cutoff = time.Now().UTC().Add(-maxAge)
-	// We approximate this by computing it here. There is a tiny window where
-	// time.Now() inside the cleaner is slightly after ours, but we add a
-	// 2-second safety margin on the "at cutoff" row to make the test robust.
+	// We approximate this by computing it here.
 	//
-	// Row A: exactly at the cutoff second (should be KEPT).
-	// Row B: 2 seconds before the cutoff (should be DELETED).
+	// Row A: 30s inside the retention window relative to our approximate
+	// cutoff (should be KEPT).
+	// Row B: 30s outside the retention window relative to our approximate
+	// cutoff (should be DELETED).
 	cutoffApprox := now.Add(-24 * time.Hour)
-	tsAtCutoff := cutoffApprox.Format(time.RFC3339Nano)
-	tsOneSecOlder := cutoffApprox.Add(-2 * time.Second).Format(time.RFC3339Nano)
+	tsInsideWindow := cutoffApprox.Add(30 * time.Second).Format(time.RFC3339Nano)
+	tsOutsideWindow := cutoffApprox.Add(-30 * time.Second).Format(time.RFC3339Nano)
 
 	ctx := context.Background()
 
@@ -419,8 +431,8 @@ func TestRunOnce_CutoffBoundary(t *testing.T) {
 		id string
 		ts string
 	}{
-		{idA.String(), tsAtCutoff},
-		{idB.String(), tsOneSecOlder},
+		{idA.String(), tsInsideWindow},
+		{idB.String(), tsOutsideWindow},
 	} {
 		_, err := database.SQL().ExecContext(ctx,
 			`INSERT INTO usage_events
@@ -436,20 +448,20 @@ func TestRunOnce_CutoffBoundary(t *testing.T) {
 	c := newTestCleaner(database, cfg)
 	c.runOnce(ctx)
 
-	// Only the row older than the cutoff should be gone; the row AT the cutoff
-	// must remain (strict < comparison in the SQL).
+	// Only the row outside the retention window should be gone; the row
+	// safely inside the window must remain.
 	if got := countTableRows(t, database, "usage_events"); got != 1 {
-		t.Errorf("usage_events count after boundary cleanup = %d, want 1 (row at cutoff must be kept)", got)
+		t.Errorf("usage_events count after boundary cleanup = %d, want 1 (row inside the retention window must be kept)", got)
 	}
 
-	// Confirm the surviving row is the one at the cutoff, not the older one.
+	// Confirm the surviving row is the one inside the window, not the one outside it.
 	var survivingID string
 	err = database.SQL().QueryRowContext(ctx, "SELECT id FROM usage_events LIMIT 1").Scan(&survivingID)
 	if err != nil {
 		t.Fatalf("select surviving row: %v", err)
 	}
 	if survivingID != idA.String() {
-		t.Errorf("surviving row id = %q, want %q (row at cutoff must be kept)", survivingID, idA.String())
+		t.Errorf("surviving row id = %q, want %q (row inside the retention window must be kept)", survivingID, idA.String())
 	}
 }
 

@@ -20,6 +20,7 @@ import type { APIKeyResponse, CreateAPIKeyParams } from '../hooks/useAPIKeys'
 import { useTeams } from '../hooks/useTeams'
 import { useServiceAccounts } from '../hooks/useServiceAccounts'
 import { useToast } from '../hooks/useToast'
+import { parseLimitInput } from '../lib/utils'
 import apiClient from '../api/client'
 
 // ---------------------------------------------------------------------------
@@ -216,9 +217,10 @@ interface CreateKeyDialogProps {
   onClose: () => void
   onCreated: (key: string) => void
   orgId: string
+  isOrgAdmin: boolean
 }
 
-function CreateKeyDialog({ open, onClose, onCreated, orgId }: CreateKeyDialogProps) {
+function CreateKeyDialog({ open, onClose, onCreated, orgId, isOrgAdmin }: CreateKeyDialogProps) {
   const [name, setName] = useState('')
   const [keyType, setKeyType] = useState('user_key')
   const [expiresIn, setExpiresIn] = useState('90d')
@@ -250,6 +252,19 @@ function CreateKeyDialog({ open, onClose, onCreated, orgId }: CreateKeyDialogPro
     queryKey: ['available-models'],
     queryFn: () => apiClient<{ models: string[] }>('/me/available-models'),
   })
+
+  const dailyTokenLimitResult = parseLimitInput(dailyTokenLimit)
+  const monthlyTokenLimitResult = parseLimitInput(monthlyTokenLimit)
+  const requestsPerMinuteResult = parseLimitInput(requestsPerMinute)
+  const requestsPerDayResult = parseLimitInput(requestsPerDay)
+  const hasLimitErrors =
+    isOrgAdmin &&
+    Boolean(
+      dailyTokenLimitResult.error ||
+        monthlyTokenLimitResult.error ||
+        requestsPerMinuteResult.error ||
+        requestsPerDayResult.error,
+    )
 
   function handleClose() {
     setName('')
@@ -324,6 +339,8 @@ function CreateKeyDialog({ open, onClose, onCreated, orgId }: CreateKeyDialogPro
       setServiceAccountError(undefined)
     }
 
+    if (hasLimitErrors) hasError = true
+
     if (hasError) return
 
     let effectiveTeamId = teamId
@@ -346,21 +363,11 @@ function CreateKeyDialog({ open, onClose, onCreated, orgId }: CreateKeyDialogPro
       ...(keyType === 'sa_key' && serviceAccountId ? { service_account_id: serviceAccountId } : {}),
     }
 
-    const parsedDailyToken = parseInt(dailyTokenLimit, 10)
-    if (dailyTokenLimit.trim() && !isNaN(parsedDailyToken)) {
-      params.daily_token_limit = parsedDailyToken
-    }
-    const parsedMonthlyToken = parseInt(monthlyTokenLimit, 10)
-    if (monthlyTokenLimit.trim() && !isNaN(parsedMonthlyToken)) {
-      params.monthly_token_limit = parsedMonthlyToken
-    }
-    const parsedRpm = parseInt(requestsPerMinute, 10)
-    if (requestsPerMinute.trim() && !isNaN(parsedRpm)) {
-      params.requests_per_minute = parsedRpm
-    }
-    const parsedRpd = parseInt(requestsPerDay, 10)
-    if (requestsPerDay.trim() && !isNaN(parsedRpd)) {
-      params.requests_per_day = parsedRpd
+    if (isOrgAdmin) {
+      if (dailyTokenLimit.trim()) params.daily_token_limit = dailyTokenLimitResult.value
+      if (monthlyTokenLimit.trim()) params.monthly_token_limit = monthlyTokenLimitResult.value
+      if (requestsPerMinute.trim()) params.requests_per_minute = requestsPerMinuteResult.value
+      if (requestsPerDay.trim()) params.requests_per_day = requestsPerDayResult.value
     }
 
     createKey.mutate(params, {
@@ -444,65 +451,71 @@ function CreateKeyDialog({ open, onClose, onCreated, orgId }: CreateKeyDialogPro
           disabled={createKey.isPending}
         />
 
-        {/* Rate & Token Limits — collapsible */}
-        <div className="border-t border-border pt-4">
-          <button
-            type="button"
-            className="flex w-full items-center justify-between"
-            onClick={() => setShowAdvancedLimits((v) => !v)}
-            disabled={createKey.isPending}
-          >
-            <span className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
-              Rate &amp; Token Limits
-            </span>
-            <IconChevronDown
-              className={[
-                'h-3.5 w-3.5 text-text-tertiary transition-transform duration-150',
-                showAdvancedLimits ? 'rotate-180' : '',
-              ].join(' ')}
-            />
-          </button>
-          {showAdvancedLimits && (
-            <div className="mt-4 space-y-4">
-              <div className="grid grid-cols-2 gap-4">
-                <Input
-                  label="Daily Token Limit"
-                  type="number"
-                  value={dailyTokenLimit}
-                  onChange={(e) => setDailyTokenLimit(e.target.value)}
-                  placeholder="0 = unlimited"
-                  disabled={createKey.isPending}
-                />
-                <Input
-                  label="Monthly Token Limit"
-                  type="number"
-                  value={monthlyTokenLimit}
-                  onChange={(e) => setMonthlyTokenLimit(e.target.value)}
-                  placeholder="0 = unlimited"
-                  disabled={createKey.isPending}
-                />
+        {/* Rate & Token Limits — collapsible, org admins only */}
+        {isOrgAdmin && (
+          <div className="border-t border-border pt-4">
+            <button
+              type="button"
+              className="flex w-full items-center justify-between"
+              onClick={() => setShowAdvancedLimits((v) => !v)}
+              disabled={createKey.isPending}
+            >
+              <span className="text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
+                Rate &amp; Token Limits
+              </span>
+              <IconChevronDown
+                className={[
+                  'h-3.5 w-3.5 text-text-tertiary transition-transform duration-150',
+                  showAdvancedLimits ? 'rotate-180' : '',
+                ].join(' ')}
+              />
+            </button>
+            {showAdvancedLimits && (
+              <div className="mt-4 space-y-4">
+                <div className="grid grid-cols-2 gap-4">
+                  <Input
+                    label="Daily Token Limit"
+                    type="number"
+                    value={dailyTokenLimit}
+                    onChange={(e) => setDailyTokenLimit(e.target.value)}
+                    placeholder="0 = unlimited"
+                    error={dailyTokenLimitResult.error}
+                    disabled={createKey.isPending}
+                  />
+                  <Input
+                    label="Monthly Token Limit"
+                    type="number"
+                    value={monthlyTokenLimit}
+                    onChange={(e) => setMonthlyTokenLimit(e.target.value)}
+                    placeholder="0 = unlimited"
+                    error={monthlyTokenLimitResult.error}
+                    disabled={createKey.isPending}
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <Input
+                    label="Requests per Minute"
+                    type="number"
+                    value={requestsPerMinute}
+                    onChange={(e) => setRequestsPerMinute(e.target.value)}
+                    placeholder="0 = unlimited"
+                    error={requestsPerMinuteResult.error}
+                    disabled={createKey.isPending}
+                  />
+                  <Input
+                    label="Requests per Day"
+                    type="number"
+                    value={requestsPerDay}
+                    onChange={(e) => setRequestsPerDay(e.target.value)}
+                    placeholder="0 = unlimited"
+                    error={requestsPerDayResult.error}
+                    disabled={createKey.isPending}
+                  />
+                </div>
               </div>
-              <div className="grid grid-cols-2 gap-4">
-                <Input
-                  label="Requests per Minute"
-                  type="number"
-                  value={requestsPerMinute}
-                  onChange={(e) => setRequestsPerMinute(e.target.value)}
-                  placeholder="0 = unlimited"
-                  disabled={createKey.isPending}
-                />
-                <Input
-                  label="Requests per Day"
-                  type="number"
-                  value={requestsPerDay}
-                  onChange={(e) => setRequestsPerDay(e.target.value)}
-                  placeholder="0 = unlimited"
-                  disabled={createKey.isPending}
-                />
-              </div>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        )}
 
         {/* Model Access — collapsible */}
         <div className="border-t border-border pt-4">
@@ -568,7 +581,7 @@ function CreateKeyDialog({ open, onClose, onCreated, orgId }: CreateKeyDialogPro
           >
             Cancel
           </Button>
-          <Button onClick={handleSubmit} loading={createKey.isPending}>
+          <Button onClick={handleSubmit} loading={createKey.isPending} disabled={hasLimitErrors}>
             Create Key
           </Button>
         </div>
@@ -652,13 +665,30 @@ const EDIT_EXPIRES_OPTIONS = [
   { value: 'never', label: 'Never' },
 ]
 
+interface ReadOnlyLimitProps {
+  label: string
+  value: number
+}
+
+function ReadOnlyLimit({ label, value }: ReadOnlyLimitProps) {
+  return (
+    <div>
+      <p className="mb-1.5 text-xs font-medium text-text-secondary">{label}</p>
+      <div className="rounded-md border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary">
+        {value > 0 ? value.toLocaleString() : 'Unlimited'}
+      </div>
+    </div>
+  )
+}
+
 interface EditKeyDialogProps {
   apiKey: APIKeyResponse
   onClose: () => void
   orgId: string
+  isOrgAdmin: boolean
 }
 
-function EditKeyDialog({ apiKey, onClose, orgId }: EditKeyDialogProps) {
+function EditKeyDialog({ apiKey, onClose, orgId, isOrgAdmin }: EditKeyDialogProps) {
   const [name, setName] = useState(apiKey.name)
   const [expiresIn, setExpiresIn] = useState('keep')
   const [dailyTokenLimit, setDailyTokenLimit] = useState(
@@ -678,6 +708,19 @@ function EditKeyDialog({ apiKey, onClose, orgId }: EditKeyDialogProps) {
   const updateKey = useUpdateAPIKey(orgId)
   const { toast } = useToast()
 
+  const dailyTokenLimitResult = parseLimitInput(dailyTokenLimit)
+  const monthlyTokenLimitResult = parseLimitInput(monthlyTokenLimit)
+  const requestsPerMinuteResult = parseLimitInput(requestsPerMinute)
+  const requestsPerDayResult = parseLimitInput(requestsPerDay)
+  const hasLimitErrors =
+    isOrgAdmin &&
+    Boolean(
+      dailyTokenLimitResult.error ||
+        monthlyTokenLimitResult.error ||
+        requestsPerMinuteResult.error ||
+        requestsPerDayResult.error,
+    )
+
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
 
@@ -688,6 +731,8 @@ function EditKeyDialog({ apiKey, onClose, orgId }: EditKeyDialogProps) {
     }
     setNameError(undefined)
 
+    if (hasLimitErrors) return
+
     const params: Record<string, unknown> = {}
 
     if (trimmedName !== apiKey.name) params.name = trimmedName
@@ -696,24 +741,19 @@ function EditKeyDialog({ apiKey, onClose, orgId }: EditKeyDialogProps) {
       params.expires_at = expiresAtFromOption(expiresIn) ?? null
     }
 
-    const parsedDailyToken = dailyTokenLimit.trim() ? parseInt(dailyTokenLimit, 10) : 0
-    if (!isNaN(parsedDailyToken) && parsedDailyToken !== apiKey.daily_token_limit) {
-      params.daily_token_limit = parsedDailyToken
-    }
-
-    const parsedMonthlyToken = monthlyTokenLimit.trim() ? parseInt(monthlyTokenLimit, 10) : 0
-    if (!isNaN(parsedMonthlyToken) && parsedMonthlyToken !== apiKey.monthly_token_limit) {
-      params.monthly_token_limit = parsedMonthlyToken
-    }
-
-    const parsedRpm = requestsPerMinute.trim() ? parseInt(requestsPerMinute, 10) : 0
-    if (!isNaN(parsedRpm) && parsedRpm !== apiKey.requests_per_minute) {
-      params.requests_per_minute = parsedRpm
-    }
-
-    const parsedRpd = requestsPerDay.trim() ? parseInt(requestsPerDay, 10) : 0
-    if (!isNaN(parsedRpd) && parsedRpd !== apiKey.requests_per_day) {
-      params.requests_per_day = parsedRpd
+    if (isOrgAdmin) {
+      if (dailyTokenLimitResult.value !== apiKey.daily_token_limit) {
+        params.daily_token_limit = dailyTokenLimitResult.value
+      }
+      if (monthlyTokenLimitResult.value !== apiKey.monthly_token_limit) {
+        params.monthly_token_limit = monthlyTokenLimitResult.value
+      }
+      if (requestsPerMinuteResult.value !== apiKey.requests_per_minute) {
+        params.requests_per_minute = requestsPerMinuteResult.value
+      }
+      if (requestsPerDayResult.value !== apiKey.requests_per_day) {
+        params.requests_per_day = requestsPerDayResult.value
+      }
     }
 
     if (Object.keys(params).length === 0) {
@@ -756,47 +796,70 @@ function EditKeyDialog({ apiKey, onClose, orgId }: EditKeyDialogProps) {
           onChange={setExpiresIn}
           disabled={updateKey.isPending}
         />
-        <div className="grid grid-cols-2 gap-4">
-          <Input
-            label="Daily Token Limit"
-            type="number"
-            value={dailyTokenLimit}
-            onChange={(e) => setDailyTokenLimit(e.target.value)}
-            placeholder="0 = unlimited"
-            disabled={updateKey.isPending}
-          />
-          <Input
-            label="Monthly Token Limit"
-            type="number"
-            value={monthlyTokenLimit}
-            onChange={(e) => setMonthlyTokenLimit(e.target.value)}
-            placeholder="0 = unlimited"
-            disabled={updateKey.isPending}
-          />
-        </div>
-        <div className="grid grid-cols-2 gap-4">
-          <Input
-            label="Requests per Minute"
-            type="number"
-            value={requestsPerMinute}
-            onChange={(e) => setRequestsPerMinute(e.target.value)}
-            placeholder="0 = unlimited"
-            disabled={updateKey.isPending}
-          />
-          <Input
-            label="Requests per Day"
-            type="number"
-            value={requestsPerDay}
-            onChange={(e) => setRequestsPerDay(e.target.value)}
-            placeholder="0 = unlimited"
-            disabled={updateKey.isPending}
-          />
-        </div>
+        {isOrgAdmin ? (
+          <>
+            <div className="grid grid-cols-2 gap-4">
+              <Input
+                label="Daily Token Limit"
+                type="number"
+                value={dailyTokenLimit}
+                onChange={(e) => setDailyTokenLimit(e.target.value)}
+                placeholder="0 = unlimited"
+                error={dailyTokenLimitResult.error}
+                disabled={updateKey.isPending}
+              />
+              <Input
+                label="Monthly Token Limit"
+                type="number"
+                value={monthlyTokenLimit}
+                onChange={(e) => setMonthlyTokenLimit(e.target.value)}
+                placeholder="0 = unlimited"
+                error={monthlyTokenLimitResult.error}
+                disabled={updateKey.isPending}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <Input
+                label="Requests per Minute"
+                type="number"
+                value={requestsPerMinute}
+                onChange={(e) => setRequestsPerMinute(e.target.value)}
+                placeholder="0 = unlimited"
+                error={requestsPerMinuteResult.error}
+                disabled={updateKey.isPending}
+              />
+              <Input
+                label="Requests per Day"
+                type="number"
+                value={requestsPerDay}
+                onChange={(e) => setRequestsPerDay(e.target.value)}
+                placeholder="0 = unlimited"
+                error={requestsPerDayResult.error}
+                disabled={updateKey.isPending}
+              />
+            </div>
+          </>
+        ) : (
+          <div className="border-t border-border pt-4">
+            <p className="mb-3 text-[10px] font-medium tracking-widest uppercase text-text-tertiary">
+              Rate &amp; Token Limits
+            </p>
+            <div className="grid grid-cols-2 gap-4">
+              <ReadOnlyLimit label="Daily Token Limit" value={apiKey.daily_token_limit} />
+              <ReadOnlyLimit label="Monthly Token Limit" value={apiKey.monthly_token_limit} />
+              <ReadOnlyLimit label="Requests per Minute" value={apiKey.requests_per_minute} />
+              <ReadOnlyLimit label="Requests per Day" value={apiKey.requests_per_day} />
+            </div>
+            <p className="mt-3 text-xs text-text-tertiary">
+              Only organization admins can change key limits.
+            </p>
+          </div>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="secondary" onClick={onClose} disabled={updateKey.isPending}>
             Cancel
           </Button>
-          <Button onClick={handleSubmit} loading={updateKey.isPending}>
+          <Button onClick={handleSubmit} loading={updateKey.isPending} disabled={hasLimitErrors}>
             Save Changes
           </Button>
         </div>
@@ -812,6 +875,7 @@ function EditKeyDialog({ apiKey, onClose, orgId }: EditKeyDialogProps) {
 export default function KeysPage() {
   const { data: me } = useMe()
   const orgId = me?.org_id ?? ''
+  const isOrgAdmin = me?.role === 'org_admin' || me?.role === 'system_admin' || me?.is_system_admin === true
 
   const [cursor, setCursor] = useState<string | undefined>()
   const [prevCursors, setPrevCursors] = useState<string[]>([])
@@ -1045,6 +1109,7 @@ export default function KeysPage() {
         onClose={() => setShowCreateDialog(false)}
         onCreated={(key) => setCreatedKey(key)}
         orgId={orgId}
+        isOrgAdmin={isOrgAdmin}
       />
 
       <KeyCreatedDialog
@@ -1057,6 +1122,7 @@ export default function KeysPage() {
           apiKey={editKey}
           onClose={() => setEditKey(null)}
           orgId={orgId}
+          isOrgAdmin={isOrgAdmin}
         />
       )}
 

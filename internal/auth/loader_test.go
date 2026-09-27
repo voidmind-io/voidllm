@@ -495,6 +495,109 @@ func TestLoadKeysIntoCache(t *testing.T) {
 			},
 		},
 		{
+			name: "user limits populated from org membership",
+			setup: func(t *testing.T, d *db.DB) []string {
+				t.Helper()
+				orgID := createOrg(t, d, "OrgUL", "org-ul", db.CreateOrgParams{})
+				userID := createUser(t, d, "userlim@example.com", false)
+				createMembership(t, d, orgID, userID, RoleMember)
+				_, err := d.UpdateOrgMembership(context.Background(), mustFindMembershipID(t, d, orgID, userID), db.UpdateOrgMembershipParams{
+					DailyTokenLimit:   ptrInt64(60_000),
+					MonthlyTokenLimit: ptrInt64(900_000),
+					RequestsPerMinute: ptrInt(20),
+					RequestsPerDay:    ptrInt(1_500),
+				})
+				if err != nil {
+					t.Fatalf("UpdateOrgMembership: %v", err)
+				}
+				pt := insertKey(t, d, db.CreateAPIKeyParams{
+					KeyType:   keygen.KeyTypeUser,
+					Name:      "userlim-key",
+					OrgID:     orgID,
+					UserID:    ptrStr(userID),
+					CreatedBy: userID,
+				})
+				return []string{pt}
+			},
+			wantLen: 1,
+			checkKeys: func(t *testing.T, kc *cache.Cache[string, KeyInfo], pts []string) {
+				t.Helper()
+				ki, ok := kc.Get(keygen.Hash(pts[0], loaderHMACSecret))
+				if !ok {
+					t.Fatal("key not found in cache")
+				}
+				if ki.UserDailyTokenLimit != 60_000 {
+					t.Errorf("UserDailyTokenLimit = %d, want 60000", ki.UserDailyTokenLimit)
+				}
+				if ki.UserMonthlyTokenLimit != 900_000 {
+					t.Errorf("UserMonthlyTokenLimit = %d, want 900000", ki.UserMonthlyTokenLimit)
+				}
+				if ki.UserRequestsPerMinute != 20 {
+					t.Errorf("UserRequestsPerMinute = %d, want 20", ki.UserRequestsPerMinute)
+				}
+				if ki.UserRequestsPerDay != 1_500 {
+					t.Errorf("UserRequestsPerDay = %d, want 1500", ki.UserRequestsPerDay)
+				}
+			},
+		},
+		{
+			name: "key without user limits has all user limits zero",
+			setup: func(t *testing.T, d *db.DB) []string {
+				t.Helper()
+				orgID := createOrg(t, d, "OrgNUL", "org-nul", db.CreateOrgParams{})
+				userID := createUser(t, d, "nouserlim@example.com", false)
+				createMembership(t, d, orgID, userID, RoleMember)
+				pt := insertKey(t, d, db.CreateAPIKeyParams{
+					KeyType:   keygen.KeyTypeUser,
+					Name:      "nouserlim-key",
+					OrgID:     orgID,
+					UserID:    ptrStr(userID),
+					CreatedBy: userID,
+				})
+				return []string{pt}
+			},
+			wantLen: 1,
+			checkKeys: func(t *testing.T, kc *cache.Cache[string, KeyInfo], pts []string) {
+				t.Helper()
+				ki, ok := kc.Get(keygen.Hash(pts[0], loaderHMACSecret))
+				if !ok {
+					t.Fatal("key not found in cache")
+				}
+				if ki.UserDailyTokenLimit != 0 || ki.UserMonthlyTokenLimit != 0 || ki.UserRequestsPerMinute != 0 || ki.UserRequestsPerDay != 0 {
+					t.Errorf("user limits = %+v, want all zero (membership has no limits set)", ki)
+				}
+			},
+		},
+		{
+			name: "team_key has all user limits zero (no owning user)",
+			setup: func(t *testing.T, d *db.DB) []string {
+				t.Helper()
+				orgID := createOrg(t, d, "OrgTKUL", "org-tkul", db.CreateOrgParams{})
+				userID := createUser(t, d, "tkul-creator@example.com", false)
+				createMembership(t, d, orgID, userID, RoleOrgAdmin)
+				teamID := createTeam(t, d, orgID, "TeamTKUL", "team-tkul", db.CreateTeamParams{})
+				pt := insertKey(t, d, db.CreateAPIKeyParams{
+					KeyType:   keygen.KeyTypeTeam,
+					Name:      "tkul-key",
+					OrgID:     orgID,
+					TeamID:    ptrStr(teamID),
+					CreatedBy: userID,
+				})
+				return []string{pt}
+			},
+			wantLen: 1,
+			checkKeys: func(t *testing.T, kc *cache.Cache[string, KeyInfo], pts []string) {
+				t.Helper()
+				ki, ok := kc.Get(keygen.Hash(pts[0], loaderHMACSecret))
+				if !ok {
+					t.Fatal("key not found in cache")
+				}
+				if ki.UserDailyTokenLimit != 0 || ki.UserMonthlyTokenLimit != 0 || ki.UserRequestsPerMinute != 0 || ki.UserRequestsPerDay != 0 {
+					t.Errorf("team_key user limits = %+v, want all zero", ki)
+				}
+			},
+		},
+		{
 			name: "deleted key is not loaded into cache",
 			setup: func(t *testing.T, d *db.DB) []string {
 				t.Helper()
@@ -760,5 +863,162 @@ func TestStartCacheRefresh(t *testing.T) {
 	t.Error("key did not appear in cache within 500ms after StartCacheRefresh")
 }
 
+// ---- TestLoadKeysIntoCache_ServiceAccountKeyRoleResolution -------------------
+
+// softDeleteServiceAccount soft-deletes a service account via the normal DB
+// function, mirroring the real API path (DeleteServiceAccount), rather than
+// poking deleted_at directly.
+func softDeleteServiceAccount(t *testing.T, d *db.DB, saID string) {
+	t.Helper()
+	if err := d.DeleteServiceAccount(context.Background(), saID); err != nil {
+		t.Fatalf("DeleteServiceAccount(%q): %v", saID, err)
+	}
+}
+
+// TestLoadKeysIntoCache_ServiceAccountKeyRoleResolution is the regression test
+// for the sa_key role-resolution fix: previously every sa_key resolved to
+// org_admin because api_keys.team_id is never populated for sa_key rows (the
+// real create-key API rejects team_id on sa_key requests — see
+// admin.CreateAPIKey). The role must instead come from the owning service
+// account's own team_id, resolved via LoadActiveKey/LoadAllActiveKeys's LEFT
+// JOIN on service_accounts. Every sa_key created here mirrors the real API:
+// no team_id is ever set on the key row itself.
+func TestLoadKeysIntoCache_ServiceAccountKeyRoleResolution(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		setup      func(t *testing.T, d *db.DB) string // returns the plaintext sa_key
+		wantAbsent bool                                // true: the key must not be present in the cache at all
+		wantRole   string                              // checked only when wantAbsent is false
+	}{
+		{
+			name: "team-bound service account: sa_key resolves team_admin",
+			setup: func(t *testing.T, d *db.DB) string {
+				t.Helper()
+				orgID := createOrg(t, d, "OrgSARole1", "org-sarole-team", db.CreateOrgParams{})
+				userID := createUser(t, d, "sarole-team@example.com", false)
+				createMembership(t, d, orgID, userID, RoleOrgAdmin)
+				teamID := createTeam(t, d, orgID, "SARoleTeam", "sarole-team", db.CreateTeamParams{})
+				saID := createSA(t, d, orgID, ptrStr(teamID), userID)
+				// No TeamID set on the key row — matches the real API, which
+				// rejects team_id on sa_key create requests.
+				return insertKey(t, d, db.CreateAPIKeyParams{
+					KeyType:          keygen.KeyTypeSA,
+					Name:             "sarole-team-key",
+					OrgID:            orgID,
+					ServiceAccountID: ptrStr(saID),
+					CreatedBy:        userID,
+				})
+			},
+			wantRole: RoleTeamAdmin,
+		},
+		{
+			name: "org-level service account: sa_key resolves org_admin",
+			setup: func(t *testing.T, d *db.DB) string {
+				t.Helper()
+				orgID := createOrg(t, d, "OrgSARole2", "org-sarole-org", db.CreateOrgParams{})
+				userID := createUser(t, d, "sarole-org@example.com", false)
+				createMembership(t, d, orgID, userID, RoleOrgAdmin)
+				saID := createSA(t, d, orgID, nil, userID)
+				return insertKey(t, d, db.CreateAPIKeyParams{
+					KeyType:          keygen.KeyTypeSA,
+					Name:             "sarole-org-key",
+					OrgID:            orgID,
+					ServiceAccountID: ptrStr(saID),
+					CreatedBy:        userID,
+				})
+			},
+			wantRole: RoleOrgAdmin,
+		},
+		{
+			name: "soft-deleted service account: sa_key is not cached at all (Cacheable skips it)",
+			setup: func(t *testing.T, d *db.DB) string {
+				t.Helper()
+				orgID := createOrg(t, d, "OrgSARole3", "org-sarole-deleted", db.CreateOrgParams{})
+				userID := createUser(t, d, "sarole-deleted@example.com", false)
+				createMembership(t, d, orgID, userID, RoleOrgAdmin)
+				teamID := createTeam(t, d, orgID, "SARoleDeletedTeam", "sarole-deleted-team", db.CreateTeamParams{})
+				saID := createSA(t, d, orgID, ptrStr(teamID), userID)
+				pt := insertKey(t, d, db.CreateAPIKeyParams{
+					KeyType:          keygen.KeyTypeSA,
+					Name:             "sarole-deleted-key",
+					OrgID:            orgID,
+					ServiceAccountID: ptrStr(saID),
+					CreatedBy:        userID,
+				})
+				// The key itself is not deleted — only the service account it
+				// belongs to. The key row therefore still loads from the DB,
+				// but auth.Cacheable rejects it before it ever reaches the
+				// cache: a sa_key whose service account is missing or
+				// soft-deleted must never authenticate again, so it must not
+				// be written into the cache under any role — including the
+				// least-privileged RoleMember default KeyInfoFromRecord would
+				// otherwise assign.
+				softDeleteServiceAccount(t, d, saID)
+				return pt
+			},
+			wantAbsent: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			d := openLoaderDB(t)
+			kc := cache.New[string, KeyInfo]()
+			log := discardLogger()
+
+			pt := tc.setup(t, d)
+
+			if err := LoadKeysIntoCache(context.Background(), d, kc, log); err != nil {
+				t.Fatalf("LoadKeysIntoCache() error = %v", err)
+			}
+
+			ki, ok := kc.Get(keygen.Hash(pt, loaderHMACSecret))
+
+			if tc.wantAbsent {
+				if ok {
+					t.Errorf("sa_key found in cache with Role = %q, want absent (soft-deleted service account must never be cached)", ki.Role)
+				}
+				return
+			}
+
+			if !ok {
+				t.Fatal("sa_key not found in cache after LoadKeysIntoCache()")
+			}
+			if ki.Role != tc.wantRole {
+				t.Errorf("Role = %q, want %q", ki.Role, tc.wantRole)
+			}
+		})
+	}
+}
+
 // ptrStr is a convenience helper returning a pointer to s.
 func ptrStr(s string) *string { return &s }
+
+// ptrInt64 is a convenience helper returning a pointer to v.
+func ptrInt64(v int64) *int64 { return &v }
+
+// ptrInt is a convenience helper returning a pointer to v.
+func ptrInt(v int) *int { return &v }
+
+// mustFindMembershipID looks up the org membership ID for a given org/user
+// pair. CreateOrgMembership does not accept limit fields directly — tests
+// that need non-zero user limits must create the membership first and then
+// call UpdateOrgMembership using the ID this helper resolves.
+func mustFindMembershipID(t *testing.T, d *db.DB, orgID, userID string) string {
+	t.Helper()
+	memberships, err := d.ListOrgMemberships(context.Background(), orgID, "", 1000)
+	if err != nil {
+		t.Fatalf("mustFindMembershipID: ListOrgMemberships: %v", err)
+	}
+	for _, m := range memberships {
+		if m.UserID == userID {
+			return m.ID
+		}
+	}
+	t.Fatalf("mustFindMembershipID: no membership found for org=%s user=%s", orgID, userID)
+	return ""
+}

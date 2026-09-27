@@ -1441,6 +1441,20 @@ type whitelistedUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// PromptTokensDetails carries only the cached_tokens count through
+	// unmodified. It is a pointer so a usage chunk without the field
+	// round-trips without emitting an empty object; when present, its
+	// cached_tokens value must be numeric like every other whitelisted
+	// field — a non-numeric value fails the surrounding jsonx.Unmarshal for
+	// the whole usage object, which the caller (buildUsageChunk) treats the
+	// same as any other malformed usage chunk: skip, do not abort the stream.
+	PromptTokensDetails *whitelistedPromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+// whitelistedPromptTokensDetails contains only the cached_tokens field we
+// re-emit from an upstream usage chunk's prompt_tokens_details object.
+type whitelistedPromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 // ── Chunk builders ────────────────────────────────────────────────────────────

@@ -1187,7 +1187,7 @@ func TestSyncYAMLMCPServers_RemovingPinOnUpdateResetsToAuto(t *testing.T) {
 // ---- CreateMCPServer / UpdateMCPServer — protocol_version validation -------
 //
 // These are the DB-layer regression tests for the validation promise
-// migration 0017_mcp_protocol_version.up.sql documents but never itself
+// migration 0019_mcp_protocol_version.up.sql documents but never itself
 // enforced: "Validation of the allowed set lives in Go instead." Before this
 // fix, that Go-side validation existed only in internal/api/admin and
 // internal/config — a direct DB caller bypassing both, or a future bug in

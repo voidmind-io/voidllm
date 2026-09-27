@@ -129,6 +129,71 @@ func derefStr(s *string) string {
 	return *s
 }
 
+// errInvalidExpiresAt is returned by normalizeExpiresAt when the supplied
+// value cannot be parsed as RFC3339. Its message is sent verbatim as the 400
+// response body.
+var errInvalidExpiresAt = errors.New("expires_at must be a valid RFC3339 timestamp")
+
+// normalizeExpiresAt validates and canonicalizes a client-supplied expires_at
+// value. A nil raw (the field was omitted from the request) returns nil,
+// nil — the column is left unchanged. Any non-nil value, including an empty
+// string, must parse as RFC3339(Nano); on success it is reformatted into the
+// canonical UTC storage format (db.FormatTimestamp) so every stored expiry
+// compares correctly as plain TEXT against other canonical timestamps. Past
+// dates are accepted — setting expires_at to an already-past time is a valid
+// way to revoke a key immediately.
+func normalizeExpiresAt(raw *string) (*string, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, *raw)
+	if err != nil {
+		return nil, errInvalidExpiresAt
+	}
+	formatted := db.FormatTimestamp(t)
+	return &formatted, nil
+}
+
+// canSetKeyLimits reports whether the caller is permitted to set rate and
+// token limits on the given key. Only org admins and system admins may set
+// limits — team admins are never permitted, even on keys scoped to their own
+// team, because a team-scoped key (team_key or team-bound sa_key) has no
+// distinct owner and a team admin could otherwise raise or remove the limits
+// on a key they themselves use.
+//
+// Human callers (a user key or session key, identified by a non-empty
+// caller.UserID) with org_admin or system_admin role may set limits on any
+// key in the org.
+//
+// Machine callers (caller.UserID == "") can only ever be an org-level
+// service-account key. The role check above already excludes team-scoped
+// sa_keys and team_keys, since auth.KeyInfoFromRecord resolves those to
+// team_admin (derived from the owning service account's own team_id, not
+// from caller.TeamID — the api_keys.team_id column is never populated on
+// sa_key rows). So once the org_admin check has passed, a machine caller can
+// only be an org-scoped sa_key, and no further role/team check is needed
+// here. Such a caller may set limits on any other key in the org, but never
+// on a key belonging to its own service account and never on itself, so a
+// machine caller can never grant itself a higher or unlimited budget.
+func canSetKeyLimits(caller *auth.KeyInfo, key *db.APIKey) bool {
+	if !auth.HasRole(caller.Role, auth.RoleOrgAdmin) {
+		return false
+	}
+	if caller.UserID != "" {
+		return true
+	}
+	if caller.KeyType != keygen.KeyTypeSA {
+		return false
+	}
+	if key.ServiceAccountID != nil && *key.ServiceAccountID == caller.ServiceAccountID {
+		return false
+	}
+	if key.ID == caller.ID {
+		return false
+	}
+	return true
+}
+
 // apiKeyVisibleToCallerKey reports whether the given API key is within the visible
 // scope of the caller. Team admins may see keys scoped to their team or owned by
 // themselves. Members may only see keys they own.
@@ -154,7 +219,7 @@ func apiKeyVisibleToCallerKey(key *db.APIKey, caller *auth.KeyInfo) bool {
 // The plaintext key is returned exactly once in the response body.
 //
 // @Summary      Create an API key
-// @Description  Creates a new API key for the organization. Members may only create user keys for themselves. The plaintext key is returned exactly once.
+// @Description  Creates a new API key for the organization. Members may only create user keys for themselves. Rate and token limit fields may only be set by org admins or system admins; non-admin callers must omit or zero these fields. expires_at, when set, must be a valid RFC3339 timestamp; it is stored normalized to UTC. The plaintext key is returned exactly once.
 // @Tags         keys
 // @Accept       json
 // @Produce      json
@@ -190,6 +255,14 @@ func (h *Handler) CreateAPIKey(c fiber.Ctx) error {
 	if !validKeyTypes[req.KeyType] {
 		return apierror.BadRequest(c, "key_type must be one of: user_key, team_key, sa_key")
 	}
+	if req.DailyTokenLimit < 0 || req.MonthlyTokenLimit < 0 || req.RequestsPerMinute < 0 || req.RequestsPerDay < 0 {
+		return apierror.BadRequest(c, "limit fields must be >= 0")
+	}
+	normalizedExpiresAt, err := normalizeExpiresAt(req.ExpiresAt)
+	if err != nil {
+		return apierror.BadRequest(c, err.Error())
+	}
+	req.ExpiresAt = normalizedExpiresAt
 
 	// Members may only create user_key for themselves.
 	if !auth.HasRole(keyInfo.Role, auth.RoleOrgAdmin) {
@@ -197,6 +270,13 @@ func (h *Handler) CreateAPIKey(c fiber.Ctx) error {
 			return apierror.Send(c, fiber.StatusForbidden, "forbidden", "you can only create user keys")
 		}
 		req.UserID = &keyInfo.UserID
+
+		// Only org admins and system admins may set key limits at creation.
+		// A non-admin who mints their own key must not be able to grant
+		// themselves a higher (or unlimited) budget than an admin assigned.
+		if req.DailyTokenLimit != 0 || req.MonthlyTokenLimit != 0 || req.RequestsPerMinute != 0 || req.RequestsPerDay != 0 {
+			return apierror.Send(c, fiber.StatusForbidden, "forbidden", "only administrators can set key limits")
+		}
 	}
 
 	switch req.KeyType {
@@ -229,7 +309,6 @@ func (h *Handler) CreateAPIKey(c fiber.Ctx) error {
 	ctx := c.Context()
 
 	// Verify referenced team belongs to this org.
-	var resolvedSA *db.ServiceAccount
 	if req.TeamID != nil && *req.TeamID != "" {
 		team, err := h.DB.GetTeam(ctx, *req.TeamID)
 		if err != nil {
@@ -295,7 +374,6 @@ func (h *Handler) CreateAPIKey(c fiber.Ctx) error {
 		if sa.OrgID != orgID {
 			return apierror.BadRequest(c, "service account not found")
 		}
-		resolvedSA = sa
 	}
 
 	plaintextKey, err := keygen.Generate(req.KeyType)
@@ -328,49 +406,30 @@ func (h *Handler) CreateAPIKey(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to create api key")
 	}
 
-	// Resolve RBAC role for the new key.
-	var resolvedRole string
-	switch req.KeyType {
-	case keygen.KeyTypeUser:
-		resolvedRole, err = h.DB.GetUserOrgRole(ctx, *req.UserID, orgID)
-		if err != nil {
-			h.Log.ErrorContext(ctx, "create api key: resolve user role", slog.String("error", err.Error()))
-			return apierror.InternalError(c, "failed to resolve user role")
+	// Populate the cache from a fresh read of the key with its full org, team,
+	// and per-user membership limits resolved via JOIN, so the key is subject
+	// to its complete limit hierarchy from the very first request instead of
+	// waiting for the next periodic cache reload. A lookup or mapping failure
+	// is logged and the cache write is skipped rather than failing the
+	// request — the key was already created, and the next reload (at most
+	// 30s later) will pick it up.
+	rec, err := h.DB.LoadActiveKey(ctx, apiKey.ID)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "create api key: load for cache", slog.String("error", err.Error()))
+	} else if !auth.Cacheable(*rec) {
+		h.Log.LogAttrs(ctx, slog.LevelWarn, "create api key: skipping non-cacheable key",
+			slog.String("key_id", rec.ID),
+			slog.String("key_type", rec.KeyType),
+		)
+	} else {
+		ki, ok := auth.KeyInfoFromRecord(*rec)
+		if !ok {
+			h.Log.LogAttrs(ctx, slog.LevelWarn, "create api key: could not resolve a definite role, defaulting to member",
+				slog.String("key_type", rec.KeyType),
+				slog.String("key_id", rec.ID),
+			)
 		}
-	case keygen.KeyTypeTeam:
-		resolvedRole = auth.RoleTeamAdmin
-	case keygen.KeyTypeSA:
-		if resolvedSA != nil && resolvedSA.TeamID != nil {
-			resolvedRole = auth.RoleTeamAdmin
-		} else {
-			resolvedRole = auth.RoleOrgAdmin
-		}
-	}
-
-	if resolvedRole != "" {
-		var expiresAt *time.Time
-		if apiKey.ExpiresAt != nil {
-			t, parseErr := time.Parse(time.RFC3339, *apiKey.ExpiresAt)
-			if parseErr == nil {
-				expiresAt = &t
-			}
-		}
-
-		h.KeyCache.Set(apiKey.KeyHash, auth.KeyInfo{
-			ID:                apiKey.ID,
-			KeyType:           apiKey.KeyType,
-			Role:              resolvedRole,
-			OrgID:             apiKey.OrgID,
-			TeamID:            derefStr(apiKey.TeamID),
-			UserID:            derefStr(apiKey.UserID),
-			ServiceAccountID:  derefStr(apiKey.ServiceAccountID),
-			Name:              apiKey.Name,
-			DailyTokenLimit:   apiKey.DailyTokenLimit,
-			MonthlyTokenLimit: apiKey.MonthlyTokenLimit,
-			RequestsPerMinute: apiKey.RequestsPerMinute,
-			RequestsPerDay:    apiKey.RequestsPerDay,
-			ExpiresAt:         expiresAt,
-		})
+		h.KeyCache.Set(rec.KeyHash, ki)
 	}
 
 	resp := createAPIKeyResponse{
@@ -496,6 +555,16 @@ func (h *Handler) ListAPIKeys(c fiber.Ctx) error {
 		filterUserID = keyInfo.UserID
 	}
 
+	// Fail closed: below org_admin, the caller must always end up scoped by
+	// some identifier of their own. A caller with neither filter — e.g. a
+	// team-bound sa_key, whose KeyInfo.TeamID is never populated (see
+	// auth.KeyInfoFromRecord) and which has no UserID either — would
+	// otherwise hit ListAPIKeys with both filters empty, and an empty filter
+	// means "no filter" at the DB layer, returning every key in the org.
+	if !auth.HasRole(keyInfo.Role, auth.RoleOrgAdmin) && filterUserID == "" && filterTeamID == "" {
+		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "insufficient scope to list keys")
+	}
+
 	keys, err := h.DB.ListAPIKeys(c.Context(), orgID, filterUserID, filterTeamID, p.Cursor, p.Limit+1, includeDeleted)
 	if err != nil {
 		h.Log.ErrorContext(c.Context(), "list api keys", slog.String("error", err.Error()))
@@ -523,11 +592,15 @@ func (h *Handler) ListAPIKeys(c fiber.Ctx) error {
 // UpdateAPIKey handles PATCH /api/v1/orgs/:org_id/keys/:key_id.
 // Org admins may update any key in the org. Team admins may update keys scoped
 // to their team or owned by themselves. Members may only update their own keys.
-// Only name, limits, and expires_at are updatable.
+// Only name, limits, and expires_at are updatable. Rate and token limit fields
+// may only be changed by org admins and system admins — see canSetKeyLimits
+// for the exact rule, including the restriction that an org-level
+// service-account caller can never change its own limits or those of another
+// key belonging to the same service account.
 // Returns 404 if the key belongs to a different org or the caller lacks access.
 //
 // @Summary      Update an API key
-// @Description  Updates name, rate limits, token limits, or expiry of an API key. Only provided fields are changed.
+// @Description  Updates name, rate limits, token limits, or expiry of an API key. Only provided fields are changed. Rate and token limit fields may only be changed by org admins or system admins — team admins can never change them, even on keys scoped to their own team. A machine caller (org-level service-account key) may set limits on other keys in the org but never on its own key or another key belonging to the same service account. Submitting a limit value unchanged from the current stored value is always allowed. expires_at, when set, must be a valid RFC3339 timestamp (including in the past, to revoke a key immediately) and is stored normalized to UTC.
 // @Tags         keys
 // @Accept       json
 // @Produce      json
@@ -573,6 +646,46 @@ func (h *Handler) UpdateAPIKey(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&req); err != nil {
 		return apierror.BadRequest(c, "invalid request body")
 	}
+	if req.DailyTokenLimit != nil && *req.DailyTokenLimit < 0 {
+		return apierror.BadRequest(c, "daily_token_limit must be >= 0")
+	}
+	if req.MonthlyTokenLimit != nil && *req.MonthlyTokenLimit < 0 {
+		return apierror.BadRequest(c, "monthly_token_limit must be >= 0")
+	}
+	if req.RequestsPerMinute != nil && *req.RequestsPerMinute < 0 {
+		return apierror.BadRequest(c, "requests_per_minute must be >= 0")
+	}
+	if req.RequestsPerDay != nil && *req.RequestsPerDay < 0 {
+		return apierror.BadRequest(c, "requests_per_day must be >= 0")
+	}
+	normalizedExpiresAt, err := normalizeExpiresAt(req.ExpiresAt)
+	if err != nil {
+		return apierror.BadRequest(c, err.Error())
+	}
+	req.ExpiresAt = normalizedExpiresAt
+
+	// Only admins (see canSetKeyLimits) may change a limit field's stored
+	// value. Submitting the unchanged value back is always allowed so
+	// idempotent clients that round-trip the full resource do not break.
+	limitChanged := (req.DailyTokenLimit != nil && *req.DailyTokenLimit != existing.DailyTokenLimit) ||
+		(req.MonthlyTokenLimit != nil && *req.MonthlyTokenLimit != existing.MonthlyTokenLimit) ||
+		(req.RequestsPerMinute != nil && *req.RequestsPerMinute != existing.RequestsPerMinute) ||
+		(req.RequestsPerDay != nil && *req.RequestsPerDay != existing.RequestsPerDay)
+	if limitChanged && !canSetKeyLimits(keyInfo, existing) {
+		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "only administrators can set key limits")
+	}
+	if !canSetKeyLimits(keyInfo, existing) {
+		// The caller may not set limits at all. Even though limitChanged is
+		// false here (the 403 above would otherwise have fired), the request
+		// may still carry the current, unchanged limit values. Drop them
+		// before building the DB params so this write can never clobber a
+		// concurrent admin's limit change with a stale value the caller
+		// merely echoed back — a nil pointer means "leave this column alone".
+		req.DailyTokenLimit = nil
+		req.MonthlyTokenLimit = nil
+		req.RequestsPerMinute = nil
+		req.RequestsPerDay = nil
+	}
 
 	apiKey, err := h.DB.UpdateAPIKey(c.Context(), existing.ID, db.UpdateAPIKeyParams{
 		Name:              req.Name,
@@ -590,21 +703,58 @@ func (h *Handler) UpdateAPIKey(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update api key")
 	}
 
-	if cached, ok := h.KeyCache.Get(existing.KeyHash); ok {
-		cached.Name = apiKey.Name
-		cached.DailyTokenLimit = apiKey.DailyTokenLimit
-		cached.MonthlyTokenLimit = apiKey.MonthlyTokenLimit
-		cached.RequestsPerMinute = apiKey.RequestsPerMinute
-		cached.RequestsPerDay = apiKey.RequestsPerDay
-		if apiKey.ExpiresAt != nil {
-			t, parseErr := time.Parse(time.RFC3339, *apiKey.ExpiresAt)
-			if parseErr == nil {
-				cached.ExpiresAt = &t
+	// Refresh the cache entry from a fresh DB read (with org, team, and
+	// per-user membership limits resolved via JOIN), the same approach used
+	// by CreateAPIKey, rather than patching the previously cached KeyInfo in
+	// place. A patch-in-place cannot re-evaluate Cacheable: if the key's
+	// owning user or membership state changed since it was last cached, a
+	// Get/modify/Set sequence would keep a key cached that should have been
+	// evicted. LoadActiveKey excludes expired keys, so a request that just
+	// patched expires_at into the past gets db.ErrNotFound here instead of a
+	// record — that case evicts the existing cache entry (and publishes a
+	// Redis invalidation, same as DeleteAPIKey) directly rather than falling
+	// into the generic error-log branch below, so the key dies immediately
+	// instead of staying usable until the next periodic reload. Any other
+	// lookup or mapping failure is logged and the cache is left as-is rather
+	// than failing the request — the update itself already succeeded, and
+	// the next periodic reload (at most 30s later) will reconcile the cache
+	// regardless.
+	rec, err := h.DB.LoadActiveKey(c.Context(), existing.ID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			h.KeyCache.Delete(existing.KeyHash)
+			if h.Redis != nil {
+				if pubErr := h.Redis.PublishInvalidation(c.Context(), voidredis.ChannelKeys, existing.KeyHash); pubErr != nil {
+					h.Log.LogAttrs(c.Context(), slog.LevelWarn, "redis: publish key invalidation failed",
+						slog.String("error", pubErr.Error()),
+					)
+				}
 			}
 		} else {
-			cached.ExpiresAt = nil
+			h.Log.ErrorContext(c.Context(), "update api key: load for cache", slog.String("error", err.Error()))
 		}
-		h.KeyCache.Set(existing.KeyHash, cached)
+	} else if !auth.Cacheable(*rec) {
+		h.Log.LogAttrs(c.Context(), slog.LevelWarn, "update api key: evicting non-cacheable key",
+			slog.String("key_id", rec.ID),
+			slog.String("key_type", rec.KeyType),
+		)
+		h.KeyCache.Delete(rec.KeyHash)
+		if h.Redis != nil {
+			if pubErr := h.Redis.PublishInvalidation(c.Context(), voidredis.ChannelKeys, rec.KeyHash); pubErr != nil {
+				h.Log.LogAttrs(c.Context(), slog.LevelWarn, "redis: publish key invalidation failed",
+					slog.String("error", pubErr.Error()),
+				)
+			}
+		}
+	} else {
+		ki, ok := auth.KeyInfoFromRecord(*rec)
+		if !ok {
+			h.Log.LogAttrs(c.Context(), slog.LevelWarn, "update api key: could not resolve a definite role, defaulting to member",
+				slog.String("key_type", rec.KeyType),
+				slog.String("key_id", rec.ID),
+			)
+		}
+		h.KeyCache.Set(rec.KeyHash, ki)
 	}
 
 	return c.JSON(apiKeyToResponse(apiKey))
@@ -682,6 +832,25 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 		return apierror.BadRequest(c, "only user, team, and service account keys can be rotated")
 	}
 
+	// A sa_key can only be rotated while its owning service account still
+	// exists and is not soft-deleted — GetServiceAccount filters both cases
+	// to ErrNotFound. Without this check, rotating a key whose service
+	// account was deleted after the key was minted would mint a brand-new,
+	// fully active key for a service account that no longer exists.
+	if existing.KeyType == keygen.KeyTypeSA {
+		if existing.ServiceAccountID == nil || *existing.ServiceAccountID == "" {
+			h.Log.ErrorContext(ctx, "rotate api key: sa_key has no service_account_id", slog.String("key_id", existing.ID))
+			return apierror.InternalError(c, "failed to rotate key")
+		}
+		if _, err := h.DB.GetServiceAccount(ctx, *existing.ServiceAccountID); err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return apierror.BadRequest(c, "service account not found")
+			}
+			h.Log.ErrorContext(ctx, "rotate api key: get service account", slog.String("error", err.Error()))
+			return apierror.InternalError(c, "failed to validate service account")
+		}
+	}
+
 	// Members and team admins may only rotate keys within their scope; org_admin+ may rotate any key.
 	if !auth.HasRole(keyInfo.Role, auth.RoleOrgAdmin) {
 		if !apiKeyVisibleToCallerKey(existing, keyInfo) {
@@ -700,12 +869,20 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 	rotatedName := strings.TrimSuffix(existing.Name, " (rotated)") + " (rotated)"
 
 	// Set the old key to expire after the grace period. If it already has an
-	// expiry that is sooner than the grace period deadline, keep that shorter expiry.
+	// expiry that is sooner than the grace period deadline, keep that shorter
+	// expiry. existing.ExpiresAt may be stored in a non-canonical RFC3339
+	// variant (e.g. a numeric UTC offset instead of Z); normalize it here so
+	// both the retained old-key expiry and the new key's copied expiry below
+	// are always written in canonical form.
 	graceDeadline := time.Now().UTC().Add(rotateKeyGracePeriod)
-	oldExpiresAt := graceDeadline.Format(time.RFC3339)
+	oldExpiresAt := db.FormatTimestamp(graceDeadline)
 	if existing.ExpiresAt != nil {
-		if t, parseErr := time.Parse(time.RFC3339, *existing.ExpiresAt); parseErr == nil && t.Before(graceDeadline) {
-			oldExpiresAt = *existing.ExpiresAt
+		if t, parseErr := time.Parse(time.RFC3339, *existing.ExpiresAt); parseErr == nil {
+			canonical := db.FormatTimestamp(t)
+			existing.ExpiresAt = &canonical
+			if t.Before(graceDeadline) {
+				oldExpiresAt = canonical
+			}
 		}
 	}
 
@@ -734,58 +911,29 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 	newKey := rotated.NewKey
 	updatedOld := rotated.OldKey
 
-	// Resolve RBAC role for the new key to populate the cache correctly.
-	// For SA keys, fetch the current service account state rather than relying
-	// on the stale team_id column copied from the old key row.
-	var resolvedRole string
-	switch existing.KeyType {
-	case keygen.KeyTypeUser:
-		resolvedRole, err = h.DB.GetUserOrgRole(ctx, *existing.UserID, orgID)
-		if err != nil {
-			h.Log.ErrorContext(ctx, "rotate api key: resolve user role", slog.String("error", err.Error()))
-			return apierror.InternalError(c, "failed to resolve user role")
+	// Populate the cache from a fresh read of the new key with its full org,
+	// team, and per-user membership limits resolved via JOIN — the same
+	// approach used by CreateAPIKey — so the rotated key is subject to its
+	// complete limit hierarchy immediately. A lookup or mapping failure is
+	// logged and the cache write is skipped rather than failing the request;
+	// the next periodic reload (at most 30s later) will pick it up.
+	newRec, err := h.DB.LoadActiveKey(ctx, newKey.ID)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "rotate api key: load for cache", slog.String("error", err.Error()))
+	} else if !auth.Cacheable(*newRec) {
+		h.Log.LogAttrs(ctx, slog.LevelWarn, "rotate api key: skipping non-cacheable key",
+			slog.String("key_id", newRec.ID),
+			slog.String("key_type", newRec.KeyType),
+		)
+	} else {
+		ki, ok := auth.KeyInfoFromRecord(*newRec)
+		if !ok {
+			h.Log.LogAttrs(ctx, slog.LevelWarn, "rotate api key: could not resolve a definite role, defaulting to member",
+				slog.String("key_type", newRec.KeyType),
+				slog.String("key_id", newRec.ID),
+			)
 		}
-	case keygen.KeyTypeTeam:
-		resolvedRole = auth.RoleTeamAdmin
-	case keygen.KeyTypeSA:
-		if existing.ServiceAccountID != nil && *existing.ServiceAccountID != "" {
-			sa, saErr := h.DB.GetServiceAccount(ctx, *existing.ServiceAccountID)
-			if saErr != nil {
-				h.Log.ErrorContext(ctx, "rotate api key: get service account", slog.String("error", saErr.Error()))
-				resolvedRole = auth.RoleOrgAdmin // safe fallback
-			} else if sa.TeamID != nil {
-				resolvedRole = auth.RoleTeamAdmin
-			} else {
-				resolvedRole = auth.RoleOrgAdmin
-			}
-		} else {
-			resolvedRole = auth.RoleOrgAdmin
-		}
-	}
-
-	// Add new key to cache.
-	if resolvedRole != "" {
-		var newExpiresAt *time.Time
-		if newKey.ExpiresAt != nil {
-			if t, parseErr := time.Parse(time.RFC3339, *newKey.ExpiresAt); parseErr == nil {
-				newExpiresAt = &t
-			}
-		}
-		h.KeyCache.Set(newKey.KeyHash, auth.KeyInfo{
-			ID:                newKey.ID,
-			KeyType:           newKey.KeyType,
-			Role:              resolvedRole,
-			OrgID:             newKey.OrgID,
-			TeamID:            derefStr(newKey.TeamID),
-			UserID:            derefStr(newKey.UserID),
-			ServiceAccountID:  derefStr(newKey.ServiceAccountID),
-			Name:              newKey.Name,
-			DailyTokenLimit:   newKey.DailyTokenLimit,
-			MonthlyTokenLimit: newKey.MonthlyTokenLimit,
-			RequestsPerMinute: newKey.RequestsPerMinute,
-			RequestsPerDay:    newKey.RequestsPerDay,
-			ExpiresAt:         newExpiresAt,
-		})
+		h.KeyCache.Set(newRec.KeyHash, ki)
 	}
 
 	// Update old key's expiry in cache so the proxy enforces the grace period.

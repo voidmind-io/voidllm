@@ -37,3 +37,28 @@ export function shortenId(id: string): string {
   if (!id) return ''
   return id.length <= 12 ? id : `${id.slice(0, 8)}…`
 }
+
+/** Result of parsing a "limit" form field. `error` is set when the raw input is invalid. */
+export interface LimitInputResult {
+  value: number
+  error?: string
+}
+
+/**
+ * Parse a rate/token limit form field where an empty string means "unlimited" (0).
+ * Any other value must be a non-negative integer (digits only, no sign, no decimals)
+ * within `Number.MAX_SAFE_INTEGER` - anything else (negative numbers, decimals,
+ * non-numeric text) is reported as an error instead of being silently coerced to 0.
+ */
+export function parseLimitInput(value: string): LimitInputResult {
+  const trimmed = value.trim()
+  if (trimmed === '') return { value: 0 }
+  if (!/^\d+$/.test(trimmed)) {
+    return { value: 0, error: 'Enter a whole number of 0 or greater' }
+  }
+  const n = Number(trimmed)
+  if (!Number.isSafeInteger(n)) {
+    return { value: 0, error: 'Number is too large' }
+  }
+  return { value: n }
+}

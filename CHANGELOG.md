@@ -2,6 +2,62 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.28] - 2026-09-28
+
+### Security
+- Security hardening of the PII filter: request fields beyond the standard chat, completion and embedding fields are now covered, and function names are validated (#240)
+
+### Upgrade notes
+- With the PII filter enabled, every request field except `model` is scanned and pseudonymized where PII is detected (restored in responses as before). This includes provider-specific fields such as `chat_template_kwargs` or `metadata` and the inputs of rerank and score requests.
+- Function and tool names must be identifiers (`A-Z a-z 0-9 _ . + -`, up to 128 characters) and must not look like PII; a name that looks like an email address or contains a phone, tax or card number is rejected with 422. `logit_bias` must map token IDs of up to seven digits to numbers.
+
+### Dependencies
+- gRPC 1.83.2 with the fix for an upstream security advisory, plus golang.org/x patch updates (#235)
+
+---
+
+## [0.0.27] - 2026-09-27
+
+### Fixes
+- Daily token budgets are enforced across restarts. Usage events were stored with a timestamp format that range queries compared as text, so the startup seed missed all of today's usage and daily budgets started from zero after every restart or deploy. The same mismatch dropped the whole start date from usage reports and included events after the end time (#226, #237)
+- Usage and MCP usage events are stored in one canonical UTC format and hourly rollups use the event time; `group_by=hour` works on PostgreSQL (#237)
+- Common OpenAI request fields work with Anthropic upstreams: `stop`, `parallel_tool_calls`, `user`, the `developer` role and `temperature` above 1 are translated instead of causing a 400. A system message with array content is no longer dropped, and per-part `cache_control` is kept (#238)
+- Anthropic streams send a usage chunk, including cached tokens, when the client requests `stream_options.include_usage` (#238)
+
+### Security
+- Security hardening for request handling and key expiry validation (#237, #238)
+
+### Upgrade notes
+- The first start after upgrading rewrites historical usage timestamps once; progress is logged. On PostgreSQL with multiple replicas, upgrade all instances promptly.
+- `expires_at` on API key create and update must be an RFC3339 timestamp; other values are rejected with 400.
+- Requests to Anthropic models that send a top-level `system` or `stop_sequences` field are rejected with a 400 asking for a system message or `stop` instead. Malformed values for translated fields are rejected by the proxy with a specific message.
+
+---
+
+## [0.0.26] - 2026-09-26
+
+### Features
+- Per-user limits. Organization admins can set token budgets and request rate limits on a user's organization membership. They apply across every API key the user owns in that organization, alongside the existing organization, team and key limits, with the most restrictive limit winning. Manage them on the Users page or via `PATCH /api/v1/orgs/{org_id}/members/{membership_id}`
+
+### Security
+- Security hardening for API key authorization and the key lifecycle. See the upgrade notes below for behavior changes
+
+### Upgrade notes
+- API key limits can only be set or changed by organization admins, and by organization-level service accounts for keys other than their own. Members and team admins can no longer change them
+- Service account keys follow their service account's team scope: keys of a team-bound service account act with team admin rights, not organization-wide admin rights. Automation that needs organization-wide access should use an organization-level service account
+- Deleting a user, removing a user from an organization, or deleting a service account revokes the affected API keys immediately
+
+### Documentation
+- `server.proxy.max_stream_duration` is documented, and the troubleshooting entry for cut-off streams now names the actual cause and how `write_timeout` and per-model `timeout` interact with it (#224)
+
+### Dependencies
+- Updated gRPC, OpenTelemetry, golang.org/x/crypto, fasthttp, sonic, go-redis, go-oidc, React, React Router, Vitest and GitHub Actions, including fixes for security advisories in gRPC and the frontend router (#234)
+
+### Internal
+- Two timing-dependent tests are deterministic now (#234)
+
+---
+
 ## [0.0.25] - 2026-07-26
 
 ### Features

@@ -915,8 +915,8 @@ func (p *ProxyHandler) readAndValidateBody(c fiber.Ctx, maxRequestBody int) ([]b
 }
 
 // checkLimits evaluates rate limits and token budgets for the authenticated key.
-// It builds the three-tier Limits structs from keyInfo and delegates to the
-// RateLimiter and TokenCounter. If either check rejects the request, an API
+// It builds the Scopes and four-tier ScopeLimits from keyInfo and delegates to
+// the RateLimiter and TokenCounter. If either check rejects the request, an API
 // error response is sent and the error is returned. Nil-safe for both
 // RateLimiter and TokenCounter; a nil keyInfo is also safe and skips all checks.
 func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
@@ -924,27 +924,41 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 		return nil
 	}
 
-	keyLimits := ratelimit.Limits{
-		RequestsPerMinute: keyInfo.RequestsPerMinute,
-		RequestsPerDay:    keyInfo.RequestsPerDay,
-		DailyTokenLimit:   keyInfo.DailyTokenLimit,
-		MonthlyTokenLimit: keyInfo.MonthlyTokenLimit,
+	scopes := ratelimit.Scopes{
+		KeyID:  keyInfo.ID,
+		UserID: keyInfo.UserID,
+		TeamID: keyInfo.TeamID,
+		OrgID:  keyInfo.OrgID,
 	}
-	teamLimits := ratelimit.Limits{
-		RequestsPerMinute: keyInfo.TeamRequestsPerMinute,
-		RequestsPerDay:    keyInfo.TeamRequestsPerDay,
-		DailyTokenLimit:   keyInfo.TeamDailyTokenLimit,
-		MonthlyTokenLimit: keyInfo.TeamMonthlyTokenLimit,
-	}
-	orgLimits := ratelimit.Limits{
-		RequestsPerMinute: keyInfo.OrgRequestsPerMinute,
-		RequestsPerDay:    keyInfo.OrgRequestsPerDay,
-		DailyTokenLimit:   keyInfo.OrgDailyTokenLimit,
-		MonthlyTokenLimit: keyInfo.OrgMonthlyTokenLimit,
+	limits := ratelimit.ScopeLimits{
+		Key: ratelimit.Limits{
+			RequestsPerMinute: keyInfo.RequestsPerMinute,
+			RequestsPerDay:    keyInfo.RequestsPerDay,
+			DailyTokenLimit:   keyInfo.DailyTokenLimit,
+			MonthlyTokenLimit: keyInfo.MonthlyTokenLimit,
+		},
+		User: ratelimit.Limits{
+			RequestsPerMinute: keyInfo.UserRequestsPerMinute,
+			RequestsPerDay:    keyInfo.UserRequestsPerDay,
+			DailyTokenLimit:   keyInfo.UserDailyTokenLimit,
+			MonthlyTokenLimit: keyInfo.UserMonthlyTokenLimit,
+		},
+		Team: ratelimit.Limits{
+			RequestsPerMinute: keyInfo.TeamRequestsPerMinute,
+			RequestsPerDay:    keyInfo.TeamRequestsPerDay,
+			DailyTokenLimit:   keyInfo.TeamDailyTokenLimit,
+			MonthlyTokenLimit: keyInfo.TeamMonthlyTokenLimit,
+		},
+		Org: ratelimit.Limits{
+			RequestsPerMinute: keyInfo.OrgRequestsPerMinute,
+			RequestsPerDay:    keyInfo.OrgRequestsPerDay,
+			DailyTokenLimit:   keyInfo.OrgDailyTokenLimit,
+			MonthlyTokenLimit: keyInfo.OrgMonthlyTokenLimit,
+		},
 	}
 
 	if p.RateLimiter != nil {
-		if err := p.RateLimiter.CheckRate(keyInfo.ID, keyInfo.TeamID, keyInfo.OrgID, keyLimits, teamLimits, orgLimits); err != nil {
+		if err := p.RateLimiter.CheckRate(scopes, limits); err != nil {
 			metrics.RateLimitRejectionsTotal.WithLabelValues("request").Inc()
 			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "rate limit exceeded",
 				slog.String("key_id", keyInfo.ID),
@@ -958,7 +972,7 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 	}
 
 	if p.TokenCounter != nil {
-		if err := p.TokenCounter.CheckTokens(keyInfo.ID, keyInfo.TeamID, keyInfo.OrgID, keyLimits, teamLimits, orgLimits); err != nil {
+		if err := p.TokenCounter.CheckTokens(scopes, limits); err != nil {
 			metrics.RateLimitRejectionsTotal.WithLabelValues("token").Inc()
 			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "token budget exceeded",
 				slog.String("key_id", keyInfo.ID),
@@ -1057,7 +1071,18 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "adapter transform request failed",
 				slog.String("error", transformErr.Error()),
 			)
-			if err := apierror.Send(c, fiber.StatusBadRequest, "bad_request", "failed to transform request for provider"); err != nil {
+			// A clientRequestError carries a fixed, caller-content-free message
+			// describing what the client sent wrong; surface it directly so the
+			// client can fix its request. Every other TransformRequest error keeps
+			// the generic message — the underlying cause may reference an
+			// internal detail or (in principle) adapter state derived from the
+			// request, and is never safe to echo verbatim.
+			var clientErr *clientRequestError
+			message := "failed to transform request for provider"
+			if errors.As(transformErr, &clientErr) {
+				message = clientErr.Error()
+			}
+			if err := apierror.Send(c, fiber.StatusBadRequest, "bad_request", message); err != nil {
 				return nil, nil, nil, err
 			}
 			return nil, nil, nil, errResponseSent

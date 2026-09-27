@@ -68,7 +68,7 @@ type MCPServer struct {
 	// ProtocolVersion is the MCP protocol era override for this upstream
 	// server: "auto" (the default) means auto-detect via probeEra, any other
 	// recognized revision string pins that era and skips detection. See
-	// migration 0017_mcp_protocol_version and mcp.ResolvePinnedVersion.
+	// migration 0019_mcp_protocol_version and mcp.ResolvePinnedVersion.
 	ProtocolVersion string `json:"protocol_version"`
 }
 

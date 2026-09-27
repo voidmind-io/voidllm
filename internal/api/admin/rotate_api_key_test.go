@@ -442,6 +442,81 @@ func TestRotateAPIKey_ExistingShorterExpiryIsPreserved(t *testing.T) {
 	}
 }
 
+// TestRotateAPIKey_OffsetExpiresAtIsCanonicalizedForBothKeys verifies that when
+// an existing key's stored expires_at is a non-canonical RFC3339 variant (a
+// numeric UTC offset instead of "Z") and is shorter than the rotation grace
+// period, rotation normalizes it to canonical form for both the retained old
+// key and the new key that copies the same expiry.
+func TestRotateAPIKey_OffsetExpiresAtIsCanonicalizedForBothKeys(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestRotateAPIKey_OffsetExpiry?mode=memory&cache=private")
+
+	org := mustCreateOrg(t, database, "Acme", "rotate-offset-expiry-org")
+	user := mustCreateUser(t, database, "rotate-offset@example.com", "Offset Expiry User")
+	team := mustCreateTeam(t, database, org.ID, "Dev", "rotate-offset-expiry-team")
+	mustCreateUserMemberships(t, database, org.ID, team.ID, user.ID)
+	callerKey := addTestKeyWithUser(t, keyCache, auth.RoleOrgAdmin, org.ID, user.ID)
+
+	keyID, _ := mustCreateUserKeyViaAPI(t, app, org.ID, user.ID, team.ID, callerKey)
+
+	// Overwrite the stored expires_at directly with a non-canonical RFC3339
+	// variant (a numeric +02:00 offset instead of "Z"), representing an
+	// instant one hour from now — shorter than the 24h rotation grace
+	// period — so the "keep the existing shorter expiry" branch is taken.
+	offsetLoc := time.FixedZone("", 2*60*60)
+	offsetExpiresAt := time.Now().Add(1 * time.Hour).In(offsetLoc).Format(time.RFC3339)
+	if _, err := database.SQL().ExecContext(context.Background(),
+		"UPDATE api_keys SET expires_at = ? WHERE id = ?", offsetExpiresAt, keyID); err != nil {
+		t.Fatalf("set offset expires_at: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", rotateKeyURL(org.ID, keyID), nil)
+	req.Header.Set("Authorization", "Bearer "+callerKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, b)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+
+	newKey, _ := got["new_key"].(map[string]any)
+	if newKey == nil {
+		t.Fatalf("new_key missing from response")
+	}
+	newKeyID, _ := newKey["id"].(string)
+	if newKeyID == "" {
+		t.Fatalf("new_key.id missing from response")
+	}
+
+	var oldStored, newStored string
+	if err := database.SQL().QueryRowContext(context.Background(),
+		"SELECT expires_at FROM api_keys WHERE id = ?", keyID,
+	).Scan(&oldStored); err != nil {
+		t.Fatalf("read old key expires_at: %v", err)
+	}
+	if err := database.SQL().QueryRowContext(context.Background(),
+		"SELECT expires_at FROM api_keys WHERE id = ?", newKeyID,
+	).Scan(&newStored); err != nil {
+		t.Fatalf("read new key expires_at: %v", err)
+	}
+
+	if _, err := time.Parse(db.TimestampLayout, oldStored); err != nil {
+		t.Errorf("old key expires_at stored in DB = %q, not canonical db.TimestampLayout shape: %v", oldStored, err)
+	}
+	if _, err := time.Parse(db.TimestampLayout, newStored); err != nil {
+		t.Errorf("new key expires_at stored in DB = %q, not canonical db.TimestampLayout shape: %v", newStored, err)
+	}
+}
+
 func TestRotateAPIKey_NewKeyHasSameMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -695,6 +770,157 @@ func TestRotateAPIKey_NewKeyAddedToCache(t *testing.T) {
 	newKeyHash := keygen.Hash(newPlaintext, testHMACSecret)
 	if _, ok := keyCache.Get(newKeyHash); !ok {
 		t.Error("new key not found in auth cache after rotation, want it to be cached")
+	}
+}
+
+// TestRotateAPIKey_NewKeyCacheHasFullLimitsImmediately verifies that the cache
+// entry for a rotated key already carries the org, team, and per-user limit
+// hierarchy — populated via db.LoadActiveKey + auth.KeyInfoFromRecord — from
+// the moment rotation completes, instead of waiting for the next periodic
+// cache reload (up to 30s later).
+func TestRotateAPIKey_NewKeyCacheHasFullLimitsImmediately(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestRotateAPIKey_CacheFullLimits?mode=memory&cache=private")
+
+	org := mustCreateOrg(t, database, "Acme", "rotate-cache-limits-org")
+	if _, err := database.SQL().ExecContext(context.Background(),
+		"UPDATE organizations SET daily_token_limit = 33000 WHERE id = ?", org.ID); err != nil {
+		t.Fatalf("set org limits: %v", err)
+	}
+
+	user := mustCreateUser(t, database, "rotate-cache-limits@example.com", "Cache Limits User")
+	team := mustCreateTeam(t, database, org.ID, "Dev", "rotate-cache-limits-team")
+	if _, err := database.SQL().ExecContext(context.Background(),
+		"UPDATE teams SET requests_per_minute = 18 WHERE id = ?", team.ID); err != nil {
+		t.Fatalf("set team limits: %v", err)
+	}
+	mustCreateUserMemberships(t, database, org.ID, team.ID, user.ID)
+
+	memberships, err := database.ListOrgMemberships(context.Background(), org.ID, "", 100)
+	if err != nil {
+		t.Fatalf("ListOrgMemberships: %v", err)
+	}
+	var membershipID string
+	for _, m := range memberships {
+		if m.UserID == user.ID {
+			membershipID = m.ID
+		}
+	}
+	if membershipID == "" {
+		t.Fatal("membership not found")
+	}
+	userDaily := int64(4_444)
+	if _, err := database.UpdateOrgMembership(context.Background(), membershipID, db.UpdateOrgMembershipParams{
+		DailyTokenLimit: &userDaily,
+	}); err != nil {
+		t.Fatalf("UpdateOrgMembership: %v", err)
+	}
+
+	callerKey := addTestKeyWithUser(t, keyCache, auth.RoleOrgAdmin, org.ID, user.ID)
+	keyID, _ := mustCreateUserKeyViaAPI(t, app, org.ID, user.ID, team.ID, callerKey)
+
+	req := httptest.NewRequest("POST", rotateKeyURL(org.ID, keyID), nil)
+	req.Header.Set("Authorization", "Bearer "+callerKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, b)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+	newKey, _ := got["new_key"].(map[string]any)
+	if newKey == nil {
+		t.Fatal("new_key missing from response")
+	}
+	newPlaintext, _ := newKey["key"].(string)
+	if newPlaintext == "" {
+		t.Fatal("new_key.key is empty")
+	}
+
+	ki, ok := keyCache.Get(keygen.Hash(newPlaintext, testHMACSecret))
+	if !ok {
+		t.Fatal("rotated key not found in cache")
+	}
+	if ki.OrgDailyTokenLimit != 33_000 {
+		t.Errorf("OrgDailyTokenLimit = %d, want 33000 (must be populated immediately)", ki.OrgDailyTokenLimit)
+	}
+	if ki.TeamRequestsPerMinute != 18 {
+		t.Errorf("TeamRequestsPerMinute = %d, want 18 (must be populated immediately)", ki.TeamRequestsPerMinute)
+	}
+	if ki.UserDailyTokenLimit != 4_444 {
+		t.Errorf("UserDailyTokenLimit = %d, want 4444 (per-user membership limit must be populated immediately)", ki.UserDailyTokenLimit)
+	}
+}
+
+// TestRotateAPIKey_GraceExpiresAtIsCanonical verifies that the old key's
+// grace-period expires_at — both as rendered in the JSON response and as
+// stored in the database — is in the exact canonical db.TimestampLayout
+// shape ("YYYY-MM-DDTHH:MM:SSZ": UTC, second precision, no fractional
+// seconds, no numeric offset), not merely some RFC3339-parseable variant.
+func TestRotateAPIKey_GraceExpiresAtIsCanonical(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestRotateAPIKey_GraceCanonical?mode=memory&cache=private")
+
+	org := mustCreateOrg(t, database, "Acme", "rotate-grace-canonical-org")
+	user := mustCreateUser(t, database, "rotate-grace-canonical@example.com", "Grace Canonical User")
+	team := mustCreateTeam(t, database, org.ID, "Dev", "rotate-grace-canonical-team")
+	mustCreateUserMemberships(t, database, org.ID, team.ID, user.ID)
+	callerKey := addTestKeyWithUser(t, keyCache, auth.RoleOrgAdmin, org.ID, user.ID)
+
+	keyID, _ := mustCreateUserKeyViaAPI(t, app, org.ID, user.ID, team.ID, callerKey)
+
+	req := httptest.NewRequest("POST", rotateKeyURL(org.ID, keyID), nil)
+	req.Header.Set("Authorization", "Bearer "+callerKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, b)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+
+	oldKey, _ := got["old_key"].(map[string]any)
+	if oldKey == nil {
+		t.Fatalf("old_key missing from response")
+	}
+	oldKeyID, _ := oldKey["id"].(string)
+	if oldKeyID == "" {
+		t.Fatalf("old_key.id missing from response")
+	}
+	respExpiresAt, ok := oldKey["expires_at"].(string)
+	if !ok || respExpiresAt == "" {
+		t.Fatalf("old_key.expires_at is absent or empty; got: %v", oldKey)
+	}
+	if _, err := time.Parse(db.TimestampLayout, respExpiresAt); err != nil {
+		t.Errorf("old_key.expires_at in response = %q, not canonical db.TimestampLayout shape: %v", respExpiresAt, err)
+	}
+
+	var storedExpiresAt string
+	if err := database.SQL().QueryRowContext(context.Background(),
+		"SELECT expires_at FROM api_keys WHERE id = ?", oldKeyID,
+	).Scan(&storedExpiresAt); err != nil {
+		t.Fatalf("read stored expires_at: %v", err)
+	}
+	if _, err := time.Parse(db.TimestampLayout, storedExpiresAt); err != nil {
+		t.Errorf("old_key expires_at stored in DB = %q, not canonical db.TimestampLayout shape: %v", storedExpiresAt, err)
+	}
+	if storedExpiresAt != respExpiresAt {
+		t.Errorf("stored expires_at %q does not match response expires_at %q", storedExpiresAt, respExpiresAt)
 	}
 }
 

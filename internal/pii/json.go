@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -22,6 +23,38 @@ var knownContentPartTypes = map[string]bool{
 	"audio":       true,
 	"document":    true,
 	"video":       true,
+}
+
+// coveredTopLevelFields lists the top-level request-body fields that
+// anonymizeWithDetectors handles with dedicated shape validation above (user,
+// stop, prompt, input, tools, messages, logit_bias, tool_choice, and the
+// legacy pre-"tools" fields functions, function_call). They are excluded
+// from the default unknown-field scan to avoid processing them twice.
+var coveredTopLevelFields = map[string]bool{
+	"user":          true,
+	"stop":          true,
+	"prompt":        true,
+	"input":         true,
+	"tools":         true,
+	"messages":      true,
+	"logit_bias":    true,
+	"tool_choice":   true,
+	"functions":     true,
+	"function_call": true,
+}
+
+// exemptTopLevelFields lists structural top-level request-body fields whose
+// value must remain byte-identical for routing semantics to keep working —
+// a pseudonymized "model" would break routing to the correct upstream — and
+// which are skipped entirely, with no shape validation, because their value
+// is never free text. Every top-level field NOT in this set and NOT in
+// coveredTopLevelFields is treated as potential content and scanned by
+// default. Fields whose exemption depends on their value having a specific
+// shape (logit_bias, tool_choice) are handled with dedicated shape
+// validation above instead of living in this set — see
+// coveredTopLevelFields.
+var exemptTopLevelFields = map[string]bool{
+	"model": true,
 }
 
 // hasDuplicateKeys reports whether body contains a JSON object (at any level of
@@ -107,13 +140,17 @@ func scanForDuplicateKeys(dec *json.Decoder) (bool, error) {
 
 // anonymizeWithDetectors replaces PII in all PII-bearing string fields of an
 // OpenAI-shaped request body. It handles chat completion, legacy completion,
-// and embeddings request shapes. Covered fields:
+// embeddings, and rerank/score request shapes. Explicitly covered fields (each
+// with dedicated shape validation):
 //
 // Chat completions:
 //   - messages[].content (string or array-of-parts "text" field)
 //   - messages[].name
 //   - messages[].tool_calls[].function.arguments (JSON string, scanned as text)
+//   - messages[].tool_calls[].function.name (function-name policy, see below)
 //   - messages[].function_call.arguments (legacy, JSON string, scanned as text)
+//   - messages[].function_call.name (legacy, function-name policy, see below)
+//   - tools[].function.name (function-name policy, see below)
 //   - tools[].function.description
 //   - tools[].function.parameters: string leaf values only (description, default,
 //     enum strings, title, etc.); object structure and keys are never modified.
@@ -124,6 +161,62 @@ func scanForDuplicateKeys(dec *json.Decoder) (bool, error) {
 //
 // Embeddings:
 //   - top-level "input" (string or array-of-strings; array-of-ints/token-arrays left unchanged)
+//
+// All request shapes:
+//   - top-level "stop" (string or array-of-strings; each string is
+//     pseudonymized independently, never concatenated)
+//   - top-level "logit_bias": exempt (untouched) only when it is a JSON
+//     object whose keys are all 1-to-7-digit ASCII-digit strings (token
+//     IDs — tokenizer vocabularies stay below 10 million entries) and whose
+//     values are all JSON numbers, or is JSON null. Any other shape,
+//     including a longer digit string that could carry a card or phone
+//     number, is rejected fail-closed — the value is never scanned, because
+//     a pseudonymized token-ID key would corrupt the bias map.
+//   - top-level "tool_choice": a JSON string is scanned like any other
+//     string field; JSON null is a no-op; a JSON object's
+//     "function.name" gets the function-name policy (see below) — every
+//     other string leaf in the object is scanned normally via
+//     scanStringLeaves. Any other shape is rejected fail-closed.
+//   - top-level "functions" (legacy, deprecated in favor of "tools"): each
+//     element is {"name", "description", "parameters"} with "name" getting
+//     the function-name policy and "description"/"parameters" scanned
+//     exactly like their tools[].function counterparts. Present but not an
+//     array (or JSON null) is rejected fail-closed.
+//   - top-level "function_call" (legacy, deprecated in favor of
+//     "tool_choice"): a JSON string is scanned like tool_choice's string
+//     form; JSON null is a no-op; an object selects a function by "name"
+//     directly (no nested "function" key) — "name" gets the function-name
+//     policy and every other string leaf is scanned normally. Any other
+//     shape is rejected fail-closed.
+//
+// Function-name policy (tools[].function.name, tool_choice.function.name,
+// messages[].tool_calls[].function.name, messages[].function_call.name, and
+// the legacy top-level functions[].name / function_call.name): the name is
+// validated against functionNamePattern and, only if it matches, run through
+// the same detectors used for free text. A declared function/tool name must
+// reach the upstream byte-identical to the name a later tool_choice or
+// tool_call selects it by, so it is never pseudonymized — if the charset
+// check fails, or the charset check passes but a detector still flags the
+// name as PII, the request is rejected fail-closed rather than rewriting the
+// name. See validateFunctionName. Each location's handling of a JSON null or
+// absent name preserves that location's prior behavior; see the comment at
+// each call site for specifics.
+//
+// Every other top-level key — anything not listed above — is scanned by
+// default: it is treated as potential free-text content and passed through
+// scanStringLeaves, which pseudonymizes every string leaf independently
+// (never concatenating array elements or object fields), leaves numbers,
+// booleans, and null untouched, rejects PII found in an object key
+// fail-closed, and bounds recursion at maxScanDepth. This covers rerank and
+// score request fields (e.g. "query", "documents", "texts", "text_1",
+// "text_2", "queries", "items", "instruction"), sampling and shape knobs
+// that carry no routing semantics (e.g. "reasoning_effort", "service_tier",
+// "modalities", "stream_options"), and any current or future
+// provider-specific field (e.g. vLLM's "chat_template_kwargs") without
+// endpoint-specific code — no client-supplied text reaches an upstream
+// unscanned through any top-level field. Only "model" (see
+// exemptTopLevelFields) is exempt from this default scan unconditionally,
+// because its value must stay byte-identical for routing.
 //
 // detectors are called for each string value to locate PII spans. replace
 // is called once per unique (type, originalValue) to obtain the pseudonym;
@@ -205,6 +298,231 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 			}
 			doc["user"] = jsonx.RawMessage(newJSON)
 			touched = true
+		}
+	}
+
+	// ── top-level "stop" field ───────────────────────────────────────────────
+	// Applies to every provider: "stop" is part of the OpenAI request surface
+	// regardless of endpoint. It may be a plain string, an array of strings,
+	// or JSON null (OpenAI's default, meaning "no stop sequences"); null is a
+	// no-op, not a covered-field violation. Unlike "prompt" and "input", an
+	// array element that is not a string (e.g. a token ID) is unsupported —
+	// "stop" has no token-array variant — and is rejected fail-closed. Each
+	// string is pseudonymized independently; array elements are never
+	// concatenated.
+	if rawStop, ok := doc["stop"]; ok {
+		if !bytes.Equal(bytes.TrimSpace(rawStop), []byte("null")) {
+			var stopStr string
+			if err := jsonx.Unmarshal(rawStop, &stopStr); err == nil {
+				replaced, did, err := detect(stopStr)
+				if err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				if did {
+					newJSON, err := jsonx.Marshal(replaced)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					doc["stop"] = jsonx.RawMessage(newJSON)
+					touched = true
+				}
+			} else {
+				// Not a string: try array of strings.
+				var stopArr []jsonx.RawMessage
+				if err2 := jsonx.Unmarshal(rawStop, &stopArr); err2 == nil {
+					arrTouched := false
+					for i, elem := range stopArr {
+						// Check the raw token explicitly rather than unmarshaling
+						// straight into a string: unmarshaling a JSON null element
+						// into a non-pointer string silently zeroes it to "" instead
+						// of erroring, which would let a null element pass through
+						// as if it were an (empty) string. Requiring the token to
+						// start with '"' rejects null and every other non-string
+						// element (number, object, array, bool) fail-closed.
+						trimmed := bytes.TrimSpace(elem)
+						if len(trimmed) == 0 || trimmed[0] != '"' {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						var s string
+						if err := jsonx.Unmarshal(elem, &s); err != nil {
+							// Non-string element: "stop" has no token-ID array variant
+							// like "prompt"/"input" — unsupported shape → fail-closed.
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						replaced, did, err := detect(s)
+						if err != nil {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						if did {
+							newJSON, err := jsonx.Marshal(replaced)
+							if err != nil {
+								return nil, errors.New("pii: request body could not be processed for anonymization")
+							}
+							stopArr[i] = jsonx.RawMessage(newJSON)
+							arrTouched = true
+						}
+					}
+					if arrTouched {
+						newJSON, err := jsonx.Marshal(stopArr)
+						if err != nil {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						doc["stop"] = jsonx.RawMessage(newJSON)
+						touched = true
+					}
+				} else {
+					// "stop" is present but is neither a string, an array, nor null:
+					// unsupported shape for a covered field → fail-closed.
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+			}
+		}
+	}
+
+	// ── top-level "logit_bias" field ─────────────────────────────────────────
+	// logit_bias maps token IDs (numeric-string object keys) to a bias value
+	// applied by the upstream sampler. The keys are structural (a token ID,
+	// not text) and must remain byte-identical for the bias to apply to the
+	// intended token; rewriting a key would silently corrupt sampling. JSON
+	// null is OpenAI's "no bias" default and is a no-op. A key must be 1 to
+	// maxLogitBiasKeyDigits ASCII digits — tokenizer vocabularies stay below
+	// 10 million entries, so a legitimate token ID never needs more digits
+	// than that, and a longer digit string could be smuggling a card or
+	// phone number through this field instead. Any shape that is not an
+	// object of such keys mapped to JSON numbers is rejected fail-closed
+	// rather than scanned or forwarded.
+	if rawLogitBias, ok := doc["logit_bias"]; ok {
+		if !bytes.Equal(bytes.TrimSpace(rawLogitBias), []byte("null")) {
+			var logitBias map[string]jsonx.RawMessage
+			if err := jsonx.Unmarshal(rawLogitBias, &logitBias); err != nil || logitBias == nil {
+				return nil, errors.New("pii: request body could not be processed for anonymization")
+			}
+			for key, val := range logitBias {
+				if !isLogitBiasTokenIDKey(key) || !isJSONNumberLiteral(val) {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+			}
+			// Valid shape: left untouched, byte-identical — never scanned.
+		}
+	}
+
+	// ── top-level "tool_choice" field ────────────────────────────────────────
+	// tool_choice selects how the model should call tools. A plain JSON
+	// string ("auto", "none", "required", or any other value) carries no
+	// routing semantics beyond its literal value and is scanned like any
+	// other string field. JSON null is OpenAI's "unset" default and is a
+	// no-op. An object selects a specific function: its "function.name" is a
+	// structural identifier the upstream must receive byte-identical to
+	// route the call correctly, so it is validated against the charset
+	// OpenAI restricts function names to and left untouched — never passed
+	// to detect — while every other string leaf in the object (including
+	// "type" and any sibling of "function") is potential free text and is
+	// scanned normally via scanStringLeaves. Any other shape (number, bool,
+	// array) is rejected fail-closed.
+	if rawToolChoice, ok := doc["tool_choice"]; ok {
+		if !bytes.Equal(bytes.TrimSpace(rawToolChoice), []byte("null")) {
+			var toolChoiceStr string
+			if err := jsonx.Unmarshal(rawToolChoice, &toolChoiceStr); err == nil {
+				replaced, did, err := detect(toolChoiceStr)
+				if err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				if did {
+					newJSON, err := jsonx.Marshal(replaced)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					doc["tool_choice"] = jsonx.RawMessage(newJSON)
+					touched = true
+				}
+			} else {
+				var toolChoice map[string]jsonx.RawMessage
+				if err2 := jsonx.Unmarshal(rawToolChoice, &toolChoice); err2 != nil || toolChoice == nil {
+					// Neither a string, an object, nor null: unsupported shape → fail-closed.
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+
+				tcTouched := false
+				tcKeys := make([]string, 0, len(toolChoice))
+				for k := range toolChoice {
+					tcKeys = append(tcKeys, k)
+				}
+				sort.Strings(tcKeys)
+
+				for _, k := range tcKeys {
+					if k == "function" {
+						continue
+					}
+					scanned, did, err := scanStringLeaves(toolChoice[k], detect)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					if did {
+						toolChoice[k] = scanned
+						tcTouched = true
+					}
+				}
+
+				if rawFn, hasFn := toolChoice["function"]; hasFn {
+					var fn map[string]jsonx.RawMessage
+					if err := jsonx.Unmarshal(rawFn, &fn); err != nil || fn == nil {
+						// tool_choice.function present but not an object (or is JSON null): unsupported shape.
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+
+					if rawName, hasName := fn["name"]; hasName {
+						// "name" present but not a string, or a valid-charset name
+						// that a detector flags as PII, is rejected fail-closed by
+						// validateFunctionName. JSON null unmarshals into an empty
+						// string, which fails functionNamePattern's 1-character
+						// minimum, so a null "name" is rejected here exactly as
+						// before this policy was shared across locations.
+						if err := validateFunctionName(rawName, detect); err != nil {
+							return nil, err
+						}
+						// Valid name: left untouched, never passed to detect.
+					}
+
+					fnTouched := false
+					fnKeys := make([]string, 0, len(fn))
+					for k := range fn {
+						if k == "name" {
+							continue
+						}
+						fnKeys = append(fnKeys, k)
+					}
+					sort.Strings(fnKeys)
+
+					for _, k := range fnKeys {
+						scanned, did, err := scanStringLeaves(fn[k], detect)
+						if err != nil {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						if did {
+							fn[k] = scanned
+							fnTouched = true
+						}
+					}
+
+					if fnTouched {
+						newFnJSON, err := jsonx.Marshal(fn)
+						if err != nil {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						toolChoice["function"] = jsonx.RawMessage(newFnJSON)
+						tcTouched = true
+					}
+				}
+
+				if tcTouched {
+					newTCJSON, err := jsonx.Marshal(toolChoice)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					doc["tool_choice"] = jsonx.RawMessage(newTCJSON)
+					touched = true
+				}
+			}
 		}
 	}
 
@@ -355,11 +673,18 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 		}
 	}
 
-	// ── tools[].function.description + parameters string leaves ─────────────
-	// tools[].function.description is scanned for PII.
-	// tools[].function.parameters: only string LEAF values are scanned (e.g.
-	// description, default, enum strings, title). Object keys and structure are
-	// never modified. "tools" present but not an array → fail-closed.
+	// ── tools[] ───────────────────────────────────────────────────────────────
+	// tools[].function.name is validated against the shared function-name
+	// policy; tools[].function.description is scanned as a string;
+	// tools[].function.parameters scans string LEAF values only (object keys
+	// and structure are never modified). Every other key on tools[].function
+	// (e.g. a "strict" flag is left alone since it is not a string, but any
+	// free-text sibling key) is potential free text and is scanned with
+	// scanStringLeaves. Every key on the tools[] element itself other than
+	// "type" (the structural type discriminator, e.g. "function") and
+	// "function" (handled above) — such as "metadata", "custom", or any
+	// sibling carried by a non-function tool type — is likewise scanned with
+	// scanStringLeaves. "tools" present but not an array → fail-closed.
 	if rawTools, ok := doc["tools"]; ok {
 		var tools []jsonx.RawMessage
 		if err := jsonx.Unmarshal(rawTools, &tools); err != nil || tools == nil {
@@ -373,20 +698,177 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 				// tools[] element is not a JSON object (or is JSON null): unsupported shape → fail-closed.
 				return nil, errors.New("pii: request body could not be processed for anonymization")
 			}
-			rawFn, hasFn := tool["function"]
-			if !hasFn {
-				continue
+			toolTouched := false
+
+			if rawFn, hasFn := tool["function"]; hasFn {
+				var fn map[string]jsonx.RawMessage
+				if err := jsonx.Unmarshal(rawFn, &fn); err != nil || fn == nil {
+					// tools[].function is not a JSON object (or is JSON null): unsupported shape → fail-closed.
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				fnTouched := false
+
+				// tools[].function.name
+				// Validated against the shared function-name policy (charset +
+				// detector) and left untouched when valid — a declared tool name
+				// must reach the upstream byte-identical so a later tool_call can
+				// reference it. JSON null keeps this location's prior behavior
+				// (this field was previously unvalidated and passed through
+				// unchanged): it is left as-is rather than validated or rejected.
+				if rawName, hasName := fn["name"]; hasName {
+					if !bytes.Equal(bytes.TrimSpace(rawName), []byte("null")) {
+						if err := validateFunctionName(rawName, detect); err != nil {
+							return nil, err
+						}
+					}
+				}
+
+				// tools[].function.description
+				// Fail-closed: when "description" is present but is not a string,
+				// reject rather than silently forwarding unscanned content.
+				if rawDesc, hasDesc := fn["description"]; hasDesc {
+					var desc string
+					if err := jsonx.Unmarshal(rawDesc, &desc); err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					replaced, did, err := detect(desc)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					if did {
+						newJSON, err := jsonx.Marshal(replaced)
+						if err != nil {
+							return nil, errors.New("pii: request body could not be processed for anonymization")
+						}
+						fn["description"] = jsonx.RawMessage(newJSON)
+						fnTouched = true
+					}
+				}
+
+				// tools[].function.parameters: scan string leaf values only.
+				if rawParams, hasParams := fn["parameters"]; hasParams {
+					scanned, paramsTouched, err := scanStringLeaves(rawParams, detect)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					if paramsTouched {
+						fn["parameters"] = scanned
+						fnTouched = true
+					}
+				}
+
+				// tools[].function: every other key is potential free text and
+				// is scanned with scanStringLeaves. Keys are collected and
+				// sorted before iterating for deterministic processing order
+				// (see anonymizeWithDetectors' unknown-field scan loop).
+				fnKeys := make([]string, 0, len(fn))
+				for k := range fn {
+					if k == "name" || k == "description" || k == "parameters" {
+						continue
+					}
+					fnKeys = append(fnKeys, k)
+				}
+				sort.Strings(fnKeys)
+				for _, k := range fnKeys {
+					scanned, did, err := scanStringLeaves(fn[k], detect)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					if did {
+						fn[k] = scanned
+						fnTouched = true
+					}
+				}
+
+				if fnTouched {
+					newFnJSON, err := jsonx.Marshal(fn)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					tool["function"] = jsonx.RawMessage(newFnJSON)
+					toolTouched = true
+				}
 			}
+
+			// tools[]: every key other than "type" and "function" is potential
+			// free text (e.g. "metadata", "custom", or a sibling carried by a
+			// non-function tool type) and is scanned with scanStringLeaves.
+			toolKeys := make([]string, 0, len(tool))
+			for k := range tool {
+				if k == "type" || k == "function" {
+					continue
+				}
+				toolKeys = append(toolKeys, k)
+			}
+			sort.Strings(toolKeys)
+			for _, k := range toolKeys {
+				scanned, did, err := scanStringLeaves(tool[k], detect)
+				if err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				if did {
+					tool[k] = scanned
+					toolTouched = true
+				}
+			}
+
+			if toolTouched {
+				newToolJSON, err := jsonx.Marshal(tool)
+				if err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				tools[i] = jsonx.RawMessage(newToolJSON)
+				toolsTouched = true
+			}
+		}
+		if toolsTouched {
+			newToolsJSON, err := jsonx.Marshal(tools)
+			if err != nil {
+				return nil, errors.New("pii: request body could not be processed for anonymization")
+			}
+			doc["tools"] = jsonx.RawMessage(newToolsJSON)
+			touched = true
+		}
+	}
+
+	// ── legacy top-level "functions" field (deprecated in favor of "tools") ──
+	// functions[] predates tools[] and mirrors tools[].function directly: each
+	// element is {"name", "description", "parameters"} with no nested
+	// "function" wrapper. "name" gets the shared function-name policy
+	// (validated and left untouched, never scanned) for the same reason as
+	// tools[].function.name; "description" and "parameters" get the same
+	// shape-validated scanning as their tools[].function counterparts. Every
+	// other key on the element is potential free text and is scanned with
+	// scanStringLeaves, exactly like tools[].function's sibling keys.
+	// "functions" present but not an array (or JSON null): unsupported shape
+	// → fail-closed.
+	if rawFunctions, ok := doc["functions"]; ok {
+		var functions []jsonx.RawMessage
+		if err := jsonx.Unmarshal(rawFunctions, &functions); err != nil || functions == nil {
+			return nil, errors.New("pii: request body could not be processed for anonymization")
+		}
+		functionsTouched := false
+		for i, rawFn := range functions {
 			var fn map[string]jsonx.RawMessage
 			if err := jsonx.Unmarshal(rawFn, &fn); err != nil || fn == nil {
-				// tools[].function is not a JSON object (or is JSON null): unsupported shape → fail-closed.
+				// functions[] element is not a JSON object (or is JSON null): unsupported shape → fail-closed.
 				return nil, errors.New("pii: request body could not be processed for anonymization")
 			}
 			fnTouched := false
 
-			// tools[].function.description
-			// Fail-closed: when "description" is present but is not a string,
-			// reject rather than silently forwarding unscanned content.
+			// functions[].name
+			// JSON null keeps this location's prior behavior: before this
+			// field was moved out of the default unknown-field scan, a null
+			// "name" was a scalar leaf left untouched by scanStringLeaves.
+			if rawName, hasName := fn["name"]; hasName {
+				if !bytes.Equal(bytes.TrimSpace(rawName), []byte("null")) {
+					if err := validateFunctionName(rawName, detect); err != nil {
+						return nil, err
+					}
+				}
+			}
+
+			// functions[].description
 			if rawDesc, hasDesc := fn["description"]; hasDesc {
 				var desc string
 				if err := jsonx.Unmarshal(rawDesc, &desc); err != nil {
@@ -406,7 +888,7 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 				}
 			}
 
-			// tools[].function.parameters: scan string leaf values only.
+			// functions[].parameters: scan string leaf values only.
 			if rawParams, hasParams := fn["parameters"]; hasParams {
 				scanned, paramsTouched, err := scanStringLeaves(rawParams, detect)
 				if err != nil {
@@ -418,27 +900,124 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 				}
 			}
 
+			// functions[]: every other key is potential free text and is
+			// scanned with scanStringLeaves. Keys are collected and sorted
+			// before iterating for deterministic processing order (see
+			// anonymizeWithDetectors' unknown-field scan loop).
+			fnKeys := make([]string, 0, len(fn))
+			for k := range fn {
+				if k == "name" || k == "description" || k == "parameters" {
+					continue
+				}
+				fnKeys = append(fnKeys, k)
+			}
+			sort.Strings(fnKeys)
+			for _, k := range fnKeys {
+				scanned, did, err := scanStringLeaves(fn[k], detect)
+				if err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				if did {
+					fn[k] = scanned
+					fnTouched = true
+				}
+			}
+
 			if fnTouched {
 				newFnJSON, err := jsonx.Marshal(fn)
 				if err != nil {
 					return nil, errors.New("pii: request body could not be processed for anonymization")
 				}
-				tool["function"] = jsonx.RawMessage(newFnJSON)
-				newToolJSON, err := jsonx.Marshal(tool)
-				if err != nil {
-					return nil, errors.New("pii: request body could not be processed for anonymization")
-				}
-				tools[i] = jsonx.RawMessage(newToolJSON)
-				toolsTouched = true
+				functions[i] = jsonx.RawMessage(newFnJSON)
+				functionsTouched = true
 			}
 		}
-		if toolsTouched {
-			newToolsJSON, err := jsonx.Marshal(tools)
+		if functionsTouched {
+			newFunctionsJSON, err := jsonx.Marshal(functions)
 			if err != nil {
 				return nil, errors.New("pii: request body could not be processed for anonymization")
 			}
-			doc["tools"] = jsonx.RawMessage(newToolsJSON)
+			doc["functions"] = jsonx.RawMessage(newFunctionsJSON)
 			touched = true
+		}
+	}
+
+	// ── legacy top-level "function_call" field (deprecated in favor of
+	// "tool_choice") ─────────────────────────────────────────────────────────
+	// function_call predates tool_choice and mirrors it directly, minus the
+	// nested "function" wrapper: a JSON string ("auto", "none", or any other
+	// value) carries no routing semantics beyond its literal value and is
+	// scanned like any other string field; JSON null is a no-op; an object
+	// selects a specific function by "name" directly (no "function" key), so
+	// "name" gets the shared function-name policy and every other string
+	// leaf in the object is scanned normally via scanStringLeaves. Any other
+	// shape is rejected fail-closed.
+	if rawFunctionCall, ok := doc["function_call"]; ok {
+		if !bytes.Equal(bytes.TrimSpace(rawFunctionCall), []byte("null")) {
+			var fcStr string
+			if err := jsonx.Unmarshal(rawFunctionCall, &fcStr); err == nil {
+				replaced, did, err := detect(fcStr)
+				if err != nil {
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+				if did {
+					newJSON, err := jsonx.Marshal(replaced)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					doc["function_call"] = jsonx.RawMessage(newJSON)
+					touched = true
+				}
+			} else {
+				var fc map[string]jsonx.RawMessage
+				if err2 := jsonx.Unmarshal(rawFunctionCall, &fc); err2 != nil || fc == nil {
+					// Neither a string, an object, nor null: unsupported shape → fail-closed.
+					return nil, errors.New("pii: request body could not be processed for anonymization")
+				}
+
+				fcTouched := false
+				fcKeys := make([]string, 0, len(fc))
+				for k := range fc {
+					if k == "name" {
+						continue
+					}
+					fcKeys = append(fcKeys, k)
+				}
+				sort.Strings(fcKeys)
+
+				for _, k := range fcKeys {
+					scanned, did, err := scanStringLeaves(fc[k], detect)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					if did {
+						fc[k] = scanned
+						fcTouched = true
+					}
+				}
+
+				// function_call.name
+				// JSON null keeps this location's prior behavior: before this
+				// field was moved out of the default unknown-field scan, a
+				// null "name" was a scalar leaf left untouched by
+				// scanStringLeaves.
+				if rawName, hasName := fc["name"]; hasName {
+					if !bytes.Equal(bytes.TrimSpace(rawName), []byte("null")) {
+						if err := validateFunctionName(rawName, detect); err != nil {
+							return nil, err
+						}
+					}
+				}
+
+				if fcTouched {
+					newFCJSON, err := jsonx.Marshal(fc)
+					if err != nil {
+						return nil, errors.New("pii: request body could not be processed for anonymization")
+					}
+					doc["function_call"] = jsonx.RawMessage(newFCJSON)
+					touched = true
+				}
+			}
 		}
 	}
 
@@ -593,6 +1172,20 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 					// "function_call" present but not an object (or is JSON null): unsupported shape.
 					return nil, errors.New("pii: request body could not be processed for anonymization")
 				}
+
+				// messages[].function_call.name
+				// Same shared function-name policy as the other three
+				// locations: validated and left untouched when valid. JSON
+				// null keeps this location's prior behavior (previously
+				// unvalidated and passed through unchanged).
+				if rawName, ok := fc["name"]; ok {
+					if !bytes.Equal(bytes.TrimSpace(rawName), []byte("null")) {
+						if err := validateFunctionName(rawName, detect); err != nil {
+							return nil, err
+						}
+					}
+				}
+
 				if rawArgs, ok := fc["arguments"]; ok {
 					var args string
 					if err := jsonx.Unmarshal(rawArgs, &args); err != nil {
@@ -644,6 +1237,21 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 						// tool_calls[].function is not a JSON object (or is JSON null) → fail-closed.
 						return nil, errors.New("pii: request body could not be processed for anonymization")
 					}
+
+					// tool_calls[].function.name
+					// Same shared function-name policy as tools[].function.name:
+					// validated and left untouched when valid, because the model's
+					// declared call must match a tool name byte-identical. JSON
+					// null keeps this location's prior behavior (previously
+					// unvalidated and passed through unchanged).
+					if rawName, hasName := callFn["name"]; hasName {
+						if !bytes.Equal(bytes.TrimSpace(rawName), []byte("null")) {
+							if err := validateFunctionName(rawName, detect); err != nil {
+								return nil, err
+							}
+						}
+					}
+
 					rawArgs, hasArgs := callFn["arguments"]
 					if !hasArgs {
 						continue
@@ -702,6 +1310,42 @@ func anonymizeWithDetectors(body []byte, detectors []Detector, replace func(typ,
 				return nil, errors.New("pii: request body could not be processed for anonymization")
 			}
 			doc["messages"] = jsonx.RawMessage(newMessagesJSON)
+		}
+	}
+
+	// ── every other top-level field: scanned by default ─────────────────────
+	// Any top-level key that is neither explicitly covered above nor in the
+	// structural exempt set is potential free-text content. Scan it with
+	// scanStringLeaves: every string leaf is pseudonymized independently
+	// (never concatenated), object keys are checked for PII and rejected
+	// fail-closed, recursion is bounded by maxScanDepth, and numbers, booleans,
+	// and null are left untouched. This is what covers rerank/score fields
+	// (query, documents, texts, text_1, text_2, ...) and any other current or
+	// future field without endpoint-specific code.
+	//
+	// Keys are collected and sorted before iterating, rather than ranged over
+	// directly, so that processing order is deterministic across runs — Go's
+	// map iteration order is randomized, and pseudonymFor records the
+	// first-seen spelling of a case-normalized value (e.g. "User@Example.com"
+	// vs. "user@example.com") for Restore. Without a fixed order, which
+	// spelling wins would vary run to run.
+	unknownKeys := make([]string, 0, len(doc))
+	for key := range doc {
+		if coveredTopLevelFields[key] || exemptTopLevelFields[key] {
+			continue
+		}
+		unknownKeys = append(unknownKeys, key)
+	}
+	sort.Strings(unknownKeys)
+	for _, key := range unknownKeys {
+		raw := doc[key]
+		scanned, did, err := scanStringLeaves(raw, detect)
+		if err != nil {
+			return nil, errors.New("pii: request body could not be processed for anonymization")
+		}
+		if did {
+			doc[key] = scanned
+			touched = true
 		}
 	}
 
@@ -807,6 +1451,87 @@ func deOverlap(spans []Span) []Span {
 	}
 	result = append(result, cur)
 	return result
+}
+
+// functionNamePattern is the shared charset for every function/tool name
+// that appears in a request: 1 to 128 characters drawn from letters, digits,
+// underscore, period, plus, and hyphen. This mirrors the charset the
+// provider adapters already enforce on tool/function identifiers (see
+// anthropicToolIDRe in internal/proxy/anthropic.go), bounded to a maximum
+// length so a name cannot be used to smuggle an arbitrarily long string
+// through this policy. It is applied wherever a function/tool name appears
+// in the request: tools[].function.name, tool_choice.function.name,
+// messages[].tool_calls[].function.name, messages[].function_call.name, and
+// the legacy top-level functions[].name and function_call.name.
+var functionNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.+\-]{1,128}$`)
+
+// validateFunctionName applies the shared function-name policy to raw, which
+// must decode as a JSON string. The name is validated against
+// functionNamePattern and then run through detect: because a declared
+// function/tool name and its later selection (by tool_choice or a model's
+// tool call) must stay byte-identical, a name is never pseudonymized — if it
+// matches functionNamePattern but detect finds PII in it anyway, or if raw is
+// not a JSON string at all, the request is rejected fail-closed rather than
+// silently forwarding or rewriting the name.
+func validateFunctionName(raw jsonx.RawMessage, detect func(string) (string, bool, error)) error {
+	var name string
+	if err := jsonx.Unmarshal(raw, &name); err != nil {
+		return errors.New("pii: request body could not be processed for anonymization")
+	}
+	if !functionNamePattern.MatchString(name) {
+		return errors.New("pii: request body could not be processed for anonymization")
+	}
+	_, matched, err := detect(name)
+	if err != nil {
+		return errors.New("pii: request body could not be processed for anonymization")
+	}
+	if matched {
+		return errors.New("pii: request body could not be processed for anonymization")
+	}
+	return nil
+}
+
+// maxLogitBiasKeyDigits is the maximum length of a logit_bias object key
+// that isLogitBiasTokenIDKey accepts as a token ID. Tokenizer vocabularies
+// are well below 10 million entries (7 digits), so a legitimate token ID
+// never needs more than maxLogitBiasKeyDigits digits. Longer digit strings
+// could carry a card number, phone number, or similar unscanned free-text
+// value smuggled through a structurally-exempt field, so they are rejected
+// fail-closed rather than treated as a token ID.
+const maxLogitBiasKeyDigits = 7
+
+// isLogitBiasTokenIDKey reports whether s is a valid logit_bias object key:
+// 1 to maxLogitBiasKeyDigits ASCII digit characters ('0'-'9'), with no other
+// characters allowed. It is used to validate logit_bias object keys, which
+// must be token IDs (numeric strings within the tokenizer's vocabulary
+// range) for the field to be exempt from scanning.
+func isLogitBiasTokenIDKey(s string) bool {
+	if len(s) == 0 || len(s) > maxLogitBiasKeyDigits {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isJSONNumberLiteral reports whether raw is a JSON number literal — not a
+// string, boolean, null, object, or array. It is used to validate
+// logit_bias object values, which must be bias numbers for the field to be
+// exempt from scanning.
+func isJSONNumberLiteral(raw jsonx.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return false
+	}
+	switch trimmed[0] {
+	case '"', '{', '[', 't', 'f', 'n':
+		return false
+	}
+	var n float64
+	return jsonx.Unmarshal(trimmed, &n) == nil
 }
 
 // isTokenElement reports whether raw is a valid OpenAI token-ID element: either
@@ -921,10 +1646,21 @@ func scanStringLeavesDepth(raw jsonx.RawMessage, detect func(string) (string, bo
 	// (the upstream model expects the original field names). Therefore, if any
 	// key matches a PII pattern we fail-closed rather than forwarding unscanned
 	// or corrupted content.
+	//
+	// Keys are collected and sorted before iterating, rather than ranged over
+	// directly, so that nested traversal order is deterministic across runs —
+	// see the identical rationale on the top-level unknown-field scan loop in
+	// anonymizeWithDetectors.
 	var obj map[string]jsonx.RawMessage
 	if err := jsonx.Unmarshal(raw, &obj); err == nil {
 		objTouched := false
-		for k, v := range obj {
+		keys := make([]string, 0, len(obj))
+		for k := range obj {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := obj[k]
 			// Scan the key for PII. If the key contains PII, fail-closed:
 			// rewriting a structural key would corrupt the schema.
 			_, keyHasPII, err := detect(k)

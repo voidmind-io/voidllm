@@ -880,3 +880,97 @@ func TestDeleteAPIKey_RemovesFromCache(t *testing.T) {
 		t.Error("key still in cache after DELETE, expected it to be evicted")
 	}
 }
+
+// TestCreateAPIKey_CacheHasFullLimitsImmediately verifies that the cache entry
+// written by CreateAPIKey already carries the org, team, and per-user limit
+// hierarchy — populated via db.LoadActiveKey + auth.KeyInfoFromRecord — from
+// the very first request, instead of only picking up those limits on the next
+// periodic cache reload (up to 30s later).
+func TestCreateAPIKey_CacheHasFullLimitsImmediately(t *testing.T) {
+	t.Parallel()
+
+	app, database, keyCache := setupTestApp(t, "file:TestCreateAPIKey_CacheFullLimits?mode=memory&cache=private")
+
+	org := mustCreateOrg(t, database, "O", "create-cache-limits-org")
+	if _, err := database.SQL().ExecContext(context.Background(),
+		"UPDATE organizations SET daily_token_limit = 70000, requests_per_day = 900 WHERE id = ?", org.ID); err != nil {
+		t.Fatalf("set org limits: %v", err)
+	}
+
+	user := mustCreateUser(t, database, "create-cache-limits@example.com", "U")
+	team := mustCreateTeam(t, database, org.ID, "T", "t-create-cache-limits")
+	if _, err := database.SQL().ExecContext(context.Background(),
+		"UPDATE teams SET monthly_token_limit = 250000, requests_per_minute = 25 WHERE id = ?", team.ID); err != nil {
+		t.Fatalf("set team limits: %v", err)
+	}
+	mustCreateUserMemberships(t, database, org.ID, team.ID, user.ID)
+
+	memberships, err := database.ListOrgMemberships(context.Background(), org.ID, "", 100)
+	if err != nil {
+		t.Fatalf("ListOrgMemberships: %v", err)
+	}
+	var membershipID string
+	for _, m := range memberships {
+		if m.UserID == user.ID {
+			membershipID = m.ID
+		}
+	}
+	if membershipID == "" {
+		t.Fatal("membership not found")
+	}
+	userRPD := 55
+	if _, err := database.UpdateOrgMembership(context.Background(), membershipID, db.UpdateOrgMembershipParams{
+		RequestsPerDay: &userRPD,
+	}); err != nil {
+		t.Fatalf("UpdateOrgMembership: %v", err)
+	}
+
+	callerKey := addTestKeyWithUser(t, keyCache, auth.RoleOrgAdmin, org.ID, user.ID)
+
+	createBody := map[string]any{
+		"name":     "Full Limits Key",
+		"key_type": keygen.KeyTypeUser,
+		"user_id":  user.ID,
+		"team_id":  team.ID,
+	}
+	createReq := httptest.NewRequest("POST", keysURL(org.ID), bodyJSON(t, createBody))
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq.Header.Set("Authorization", "Bearer "+callerKey)
+	createResp, err := app.Test(createReq, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != fiber.StatusCreated {
+		b, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("status = %d, want 201; body: %s", createResp.StatusCode, b)
+	}
+
+	var created map[string]any
+	decodeBody(t, createResp.Body, &created)
+	plaintextKey, _ := created["key"].(string)
+	if plaintextKey == "" {
+		t.Fatal("create response missing plaintext key")
+	}
+
+	keyHash := keygen.Hash(plaintextKey, testHMACSecret)
+	ki, ok := keyCache.Get(keyHash)
+	if !ok {
+		t.Fatal("new key not found in cache after creation")
+	}
+	if ki.OrgDailyTokenLimit != 70_000 {
+		t.Errorf("OrgDailyTokenLimit = %d, want 70000 (must be populated immediately)", ki.OrgDailyTokenLimit)
+	}
+	if ki.OrgRequestsPerDay != 900 {
+		t.Errorf("OrgRequestsPerDay = %d, want 900", ki.OrgRequestsPerDay)
+	}
+	if ki.TeamMonthlyTokenLimit != 250_000 {
+		t.Errorf("TeamMonthlyTokenLimit = %d, want 250000 (must be populated immediately)", ki.TeamMonthlyTokenLimit)
+	}
+	if ki.TeamRequestsPerMinute != 25 {
+		t.Errorf("TeamRequestsPerMinute = %d, want 25", ki.TeamRequestsPerMinute)
+	}
+	if ki.UserRequestsPerDay != 55 {
+		t.Errorf("UserRequestsPerDay = %d, want 55 (per-user membership limit must be populated immediately)", ki.UserRequestsPerDay)
+	}
+}

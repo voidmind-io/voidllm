@@ -7,6 +7,10 @@ export interface OrgMembershipResponse {
   org_id: string
   user_id: string
   role: string
+  daily_token_limit: number
+  monthly_token_limit: number
+  requests_per_minute: number
+  requests_per_day: number
   created_at: string
 }
 
@@ -22,7 +26,11 @@ export interface CreateOrgMemberParams {
 }
 
 export interface UpdateOrgMemberParams {
-  role: string
+  role?: string
+  daily_token_limit?: number
+  monthly_token_limit?: number
+  requests_per_minute?: number
+  requests_per_day?: number
 }
 
 export function useOrgMembers(orgId: string, cursor?: string) {

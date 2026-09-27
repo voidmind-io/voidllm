@@ -66,6 +66,23 @@ type KeyInfo struct {
 	// TeamRequestsPerDay is the team-level requests-per-day limit cached alongside the key.
 	// Zero means unlimited.
 	TeamRequestsPerDay int
+
+	// UserDailyTokenLimit is the per-user daily token limit cached alongside the
+	// key, sourced from the org membership. It applies across every key the
+	// user owns in this org. Zero means unlimited.
+	UserDailyTokenLimit int64
+	// UserMonthlyTokenLimit is the per-user monthly token limit cached alongside
+	// the key, sourced from the org membership. It applies across every key the
+	// user owns in this org. Zero means unlimited.
+	UserMonthlyTokenLimit int64
+	// UserRequestsPerMinute is the per-user requests-per-minute limit cached
+	// alongside the key, sourced from the org membership. It applies across
+	// every key the user owns in this org. Zero means unlimited.
+	UserRequestsPerMinute int
+	// UserRequestsPerDay is the per-user requests-per-day limit cached alongside
+	// the key, sourced from the org membership. It applies across every key the
+	// user owns in this org. Zero means unlimited.
+	UserRequestsPerDay int
 }
 
 // Middleware returns a Fiber handler that authenticates requests via Bearer token.

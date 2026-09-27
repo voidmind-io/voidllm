@@ -1,4 +1,4 @@
--- Migration: 0017_mcp_protocol_version.up.sql
+-- Migration: 0019_mcp_protocol_version.up.sql
 -- Description: Adds protocol_version to mcp_servers so VoidLLM can pin the
 -- MCP protocol era a specific upstream server speaks.
 --

@@ -95,10 +95,19 @@ func (l *Logger) Log(event Event) {
 	event.ModelName = truncateForStorage(event.ModelName)
 	event.RequestedModelName = truncateForStorage(event.RequestedModelName)
 
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = time.Now().UTC()
+	}
+
 	// Increment the in-memory token counter immediately so that subsequent
 	// CheckTokens calls reflect this request even before it reaches the DB.
 	if l.tokenCounter != nil && event.TotalTokens > 0 {
-		l.tokenCounter.Add(event.KeyID, event.TeamID, event.OrgID, int64(event.TotalTokens))
+		l.tokenCounter.Add(ratelimit.Scopes{
+			KeyID:  event.KeyID,
+			UserID: event.UserID,
+			TeamID: event.TeamID,
+			OrgID:  event.OrgID,
+		}, int64(event.TotalTokens))
 	}
 
 	if l.dropOnFull {
@@ -195,14 +204,14 @@ func (l *Logger) flush(events []Event) error {
 		"model_name, prompt_tokens, completion_tokens, total_tokens, " +
 		"cached_read_tokens, cache_write_tokens, " +
 		"cost_estimate, request_duration_ms, ttft_ms, tokens_per_second, status_code, request_id, " +
-		"requested_model_name) " +
+		"requested_model_name, created_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " +
 		p(5) + ", " + p(6) + ", " + p(7) + ", " + p(8) + ", " +
 		p(9) + ", " + p(10) + ", " + p(11) + ", " +
 		p(12) + ", " + p(13) + ", " +
 		p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " + p(18) + ", " + p(19) + ", " +
-		p(20) + ")"
+		p(20) + ", " + p(21) + ")"
 
 	ctx := context.Background()
 
@@ -238,6 +247,7 @@ func (l *Logger) flush(events []Event) error {
 				ev.StatusCode,
 				ev.RequestID,
 				ev.RequestedModelName,
+				db.FormatTimestamp(ev.CreatedAt),
 			)
 			if err != nil {
 				return fmt.Errorf("usage flush: insert event: %w", err)
@@ -249,14 +259,16 @@ func (l *Logger) flush(events []Event) error {
 	}
 
 	// Aggregate the flushed events into hourly rollup buckets. The bucket hour
-	// is derived from the current wall clock time, which is accurate to within
-	// the flush interval (default 5s) — sufficient precision for hour granularity.
-	// Rollup failures are logged but do not fail the flush; raw usage_events
-	// remain the source of truth and rollups can be recomputed from them.
+	// is derived from each event's own CreatedAt (stamped when the event was
+	// logged, not when the batch happened to flush), so a request made near an
+	// hour boundary is bucketed by when it actually happened rather than by
+	// how long it sat in the flush buffer. Rollup failures are logged but do
+	// not fail the flush; raw usage_events remain the source of truth and
+	// rollups can be recomputed from them.
 	rollups := make(map[rollupKey]*db.HourlyRollup)
-	bucketHour := time.Now().UTC().Truncate(time.Hour).Format("2006-01-02T15:00:00Z")
 
 	for _, ev := range events {
+		bucketHour := db.FormatTimestamp(ev.CreatedAt.Truncate(time.Hour))
 		key := rollupKey{KeyID: ev.KeyID, ModelName: ev.ModelName, BucketHour: bucketHour}
 		r, exists := rollups[key]
 		if !exists {
