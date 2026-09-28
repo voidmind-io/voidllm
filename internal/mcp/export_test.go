@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"time"
@@ -277,6 +278,138 @@ func (s *Server) RegisterToolUnsafe(tool Tool, handler ToolHandler) {
 	defer s.mu.Unlock()
 	s.tools = append(s.tools, tool)
 	s.handlers[tool.Name] = registeredTool{handler: handler}
+}
+
+// CountToolsListPageTools exposes countToolsListPageTools for direct testing
+// of ListTools' pre-decode tool-count bound — in particular for measuring
+// its allocation profile against a pathological page (millions of minimal
+// {} tool elements) without the unrelated allocation noise a full HTTP round
+// trip through net/http would add.
+var CountToolsListPageTools = countToolsListPageTools
+
+// ErrJSONSkipMaxDepthExceeded exposes the unexported errJSONSkipMaxDepthExceeded
+// sentinel so a test can assert skipJSONValue's own depth guard failed via
+// errors.Is, rather than only observing it indirectly through
+// countToolsListPageTools' own fail-closed error return (see that
+// function's own doc).
+var ErrJSONSkipMaxDepthExceeded = errJSONSkipMaxDepthExceeded
+
+// ErrToolCacheRefreshRetriesExhausted exposes the unexported
+// errToolCacheRefreshRetriesExhausted sentinel so a test can assert, via
+// errors.Is, that RefreshServer gave up after maxToolCacheEntryAttempts
+// consecutive non-fetching rounds — see that sentinel's own doc.
+var ErrToolCacheRefreshRetriesExhausted = errToolCacheRefreshRetriesExhausted
+
+// ErrToolsListPreScanFailed exposes the unexported errToolsListPreScanFailed
+// sentinel so a test can assert, via errors.Is, that ListTools rejected a
+// page because countToolsListPageTools' own pre-decode walk failed — rather
+// than for any other reason a ListTools call can fail — without depending
+// on matching its error text.
+var ErrToolsListPreScanFailed = errToolsListPreScanFailed
+
+// SkipJSONValueForTest exposes skipJSONValue for direct testing of its own
+// iterative, bounded-depth walk — in particular for proving a value nested
+// far deeper than maxJSONSkipDepth is rejected with
+// errJSONSkipMaxDepthExceeded (via ErrJSONSkipMaxDepthExceeded above)
+// rather than growing this goroutine's own call stack, something only a
+// test constructing a pathologically deep value and driving skipJSONValue
+// against it directly — not any higher-level, allocation-shaped test — can
+// actually observe.
+func SkipJSONValueForTest(dec *json.Decoder) error {
+	return skipJSONValue(dec)
+}
+
+// MaxConcurrentToolsListFetches exposes maxConcurrentToolsListFetches so
+// tests can assert the exact concurrency cap ToolCache.fetchSem enforces,
+// instead of duplicating the literal and risking silent drift if the
+// constant is ever tuned.
+const MaxConcurrentToolsListFetches = maxConcurrentToolsListFetches
+
+// SetFetchTimeoutForTest overrides tc's fetchTimeout — the production
+// toolsListFetchTimeout by default (see that constant's own doc) — letting a
+// test exercise sharedFetch's 2-minute fetch budget (and, since
+// maxConcurrentToolsListFetches' semaphore is acquired with the same bounded
+// context, its concurrency-slot wait too) without actually waiting out the
+// real production duration.
+func (tc *ToolCache) SetFetchTimeoutForTest(d time.Duration) {
+	tc.fetchTimeout.Store(int64(d))
+}
+
+// SharedFetchToolsForTest calls the production sharedFetch directly,
+// bypassing entryFor's own OUTER freshness check entirely, for testing
+// sharedFetch's own INNER freshness recheck (see that method's own doc) in
+// isolation: a test that pre-populates a fresh entry (e.g. via SetTools) and
+// then calls this directly proves the recheck inside sharedFetch's
+// singleflight callback — not entryFor's separate, outer one — is what
+// avoids the redundant fetch, something a call to the exported GetTools
+// could never isolate on its own, since GetTools' own entryFor call would
+// already short-circuit before ever reaching sharedFetch.
+func (tc *ToolCache) SharedFetchToolsForTest(ctx context.Context, serverID string, force bool) ([]Tool, error) {
+	e, _, err := tc.sharedFetch(ctx, serverID, force)
+	if err != nil {
+		return nil, err
+	}
+	return copyTools(e.tools), nil
+}
+
+// SharedFetchForTest calls the production sharedFetch directly and also
+// returns its fetched result — whether this singleflight round actually
+// reached fetchAndPublish, as opposed to returning early via the
+// force-false freshness recheck (see sharedFetch's own doc) — which
+// SharedFetchToolsForTest's narrower []Tool-only return cannot expose. Used
+// by tests exercising RefreshServer's own retry-once-if-not-fetched
+// behavior (see RefreshServer's own doc).
+func (tc *ToolCache) SharedFetchForTest(ctx context.Context, serverID string, force bool) (fetched bool, err error) {
+	_, fetched, err = tc.sharedFetch(ctx, serverID, force)
+	return fetched, err
+}
+
+// SetSharedFetchFreshEntryHookForTest installs fn (or, when fn is nil,
+// clears the previously installed hook) as sharedFetch's package-level
+// force=false freshness-shortcut test hook — see
+// sharedFetchFreshEntryHookForTest's own doc. It is a single package-level
+// atomic.Pointer[func()] shared by every ToolCache instance in the test
+// binary, so a test that sets it must always clear it again before
+// returning (defer SetSharedFetchFreshEntryHookForTest(nil)) and must not
+// run in parallel with any other test that also sets it — the atomic makes
+// the SET/CLEAR itself race-free, it does not make two tests' hooks
+// coexist.
+func SetSharedFetchFreshEntryHookForTest(fn func()) {
+	if fn == nil {
+		sharedFetchFreshEntryHookForTest.Store(nil)
+		return
+	}
+	sharedFetchFreshEntryHookForTest.Store(&fn)
+}
+
+// SetSharedFetchJoinedHookForTest installs fn (or, when fn is nil, clears the
+// previously installed hook) as sharedFetch's package-level per-caller
+// joined-round test hook — see sharedFetchJoinedHookForTest's own doc. Same
+// single-package-level-pointer discipline as
+// SetSharedFetchFreshEntryHookForTest: a test that sets it must always clear
+// it again (defer SetSharedFetchJoinedHookForTest(nil)) and must not run in
+// parallel with any other test that also sets a shared-fetch test hook.
+func SetSharedFetchJoinedHookForTest(fn func(ctx context.Context)) {
+	if fn == nil {
+		sharedFetchJoinedHookForTest.Store(nil)
+		return
+	}
+	sharedFetchJoinedHookForTest.Store(&fn)
+}
+
+// SetSharedFetchResultHookForTest installs fn (or, when fn is nil, clears the
+// previously installed hook) as sharedFetch's package-level per-caller
+// result-observation test hook — see sharedFetchResultHookForTest's own doc.
+// Same single-package-level-pointer discipline as
+// SetSharedFetchFreshEntryHookForTest: a test that sets it must always clear
+// it again (defer SetSharedFetchResultHookForTest(nil)) and must not run in
+// parallel with any other test that also sets a shared-fetch test hook.
+func SetSharedFetchResultHookForTest(fn func(ctx context.Context, fetched bool)) {
+	if fn == nil {
+		sharedFetchResultHookForTest.Store(nil)
+		return
+	}
+	sharedFetchResultHookForTest.Store(&fn)
 }
 
 // ScopedStateCount returns the number of distinct SessionScope entries the

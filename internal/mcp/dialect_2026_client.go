@@ -212,15 +212,70 @@ func targetName(method string, params map[string]jsonx.RawMessage) string {
 // malformed JSON or a resultType of "input_required" — see the doc on
 // ClientDialect.Parse for why an ordinary wire-level JSON-RPC error is
 // deliberately NOT treated the same way.
+//
+// resp.Error is decoded as jsonx.RawMessage, not *Error: Parse only ever
+// checks whether an error is present, never reads its Code, Message, or
+// Data (doCall, the sole caller, forwards the raw bytes unchanged on error
+// — see the &Result{}, nil return just below). Decoding into *Error would
+// materialize Message and a generic Data any for every modern-era error
+// response solely to throw both away; a raw byte slice costs one slice
+// header instead. Presence is therefore a byte-level check: the field is
+// treated as present when its trimmed bytes are non-empty and not the JSON
+// literal "null" — a JSON-RPC error member that is textually null is, per
+// spec, the same as an absent one.
+//
+// Parse's own decode of raw happens in two distinct steps with two very
+// different retention profiles, and the two must not be conflated:
+//
+//  1. jsonx.Unmarshal(raw, &resp) below copies resp.Result ONCE, as a
+//     jsonx.RawMessage — the "result" field's raw JSON bytes, verbatim,
+//     un-parsed. This is a real, single allocation, sized however large
+//     that one field's own text is — bounded, transitively, by raw's own
+//     size, which is itself bounded by rawPostMaxBodyBytes (10 MiB) at
+//     doCall's own read boundary (http_transport.go) — never by a generic
+//     Go structure whose size could balloon past the source bytes. It is
+//     NOT a scan that "retains nothing": one full copy of resp.Result's own
+//     bytes is retained for as long as this Parse call's stack frame is,
+//     which is the entire point of typing the field jsonx.RawMessage rather
+//     than any.
+//  2. jsonx.Unmarshal(resp.Result, &rt) further down decodes THAT
+//     already-bounded copy into rt — three small, fixed-shape fields
+//     (ResultType, TTLMs, CacheScope), never a generic map[string]any. THIS
+//     is the step that is a genuinely non-retaining scan: it costs a full
+//     walk of resp.Result's bytes — an object's fields cannot be selected
+//     without walking past every key — but retains nothing beyond those
+//     three small typed fields, regardless of how large or deeply nested
+//     the OTHER fields this dialect never reads (in particular a "tools"
+//     array of millions of minimal {} elements) turn out to be.
+//
+// Before step 1 existed, an earlier version of this method decoded resp.Result
+// into a generic map[string]any directly, which is what step 2's own
+// non-retaining scan replaced: a tools/list page's "tools" array run to the
+// megabytes, and decoding IT into map[string]any retains every one of those
+// elements as a Go value for the sole purpose of being thrown away the
+// instant Parse returns — previously the dominant cost of every modern-era
+// Call, including every ListTools page, independent of anything ListTools'
+// own pre-decode guards (countToolsListPageTools) could bound. The returned
+// *Result's Payload is always left at its zero value, nil: the only two
+// things any caller of this dialect's Parse has ever read from its return
+// value are the resultType-derived MRTR error above and Cache below (doCall,
+// http_transport.go — the sole call site of ClientDialect.Parse in this
+// package) — doCall's own CallResult carries the caller-visible payload as
+// res.body, the same raw bytes Parse itself decoded from, never as
+// Result.Payload. Should a future caller ever need the payload itself, the
+// fix is to have that caller read it from the raw response bytes it already
+// has (CallResult.Body) — via its own on-demand decode — not to reintroduce
+// a generic decode inside Parse that every OTHER caller then pays for again.
 func (d *dialect2026Client) Parse(raw []byte) (*Result, *Error) {
 	var resp struct {
 		Result jsonx.RawMessage `json:"result"`
-		Error  *Error           `json:"error"`
+		Error  jsonx.RawMessage `json:"error"`
 	}
 	if err := jsonx.Unmarshal(raw, &resp); err != nil {
 		return nil, &Error{Code: CodeParseError, Message: "parse error"}
 	}
-	if resp.Error != nil || len(resp.Result) == 0 {
+	hasError := len(bytes.TrimSpace(resp.Error)) != 0 && !bytes.Equal(bytes.TrimSpace(resp.Error), []byte("null"))
+	if hasError || len(resp.Result) == 0 {
 		// A genuine wire-level JSON-RPC error, or a result-less response,
 		// carries no resultType to inspect for MRTR. Nothing to flag: Call
 		// forwards it unchanged, exactly like an ordinary success payload.
@@ -248,12 +303,7 @@ func (d *dialect2026Client) Parse(raw []byte) (*Result, *Error) {
 		}
 	}
 
-	var payload map[string]any
-	if err := jsonx.Unmarshal(resp.Result, &payload); err != nil {
-		return nil, &Error{Code: CodeParseError, Message: "parse error: result"}
-	}
-
-	result := &Result{Payload: payload}
+	result := &Result{}
 	if resultType == "complete" {
 		// CacheableResult hints (MCP 2026-07-28 §5) are only defined for
 		// resultType:"complete" — a "task" result (Tasks extension) or any

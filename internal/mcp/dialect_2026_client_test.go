@@ -3,7 +3,9 @@ package mcp_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/voidmind-io/voidllm/internal/mcp"
@@ -485,5 +487,59 @@ func TestDialect2026Client_Parse(t *testing.T) {
 				t.Fatal("Parse() result = nil, want non-nil")
 			}
 		})
+	}
+}
+
+// TestDialect2026Client_Parse_ErrorWithLargeData verifies Parse's resp.Error
+// field is decoded as jsonx.RawMessage, not *Error (see Parse's own doc): an
+// error response whose "data" member is a large array must not be
+// materialized into a generic Message string plus a Data any merely to be
+// thrown away — Parse only ever checks whether an error is PRESENT, never
+// reads its Code, Message, or Data. Presence must still be detected
+// correctly even when "data" is large, and the outcome must be the exact
+// same (&Result{}, nil) an ordinary wire-level JSON-RPC error has always
+// produced (see the "an ordinary wire-level JSON-RPC error..." case in
+// TestDialect2026Client_Parse above) — never a parse error, and never a
+// populated *Result.
+func TestDialect2026Client_Parse_ErrorWithLargeData(t *testing.T) {
+	t.Parallel()
+
+	const dataElements = 50000
+	data := "[" + strings.TrimSuffix(strings.Repeat("1,", dataElements), ",") + "]"
+	raw := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"failed","data":%s}}`, data)
+
+	d := mcp.NewDialect2026Client(mcp.V20260728, mcp.ClientInfo{})
+	result, err := d.Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse() unexpected error: %+v", err)
+	}
+	if !reflect.DeepEqual(result, &mcp.Result{}) {
+		t.Errorf("Parse() result = %+v, want &Result{} — the same zero-value result an ordinary wire-level JSON-RPC error has always produced, regardless of how large its data member is", result)
+	}
+}
+
+// TestDialect2026Client_Parse_NullErrorWithResult verifies an "error": null
+// member — textually present but the JSON literal null — is treated as
+// ABSENT, exactly like a response that omits the error member entirely:
+// Parse must fall through to parsing "result" as an ordinary success, never
+// short-circuiting to (&Result{}, nil) as it would for a genuine error. A
+// ttlMs hint on the result proves the success path actually ran — a
+// short-circuit would never see it.
+func TestDialect2026Client_Parse_NullErrorWithResult(t *testing.T) {
+	t.Parallel()
+
+	d := mcp.NewDialect2026Client(mcp.V20260728, mcp.ClientInfo{})
+	result, err := d.Parse([]byte(`{"jsonrpc":"2.0","id":1,"error":null,"result":{"resultType":"complete","ttlMs":5000}}`))
+	if err != nil {
+		t.Fatalf("Parse() unexpected error: %+v", err)
+	}
+	if result == nil {
+		t.Fatal("Parse() result = nil, want non-nil")
+	}
+	if !result.Cache.TTLMsSet {
+		t.Fatal("Parse() result.Cache.TTLMsSet = false, want true — the result must have been parsed for a cache hint, proving \"error\": null took the success path rather than the error short-circuit")
+	}
+	if result.Cache.TTLMs != 5000 {
+		t.Errorf("Parse() result.Cache.TTLMs = %d, want 5000", result.Cache.TTLMs)
 	}
 }

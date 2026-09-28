@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net"
 	"net/http"
@@ -78,6 +80,97 @@ var ErrSSENotSupported = errors.New("server uses deprecated SSE transport (not s
 // content this repo's zero-knowledge logging contract must never let reach
 // a log line via err.Error().
 var errToolsListDecodeFailed = errors.New("mcp: tools/list response decode failed")
+
+// Pagination guards for ListTools (MCP tools/list cursor pagination):
+// nextCursor is an opaque string entirely under the upstream's control, so
+// nothing about its shape structurally bounds how long ListTools could keep
+// following it. An upstream that never lets nextCursor go absent, or that
+// echoes a cursor it already handed out, would otherwise make ListTools loop
+// forever, accumulate an unbounded tool list in memory, or repeat the exact
+// same request indefinitely. Each guard below fails the WHOLE fetch, never a
+// subset of the pages already read — see ListTools' own doc for why a
+// partial listing must never be returned to a caller instead.
+const (
+	// maxToolsListPages bounds how many tools/list requests ListTools will
+	// send for one fetch — the initial request plus every nextCursor-driven
+	// follow-up.
+	maxToolsListPages = 100
+	// maxToolsListTools bounds the total number of tools ListTools will
+	// accumulate across every page of one fetch.
+	maxToolsListTools = 10_000
+	// maxToolsListCursorLen bounds the byte length of a single nextCursor
+	// ListTools will echo back as the following request's params.cursor.
+	maxToolsListCursorLen = 4096
+	// maxToolsListTotalBytes bounds the sum of len(result.Body) across every
+	// page of one fetch. This is distinct from both rawPostMaxBodyBytes,
+	// which only ever bounds a SINGLE page's own response body, and
+	// maxToolsListTools, which counts tools rather than wire bytes: an
+	// upstream could stay under the ceiling on every individual page — and
+	// even under maxToolsListTools, by repeating few tools with very large
+	// schemas — while still driving ListTools to accumulate an unbounded
+	// number of response bytes in memory across enough pages before any
+	// other guard would ever trip.
+	maxToolsListTotalBytes = 32 << 20 // 32 MiB
+)
+
+// errToolsListTooManyPages, errToolsListTooManyTools, errToolsListCursorTooLong,
+// and errToolsListTooManyBytes each guard one of the const bounds above; see
+// that block's own doc for what each protects against and why. All four
+// carry only counts or lengths in their wrapping fmt.Errorf calls — never
+// the cursor value itself, which is upstream-controlled and therefore
+// subject to the same zero-knowledge-logging rule as any other upstream
+// response content.
+var (
+	errToolsListTooManyPages  = errors.New("mcp: tools/list exceeded the maximum number of pages")
+	errToolsListTooManyTools  = errors.New("mcp: tools/list exceeded the maximum number of tools")
+	errToolsListCursorTooLong = errors.New("mcp: tools/list nextCursor exceeds the maximum length")
+	errToolsListTooManyBytes  = errors.New("mcp: tools/list exceeded the maximum aggregate response bytes")
+)
+
+// errToolsListRepeatedCursor is returned when an upstream hands back a
+// nextCursor ListTools has already used to request an earlier page in this
+// same fetch — a cycle that would otherwise make ListTools loop forever
+// re-requesting the same page.
+var errToolsListRepeatedCursor = errors.New("mcp: tools/list nextCursor repeated an earlier page's cursor")
+
+// errToolsListNilBodyMidFetch is returned when a page AFTER the first
+// carries a nil response body (a *CallResult with Body == nil, signaling an
+// HTTP 202 Accepted with no payload — see CallResult's own doc). The FIRST
+// page alone keeps the pre-pagination behavior of ending the fetch right
+// there with whatever was read as an empty listing, since a bodyless first
+// response cannot possibly have started a multi-page fetch to begin with. A
+// nil body on any LATER page means pages were already accumulated and must
+// not be silently truncated to whatever was read so far — this method's own
+// no-partial-listing contract (see ListTools' own doc) requires failing the
+// whole fetch instead.
+var errToolsListNilBodyMidFetch = errors.New("mcp: tools/list follow-up page returned no response body")
+
+// errToolsListDuplicateTool is returned when two pages of the same fetch —
+// whether adjacent or not — name the same tool. Without this check, the
+// duplicate would reach FilterHeaderParamTools' HeaderParams map (silently
+// overwriting the first occurrence's x-mcp-header bindings) and then
+// db.UpsertServerTools' UNIQUE(server_id, name) constraint, whose failure
+// tool_cache.go's persistListing already treats as fire-and-forget and
+// swallows — by the time either of those runs it is too late to reject the
+// fetch, so the check belongs here, before either is ever reached.
+var errToolsListDuplicateTool = errors.New("mcp: tools/list returned the same tool name on more than one page")
+
+// errToolsListPreScanFailed is returned by ListTools when
+// countToolsListPageTools' pre-decode tool-count walk over a page's body
+// fails for any reason — see that function's own doc for its fail-closed
+// contract and the exact class of bypass (a page shaped so an EARLIER,
+// unrelated key's value trips the walk's own bounded-depth guard while the
+// real decode's own, more permissive depth tolerance would have sailed
+// past it and gone on to fully unmarshal a later, enormous "tools" array)
+// this guards against. ListTools fails the whole fetch on this error
+// WITHOUT ever reaching jsonx.Unmarshal for the page in question — the one
+// call this pre-decode walk exists to keep from ever running unbounded. A
+// bare, static sentinel: the underlying walk error is upstream-controlled
+// content (or, for errJSONSkipMaxDepthExceeded specifically, the mere fact
+// that some upstream-controlled value nested unusually deep) this package's
+// zero-knowledge-logging rule keeps out of error text everywhere else in
+// this file, and this guard is no exception.
+var errToolsListPreScanFailed = errors.New("mcp: tools/list pre-decode tool-count scan failed")
 
 // cloudMetadataIP is the well-known link-local address used by cloud provider
 // instance metadata services (AWS, GCP, Azure, DigitalOcean, etc.).
@@ -1412,81 +1505,858 @@ func (t *HTTPTransport) doCall(ctx context.Context, b *eraBinding, st *UpstreamS
 	return &CallResult{Body: res.body}, usedSession, nil
 }
 
-// ListTools sends tools/list to the remote server, parses the returned tool
-// definitions, and applies FilterHeaderParamTools to them before returning.
-// Session/handshake management, if the resolved era needs any, happens
-// transparently inside Call — in the modern era this sends only tools/list,
-// with no initialize and no notifications/initialized, matching the
-// stateless core (docs/mcp-v2.md §2). ListTools is tool discovery, not a
+// maxJSONSkipDepth bounds how many nested '{'/'[' containers skipJSONValue
+// (via skipContainerBody) and countArrayElements' own object-skip branch
+// will follow into before giving up with errJSONSkipMaxDepthExceeded. It is
+// deliberately far smaller than either encoding/json's or sonic's own
+// built-in nesting limits (on the order of 10,000): this guard exists so a
+// pathological page — one whose "tools" key's value, or any OTHER key's
+// value this walk has to skip past, nests tens or hundreds of thousands of
+// levels deep, a shape that costs an attacker only a couple of bytes per
+// level to construct — is rejected by an explicit, bounded depth counter
+// this package owns and controls, rather than by however deep whichever
+// JSON library happens to be running underneath decides to tolerate before
+// erroring on its own. 512 comfortably exceeds any nesting depth a
+// legitimate tool schema could plausibly need (MCP tool input schemas are
+// typically a handful of levels deep at most) while still failing fast, long
+// before either library's own much larger internal limit would even be
+// reached.
+const maxJSONSkipDepth = 512
+
+// errJSONSkipMaxDepthExceeded is returned by skipJSONValue and
+// countArrayElements (via skipContainerBody) when a value being skipped
+// nests more than maxJSONSkipDepth containers deep. It is a bare, static
+// sentinel — never wrapped with any detail about the value itself, which is
+// upstream-controlled content this package's zero-knowledge-logging rule
+// already keeps out of error text everywhere else in this file.
+var errJSONSkipMaxDepthExceeded = errors.New("mcp: json value nests deeper than the maximum depth this walk will follow")
+
+// errJSONObjectKeyNotString is returned by countResultTools and
+// countToolsListPageTools when *json.Decoder's Token() call, invoked right
+// after dec.More() reported another object member was present, returns a
+// token that is not a Go string. Per encoding/json's own documented
+// contract, Token() always returns object member names as strings — this
+// branch is therefore unreachable given the decoder's own invariants and
+// exists purely as defense in depth against a future change to that
+// contract (or a decoder swap) rather than any input this package has ever
+// observed trigger it. It is a bare, static sentinel for the same reason
+// every other guard in this file is: whatever token actually came back is
+// upstream-controlled content this package's zero-knowledge-logging rule
+// keeps out of error text.
+var errJSONObjectKeyNotString = errors.New("mcp: json decoder returned a non-string object member name")
+
+// skipJSONValue consumes exactly one JSON value from dec — a scalar
+// (string, number, bool, or null; already fully consumed by the single
+// Token() call that reads it), or a full object or array, including every
+// value nested inside it — without ever unmarshaling into any typed Go
+// value beyond the tokens themselves. This is the "skip a value neither of
+// us has any interest in the CONTENTS of, only in getting past it"
+// primitive countToolsListPageTools' own object-key loop and
+// countArrayElements' own array-element loop both use.
+//
+// It is iterative, not recursive: skipContainerBody below tracks how many
+// containers are currently open with a single explicit depth counter,
+// incremented on every '{'/'[' and decremented on every matching '}'/']',
+// rather than calling itself once per nesting level the way an earlier
+// version of this function did. Every value this function is ever asked to
+// skip is upstream-controlled content; a naive recursive walker over it
+// would grow this goroutine's own call stack by one frame per nesting
+// level, which an upstream sending a value nested tens or hundreds of
+// thousands of levels deep — trivially cheap to construct, one open
+// bracket per level — could drive arbitrarily high. The explicit counter
+// bounds that cost to a small, fixed amount of stack regardless of how deep
+// the value actually nests, and maxJSONSkipDepth (see its own doc) turns
+// "arbitrarily deep" into a fast, bounded rejection instead.
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		// A scalar — string, number, bool, or null — Token() already
+		// consumed it in full; nothing more to skip.
+		return nil
+	}
+	if delim == '{' || delim == '[' {
+		return skipContainerBody(dec, 1)
+	}
+	return nil
+}
+
+// skipContainerBody consumes tokens from dec until depth currently-open
+// containers have all been closed. depth starts above zero because the
+// caller has already consumed the outermost container's own opening '{' or
+// '[' before calling this function — skipJSONValue's own first Token()
+// call, or countArrayElements' peek at a "tools" value that turned out to
+// be an object rather than an array (see that function's own doc) — so this
+// function itself never reads an opening delimiter it did not already know
+// about via depth's initial value.
+//
+// Every '{' or '[' token encountered increments depth (bounded by
+// maxJSONSkipDepth — see that constant's own doc); every '}' or ']' token
+// decrements it; every other token — an object key, or a scalar value at
+// any level — is read and discarded without affecting depth at all. See
+// skipJSONValue's own doc for why this explicit counter, rather than one
+// recursive call per nesting level, is what keeps this bounded regardless
+// of how deep the container actually nests.
+func skipContainerBody(dec *json.Decoder, depth int) error {
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		delim, ok := tok.(json.Delim)
+		if !ok {
+			continue
+		}
+		switch delim {
+		case '{', '[':
+			depth++
+			if depth > maxJSONSkipDepth {
+				return errJSONSkipMaxDepthExceeded
+			}
+		case '}', ']':
+			depth--
+		}
+	}
+	return nil
+}
+
+// countArrayElements reads exactly one JSON value from dec — the value
+// immediately following a "tools"-matching key, dec positioned right before
+// it — and, if that value is a JSON array, counts its elements without
+// unmarshaling into any of them, stopping the instant the count exceeds
+// budget rather than draining (or even fully skipping) whatever elements
+// remain past that point: a caller that has already established "this
+// array alone pushes the page over its ceiling" has no further use for the
+// array's own exact remaining length, mirroring countToolsListPageTools'
+// own early-exit contract for the page as a whole (see its own doc). budget
+// may already be negative — the running total is already at or past the
+// ceiling before this array is even considered — in which case the very
+// first element, if any, already exceeds it.
+//
+// If the value is anything other than a JSON array — an object, string,
+// number, bool, or null — it is fully skipped (contributing 0 elements) so
+// dec is left correctly positioned for whatever key follows, per this
+// package's "treat a non-array tools value as 0" contract: an upstream is
+// free to name some OTHER, unrelated field "tools", "Tools", or any other
+// case variant that is not itself a tool list at all, and this pre-check
+// must neither crash on it nor mistake it for one.
+func countArrayElements(dec *json.Decoder, budget int) (n int, err error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return 0, err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		// A scalar value — already fully consumed above, not an array:
+		// contributes 0.
+		return 0, nil
+	}
+	if delim != '[' {
+		// '{' — an object, not an array: contributes 0, but its contents
+		// still need to be skipped — its own opening '{' was already
+		// consumed by the Token() call above, hence depth starting at 1.
+		return 0, skipContainerBody(dec, 1)
+	}
+
+	for dec.More() {
+		if err := skipJSONValue(dec); err != nil {
+			return n, err
+		}
+		n++
+		if n > budget {
+			// Over budget: stop here, leaving dec positioned mid-array on
+			// purpose. countToolsListPageTools returns immediately once it
+			// sees the running total exceed limit and never reads from dec
+			// again — see its own doc.
+			return n, nil
+		}
+	}
+	// Under budget: unlike the early return above, this array's own caller
+	// (countResultTools) keeps using dec afterward — to look for another
+	// "tools"-matching key, and eventually to consume the enclosing
+	// result object's own closing '}' — so, unlike the early return above,
+	// the array's closing ']' must be consumed here before returning.
+	if _, err := dec.Token(); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// countResultTools reads exactly one JSON value from dec — a top-level
+// "result"-matching key's value, dec positioned right before it — and, if
+// that value is a JSON object, sums the element counts of every key inside
+// it that equals "tools" case-insensitively (strings.EqualFold — catching
+// "Tools", "TOOLS", or any other case variant, not only an exact lowercase
+// match), stopping the instant the running sum exceeds limit rather than
+// continuing to walk the rest of the object. See countToolsListPageTools'
+// own doc for why summing every match, rather than trying to pick the one
+// key the real decode would resolve "tools" to, is the conservative choice
+// this walk deliberately makes. If the value is not a JSON object at all —
+// a scalar or an array — it is fully skipped, contributing 0: a "result"
+// that carries no object at all has no "tools" field to sum, exactly as
+// countToolsListPageTools' own doc for a non-object result describes.
+func countResultTools(dec *json.Decoder, limit int) (count int, exceeded bool, err error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return 0, false, err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return 0, false, nil // scalar result value — no tools field to sum.
+	}
+	if delim != '{' {
+		// '[' — result is an array, not an object: no tools field, but its
+		// contents still need to be skipped (its own opening '[' was
+		// already consumed above, hence depth starting at 1).
+		return 0, false, skipContainerBody(dec, 1)
+	}
+
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return count, false, err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return count, false, errJSONObjectKeyNotString
+		}
+		if !strings.EqualFold(key, "tools") {
+			if err := skipJSONValue(dec); err != nil {
+				return count, false, err
+			}
+			continue
+		}
+
+		n, err := countArrayElements(dec, limit-count)
+		if err != nil {
+			return count, false, err
+		}
+		count += n
+		if count > limit {
+			return count, true, nil
+		}
+	}
+	if _, err := dec.Token(); err != nil { // closing '}'
+		return count, false, err
+	}
+	return count, false, nil
+}
+
+// countToolsListPageTools performs a streaming token walk over body — one
+// tools/list page's raw JSON-RPC response — to count how many elements
+// result.tools carries, without ever unmarshaling a single element into a
+// Tool (or any other allocating shape). It exists so ListTools' running
+// len(allTools)+count bound (maxToolsListTools) can be enforced BEFORE the
+// much more expensive jsonx.Unmarshal(body, &rpcResp) call at its own call
+// site ever runs: a page whose tools array holds millions of minimal {}
+// elements can stay comfortably under maxToolsListTotalBytes (32 MiB is
+// roughly 3 bytes per element at that count) and even under a single page's
+// own rawPostMaxBodyBytes (10 MiB) ceiling, while still costing an enormous
+// amount of memory once each element is unmarshaled into a full Tool struct
+// (InputSchema bytes, HeaderParams validation, name/description strings,
+// ...).
+//
+// The whole walk — both the top-level "result" key and, inside it, every
+// "tools"-matching key — runs over a single encoding/json *Decoder token
+// stream, deliberately never through jsonx.Unmarshal (sonic): an earlier
+// version of this function routed the outer "result" field through
+// jsonx.Unmarshal specifically to reuse its exact duplicate/case-variant
+// key resolution, but on a build where sonic falls back to its own
+// generic-value machinery (see internal/jsonx's own package doc) that
+// single call alone allocates many times more than decoding the SAME bytes
+// straight into a typed []Tool slice would — the opposite of what a
+// pre-decode bound exists to guarantee, and the reason a dedicated,
+// allocation-bounded test exists for this function at all
+// (TestCountToolsListPageTools_LargeArray_ExceededWithBoundedAllocs).
+//
+// A single sequential *json.Decoder walk turns out to reproduce
+// jsonx.Unmarshal's own resolution exactly anyway, not merely approximate
+// it: encoding/json (and sonic's ConfigStd, built to mimic it) decodes an
+// object into a struct by processing its keys strictly in document order
+// and, for each one that maps to a given field — case-insensitively when no
+// exact match exists, as ordinary for that field alone — OVERWRITING
+// whatever that field already held from an earlier key. Since the struct
+// the real decode (ListTools' own jsonx.Unmarshal(body, &rpcResp) call)
+// targets has exactly one field mapped from "result", every key anywhere in
+// body that equals "result" case-insensitively maps to that SAME field —
+// there is no second, competing field for "exact match" preference to ever
+// have to arbitrate between — so the real decode's own outcome is already
+// exactly "whichever result-matching key appears LAST in body, verbatim".
+// The top-level loop below reproduces that identically: it walks every key
+// of body's own top-level object in order, and every time it sees one
+// matching "result" case-insensitively, it computes that key's own
+// "tools"-sum via countResultTools and OVERWRITES this function's own
+// running count with it, discarding whatever an earlier "result" key
+// produced — the same "keep processing in order, last write wins" rule,
+// applied identically. Only when a given "result" candidate's own count
+// would exceed limit does this function deviate from strict fidelity and
+// return exceeded immediately without first confirming that candidate is
+// the actual final one: this is deliberately still the conservative
+// direction (rejecting a body the real decode might have accepted, never
+// the reverse) — see countResultTools' own doc for the identical reasoning
+// applied to "tools" duplicates one level down.
+//
+// limit is maxToolsListTools minus however many tools ListTools has already
+// accumulated across earlier pages of this same fetch. A non-positive limit
+// (the running total already at or past the ceiling before this page's own
+// tools are even considered) is reported as exceeded immediately, without
+// reading any further into body at all.
+//
+// Fail-closed contract: err is non-nil whenever this walk stopped before it
+// had fully accounted for the top-level object's own "result" key (or
+// confirmed none exists), for ANY reason — a genuine JSON syntax error, an
+// I/O failure, an object member name that was not a string
+// (errJSONObjectKeyNotString — see its own doc for why this is defense in
+// depth against an unreachable case, not a real input this package has ever
+// observed), or a value nested deeper than maxJSONSkipDepth
+// (errJSONSkipMaxDepthExceeded). ListTools treats any such error as reason
+// to fail the WHOLE fetch via errToolsListPreScanFailed, WITHOUT ever
+// reaching jsonx.Unmarshal — see that call site's own comment for why. This
+// used to instead be reported as the same (0, false) "not exceeded" outcome
+// a clean, tools-free page produces, which was a fail-OPEN bug: this walk
+// runs over a plain *encoding/json.Decoder (via jsonx.NewDecoder — see that
+// function's own "falls back to stdlib" doc), a DIFFERENT implementation
+// from the real decode's jsonx.Unmarshal (sonic's ConfigStd), and this
+// file's own doc elsewhere already documents that sonic's own generic
+// fallback machinery can diverge from encoding/json's behavior on the same
+// bytes. maxJSONSkipDepth (512) in particular is deliberately far smaller
+// than either library's own much larger internal nesting limit (see that
+// constant's own doc) specifically so this walk fails fast on a
+// pathologically deep value — which means a body shaped like
+// {"junk": <513 levels deep>, "result": {"tools": [...millions...]}} trips
+// this walk's depth guard on the UNRELATED "junk" key, strictly before ever
+// reaching "result", while the real decode's own, much more permissive
+// depth tolerance sails straight past that same "junk" key and goes on to
+// fully unmarshal the enormous "tools" array into typed Tool structs — the
+// exact per-element allocation cost this whole pre-decode bound exists to
+// avoid ever paying for an unbounded page. Any OTHER decode error uncovered
+// mid-walk carries the identical risk for the identical reason: this
+// function cannot prove, from the error alone, that the real decode would
+// have failed at the same point rather than tolerating it and continuing on
+// to a later, well-formed "tools" array this walk never got to see — so
+// every one of them is treated the same way, fail closed, rather than
+// trying to classify which specific errors are "safe" to let through.
+//
+// Two, and only two, outcomes remain (0, false, nil) — no error — despite
+// not having walked the entire body, because both are provably safe
+// regardless of any behavioral difference between this walk's decoder and
+// the real decode's: they are decided by the FIRST token of body alone,
+// before this function has consumed anything a "result" key's value could
+// ever have followed.
+//
+//   - body's very first token is a valid, complete JSON value that is not an
+//     object at all (a JSON array, string, number, bool, or null) — no
+//     RFC 8259-compliant parser, whichever library implements it, can ever
+//     resolve a top-level "result" key out of a value that structurally
+//     is not an object; this holds independent of any parser-specific
+//     leniency elsewhere. The real decode's own outcome for this shape is
+//     bounded the same way this walk's is: encoding/json (and sonic's
+//     ConfigStd) responds to a top-level type mismatch against a struct
+//     target by skipping the mismatched value at the token level, the same
+//     class of cheap, non-allocating walk this package's own
+//     skipJSONValue/skipContainerBody perform, never by decoding it into
+//     any typed Tool slice.
+//   - dec.More() reports no further top-level members, and no key seen so
+//     far matched "result" — a genuine, complete scan of every top-level
+//     key that turned up no "result" at all. The real decode leaves
+//     rpcResp.Result at its zero value for the identical reason.
+//
+// Every OTHER path — in particular a decode error encountered ANYWHERE
+// after the first token has confirmed the top level IS an object — fails
+// closed, per the contract above.
+//
+// Trailing bytes after the top-level object's own closing '}' are never
+// inspected by this walk at all: it stops as soon as dec.More() reports no
+// further top-level members, without reading (or needing to read) the
+// closing '}' itself. This is safe without an explicit check: JSON's own
+// brace-matching rules mean nothing that could ever appear AFTER a
+// well-formed top-level object's closing '}' can retroactively change what
+// that object's own "result"/"tools" keys already resolved to — trailing
+// bytes cannot smuggle a bigger "tools" array into a page whose properly
+// nested top-level object this walk already counted correctly. Separately,
+// this repo's jsonx.Unmarshal (sonic's ConfigStd) has been confirmed to
+// still reject a body carrying trailing non-whitespace bytes after its
+// top-level value (a non-nil error, matching encoding/json's own
+// json.Unmarshal contract), so ListTools' own decode-error path still fails
+// the fetch for such a body rather than silently accepting it — this walk
+// simply never needed to duplicate that check itself.
+func countToolsListPageTools(body []byte, limit int) (count int, exceeded bool, err error) {
+	if limit < 0 {
+		return 0, true, nil
+	}
+
+	dec := jsonx.NewDecoder(bytes.NewReader(body))
+	tok, err := dec.Token()
+	if err != nil {
+		return 0, false, err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		// Not an object at the top level — provably safe, no error; see
+		// this function's own doc.
+		return 0, false, nil
+	}
+
+	found := false
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return count, false, err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return count, false, errJSONObjectKeyNotString
+		}
+		if !strings.EqualFold(key, "result") {
+			if err := skipJSONValue(dec); err != nil {
+				return count, false, err
+			}
+			continue
+		}
+
+		n, resultExceeded, err := countResultTools(dec, limit)
+		if err != nil {
+			return count, false, err
+		}
+		if resultExceeded {
+			return n, true, nil
+		}
+		count = n
+		found = true
+	}
+	if !found {
+		return 0, false, nil
+	}
+	return count, false, nil
+}
+
+// ListTools sends tools/list to the remote server, follows every nextCursor
+// page it returns, parses and aggregates the tool definitions across all of
+// them, and applies FilterHeaderParamTools to the aggregated list before
+// returning. Session/handshake management, if the resolved era needs any,
+// happens transparently inside Call — in the modern era this sends only
+// tools/list, with no initialize and no notifications/initialized, matching
+// the stateless core (docs/mcp-v2.md §2). ListTools is tool discovery, not a
 // call on behalf of any one caller's organization, so it always uses the
 // empty SessionScope, isolated from every real org's legacy session on this
 // same server.
 //
-// The x-mcp-header filtering happens here, and only here, because this is
-// the sole place a tools/list response becomes VoidLLM's own []Tool shape —
-// MCP 2026-07-28 §4.3 requires the exclusion to happen against the
-// tools/list RESULT, not at some later consumer of it.
-// FilterHeaderParamTools is given t.serverID (the stable server ID this
-// transport was constructed with — empty only for the handful of ad-hoc,
-// non-persistent probes that pass "" to NewHTTPTransport, e.g. the startup
-// SSE probe in cmd/voidllm's app wiring) so an excluded tool's warning log
-// line can identify which server it came from.
+// Pagination: the first request carries no params, exactly as it did before
+// pagination existed. Whenever a page's response carries a nextCursor, the
+// following request's params.cursor is set to that value, and ListTools
+// loops; an absent (or explicit JSON null) nextCursor ends the fetch — MCP's
+// pagination contract treats a MISSING nextCursor as "no more pages", not an
+// empty one: nextCursor is decoded as *string specifically so an upstream
+// that returns cursor: "" is followed one more time (a nil pointer is "no
+// more"; a non-nil pointer to "" is a real, if unusual, cursor). Both
+// ClientDialect implementations already forward params.cursor unmodified —
+// legacyClientDialect.Prepare returns req.Raw byte-for-byte, and
+// dialect2026Client.Prepare only ever adds or replaces the top-level "_meta"
+// key inside params, leaving every other key (cursor included) exactly as
+// this method set it — so no dialect-level change was needed to carry it.
 //
-// The returned *ToolListing's Cache field carries the CacheableResult hint
-// (MCP 2026-07-28 §5) Call's own Parse already extracted — see CallResult's
-// doc. It is not merely carried along on ToolListing for a later change to
-// wire up: ToolCache.resolveTTL reads it to decide the ttl and neverExpires
-// a fetched entry is cached under, and ToolCache.persistListing reads its
-// Scope to decide whether the fetch is written through to the backing store
-// at all — see both methods' own docs.
+// This method never returns a partial listing: any of the guards below
+// (see their own docs — errToolsListTooManyPages, errToolsListTooManyTools,
+// errToolsListTooManyBytes, errToolsListCursorTooLong,
+// errToolsListRepeatedCursor, errToolsListDuplicateTool,
+// errToolsListNilBodyMidFetch) or a page-level fetch/decode/protocol error
+// fails the WHOLE fetch, discarding every page already read, rather than
+// returning what was accumulated so far. The one exception, unchanged from
+// before pagination existed, is a nil response body on the very FIRST page —
+// see errToolsListNilBodyMidFetch's own doc for why only the first page gets
+// this treatment.
+//
+// ctx is checked for cancellation or deadline expiry at the top of every
+// page's iteration, in addition to whatever bounds this method's own caller
+// applies via ToolCache's singleflight fetch (see ToolCache.sharedFetch):
+// this is what bounds a caller of ListTools directly — the health checker
+// and the admin API's test-connection endpoint, neither of which goes
+// through ToolCache at all — by its own context, rather than only by
+// maxToolsListPages.
+//
+// errToolsListDuplicateTool is a bare, static sentinel: unlike
+// errToolsListCursorTooLong or the others above, it deliberately never
+// embeds the colliding tool name, upstream-controlled content that this
+// package's zero-knowledge-logging rule already keeps out of every other
+// guard's error text here.
+//
+// CacheHint aggregation (MCP 2026-07-28 §5), per page's own result.Cache.
+// Every page falls into exactly one of three hint categories — CacheHint.
+// Scope has no fourth value (parseCacheHint's own doc), so these three are
+// exhaustive:
+//
+//   - "no hint": TTLMsSet false (the common case today, since CacheableResult
+//     is opt-in and most upstreams, including every legacy-era one, never
+//     set it).
+//   - "public hint": TTLMsSet true, Scope == CacheScopePublic.
+//   - "private hint": TTLMsSet true, Scope == CacheScopePrivate.
+//   - "unknown-scope hint": TTLMsSet true, Scope neither public nor private
+//     (parseCacheHint leaves Scope at its zero value "" when cacheScope was
+//     absent or unrecognized within an otherwise-present hint).
+//
+// The aggregate is decided by which of these categories appear across every
+// page of the fetch, in this priority order — persistListing is the sole
+// reader of the resulting Scope/TTLMsSet/TTLMs, and its own doc defines
+// exactly what each combination does (save, delete, or neither):
+//
+//  1. ANY page is "private hint": the aggregate's Scope is forced to
+//     CacheScopePrivate unconditionally — regardless of what any OTHER page
+//     said, including a page that offered no hint at all, which would
+//     otherwise mask this page's explicit privacy claim entirely. This is
+//     checked FIRST, ahead of every other rule below, because "fail closed
+//     to delete-only" is the safest possible outcome for a listing any page
+//     ever claimed contains caller-specific data — persistListing's own
+//     Scope == CacheScopePrivate branch reads Scope alone, so nothing else
+//     computed below can override it once this rule applies. TTLMsSet/TTLMs
+//     are still populated from every hint-carrying page (rule 4) purely so
+//     ToolCache.resolveTTL — which reads Cache regardless of what
+//     persistListing will do with it — has an accurate freshness window for
+//     the in-memory entry; persistListing itself never consults them once
+//     Scope is private.
+//  2. Else, ANY page is "unknown-scope hint": the aggregate is neither
+//     public nor private — TTLMsSet true, Scope left at "" — exactly the
+//     shape persistListing already treats as "unproven: neither save nor
+//     delete" for a single-page fetch with that Scope. This applies
+//     EVEN IF other pages carried no hint at all: an unproven scope claim is
+//     not something a hint-less page can dilute back into "safe to persist"
+//     — persisting on the strength of the OTHER pages' silence would still
+//     hand every caller a listing this one page never actually vouched for.
+//     TTLMs is the minimum across every page that carried ANY hint
+//     (public or unknown-scope alike — see rule 4), so the aggregate still
+//     carries a sensible freshness window rather than none at all.
+//  3. Else (no page was private or unknown-scope — every page was either
+//     "no hint" or "public hint"): the aggregate MAY be persisted.
+//     - If every page actually carried a hint (all of them "public hint",
+//     since neither of the other two categories is present here), the
+//     aggregate carries that agreement through: TTLMsSet true, Scope
+//     CacheScopePublic, TTLMs the minimum across every page.
+//     - If at least one page offered no hint at all, the aggregate
+//     collapses to "no hint" (the zero CacheHint) — the same "if ANY page
+//     carried no hint at all, the whole aggregated listing gets no hint"
+//     behavior this rule always had, now scoped to apply only once
+//     private/unknown-scope pages are already ruled out. persistListing's
+//     own no-hint branch still persists it (mirroring a legacy upstream
+//     that never implements CacheableResult at all), it simply carries no
+//     TTL opinion of its own.
+//  4. TTLMs/TTLMsSet, independent of the Scope decision above: TTLMsSet is
+//     true, and TTLMs is the minimum ttlMs across every page whose own hint
+//     was present (TTLMsSet true), whenever at least one page carried a
+//     hint at all — regardless of category, so a private or unknown-scope
+//     page still contributes to (and can lower) the minimum. This is what
+//     ToolCache.resolveTTL reads to size the in-memory entry's freshness
+//     window even when persistListing goes on to neither save nor delete
+//     (rule 2) or to delete (rule 1) — the in-memory cache and the backing
+//     store answer two different questions and are sized independently.
+//     Only when NO page carried any hint at all does TTLMsSet stay false
+//     (rule 3's "no hint" collapse).
+//
+// A page's Scope disagreeing with another page's — e.g. one "public", one
+// "unknown-scope" — is logged once at Warn with only the server ID, never a
+// cursor or scope value (both would still be diagnosable from the server ID
+// alone via the upstream's own logs), whenever more than one of
+// {private, unknown-scope, public} actually appears among the fetch's pages.
+//
+// The x-mcp-header filtering happens here, once, on the fully aggregated and
+// deduplicated tool list, and only here, because this is the sole place a
+// tools/list response becomes VoidLLM's own []Tool shape — MCP 2026-07-28
+// §4.3 requires the exclusion to happen against the tools/list RESULT, not
+// at some later consumer of it, and running it once on the aggregate (rather
+// than per page) is what lets it see every tool at once. FilterHeaderParamTools
+// is given t.serverID (the stable server ID this transport was constructed
+// with — empty only for the handful of ad-hoc, non-persistent probes that
+// pass "" to NewHTTPTransport, e.g. the startup SSE probe in cmd/voidllm's
+// app wiring) so an excluded tool's warning log line can identify which
+// server it came from.
+//
+// The returned *ToolListing's Cache field carries the aggregated
+// CacheableResult hint (MCP 2026-07-28 §5) computed above. It is not merely
+// carried along on ToolListing for a later change to wire up:
+// ToolCache.resolveTTL reads it to decide the ttl and neverExpires a fetched
+// entry is cached under, and ToolCache.persistListing reads its Scope to
+// decide whether the fetch is written through to the backing store at all —
+// see both methods' own docs.
+//
+// toolsListRPCErrorCode is the minimal shape ListTools decodes a tools/list
+// response's top-level "error" field into: only the numeric JSON-RPC code.
+// It deliberately has no Message or Data field at all — unlike this
+// package's general-purpose Error type (protocol.go), which carries both —
+// so that decoding rpcResp below can never populate either with
+// upstream-controlled, free-form content in the first place. Before this
+// existed, rpcResp.Error was typed *Error, so a malicious "data" payload
+// (Error.Data is typed any) was fully decoded into memory even though
+// nothing downstream of this decode ever reads it — ListTools' own error
+// return already only ever names rpcResp.Error.Code (see below). This is
+// the same "don't retain what nothing reads" principle
+// dialect2026Client.Parse's own doc already documents for resp.Result.
+type toolsListRPCErrorCode struct {
+	Code int `json:"code"`
+}
+
 func (t *HTTPTransport) ListTools(ctx context.Context) (*ToolListing, error) {
-	rpcReq := Request{
-		JSONRPC: "2.0",
-		ID:      jsonx.RawMessage(`1`),
-		Method:  "tools/list",
-	}
-	raw, err := jsonx.Marshal(rpcReq)
-	if err != nil {
-		return nil, fmt.Errorf("marshal tools/list: %w", err)
+	var (
+		allTools    []Tool
+		seenNames   = make(map[string]struct{})
+		seenCursors = make(map[string]struct{})
+		cursor      *string
+		totalBytes  int64
+
+		// aggTTLMs/aggTTLSet track the minimum ttlMs across every page whose
+		// own hint was present, regardless of which of the three hint
+		// categories below it fell into — see the CacheHint aggregation
+		// rule table above, rule 4.
+		aggTTLMs  int64
+		aggTTLSet bool
+		// aggNoHint, aggAnyPublicHint, aggAnyUnknownScope, and aggAnyPrivate
+		// each record whether at least one page fell into that hint
+		// category — see the rule table above for how the four combine.
+		// A page contributes to at most one of the latter three (Scope has
+		// no fourth value), so these four flags alone fully characterize
+		// every page seen without needing to track each page's Scope
+		// individually.
+		aggNoHint          bool
+		aggAnyPublicHint   bool
+		aggAnyUnknownScope bool
+		aggAnyPrivate      bool
+	)
+
+	for page := 0; ; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("mcp: tools/list: %w", err)
+		}
+		if page >= maxToolsListPages {
+			return nil, fmt.Errorf("%w: stopped after %d requests", errToolsListTooManyPages, page)
+		}
+
+		rpcReq := Request{
+			JSONRPC: "2.0",
+			ID:      jsonx.RawMessage(`1`),
+			Method:  "tools/list",
+		}
+		if cursor != nil {
+			cursorRaw, err := jsonx.Marshal(*cursor)
+			if err != nil {
+				return nil, fmt.Errorf("marshal tools/list cursor: %w", err)
+			}
+			paramsRaw, err := jsonx.Marshal(map[string]jsonx.RawMessage{"cursor": cursorRaw})
+			if err != nil {
+				return nil, fmt.Errorf("marshal tools/list params: %w", err)
+			}
+			rpcReq.Params = paramsRaw
+		}
+		raw, err := jsonx.Marshal(rpcReq)
+		if err != nil {
+			return nil, fmt.Errorf("marshal tools/list: %w", err)
+		}
+
+		result, err := t.Call(ctx, &CallRequest{Raw: raw}, "")
+		if err != nil {
+			return nil, err
+		}
+		if result.Body == nil {
+			// No body at all (e.g. an HTTP 202 with no payload). On the very
+			// first page this mirrors the pre-pagination behavior of ending
+			// the fetch with an empty listing; on any later page it means a
+			// fetch already under way abruptly lost its body, and the
+			// no-partial-listing contract requires failing the whole fetch
+			// instead of silently truncating it — see
+			// errToolsListNilBodyMidFetch's own doc.
+			//
+			// Returning &ToolListing{} directly here — rather than breaking
+			// out of the loop into the CacheHint aggregation switch below —
+			// matters beyond convenience: that switch has no case at all for
+			// "zero pages ever contributed a flag", since every one of
+			// aggAnyPrivate/aggAnyUnknownScope/aggNoHint stays false when no
+			// page's Cache was ever inspected, so it falls through to the
+			// switch's default case — the "every page was a public hint"
+			// branch — and would incorrectly claim TTLMsSet true, Scope
+			// CacheScopePublic for a listing that in fact carried no hint
+			// from anywhere, since no upstream response was ever read at all.
+			// A bare zero-value ToolListing is also exactly what the
+			// pre-pagination version of this method returned for this same
+			// case: an empty Tools/HeaderParams pair, not the output of
+			// FilterHeaderParamTools run over an empty slice.
+			if page == 0 {
+				return &ToolListing{}, nil
+			}
+			return nil, errToolsListNilBodyMidFetch
+		}
+
+		totalBytes += int64(len(result.Body))
+		if totalBytes > maxToolsListTotalBytes {
+			return nil, fmt.Errorf("%w: %d bytes", errToolsListTooManyBytes, totalBytes)
+		}
+
+		// Pre-decode bound, BEFORE the far more expensive jsonx.Unmarshal into
+		// []Tool below ever runs — see countToolsListPageTools' own doc for
+		// why maxToolsListTotalBytes/rawPostMaxBodyBytes alone do not already
+		// close this gap: a page of millions of minimal {} tool elements can
+		// stay comfortably under both byte ceilings while still costing an
+		// enormous amount of memory once each element is unmarshaled into a
+		// full Tool struct. The post-decode len(allTools)+len(...) check
+		// below still runs unchanged as defense in depth.
+		//
+		// A non-nil err here means the walk itself failed — for any reason,
+		// including this file's own known bypass class (see
+		// countToolsListPageTools' and errToolsListPreScanFailed's own docs)
+		// — and the whole fetch is rejected right here, WITHOUT ever reaching
+		// jsonx.Unmarshal below for this page: that unmarshal is exactly the
+		// expensive, unbounded call this pre-scan exists to gate, so a pre-scan
+		// that could not finish must never be treated as "go ahead anyway".
+		if _, exceeded, err := countToolsListPageTools(result.Body, maxToolsListTools-len(allTools)); err != nil {
+			return nil, errToolsListPreScanFailed
+		} else if exceeded {
+			return nil, fmt.Errorf("%w: accumulated more than %d tools", errToolsListTooManyTools, maxToolsListTools)
+		}
+
+		var rpcResp struct {
+			Result struct {
+				Tools      []Tool  `json:"tools"`
+				NextCursor *string `json:"nextCursor"`
+			} `json:"result"`
+			// Error only decodes the numeric JSON-RPC code — never Message or
+			// Data, both upstream-controlled, free-form content this
+			// package's zero-knowledge-logging rule keeps out of decoded
+			// memory entirely, not merely out of the error text built from it
+			// below (see toolsListRPCErrorCode's own doc).
+			Error *toolsListRPCErrorCode `json:"error"`
+		}
+		if err := jsonx.Unmarshal(result.Body, &rpcResp); err != nil {
+			// err's own message is deliberately never embedded here: this
+			// package's JSON decoder (internal/jsonx, backed by sonic) reports a
+			// syntax error by quoting a window of the SOURCE bytes around the
+			// failure position — an upstream that returns deliberately malformed
+			// JSON with embedded content would otherwise put those bytes into
+			// whatever log line a caller builds from err.Error() (docs/mcp-v2.md
+			// review round, Fund 4; the same class ToolHeaderParams' own decode
+			// error already closed — see that function's identical comment). The
+			// fixed message plus errToolsListDecodeFailed is diagnosis enough:
+			// this response did not even parse as the expected JSON-RPC shape.
+			return nil, fmt.Errorf("%w: tools/list response is not valid JSON-RPC", errToolsListDecodeFailed)
+		}
+		if rpcResp.Error != nil {
+			// An upstream-controlled, free-form "message" (and any "data") is
+			// never embedded in a Go error, which callers log via err.Error()
+			// (see docs/mcp-v2.md §11.2/§11.5, formerly tracked here as
+			// L-004) — rpcResp.Error's own type (toolsListRPCErrorCode) only
+			// ever decodes "code" in the first place, so neither is even
+			// present here to embed by mistake. The numeric JSON-RPC code is
+			// enough to diagnose from VoidLLM's side.
+			return nil, fmt.Errorf("tools/list error: code %d", rpcResp.Error.Code)
+		}
+
+		// Checked BEFORE any of this page's tools are appended to allTools or
+		// inserted into seenNames: a single page whose own tool count would
+		// push the running total above the ceiling must be rejected outright,
+		// not partially ingested up to the ceiling and then rejected.
+		if len(allTools)+len(rpcResp.Result.Tools) > maxToolsListTools {
+			return nil, fmt.Errorf("%w: accumulated %d tools", errToolsListTooManyTools, len(allTools)+len(rpcResp.Result.Tools))
+		}
+		for _, tool := range rpcResp.Result.Tools {
+			if _, dup := seenNames[tool.Name]; dup {
+				return nil, errToolsListDuplicateTool
+			}
+			seenNames[tool.Name] = struct{}{}
+			allTools = append(allTools, tool)
+		}
+
+		if !result.Cache.TTLMsSet {
+			aggNoHint = true
+		} else {
+			if !aggTTLSet || result.Cache.TTLMs < aggTTLMs {
+				aggTTLMs = result.Cache.TTLMs
+				aggTTLSet = true
+			}
+			switch result.Cache.Scope {
+			case CacheScopePrivate:
+				aggAnyPrivate = true
+			case CacheScopePublic:
+				aggAnyPublicHint = true
+			default:
+				// Present hint (TTLMsSet true) but a Scope that is neither
+				// public nor private — parseCacheHint's own doc.
+				aggAnyUnknownScope = true
+			}
+		}
+
+		next := rpcResp.Result.NextCursor
+		if next == nil {
+			break
+		}
+		if len(*next) > maxToolsListCursorLen {
+			return nil, fmt.Errorf("%w: %d bytes", errToolsListCursorTooLong, len(*next))
+		}
+		if _, dup := seenCursors[*next]; dup {
+			return nil, errToolsListRepeatedCursor
+		}
+		seenCursors[*next] = struct{}{}
+		cursor = next
 	}
 
-	result, err := t.Call(ctx, &CallRequest{Raw: raw}, "")
-	if err != nil {
-		return nil, err
-	}
-	if result.Body == nil {
-		return &ToolListing{}, nil
-	}
-
-	var rpcResp struct {
-		Result struct {
-			Tools []Tool `json:"tools"`
-		} `json:"result"`
-		Error *Error `json:"error"`
-	}
-	if err := jsonx.Unmarshal(result.Body, &rpcResp); err != nil {
-		// err's own message is deliberately never embedded here: this
-		// package's JSON decoder (internal/jsonx, backed by sonic) reports a
-		// syntax error by quoting a window of the SOURCE bytes around the
-		// failure position — an upstream that returns deliberately malformed
-		// JSON with embedded content would otherwise put those bytes into
-		// whatever log line a caller builds from err.Error() (docs/mcp-v2.md
-		// review round, Fund 4; the same class ToolHeaderParams' own decode
-		// error already closed — see that function's identical comment). The
-		// fixed message plus errToolsListDecodeFailed is diagnosis enough:
-		// this response did not even parse as the expected JSON-RPC shape.
-		return nil, fmt.Errorf("%w: tools/list response is not valid JSON-RPC", errToolsListDecodeFailed)
-	}
-	if rpcResp.Error != nil {
-		// rpcResp.Error.Message is upstream-controlled, free-form text — never
-		// embed it in a Go error, which callers log via err.Error() (see
-		// docs/mcp-v2.md §11.2/§11.5, formerly tracked here as L-004). The
-		// numeric JSON-RPC code is enough to diagnose from VoidLLM's side.
-		return nil, fmt.Errorf("tools/list error: code %d", rpcResp.Error.Code)
+	// See this method's own "CacheHint aggregation" doc above for the full
+	// rule table this implements; aggAnyPrivate, aggAnyUnknownScope, and
+	// aggAnyPublicHint are mutually exclusive per page (CacheHint.Scope has
+	// no fourth value), so at most one of the first two switch cases below
+	// ever applies, and the third only when neither did.
+	if categories := boolCount(aggAnyPrivate, aggAnyUnknownScope, aggAnyPublicHint); categories > 1 {
+		slog.Default().LogAttrs(ctx, slog.LevelWarn,
+			"mcp: tools/list pages disagreed on cacheScope, resolving to the most restrictive aggregate",
+			slog.String("server_id", t.serverID))
 	}
 
-	kept, headerParams := FilterHeaderParamTools(ctx, t.serverID, rpcResp.Result.Tools)
-	return &ToolListing{Tools: kept, HeaderParams: headerParams, Cache: result.Cache}, nil
+	var cache CacheHint
+	switch {
+	case aggAnyPrivate:
+		// Rule 1: fail closed unconditionally, regardless of anything else —
+		// see the rule table's own doc for why this is checked first. TTL is
+		// still populated (rule 4) purely for ToolCache.resolveTTL's benefit;
+		// persistListing never reads it once Scope is private.
+		cache.Scope = CacheScopePrivate
+		if aggTTLSet {
+			cache.TTLMsSet = true
+			cache.TTLMs = aggTTLMs
+		}
+	case aggAnyUnknownScope:
+		// Rule 2: unproven — neither save nor delete — even if another page
+		// carried no hint at all. aggTTLSet is guaranteed true here, since
+		// this page's own hint is what set aggAnyUnknownScope.
+		cache.TTLMsSet = true
+		cache.TTLMs = aggTTLMs
+		// cache.Scope stays "" — neither public nor private, exactly the
+		// shape persistListing already treats as "unproven".
+	case aggNoHint:
+		// Rule 3, no-hint branch: every page was "no hint" or "public hint",
+		// and at least one was "no hint" — the aggregate collapses to no
+		// hint at all, still persisted by persistListing's own fallback
+		// branch, but with no TTL opinion of its own.
+	default:
+		// Rule 3, all-hinted branch: every page carried a hint and none of
+		// them was private or unknown-scope, so — Scope having no fourth
+		// value — every one of them must have been "public hint".
+		cache.TTLMsSet = true
+		cache.TTLMs = aggTTLMs
+		cache.Scope = CacheScopePublic
+	}
+
+	kept, headerParams := FilterHeaderParamTools(ctx, t.serverID, allTools)
+	return &ToolListing{Tools: kept, HeaderParams: headerParams, Cache: cache}, nil
+}
+
+// boolCount returns how many of vs are true, for ListTools' own diagnostic
+// log of disagreeing per-page cacheScope categories (see its "CacheHint
+// aggregation" doc) — a tiny local helper rather than a one-off inline
+// three-way sum, so the log condition reads as "how many categories
+// actually appeared" rather than an opaque boolean expression.
+func boolCount(vs ...bool) int {
+	n := 0
+	for _, v := range vs {
+		if v {
+			n++
+		}
+	}
+	return n
 }
 
 // Close releases idle connections held by both underlying HTTP clients —

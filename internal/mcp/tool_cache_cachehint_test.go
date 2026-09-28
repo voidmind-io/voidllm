@@ -235,6 +235,11 @@ type fakeToolStore struct {
 	mu      sync.Mutex
 	loadAll map[string][]mcp.Tool
 	calls   []fakeToolStoreCall
+	// saveErr, when non-nil, is returned by every Save call instead of nil —
+	// used to drive persistListing's own Save-failure branch (see its own
+	// doc): saved must be reported false, and fetchAndPublish's post-Save
+	// cleanup-Delete block must never run, for a Save that failed.
+	saveErr error
 }
 
 func (f *fakeToolStore) LoadAll(context.Context) (map[string][]mcp.Tool, error) {
@@ -247,7 +252,7 @@ func (f *fakeToolStore) Save(_ context.Context, serverID string, tools []mcp.Too
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, fakeToolStoreCall{op: "save", serverID: serverID, toolsLen: len(tools)})
-	return nil
+	return f.saveErr
 }
 
 func (f *fakeToolStore) Delete(_ context.Context, serverID string) error {
@@ -460,5 +465,237 @@ func TestSetTools_StaysFreshAfterPerEntryTTLRefactor(t *testing.T) {
 		if len(got) != 1 || got[0].Name != "builtin_tool" {
 			t.Fatalf("GetTools (call %d) = %+v, want [builtin_tool]", i, got)
 		}
+	}
+}
+
+// ---- A nil-first-page *ToolListing (zero CacheHint) through resolveTTL ------
+
+// TestToolCache_ZeroCacheHintListing_MaxAgeZero_NeverExpires drives a
+// fetcher returning exactly what ListTools now returns for a bodyless first
+// page (see errToolsListNilBodyMidFetch's own doc and the ListTools test
+// covering it directly): a &ToolListing{} whose Cache field is the zero
+// CacheHint, TTLMsSet false. Through resolveTTL's own no-hint fallback (see
+// its doc), TTLMsSet false with maxAge == 0 must resolve to neverExpires —
+// exactly the same fallback any other no-hint upstream (in practice, every
+// legacy MCP server today) already gets. A fetcher that fails the test if
+// called more than once proves the entry this listing produced is treated
+// as never expiring, not as the erroneous "public, TTLMsSet true" default a
+// prior bug in ListTools' own CacheHint aggregation would have produced for
+// this exact shape (see ListTools' nil-first-page handling).
+func TestToolCache_ZeroCacheHintListing_MaxAgeZero_NeverExpires(t *testing.T) {
+	t.Parallel()
+
+	var calls int64
+	fetcher := func(context.Context, string) (*mcp.ToolListing, error) {
+		if n := atomic.AddInt64(&calls, 1); n > 1 {
+			return nil, errors.New("fetcher must not be called again for a neverExpires entry")
+		}
+		return &mcp.ToolListing{}, nil
+	}
+	cache := mcp.NewToolCache(fetcher, 0)
+
+	for i := 0; i < 5; i++ {
+		got, err := cache.GetTools(context.Background(), "srv")
+		if err != nil {
+			t.Fatalf("GetTools (call %d): %v", i, err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("GetTools (call %d) = %+v, want an empty listing", i, got)
+		}
+	}
+	if c := atomic.LoadInt64(&calls); c != 1 {
+		t.Errorf("fetcher called %d times, want exactly 1 (maxAge == 0 with a zero CacheHint must never expire)", c)
+	}
+}
+
+// TestToolCache_ZeroCacheHintListing_MaxAgeSet_UsesMaxAge is the maxAge != 0
+// counterpart: the SAME &ToolListing{} (zero CacheHint) shape must instead
+// resolve to ttl == maxAge, neverExpires false — a second GetTools call made
+// after maxAge has elapsed must trigger a genuine refetch, not be served
+// from an entry that incorrectly latched onto "never expires" for this
+// shape.
+func TestToolCache_ZeroCacheHintListing_MaxAgeSet_UsesMaxAge(t *testing.T) {
+	t.Parallel()
+
+	const maxAge = 30 * time.Millisecond
+
+	var calls int64
+	fetcher := func(context.Context, string) (*mcp.ToolListing, error) {
+		atomic.AddInt64(&calls, 1)
+		return &mcp.ToolListing{}, nil
+	}
+	cache := mcp.NewToolCache(fetcher, maxAge)
+
+	if _, err := cache.GetTools(context.Background(), "srv"); err != nil {
+		t.Fatalf("GetTools (first call): %v", err)
+	}
+	if c := atomic.LoadInt64(&calls); c != 1 {
+		t.Fatalf("fetcher called %d times after the first call, want 1", c)
+	}
+
+	// Immediately afterward the entry is still fresh: no refetch yet.
+	if _, err := cache.GetTools(context.Background(), "srv"); err != nil {
+		t.Fatalf("GetTools (immediate second call): %v", err)
+	}
+	if c := atomic.LoadInt64(&calls); c != 1 {
+		t.Fatalf("fetcher called %d times after the immediate second call, want still 1 (entry should still be fresh)", c)
+	}
+
+	// >= 5x maxAge — a wide, non-flaky margin: 2x left this test vulnerable
+	// to spurious failure under scheduler contention or a slow CI runner,
+	// where wall-clock time between the sleep starting and the entry's own
+	// fetchedAt-relative freshness check running could plausibly eat into a
+	// 2x-only margin.
+	time.Sleep(6 * maxAge)
+
+	if _, err := cache.GetTools(context.Background(), "srv"); err != nil {
+		t.Fatalf("GetTools (after maxAge elapsed): %v", err)
+	}
+	if c := atomic.LoadInt64(&calls); c != 2 {
+		t.Errorf("fetcher called %d times after maxAge elapsed, want 2 (maxAge, not neverExpires, must govern this entry's freshness)", c)
+	}
+}
+
+// ---- persistListing: saved reflects Save's own outcome, not merely "took the Save branch" --
+
+// TestToolCache_PersistListing_SaveError_NoCleanupDeleteAttempted drives a
+// store whose Save always fails and verifies two things: the failed Save is
+// still attempted (persistListing's Scope-based decision to try saving at
+// all is unaffected by whether it then succeeds), and — the actual
+// regression this test guards — fetchAndPublish's post-Save cleanup-Delete
+// block never runs for it. Before persistListing reported saved=true purely
+// because it took the Save branch (a store.Save error was discarded
+// entirely), a superseded generation landing after a FAILED Save could still
+// trigger that cleanup block and issue a store.Delete for a row Save itself
+// never actually wrote.
+//
+// No concurrent Invalidate is needed to prove this: fetchAndPublish's
+// cleanup block is nested entirely inside `if tc.persistListing(...)`, so a
+// false return already skips it unconditionally, regardless of whether a
+// supersede would otherwise have been detected — see
+// TestToolCache_FetchAndPublish_CleanupDelete_UsesOwnContext_NotExpiredFetchCtx
+// below for the counterpart that DOES drive a real supersede, against a
+// store whose Save succeeds, to reach that same block from the other side.
+func TestToolCache_PersistListing_SaveError_NoCleanupDeleteAttempted(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeToolStore{saveErr: errors.New("store unavailable")}
+	fetcher := func(context.Context, string) (*mcp.ToolListing, error) {
+		return &mcp.ToolListing{Tools: []mcp.Tool{{Name: "t"}}}, nil
+	}
+	cache := mcp.NewPersistentToolCache(fetcher, time.Hour, store)
+
+	// A failed store write must not fail the fetch itself: the entry is
+	// still served from memory exactly as it would be without a store at
+	// all (persistListing's own Save-failure doc).
+	got, err := cache.GetTools(context.Background(), "srv")
+	if err != nil {
+		t.Fatalf("GetTools: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "t" {
+		t.Errorf("GetTools = %+v, want [t] served from memory despite the store Save failing", got)
+	}
+
+	saves, deletes := store.counts()
+	if saves != 1 {
+		t.Errorf("store.Save called %d times, want exactly 1 (the attempt itself must still happen)", saves)
+	}
+	if deletes != 0 {
+		t.Errorf("store.Delete called %d times, want 0 — no cleanup Delete may be attempted for a Save that failed", deletes)
+	}
+}
+
+// blockingSaveStore is a ToolStore whose Save blocks until released,
+// ignoring the context it is given entirely (deliberately: this fixture
+// exists to prove WHICH context fetchAndPublish's post-Save cleanup Delete
+// call is given, by having Delete record ctx.Err() at the moment it is
+// called — a store that itself respected ctx cancellation would make that
+// observation impossible to attribute to one specific ctx). LoadAll is
+// unused by every test that uses this fixture.
+type blockingSaveStore struct {
+	saveStarted chan struct{}
+	saveRelease chan struct{}
+
+	mu            sync.Mutex
+	deleteCalls   int
+	deleteCtxErrs []error
+}
+
+func (s *blockingSaveStore) LoadAll(context.Context) (map[string][]mcp.Tool, error) {
+	return nil, nil
+}
+
+func (s *blockingSaveStore) Save(context.Context, string, []mcp.Tool) error {
+	close(s.saveStarted)
+	<-s.saveRelease
+	return nil
+}
+
+func (s *blockingSaveStore) Delete(ctx context.Context, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteCalls++
+	s.deleteCtxErrs = append(s.deleteCtxErrs, ctx.Err())
+	return nil
+}
+
+// TestToolCache_FetchAndPublish_CleanupDelete_UsesOwnContext_NotExpiredFetchCtx
+// drives the exact race fetchAndPublish's post-Save recheck-and-delete
+// exists to close (see that method's own doc): a concurrent Invalidate
+// landing WHILE store.Save is still in flight, discovered only once Save
+// returns. It additionally proves the cleanup Delete call itself uses its
+// own dedicated context.WithTimeout(context.Background(),
+// toolCacheCleanupDeleteTimeout) — never the fetch's own (by then already
+// expired) context — by configuring an unusually short fetch timeout, then
+// deliberately letting it elapse WHILE Save is still blocked, before the
+// invalidation and release that let Save return.
+func TestToolCache_FetchAndPublish_CleanupDelete_UsesOwnContext_NotExpiredFetchCtx(t *testing.T) {
+	t.Parallel()
+
+	store := &blockingSaveStore{
+		saveStarted: make(chan struct{}),
+		saveRelease: make(chan struct{}),
+	}
+	fetcher := func(context.Context, string) (*mcp.ToolListing, error) {
+		return &mcp.ToolListing{Tools: []mcp.Tool{{Name: "t"}}}, nil
+	}
+	cache := mcp.NewPersistentToolCache(fetcher, time.Hour, store)
+	cache.SetFetchTimeoutForTest(20 * time.Millisecond)
+
+	refreshDone := make(chan error, 1)
+	go func() {
+		refreshDone <- cache.RefreshServer(context.Background(), "srv")
+	}()
+
+	// The fetch itself has already succeeded and the entry already
+	// published in memory (fetchAndPublish's own FIRST generation check,
+	// before Save, has already passed) by the time Save blocks here.
+	<-store.saveStarted
+
+	// Let the fetch's own 20ms budget elapse WHILE Save is still in
+	// flight, then invalidate — landing exactly in the window
+	// fetchAndPublish's own doc calls out: after the pre-Save generation
+	// check, during persistListing's own Save call.
+	time.Sleep(100 * time.Millisecond)
+	cache.Invalidate("srv")
+	close(store.saveRelease)
+
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("RefreshServer: %v", err)
+	}
+
+	store.mu.Lock()
+	deleteCalls := store.deleteCalls
+	var deleteCtxErr error
+	if len(store.deleteCtxErrs) > 0 {
+		deleteCtxErr = store.deleteCtxErrs[0]
+	}
+	store.mu.Unlock()
+
+	if deleteCalls != 1 {
+		t.Fatalf("store.Delete called %d times, want exactly 1 — cleanup must run even though the fetch context already expired", deleteCalls)
+	}
+	if deleteCtxErr != nil {
+		t.Errorf("ctx passed to Delete had Err() = %v, want nil — the cleanup Delete must use its own dedicated, freshly-timed context, never the (by now expired) fetch context", deleteCtxErr)
 	}
 }

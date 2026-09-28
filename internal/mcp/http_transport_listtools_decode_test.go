@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -48,5 +49,90 @@ func TestHTTPTransport_ListTools_DecodeFailure_NeverLeaksUpstreamBytes(t *testin
 	}
 	if strings.Contains(err.Error(), sentinel) {
 		t.Errorf("ListTools() error leaks upstream response bytes: %v", err)
+	}
+}
+
+// TestHTTPTransport_ListTools_DecodeFailure_OnSecondPage_ReturnsError_NoPartialList
+// is the mid-pagination counterpart of the test above: the FIRST page
+// succeeds and carries a nextCursor, but the SECOND page's response fails to
+// decode as JSON-RPC. ListTools must fail the whole fetch — discarding the
+// first page's already-read tool — rather than returning a partial listing
+// built from page 1 alone, and the decode error must stay upstream-byte-free
+// on this path exactly as it does on the first page.
+func TestHTTPTransport_ListTools_DecodeFailure_OnSecondPage_ReturnsError_NoPartialList(t *testing.T) {
+	t.Parallel()
+
+	const sentinel = "SENTINEL-UPSTREAM-BYTES-PAGE2-do-not-leak-me"
+	malformed := `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"` + sentinel + `"` // truncated, invalid JSON
+
+	var hits int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := atomic.AddInt64(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		switch n {
+		case 1:
+			fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"page1_tool","inputSchema":{"type":"object"}}],"nextCursor":"next"}}`)
+		case 2:
+			fmt.Fprint(w, malformed)
+		default:
+			t.Errorf("unexpected request #%d", n)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	tr := newModernTransport(srv.URL, "none", "", "")
+	listing, err := tr.ListTools(context.Background())
+	if err == nil {
+		t.Fatal("ListTools() error = nil, want a decode error for a malformed second page")
+	}
+	if listing != nil {
+		t.Errorf("ListTools() listing = %v, want nil — no partial listing built from page 1 alone", listing)
+	}
+	if strings.Contains(err.Error(), sentinel) {
+		t.Errorf("ListTools() error leaks upstream response bytes: %v", err)
+	}
+}
+
+// TestHTTPTransport_ListTools_JSONRPCError_OnSecondPage_ReturnsError_NoPartialList
+// is the JSON-RPC-level counterpart: the first page succeeds, but the second
+// page answers with a well-formed JSON-RPC error object instead of a result.
+// ListTools must fail the whole fetch, and the error must carry only the
+// numeric JSON-RPC code — never the upstream-controlled, free-form error
+// message.
+func TestHTTPTransport_ListTools_JSONRPCError_OnSecondPage_ReturnsError_NoPartialList(t *testing.T) {
+	t.Parallel()
+
+	const sentinel = "SENTINEL-UPSTREAM-ERROR-MESSAGE-do-not-leak-me"
+
+	var hits int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := atomic.AddInt64(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		switch n {
+		case 1:
+			fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"page1_tool","inputSchema":{"type":"object"}}],"nextCursor":"next"}}`)
+		case 2:
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":%q}}`, sentinel)
+		default:
+			t.Errorf("unexpected request #%d", n)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	tr := newModernTransport(srv.URL, "none", "", "")
+	listing, err := tr.ListTools(context.Background())
+	if err == nil {
+		t.Fatal("ListTools() error = nil, want an error for a JSON-RPC error on the second page")
+	}
+	if listing != nil {
+		t.Errorf("ListTools() listing = %v, want nil — no partial listing built from page 1 alone", listing)
+	}
+	if !strings.Contains(err.Error(), "code -32000") {
+		t.Errorf("error = %q, want it to include the numeric JSON-RPC code", err.Error())
+	}
+	if strings.Contains(err.Error(), sentinel) {
+		t.Errorf("error = %q, leaks the upstream's own free-form error message", err.Error())
 	}
 }

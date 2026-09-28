@@ -341,6 +341,31 @@ func peekID(raw []byte) jsonx.RawMessage {
 	return probe.ID
 }
 
+// hasCursorParam reports whether params — a tools/list request's raw
+// JSON-RPC params, verbatim (Envelope.Params) — carries a top-level "cursor"
+// key at all, regardless of its value: an explicit JSON null, an empty
+// string, or any other JSON value are all ordinary values a key can carry,
+// and every one of them means the same thing here. VoidLLM's handleToolsList
+// never returns a nextCursor (see its own doc — this server does not
+// paginate tools/list), so there is no cursor value this server could ever
+// have handed a caller to legitimately echo back; any cursor key at all is
+// therefore invalid input regardless of what it holds, not a value worth
+// inspecting further. params that is empty, or that does not even decode as
+// a JSON object (a malformed or non-object params — some other check
+// upstream of dispatch is responsible for rejecting that shape on its own
+// terms), is reported as not carrying the key.
+func hasCursorParam(params jsonx.RawMessage) bool {
+	if len(params) == 0 {
+		return false
+	}
+	var top map[string]jsonx.RawMessage
+	if err := jsonx.Unmarshal(params, &top); err != nil {
+		return false
+	}
+	_, ok := top["cursor"]
+	return ok
+}
+
 // dispatch routes env to its handler. Methods common to both eras
 // (tools/list, tools/call) are handled first; era-specific methods are then
 // routed by dialect.Version().Era() — the era chosen once, at the edge, by
@@ -353,6 +378,25 @@ func peekID(raw []byte) jsonx.RawMessage {
 func (s *Server) dispatch(ctx context.Context, dialect ServerDialect, env *Envelope, hdr Header) (*Result, *Error) {
 	switch env.Method {
 	case "tools/list":
+		if hasCursorParam(env.Params) {
+			// This server never issues a nextCursor (handleToolsList's own
+			// doc), so a caller sending params.cursor at all can only be
+			// replaying a cursor from elsewhere, or guessing — either way,
+			// invalid input per MCP's pagination contract (a cursor's
+			// validity is defined entirely by the server that issued it).
+			// CodeInvalidParams is the ordinary (HTTP 200) JSON-RPC-error
+			// convention per hintForError, EXCEPT in the modern era, where
+			// this specific violation is explicitly given HintBadRequest
+			// (HTTP 400) instead — see statusHintFor's own doc for the one
+			// other CodeInvalidParams case that already carries the same
+			// override, and hintForError's for why CodeInvalidParams alone
+			// is not enough to derive an era-specific hint.
+			e := &Error{Code: CodeInvalidParams, Message: "invalid cursor"}
+			if dialect.Version().Era() == EraModern {
+				e.Hint = HintBadRequest
+			}
+			return nil, e
+		}
 		return s.handleToolsList(), nil
 	case "tools/call":
 		payload, err := s.handleToolsCall(ctx, env, hdr, dialect.Version().Era())
@@ -489,6 +533,17 @@ func (s *Server) handleDiscover() *Result {
 // themselves are caller-agnostic, which subset of them a given caller may
 // see is not, and a public cache would leak an admin-only tool's existence
 // to every caller sharing the cache.
+//
+// This server never paginates: the returned Payload never carries a
+// nextCursor key at all (as opposed to an explicit nextCursor: null), so a
+// caller can never receive a cursor from this server to legitimately echo
+// back on a later request. dispatch's own handling of a tools/list request
+// that DOES carry params.cursor (any value at all) — rejecting it with
+// CodeInvalidParams before this method is ever called — is this method's
+// necessary counterpart: without it, a caller sending a cursor anyway would
+// silently get the same single, complete, unpaginated list back, which
+// could read as "the cursor advanced past the end" rather than "the cursor
+// was never valid to begin with".
 func (s *Server) handleToolsList() *Result {
 	s.mu.RLock()
 	tools := make([]Tool, len(s.tools))
