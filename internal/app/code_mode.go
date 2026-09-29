@@ -39,6 +39,15 @@ type mcpServerByIDer interface {
 // SearchMCPTools. Matches VoidMCP's hard limit to keep responses tractable.
 const searchToolsLimit = 50
 
+// toolsListHookDeadline bounds the total wall-clock time toolsListHook may
+// spend on every DB read it performs — accessibleServers, the per-server
+// blocklist reads, and the per-server output-schema reads — combined. It is
+// derived from the incoming request context so cancellation of the request
+// still takes effect immediately; if it elapses before the hook finishes
+// rendering the dynamic tool list, the hook fails closed and returns the
+// static description instead of a partially-built one.
+const toolsListHookDeadline = 3 * time.Second
+
 // codeModeService holds the dependencies for the three Code Mode VoidLLMDeps
 // closures (ExecuteCode, ListAccessibleMCPServers, SearchMCPTools) and the
 // OnToolsListHook. It is constructed once in app.go and its methods are wired
@@ -80,13 +89,32 @@ func (s *codeModeService) accessibleServers(ctx context.Context, codeModeOnly bo
 		return nil, listErr
 	}
 
+	// Multiple servers may share the same alias across scopes — e.g. an
+	// org-scoped and a global server both registered under alias "foo". Every
+	// caller of accessibleServers keys its output by alias (tool lists,
+	// search results, execution dispatch), so resolve ties here, first, among
+	// every scope-visible active server — before any per-server exclusion
+	// below (code-mode-enabled filter, global access grant). This mirrors the
+	// team > org > global priority applied at execution time by
+	// proxy.MCPServerCache.Get and db.GetMCPServerByAliasScoped, which
+	// resolve purely on scope and never consider CodeModeEnabled or the
+	// global access grant. Resolving winners on the filtered subset instead
+	// would let a lower-priority server "win" an alias here whenever the
+	// true (higher-priority) winner is excluded by one of those filters,
+	// even though the execution path still dispatches every call for that
+	// alias to the true winner — advertising tools and schemas the execution
+	// path can never actually reach. Deduping first means a winner that
+	// turns out to be unusable (see the per-winner checks below) simply
+	// drops the alias entirely; there is no loser left to fall back to.
+	winners := resolveServersByAlias(servers)
+
 	// Filter global servers (OrgID == nil && TeamID == nil) to only those
 	// explicitly allowed via org/team/key access tables. Org- and team-scoped
 	// servers are implicitly accessible to members of that org/team.
 	// System admins bypass the access check — they have unrestricted access.
 	isSystemAdmin := ki.Role == auth.RoleSystemAdmin
-	accessible := make([]db.MCPServer, 0, len(servers))
-	for _, sv := range servers {
+	accessible := make([]db.MCPServer, 0, len(winners))
+	for _, sv := range winners {
 		if sv.OrgID != nil || sv.TeamID != nil {
 			if !codeModeOnly || sv.CodeModeEnabled {
 				accessible = append(accessible, sv)
@@ -116,7 +144,54 @@ func (s *codeModeService) accessibleServers(ctx context.Context, codeModeOnly bo
 			}
 		}
 	}
+
 	return accessible, nil
+}
+
+// resolveServersByAlias deduplicates servers by alias, keeping only the
+// highest-priority server for each alias (see serverScopePriority). The
+// order of first appearance of each alias in servers is preserved in the
+// returned slice.
+func resolveServersByAlias(servers []db.MCPServer) []db.MCPServer {
+	type winner struct {
+		server   db.MCPServer
+		priority int
+	}
+	winners := make(map[string]winner, len(servers))
+	order := make([]string, 0, len(servers))
+	for _, sv := range servers {
+		priority := serverScopePriority(sv)
+		w, ok := winners[sv.Alias]
+		if !ok {
+			winners[sv.Alias] = winner{server: sv, priority: priority}
+			order = append(order, sv.Alias)
+			continue
+		}
+		if priority < w.priority {
+			winners[sv.Alias] = winner{server: sv, priority: priority}
+		}
+	}
+	resolved := make([]db.MCPServer, 0, len(order))
+	for _, alias := range order {
+		resolved = append(resolved, winners[alias].server)
+	}
+	return resolved
+}
+
+// serverScopePriority returns the alias-resolution priority for sv: 1
+// (highest, team-scoped), 2 (org-scoped), or 3 (global, lowest). Lower values
+// win ties in resolveServersByAlias. This mirrors the CASE ordering in
+// db.GetMCPServerByAliasScoped and the team > org > global priority applied
+// by proxy.MCPServerCache.Get.
+func serverScopePriority(sv db.MCPServer) int {
+	switch {
+	case sv.TeamID != nil:
+		return 1
+	case sv.OrgID != nil:
+		return 2
+	default:
+		return 3
+	}
 }
 
 // ExecuteCode runs JavaScript code in the Code Mode sandbox with MCP tools
@@ -142,22 +217,31 @@ func (s *codeModeService) ExecuteCode(ctx context.Context, code string, serverAl
 		wantSet[a] = true
 	}
 
-	// Build a blocklist map (alias → set of blocked tool names) once so
-	// it can be used both for filtering the tool list and as a second
-	// defense inside the ToolCaller closure.
+	// Build the blocklist map (alias → set of blocked tool names) and the
+	// per-alias tool list in a single pass. blockedByServer is used both to
+	// filter the tool list and as a second defense inside the ToolCaller
+	// closure below. excludedAliases holds the aliases of servers whose
+	// blocklist could not be read at all: such a server is excluded from
+	// every Code Mode surface for this execution — no tools listed, no calls
+	// permitted — rather than treated as having an empty blocklist. A
+	// blocklist read failure must never silently widen what an execution is
+	// allowed to reach.
 	blockedByServer := make(map[string]map[string]bool)
+	excludedAliases := make(map[string]bool)
+	serverTools := make(map[string][]mcp.Tool)
+	aliasToServerID := make(map[string]string, len(servers))
 	for _, sv := range servers {
 		if len(wantSet) > 0 && !wantSet[sv.Alias] {
 			continue
 		}
+
 		blocked, blockErr := s.db.ListBlockedToolNames(ctx, sv.ID)
 		if blockErr != nil {
-			s.log.LogAttrs(ctx, slog.LevelWarn, "code mode: list blocked tools",
-				slog.String("server", sv.Alias),
-				slog.String("error", blockErr.Error()),
-			)
-			// Continue with an empty blocklist for this server rather than
-			// aborting; the ToolCache fetch below will still run.
+			s.log.LogAttrs(ctx, slog.LevelWarn,
+				"code mode: list blocked tools failed, excluding server",
+				slog.String("server_id", sv.ID))
+			excludedAliases[sv.Alias] = true
+			continue
 		}
 		if len(blocked) > 0 {
 			set := make(map[string]bool, len(blocked))
@@ -166,13 +250,9 @@ func (s *codeModeService) ExecuteCode(ctx context.Context, code string, serverAl
 			}
 			blockedByServer[sv.Alias] = set
 		}
-	}
 
-	serverTools := make(map[string][]mcp.Tool)
-	for _, sv := range servers {
-		if len(wantSet) > 0 && !wantSet[sv.Alias] {
-			continue
-		}
+		aliasToServerID[sv.Alias] = sv.ID
+
 		tools, toolErr := s.toolCache.GetTools(ctx, sv.ID)
 		if toolErr != nil {
 			// A single server failure does not abort the whole execution.
@@ -211,19 +291,14 @@ func (s *codeModeService) ExecuteCode(ctx context.Context, code string, serverAl
 	executionID := executionUUID.String()
 
 	callTool := mcp.ToolCaller(func(callCtx context.Context, serverAlias, toolName string, args jsonx.RawMessage) (jsonx.RawMessage, error) {
+		if excludedAliases[serverAlias] {
+			return nil, fmt.Errorf("tool %q is unavailable on server %q", toolName, serverAlias)
+		}
 		if bs, ok := blockedByServer[serverAlias]; ok && bs[toolName] {
 			return nil, fmt.Errorf("tool %q is blocked on server %q", toolName, serverAlias)
 		}
 		return s.callMCPTool(callCtx, kiAuth, serverAlias, toolName, args, true, executionID)
 	})
-
-	aliasToServerID := make(map[string]string, len(servers))
-	for _, sv := range servers {
-		if len(wantSet) > 0 && !wantSet[sv.Alias] {
-			continue
-		}
-		aliasToServerID[sv.Alias] = sv.ID
-	}
 
 	start := time.Now()
 	result, execErr := s.executor.Execute(ctx, mcp.ExecuteParams{
@@ -300,13 +375,17 @@ func (s *codeModeService) ListAccessibleMCPServers(ctx context.Context, codeMode
 
 	result := make([]map[string]any, 0, len(servers))
 	for _, sv := range servers {
-		toolCount := s.toolCache.ToolCount(sv.ID)
 		blocked, blockErr := s.db.ListBlockedToolNames(ctx, sv.ID)
 		if blockErr != nil {
-			s.log.LogAttrs(ctx, slog.LevelWarn, "list servers: list blocked tools",
-				slog.String("server", sv.Alias),
-				slog.String("error", blockErr.Error()))
+			// Fail closed: a server whose blocklist cannot be read is
+			// excluded from the result entirely rather than reported with an
+			// unadjusted (too-high) tool_count.
+			s.log.LogAttrs(ctx, slog.LevelWarn,
+				"list servers: list blocked tools failed, excluding server",
+				slog.String("server_id", sv.ID))
+			continue
 		}
+		toolCount := s.toolCache.ToolCount(sv.ID)
 		toolCount -= len(blocked)
 		if toolCount < 0 {
 			toolCount = 0
@@ -364,9 +443,13 @@ func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serv
 		}
 		blocked, blockErr := s.db.ListBlockedToolNames(ctx, sv.ID)
 		if blockErr != nil {
-			s.log.LogAttrs(ctx, slog.LevelWarn, "search mcp tools: list blocked tools",
-				slog.String("server", sv.Alias),
-				slog.String("error", blockErr.Error()))
+			// Fail closed: a server whose blocklist cannot be read is
+			// excluded from search results entirely rather than searched with
+			// an assumed-empty blocklist.
+			s.log.LogAttrs(ctx, slog.LevelWarn,
+				"search mcp tools: list blocked tools failed, excluding server",
+				slog.String("server_id", sv.ID))
+			continue
 		}
 		blockedSet := make(map[string]bool, len(blocked))
 		for _, name := range blocked {
@@ -426,59 +509,139 @@ func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serv
 }
 
 // toolsListHook returns an mcp.OnToolsListHook that injects TypeScript type
-// declarations for all currently-cached tools into the execute_code tool
-// description. This keeps the LLM-visible schema current as the ToolCache is
-// populated lazily.
+// declarations for the tools of MCP servers accessible to the caller into the
+// execute_code tool description. This keeps the LLM-visible schema current as
+// the ToolCache is populated lazily, and — critically — scoped to what the
+// caller identified by ctx may actually see: the server list comes only from
+// accessibleServers, tools are read from the cache snapshot (no upstream
+// fetch), and each server's blocklist is applied exactly as ExecuteCode and
+// SearchMCPTools do.
+//
+// The whole hook — accessibleServers, every per-server blocklist read, and
+// every per-server output-schema read — is bounded by a single overall
+// deadline, toolsListHookDeadline, derived from ctx (see that constant's
+// doc). If the deadline elapses before rendering finishes, the hook discards
+// whatever it had built and returns the static description unchanged; it
+// never returns a partially-rendered tool list.
+//
+// If ctx carries no caller identity, or accessibleServers fails, the hook
+// fails closed: it returns tools unchanged (static description only, no
+// upstream tool types are rendered). A server whose blocklist cannot be read
+// is excluded from the rendered list entirely — see the ListBlockedToolNames
+// error branch below — rather than rendered with an assumed-empty blocklist.
 func (s *codeModeService) toolsListHook() mcp.OnToolsListHook {
-	return func(tools []mcp.Tool) []mcp.Tool {
-		allCached := s.toolCache.GetAllTools() // map[serverID][]Tool
-		if len(allCached) == 0 {
+	return func(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
+		if !mcp.KeyIdentityPresent(ctx) {
+			s.log.LogAttrs(ctx, slog.LevelWarn,
+				"tools/list: no caller identity in context, omitting upstream tool types")
 			return tools
 		}
 
-		// Convert server ID keys to alias keys so GenerateToolTypeDefs produces
-		// TypeScript namespaces that match the JS `await tools.alias.toolName()`
-		// calling convention. Entries whose server ID cannot be resolved in the
-		// cache are skipped rather than blocking the entire hook.
-		byAlias := make(map[string][]mcp.Tool, len(allCached))
-		for serverID, serverToolList := range allCached {
-			if s.serverCache != nil {
-				if server, ok := s.serverCache.GetByID(serverID); ok {
-					byAlias[server.Alias] = serverToolList
-					continue
-				}
-			}
-			// Fallback: use serverID as key so tools are not silently dropped
-			// when the cache is unavailable (e.g. in unit tests).
-			byAlias[serverID] = serverToolList
+		// hctx bounds every DB read this hook performs. It cascades from ctx,
+		// so request cancellation still takes effect immediately.
+		hctx, cancel := context.WithTimeout(ctx, toolsListHookDeadline)
+		defer cancel()
+
+		servers, listErr := s.accessibleServers(hctx, true)
+		if listErr != nil {
+			s.log.LogAttrs(ctx, slog.LevelWarn, "tools/list: list accessible servers failed",
+				slog.String("error", listErr.Error()))
+			return tools
+		}
+		if len(servers) == 0 {
+			return tools
 		}
 
-		// The hook runs on every tools/list request. Bound the per-server schema
-		// reads so a slow or stuck DB cannot pin the handler.
-		outputSchemas := make(map[string]map[string]jsonx.RawMessage, len(allCached))
-		hctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		for serverID := range allCached {
-			if s.serverCache != nil {
-				if server, ok := s.serverCache.GetByID(serverID); ok {
-					schemas, err := s.db.GetAllOutputSchemas(hctx, serverID, s.schemaTTL)
-					if err == nil && len(schemas) > 0 {
-						outputSchemas[server.Alias] = schemas
+		// Snapshot only — no upstream fetch is triggered for tools/list.
+		allCached := s.toolCache.GetAllTools() // map[serverID][]Tool
+
+		byAlias := make(map[string][]mcp.Tool, len(servers))
+		outputSchemas := make(map[string]map[string]jsonx.RawMessage, len(servers))
+		for _, sv := range servers {
+			cachedTools, ok := allCached[sv.ID]
+			if !ok || len(cachedTools) == 0 {
+				continue
+			}
+
+			blocked, blockErr := s.db.ListBlockedToolNames(hctx, sv.ID)
+			if blockErr != nil {
+				// Fail closed: exclude this server entirely rather than
+				// render it with an assumed-empty blocklist.
+				s.log.LogAttrs(ctx, slog.LevelWarn,
+					"tools/list: list blocked tools failed, excluding server",
+					slog.String("server_id", sv.ID))
+				continue
+			}
+
+			filtered := cachedTools
+			if len(blocked) > 0 {
+				blockedSet := make(map[string]bool, len(blocked))
+				for _, name := range blocked {
+					blockedSet[name] = true
+				}
+				filtered = make([]mcp.Tool, 0, len(cachedTools))
+				for _, t := range cachedTools {
+					if !blockedSet[t.Name] {
+						filtered = append(filtered, t)
 					}
 				}
 			}
+			if len(filtered) == 0 {
+				continue
+			}
+			byAlias[sv.Alias] = filtered
+
+			schemas, schemaErr := s.db.GetAllOutputSchemas(hctx, sv.ID, s.schemaTTL)
+			if schemaErr == nil && len(schemas) > 0 {
+				outputSchemas[sv.Alias] = schemas
+			}
 		}
+
+		// The overall deadline covers every read above. If it expired before
+		// rendering finished, discard whatever was built — including servers
+		// that were fully processed before the deadline hit — and return the
+		// static description rather than a partial list.
+		if hctx.Err() != nil {
+			s.log.LogAttrs(ctx, slog.LevelWarn,
+				"tools/list: deadline exceeded, returning static description")
+			return tools
+		}
+
+		if len(byAlias) == 0 {
+			return tools
+		}
+
 		types := mcp.GenerateToolTypeDefs(byAlias, outputSchemas)
 		if types == "" {
 			return tools
 		}
 		desc := mcp.CodeModeDescription() + "\n\n## Available Tools\n\n" + types
-		for i := range tools {
-			if tools[i].Name == "execute_code" {
-				tools[i].Description = desc
-				break
-			}
-		}
+
+		return s.finalizeToolsList(ctx, hctx, tools, desc)
+	}
+}
+
+// finalizeToolsList installs desc as the execute_code tool's description,
+// unless hctx's overall deadline has elapsed since the last check performed
+// in toolsListHook. Generating desc — mcp.GenerateToolTypeDefs plus the
+// description concatenation — is not free, so the "no partial list" rule
+// covers that work too: re-checking here, immediately before the result is
+// returned, closes the window between "every DB read succeeded" and "the
+// rendered description is actually handed back" during which the deadline
+// could still elapse. On expiry it discards desc and returns tools unchanged
+// (the static description), exactly like every earlier fail-closed check in
+// toolsListHook.
+func (s *codeModeService) finalizeToolsList(ctx, hctx context.Context, tools []mcp.Tool, desc string) []mcp.Tool {
+	if hctx.Err() != nil {
+		s.log.LogAttrs(ctx, slog.LevelWarn,
+			"tools/list: deadline exceeded after rendering, returning static description")
 		return tools
 	}
+	for i := range tools {
+		if tools[i].Name == "execute_code" {
+			tools[i].Description = desc
+			break
+		}
+	}
+	return tools
 }

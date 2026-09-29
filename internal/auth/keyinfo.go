@@ -21,7 +21,11 @@ import (
 //     team-bound, org_admin if it is org-scoped. Note that KeyInfo.TeamID is
 //     NOT set from the service account's team here — it stays derived from
 //     k.team_id as for every other key type, so model access and team limits
-//     for sa_key are unaffected by this change.
+//     for sa_key are unaffected by this change. The service account's own
+//     team, when it has one, is instead copied into the separate
+//     KeyInfo.ServiceAccountTeamID field, for callers (e.g. MCP server read
+//     permission checks) that need to authorize a team-bound sa_key against
+//     its own team without conflating it with TeamID's key-scoping meaning.
 //
 // The returned bool is false when the role could not be resolved with
 // confidence — a user/session key with no org membership row, a sa_key whose
@@ -72,6 +76,9 @@ func KeyInfoFromRecord(r db.KeyRecord) (KeyInfo, bool) {
 	}
 	if r.ServiceAccountID != nil {
 		ki.ServiceAccountID = *r.ServiceAccountID
+	}
+	if r.ServiceAccountTeamID != nil {
+		ki.ServiceAccountTeamID = *r.ServiceAccountTeamID
 	}
 
 	ok := true
