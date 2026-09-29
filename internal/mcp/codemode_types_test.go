@@ -463,7 +463,7 @@ func TestServer_SetOnToolsList_BasicModification(t *testing.T) {
 	})
 
 	// Hook appends a modified description note.
-	s.SetOnToolsList(func(tools []mcp.Tool) []mcp.Tool {
+	s.SetOnToolsList(func(_ context.Context, tools []mcp.Tool) []mcp.Tool {
 		for i := range tools {
 			tools[i].Description = tools[i].Description + " [modified by hook]"
 		}
@@ -501,7 +501,7 @@ func TestServer_SetOnToolsList_FilterTools(t *testing.T) {
 		})
 
 	// Hook filters out any tool whose name contains "hidden".
-	s.SetOnToolsList(func(tools []mcp.Tool) []mcp.Tool {
+	s.SetOnToolsList(func(_ context.Context, tools []mcp.Tool) []mcp.Tool {
 		visible := tools[:0]
 		for _, t := range tools {
 			if !strings.Contains(t.Name, "hidden") {
@@ -543,7 +543,7 @@ func TestServer_SetOnToolsList_HookReceivesCopy(t *testing.T) {
 	})
 
 	// Hook mutates the slice it receives (tests that this is a copy).
-	s.SetOnToolsList(func(tools []mcp.Tool) []mcp.Tool {
+	s.SetOnToolsList(func(_ context.Context, tools []mcp.Tool) []mcp.Tool {
 		for i := range tools {
 			tools[i].Description = "mutated"
 		}
@@ -584,7 +584,7 @@ func TestServer_SetOnToolsList_NilHookClearsHook(t *testing.T) {
 		})
 
 	var hookCalled bool
-	s.SetOnToolsList(func(tools []mcp.Tool) []mcp.Tool {
+	s.SetOnToolsList(func(_ context.Context, tools []mcp.Tool) []mcp.Tool {
 		hookCalled = true
 		return tools
 	})
@@ -610,7 +610,7 @@ func TestServer_SetOnToolsList_HookCanReturnEmpty(t *testing.T) {
 			return mcp.TextResult("ok"), nil
 		})
 
-	s.SetOnToolsList(func(_ []mcp.Tool) []mcp.Tool {
+	s.SetOnToolsList(func(_ context.Context, _ []mcp.Tool) []mcp.Tool {
 		return []mcp.Tool{}
 	})
 
@@ -657,7 +657,7 @@ func TestServer_SetOnToolsList_ConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for i := range 10 {
 				if i%2 == 0 {
-					s.SetOnToolsList(func(tools []mcp.Tool) []mcp.Tool { return tools })
+					s.SetOnToolsList(func(_ context.Context, tools []mcp.Tool) []mcp.Tool { return tools })
 				} else {
 					s.SetOnToolsList(nil)
 				}
@@ -680,7 +680,7 @@ func TestServer_SetOnToolsList_HookInvocationCount(t *testing.T) {
 		})
 
 	var callCount int
-	s.SetOnToolsList(func(tools []mcp.Tool) []mcp.Tool {
+	s.SetOnToolsList(func(_ context.Context, tools []mcp.Tool) []mcp.Tool {
 		callCount++
 		return tools
 	})

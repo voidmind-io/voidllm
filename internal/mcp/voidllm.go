@@ -109,6 +109,16 @@ func KeyIdentityFromCtx(ctx context.Context) KeyIdentity {
 	return keyIdentityFromCtx(ctx)
 }
 
+// KeyIdentityPresent reports whether ctx carries a KeyIdentity set by
+// WithKeyIdentity. Unlike KeyIdentityFromCtx, this distinguishes "no identity
+// was ever set" from "an identity with zero-value fields was set", which
+// callers use to fail closed when the transport did not authenticate the
+// caller before dispatching the request.
+func KeyIdentityPresent(ctx context.Context) bool {
+	_, ok := ctx.Value(keyInfoContextKey).(KeyIdentity)
+	return ok
+}
+
 // VoidLLMDeps holds the injectable dependencies for the built-in VoidLLM MCP
 // tools. Each field is a function so the mcp package has no compile-time
 // dependency on VoidLLM internal packages. All fields must be non-nil when

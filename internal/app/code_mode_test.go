@@ -36,10 +36,25 @@ type mockCodeModeDB struct {
 	orgServers map[string][]db.MCPServer // orgID → servers
 	// teamServers is returned by ListMCPServersByTeam.
 	teamServers map[string][]db.MCPServer // teamID → servers
-	// accessAllowed maps serverID → bool for CheckMCPAccess.
+	// accessAllowed maps serverID → bool for CheckMCPAccess. Used when
+	// accessAllowedByOrg is nil — i.e. access does not vary by caller org.
 	accessAllowed map[string]bool
+	// accessAllowedByOrg maps orgID → serverID → bool for CheckMCPAccess. When
+	// non-nil it takes precedence over accessAllowed, letting a single global
+	// server be open for one org and closed for another within the same test
+	// (accessibleServers passes the caller's own OrgID as CheckMCPAccess's
+	// orgID argument). A caller whose org has no entry in the inner map is
+	// denied, matching the real DB's closed-by-default behaviour for orgs
+	// with no org_mcp_access row.
+	accessAllowedByOrg map[string]map[string]bool
 	// blockedTools maps serverID → tool names for ListBlockedToolNames.
 	blockedTools map[string][]string
+	// blockedToolsErr maps serverID → the error ListBlockedToolNames returns
+	// for that specific server, independent of listErr. Used to test the
+	// fail-closed behaviour every Code Mode caller applies when a server's
+	// blocklist cannot be read: that server must be excluded entirely rather
+	// than treated as having an empty blocklist.
+	blockedToolsErr map[string]error
 	// listErr is returned by all List* methods when non-nil.
 	listErr error
 	// saveErr is returned by SaveOutputSchema when non-nil.
@@ -70,7 +85,10 @@ func (m *mockCodeModeDB) ListMCPServersByTeam(_ context.Context, teamID, _ strin
 	return append([]db.MCPServer(nil), m.teamServers[teamID]...), nil
 }
 
-func (m *mockCodeModeDB) CheckMCPAccess(_ context.Context, _, _, _, serverID string) (bool, error) {
+func (m *mockCodeModeDB) CheckMCPAccess(_ context.Context, orgID, _, _, serverID string) (bool, error) {
+	if m.accessAllowedByOrg != nil {
+		return m.accessAllowedByOrg[orgID][serverID], nil
+	}
 	if m.accessAllowed == nil {
 		return false, nil
 	}
@@ -78,6 +96,11 @@ func (m *mockCodeModeDB) CheckMCPAccess(_ context.Context, _, _, _, serverID str
 }
 
 func (m *mockCodeModeDB) ListBlockedToolNames(_ context.Context, serverID string) ([]string, error) {
+	if m.blockedToolsErr != nil {
+		if err, ok := m.blockedToolsErr[serverID]; ok {
+			return nil, err
+		}
+	}
 	if m.blockedTools == nil {
 		return nil, nil
 	}
@@ -1212,13 +1235,20 @@ func TestToolsListHook_InjectsTypes(t *testing.T) {
 		},
 	})
 
+	// A builtin server bypasses the MCP access check so any identity can see
+	// it, matching how accessibleServers treats built-in servers.
 	svc := &codeModeService{
-		db:        &mockCodeModeDB{},
+		db: &mockCodeModeDB{
+			servers: []db.MCPServer{
+				{ID: "myserver", Alias: "myserver", Source: "builtin", CodeModeEnabled: true},
+			},
+		},
 		toolCache: tc,
 		log:       newDiscardLogger(),
 	}
 
 	hook := svc.toolsListHook()
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-1", Role: "member"})
 
 	// Build a minimal list of tools that includes execute_code.
 	inputTools := []mcp.Tool{
@@ -1232,7 +1262,7 @@ func TestToolsListHook_InjectsTypes(t *testing.T) {
 		},
 	}
 
-	got := hook(inputTools)
+	got := hook(ctx, inputTools)
 
 	if len(got) != len(inputTools) {
 		t.Fatalf("hook changed tool count: got %d, want %d", len(got), len(inputTools))
@@ -1278,12 +1308,13 @@ func TestToolsListHook_EmptyCache(t *testing.T) {
 	}
 
 	hook := svc.toolsListHook()
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-1", Role: "system_admin"})
 
 	inputTools := []mcp.Tool{
 		{Name: "execute_code", Description: "original"},
 	}
 
-	got := hook(inputTools)
+	got := hook(ctx, inputTools)
 
 	if len(got) != 1 {
 		t.Fatalf("got %d tools, want 1", len(got))
@@ -1308,12 +1339,13 @@ func TestToolsListHook_NoExecuteCodeTool(t *testing.T) {
 	}
 
 	hook := svc.toolsListHook()
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-1", Role: "system_admin"})
 
 	inputTools := []mcp.Tool{
 		{Name: "list_models", Description: "lists models"},
 	}
 
-	got := hook(inputTools)
+	got := hook(ctx, inputTools)
 
 	if len(got) != 1 {
 		t.Fatalf("got %d tools, want 1", len(got))
@@ -1321,6 +1353,102 @@ func TestToolsListHook_NoExecuteCodeTool(t *testing.T) {
 	// execute_code is not in the list — other tools must be unchanged.
 	if got[0].Description != "lists models" {
 		t.Errorf("description changed to %q", got[0].Description)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// finalizeToolsList: post-rendering deadline recheck
+// ---------------------------------------------------------------------------
+//
+// toolsListHook calls finalizeToolsList as its very last step, after
+// mcp.GenerateToolTypeDefs and the description string concatenation have
+// already run. mcp.GenerateToolTypeDefs is pure, in-memory, and takes
+// microseconds even for a large tool set, so there is no way to make the
+// hook's overall 3-second deadline (toolsListHookDeadline) elapse strictly
+// *during* that call without either sleeping for the real duration of the
+// deadline (explicitly disallowed) or fabricating an unrealistically large
+// input whose generation time is not deterministic across machines/CI load
+// (flaky). Per the task's documented fallback, these tests instead exercise
+// finalizeToolsList directly with a synthetic already-expired hctx, proving
+// the recheck itself fails closed correctly; the fact that toolsListHook
+// calls finalizeToolsList as its final step (rather than mutating tools
+// directly) is verified by every other toolsListHook test still passing
+// unchanged (e.g. TestToolsListHook_InjectsTypes).
+
+// TestFinalizeToolsList_DeadlineExpired_StaticDescriptionOnly verifies that
+// finalizeToolsList discards the rendered description and returns tools
+// unchanged when hctx's deadline has already elapsed by the time it runs —
+// modelling the deadline elapsing during type generation or description
+// assembly, the CPU-bound work performed between the last DB read and this
+// final check.
+func TestFinalizeToolsList_DeadlineExpired_StaticDescriptionOnly(t *testing.T) {
+	t.Parallel()
+
+	svc := &codeModeService{log: newDiscardLogger()}
+
+	hctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	defer cancel()
+	if hctx.Err() == nil {
+		t.Fatal("test setup: hctx should already be expired")
+	}
+
+	inputTools := []mcp.Tool{
+		{Name: "execute_code", Description: "original description"},
+		{Name: "other_tool", Description: "untouched"},
+	}
+
+	got := svc.finalizeToolsList(context.Background(), hctx, inputTools, "rendered description")
+
+	if len(got) != len(inputTools) {
+		t.Fatalf("finalizeToolsList changed tool count: got %d, want %d", len(got), len(inputTools))
+	}
+	for _, tool := range got {
+		switch tool.Name {
+		case "execute_code":
+			if tool.Description != "original description" {
+				t.Errorf("execute_code description = %q, want unchanged %q (deadline had already expired)", tool.Description, "original description")
+			}
+		case "other_tool":
+			if tool.Description != "untouched" {
+				t.Errorf("other_tool description = %q, want %q", tool.Description, "untouched")
+			}
+		}
+	}
+}
+
+// TestFinalizeToolsList_WithinDeadline_InstallsDescription verifies the
+// normal-path behaviour: when hctx has not expired, finalizeToolsList
+// installs desc as the execute_code tool's description and leaves every
+// other tool untouched.
+func TestFinalizeToolsList_WithinDeadline_InstallsDescription(t *testing.T) {
+	t.Parallel()
+
+	svc := &codeModeService{log: newDiscardLogger()}
+
+	hctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	inputTools := []mcp.Tool{
+		{Name: "execute_code", Description: "original description"},
+		{Name: "other_tool", Description: "untouched"},
+	}
+
+	got := svc.finalizeToolsList(context.Background(), hctx, inputTools, "rendered description")
+
+	var execDesc, otherDesc string
+	for _, tool := range got {
+		switch tool.Name {
+		case "execute_code":
+			execDesc = tool.Description
+		case "other_tool":
+			otherDesc = tool.Description
+		}
+	}
+	if execDesc != "rendered description" {
+		t.Errorf("execute_code description = %q, want %q", execDesc, "rendered description")
+	}
+	if otherDesc != "untouched" {
+		t.Errorf("other_tool description = %q, want unchanged %q", otherDesc, "untouched")
 	}
 }
 
@@ -1497,7 +1625,7 @@ func TestCodeMode_InfersSchemaOnFirstCall(t *testing.T) {
 	inputTools := []mcp.Tool{
 		{Name: "execute_code", Description: "original"},
 	}
-	got := hook(inputTools)
+	got := hook(ctx, inputTools)
 
 	if len(got) != 1 {
 		t.Fatalf("hook returned %d tools, want 1", len(got))
@@ -1631,12 +1759,17 @@ func TestToolsListHook_InjectsCodeModePreference(t *testing.T) {
 	})
 
 	svc := &codeModeService{
-		db:        &mockCodeModeDB{},
+		db: &mockCodeModeDB{
+			servers: []db.MCPServer{
+				{ID: "myserver", Alias: "myserver", Source: "builtin", CodeModeEnabled: true},
+			},
+		},
 		toolCache: tc,
 		log:       newDiscardLogger(),
 	}
 
 	hook := svc.toolsListHook()
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-1", Role: "member"})
 
 	// The hook receives the static description that RegisterCodeModeTools wires.
 	inputTools := []mcp.Tool{
@@ -1646,7 +1779,7 @@ func TestToolsListHook_InjectsCodeModePreference(t *testing.T) {
 		},
 	}
 
-	got := hook(inputTools)
+	got := hook(ctx, inputTools)
 	if len(got) != 1 {
 		t.Fatalf("hook changed tool count: got %d, want 1", len(got))
 	}

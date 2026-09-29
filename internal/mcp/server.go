@@ -19,10 +19,11 @@ const protocolVersion = "2025-03-26"
 type ToolHandler func(ctx context.Context, args jsonx.RawMessage) (*ToolResult, error)
 
 // OnToolsListHook is an optional callback invoked inside tools/list before the
-// tool list is returned to the caller. It receives a copy of the registered
-// tools and may return a modified slice. The hook must not retain references to
-// the slice after it returns.
-type OnToolsListHook func(tools []Tool) []Tool
+// tool list is returned to the caller. It receives the request context (which
+// carries the caller's KeyIdentity, see WithKeyIdentity) and a copy of the
+// registered tools, and may return a modified slice. The hook must not retain
+// references to the slice after it returns.
+type OnToolsListHook func(ctx context.Context, tools []Tool) []Tool
 
 // Server is an MCP server that handles JSON-RPC 2.0 requests.
 // It is safe for concurrent use.
@@ -103,7 +104,7 @@ func (s *Server) Handle(ctx context.Context, raw []byte) []byte {
 	case "ping":
 		result = map[string]any{}
 	case "tools/list":
-		result = s.handleToolsList()
+		result = s.handleToolsList(ctx)
 	case "tools/call":
 		result, respErr = s.handleToolsCall(ctx, req.Params)
 	default:
@@ -141,9 +142,9 @@ func (s *Server) handleInitialize(_ jsonx.RawMessage) any {
 }
 
 // handleToolsList returns the list of registered tools. If an OnToolsListHook
-// has been set via SetOnToolsList, the hook is invoked with a copy of the tool
-// list and its return value is used as the response payload.
-func (s *Server) handleToolsList() any {
+// has been set via SetOnToolsList, the hook is invoked with ctx and a copy of
+// the tool list, and its return value is used as the response payload.
+func (s *Server) handleToolsList(ctx context.Context) any {
 	s.mu.RLock()
 	tools := make([]Tool, len(s.tools))
 	copy(tools, s.tools)
@@ -151,7 +152,7 @@ func (s *Server) handleToolsList() any {
 	s.mu.RUnlock()
 
 	if hook != nil {
-		tools = hook(tools)
+		tools = hook(ctx, tools)
 	}
 	return map[string]any{
 		"tools": tools,
