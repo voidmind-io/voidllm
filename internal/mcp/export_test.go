@@ -223,10 +223,15 @@ func DecodeClientSessionScope(scope SessionScope) (orgID, apiKeyID string, ok bo
 
 // NewIdleTimeoutReader exposes newIdleTimeoutReader for direct unit testing
 // of idle_timeout_reader.go's timer-reset semantics — in particular that a
-// zero-byte, no-error Read must NOT reset the idle timer (see Read's doc) —
-// without needing a full HTTPTransport.Forward round trip.
-func NewIdleTimeoutReader(r io.ReadCloser, idle time.Duration, cancel context.CancelFunc) io.ReadCloser {
-	return newIdleTimeoutReader(r, idle, cancel)
+// zero-byte, no-error Read must NOT reset the idle timer (see Read's doc),
+// and that Close invokes only closeCancel, never onIdle (see Close's own
+// doc) — without needing a full HTTPTransport.Forward round trip. A test
+// that does not care about the onIdle/closeCancel distinction (most of this
+// package's own idle_timeout_reader_test.go) may simply pass the same
+// CancelFunc for both, exactly as HTTPTransport.Forward's own production
+// call site does.
+func NewIdleTimeoutReader(r io.ReadCloser, idle time.Duration, onIdle, closeCancel context.CancelFunc) io.ReadCloser {
+	return newIdleTimeoutReader(r, idle, onIdle, closeCancel)
 }
 
 // ParseCacheHint exposes parseCacheHint for direct testing of the
@@ -411,6 +416,178 @@ func SetSharedFetchResultHookForTest(fn func(ctx context.Context, fetched bool))
 	}
 	sharedFetchResultHookForTest.Store(&fn)
 }
+
+// SetListenMinBackoffForTest overrides listenMinBackoff — runListener's
+// exponential-backoff floor and per-attempt doubling base — for a test that
+// needs to observe several backoff cycles without waiting out the real
+// production floor.
+func SetListenMinBackoffForTest(d time.Duration) { listenMinBackoff = d }
+
+// SetListenMaxBackoffForTest overrides listenMaxBackoff — runListener's
+// exponential-backoff ceiling (5 minutes in production) — for a test that
+// needs to observe backoff actually hitting its cap.
+func SetListenMaxBackoffForTest(d time.Duration) { listenMaxBackoff = d }
+
+// SetListenUnsupportedRetryForTest overrides listenUnsupportedRetry —
+// runListener's fixed wait after ErrListenUnsupported/ErrListenNotHonored (1
+// hour in production) — for a test that needs to observe a retry in that
+// bucket without waiting out the real production duration.
+func SetListenUnsupportedRetryForTest(d time.Duration) { listenUnsupportedRetry = d }
+
+// SetListenReconnectJitterMaxForTest overrides listenReconnectJitterMax —
+// the upper bound of runListener's post-graceful-end/idle reconnect jitter
+// (1 second in production) — for a test that needs a tight, deterministic
+// upper bound on how long that reconnect can take.
+func SetListenReconnectJitterMaxForTest(d time.Duration) { listenReconnectJitterMax = d }
+
+// SetListenThrottleIntervalForTest overrides listenThrottleInterval —
+// listenThrottle's own coalescing window (1 second in production) — for a
+// test that needs to observe several throttle windows without waiting out
+// the real production interval.
+func SetListenThrottleIntervalForTest(d time.Duration) { listenThrottleInterval = d }
+
+// SetListenAckHookForTest installs fn (or, when fn is nil, clears the
+// previously installed hook) as runListener's own onAck completion test
+// hook — see listenAckHookForTest's own doc (listen_manager.go). A test that
+// sets it must always clear it again (defer SetListenAckHookForTest(nil))
+// and must not run concurrently with any other test that also sets it —
+// the same single-package-level-hook discipline
+// SetSharedFetchFreshEntryHookForTest already documents.
+func SetListenAckHookForTest(fn func(serverID string)) {
+	if fn == nil {
+		listenAckHookForTest.Store(nil)
+		return
+	}
+	listenAckHookForTest.Store(&fn)
+}
+
+// SetListenExitDelayHookForTest installs fn (or, when fn is nil, clears the
+// previously installed hook) as runListener's own pre-exit test hook — see
+// listenExitDelayHookForTest's own doc (listen_manager.go). Same
+// single-package-level-hook discipline as SetListenAckHookForTest.
+func SetListenExitDelayHookForTest(fn func()) {
+	if fn == nil {
+		listenExitDelayHookForTest.Store(nil)
+		return
+	}
+	listenExitDelayHookForTest.Store(&fn)
+}
+
+// NewListenThrottleForTest exposes newListenThrottle (listen_manager.go) for
+// direct testing of its own leading-edge/trailing-edge coalescing and Stop
+// semantics, independent of a full ListenManager/runListener/HTTP round
+// trip. The returned value's type is unexported, but its Call and Stop
+// methods are exported, so a caller in another package can still use it via
+// :=, exactly as NewSSEEventReaderForTest's identical pattern already
+// establishes elsewhere in this file.
+func NewListenThrottleForTest(fire func()) *listenThrottle {
+	return newListenThrottle(fire)
+}
+
+// SetListenJitterFuncForTest installs fn (or, when fn is nil, clears the
+// previously installed override) as randDuration's own jitter-source test
+// hook — see randDuration's own doc (listen_manager.go) — letting a test
+// assert an EXACT reconnect/backoff wait for a given bound instead of only a
+// looser randomized-within-bound one. Same single-package-level-hook
+// discipline as SetListenAckHookForTest.
+func SetListenJitterFuncForTest(fn func(max time.Duration) time.Duration) {
+	if fn == nil {
+		listenJitterFuncForTest.Store(nil)
+		return
+	}
+	listenJitterFuncForTest.Store(&fn)
+}
+
+// NewSSEEventReaderForTest exposes newSSEEventReader (sse_reader.go) so a
+// black-box test can drive HTTPTransport.Listen's own incremental,
+// live-connection SSE parser directly — multi-line data, comments, CR/CRLF/LF
+// line endings, an event split across separate underlying Reads, the
+// per-event size cap, and EOF mid-event — independent of any HTTP transport
+// plumbing. The returned value's type is unexported, but its Next method
+// (and the sseEvent fields it returns) are exported, so a caller in another
+// package can still use it via :=, exactly as every other ForTest
+// constructor in this file already does for its own unexported return type.
+func NewSSEEventReaderForTest(r io.Reader) *sseEventReader {
+	return newSSEEventReader(r)
+}
+
+// ErrSSEEventTooLargeForTest exposes errSSEEventTooLarge for a black-box test
+// to assert sseEventReader.Next's per-event size cap via errors.Is.
+var ErrSSEEventTooLargeForTest = errSSEEventTooLarge
+
+// ErrSSELineTooLargeForTest exposes errSSELineTooLarge for a black-box test
+// to assert sseEventReader.readLine's per-line size cap via errors.Is.
+var ErrSSELineTooLargeForTest = errSSELineTooLarge
+
+// MaxSSELineBytesForTest exposes maxSSELineBytes so a test can size its
+// fixture relative to the real production per-line cap instead of
+// hardcoding a second copy of the same limit.
+const MaxSSELineBytesForTest = maxSSELineBytes
+
+// MaxSSEEventDataBytesForTest exposes maxSSEEventDataBytes so a test can size
+// its fixture relative to the real production per-event cap instead of
+// hardcoding a second copy of the same limit.
+const MaxSSEEventDataBytesForTest = maxSSEEventDataBytes
+
+// SSELineOverheadBytesForTest exposes sseLineOverheadBytes so a test can
+// compute the exact per-line cost Next's own per-event budget check charges
+// (raw line length plus this fixed floor) instead of hardcoding a second
+// copy of the same constant.
+const SSELineOverheadBytesForTest = sseLineOverheadBytes
+
+// ClassifySSELineForTest exposes classifySSELine — the single field-
+// recognition implementation shared by extractSSEResult (the fully-buffered
+// path) and sseEventReader (the incremental path) — for a black-box test to
+// verify directly. The returned kind is one of the SSELineKindXxx constants
+// below, since sseLineKind itself is unexported.
+func ClassifySSELineForTest(line []byte) (kind int, value []byte) {
+	k, v := classifySSELine(line)
+	return int(k), v
+}
+
+// SSELineKindOther, SSELineKindBlank, SSELineKindComment, SSELineKindData,
+// SSELineKindID, and SSELineKindEvent expose the sseLineKind enum's own
+// values (sse_reader.go), in the same order, for ClassifySSELineForTest's
+// caller to compare against.
+const (
+	SSELineKindOther   = int(sseLineOther)
+	SSELineKindBlank   = int(sseLineBlank)
+	SSELineKindComment = int(sseLineComment)
+	SSELineKindData    = int(sseLineData)
+	SSELineKindID      = int(sseLineID)
+	SSELineKindEvent   = int(sseLineEvent)
+)
+
+// SplitSSEBodyForTest exposes splitSSEBody — the CRLF/CR/LF line-ending
+// normalization extractSSEResult relies on — for direct testing.
+func SplitSSEBodyForTest(body []byte) [][]byte {
+	return splitSSEBody(body)
+}
+
+// ExtractSSEResult exposes the real, production extractSSEResult
+// (http_transport.go) — the fully-buffered SSE parser rawPost/Call use — for
+// a black-box test to run directly against the same input bytes it drives
+// through sseEventReader (via NewSSEEventReaderForTest), proving the two
+// parsers dispatch identical event data for a matching id rather than merely
+// a hand-rolled replica of extractSSEResult's own dispatch loop (see
+// sse_reader_parity_test.go's own doc for why a second, independent
+// implementation of the same loop cannot rule out both containing the
+// identical mistake).
+func ExtractSSEResult(body []byte, wantID []byte) ([]byte, error) {
+	return extractSSEResult(body, wantID)
+}
+
+// ErrListenMalformedEventForTest, ErrListenUpstreamErrorForTest,
+// ErrListenUnexpectedResponseForTest, and ErrUnsolicitedContentEncodingForTest
+// expose Listen's own unexported error sentinels (listen_client.go,
+// http_transport.go) for a black-box test to assert via errors.Is — the same
+// need every other ForTest error alias in this file already serves.
+var (
+	ErrListenMalformedEventForTest       = errListenMalformedEvent
+	ErrListenUpstreamErrorForTest        = errListenUpstreamError
+	ErrListenUnexpectedResponseForTest   = errListenUnexpectedResponse
+	ErrUnsolicitedContentEncodingForTest = errUnsolicitedContentEncoding
+)
 
 // ScopedStateCount returns the number of distinct SessionScope entries the
 // currently resolved *eraBinding has ever created a scopedState for (see

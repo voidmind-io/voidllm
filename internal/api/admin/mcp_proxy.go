@@ -911,6 +911,19 @@ func (h *Handler) sendLegacySSEWrapped(c fiber.Ctx, result *mcp.ForwardResult, a
 // server/tool/status Prometheus counters, the call-duration histogram, and
 // (when MCPLogger is configured) one usage.MCPToolCallEvent.
 //
+// The call-duration histogram specifically is never observed for
+// subscriptions/listen (docs/mcp-v2.md §3.4): duration here is the ENTIRE
+// stream's lifetime, from the moment HandleMCPProxy started forwarding the
+// request to the moment its response stream ended — for every other method
+// that is a genuinely bounded call, but a subscriptions/listen stream is
+// specified to stay open indefinitely, so its "duration" is really however
+// long the real MCP client on the other end of this proxy happened to keep
+// it open, not a value any operator alerting on this histogram's buckets
+// would find meaningful mixed in with ordinary tool-call latencies. The
+// MCPToolCallsTotal counter (success/failure counts) and the usage event
+// below are still recorded exactly as for any other method — only the
+// duration SAMPLE is skipped.
+//
 // errorType, when non-empty, additionally increments MCPTransportErrorsTotal
 // under that error_type label — "call" for a failure discovered before any
 // response reached the caller (Forward itself returned an error, or the
@@ -931,7 +944,9 @@ func (h *Handler) recordMCPForwardOutcome(ki *auth.KeyInfo, alias string, meta m
 	}
 	metricsMethod := meta.MetricsMethod()
 	metrics.MCPToolCallsTotal.WithLabelValues(alias, metricsMethod, status).Inc()
-	metrics.MCPToolCallDurationSeconds.WithLabelValues(alias, metricsMethod).Observe(duration.Seconds())
+	if metricsMethod != "subscriptions/listen" {
+		metrics.MCPToolCallDurationSeconds.WithLabelValues(alias, metricsMethod).Observe(duration.Seconds())
+	}
 
 	if h.MCPLogger != nil {
 		h.MCPLogger.Log(usage.MCPToolCallEvent{

@@ -578,19 +578,38 @@ func applyExtraHeaders(req *http.Request, hdr MapHeader, protect string) {
 	}
 }
 
-// rawPost sends raw as a JSON-RPC POST to target with hdr merged in as extra
-// request headers on top of Content-Type, Accept, and whatever
-// authentication this transport is configured for. target is supplied by
-// the caller rather than read from transport state: probeEra and
-// probeLegacy pass t.endpoint directly, since no binding exists yet at probe
-// time, while doCall and the RoundTripper Warmup depends on pass the
-// already-resolved eraBinding's postURL (see postTarget). rawPost performs
-// no interpretation of the response body's JSON-RPC shape, but does unwrap a
-// text/event-stream response down to the one event that answers raw's own
-// JSON-RPC id (see extractSSEResult), since every caller needs the same JSON
-// payload regardless of which content type the upstream chose to answer
-// with.
-func (t *HTTPTransport) rawPost(ctx context.Context, target string, raw []byte, hdr MapHeader) (*httpResult, error) {
+// buildAuthedRequest builds a POST request to target carrying raw as its
+// body, sets Content-Type and Accept, applies whatever authentication this
+// transport is configured for, and merges hdr on top via applyExtraHeaders —
+// which refuses to let any entry in hdr overwrite whichever header the auth
+// switch below just set to carry the request's own credential (see
+// protectedAuthHeaderName). This is the single place rawPost, Forward, and
+// Listen each obtain an authenticated outbound request, so the
+// authentication switch — and the applyExtraHeaders protection against hdr
+// overwriting it — exists in exactly one implementation rather than being
+// reproduced, and possibly drifting, at every call site that needs to send
+// an authenticated request to this transport's upstream.
+//
+// That protection is not merely defense in depth on this path: hdr may be
+// whatever the resolved ClientDialect's Prepare produced (see
+// roundTripper/doCall), and dialect2026Client.Prepare mirrors x-mcp-header
+// annotations from the UPSTREAM's own tool schema onto exactly this map
+// (docs/mcp-v2.md §4.3) — so an upstream schema that happens to annotate a
+// property "Mcp-Param-Token" (or any other name colliding with authType
+// "header"'s configured auth_header) could otherwise overwrite VoidLLM's own
+// outbound credential with a tool-argument value. Server registration
+// rejects a NEW auth_header equal to any reserved MCP header name, this
+// prefix included (internal/api/admin's isReservedMCPHeader), but a server
+// registered before that validation existed could still have one configured
+// — so this guard, not registration-time validation, is what must hold
+// (docs/mcp-v2.md, review finding C4).
+//
+// The returned request carries ctx directly (via
+// http.NewRequestWithContext); callers that need a different context for the
+// request they actually send (Forward and Listen, both of which attach their
+// own streamCtx afterward so an idle timeout can tear the request down
+// independently of ctx) replace it with req.WithContext before use.
+func (t *HTTPTransport) buildAuthedRequest(ctx context.Context, target string, raw []byte, hdr MapHeader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(raw))
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
@@ -598,25 +617,6 @@ func (t *HTTPTransport) rawPost(ctx context.Context, target string, raw []byte, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 
-	// Authentication is applied BEFORE hdr below — so that hdr, which may
-	// carry MCP standard request headers this transport does not interpret,
-	// can still win an ordinary name collision — but the merge itself
-	// (applyExtraHeaders) refuses to let any entry in hdr overwrite whichever
-	// header this switch just set to carry the request's own credential (see
-	// protectedAuthHeaderName). That protection is no longer merely defense
-	// in depth on this path: hdr here is whatever the resolved ClientDialect's
-	// Prepare produced (see roundTripper/doCall), and dialect2026Client.Prepare
-	// mirrors x-mcp-header annotations from the UPSTREAM's own tool schema
-	// onto exactly this map (docs/mcp-v2.md §4.3) — so an upstream schema
-	// that happens to annotate a property "Mcp-Param-Token" (or any other
-	// name colliding with authType "header"'s configured auth_header) could
-	// otherwise overwrite VoidLLM's own outbound credential with a
-	// tool-argument value. Server registration rejects a NEW auth_header
-	// equal to any reserved MCP header name, this prefix included
-	// (internal/api/admin's isReservedMCPHeader), but a server registered
-	// before that validation existed could still have one configured — so
-	// this guard, not registration-time validation, is what must hold
-	// (docs/mcp-v2.md, review finding C4).
 	switch t.authType {
 	case "bearer":
 		if t.authToken == "" {
@@ -640,6 +640,26 @@ func (t *HTTPTransport) rawPost(ctx context.Context, target string, raw []byte, 
 	}
 
 	applyExtraHeaders(req, hdr, t.protectedAuthHeaderName())
+	return req, nil
+}
+
+// rawPost sends raw as a JSON-RPC POST to target with hdr merged in as extra
+// request headers on top of Content-Type, Accept, and whatever
+// authentication this transport is configured for (see buildAuthedRequest).
+// target is supplied by the caller rather than read from transport state:
+// probeEra and probeLegacy pass t.endpoint directly, since no binding exists
+// yet at probe time, while doCall and the RoundTripper Warmup depends on
+// pass the already-resolved eraBinding's postURL (see postTarget). rawPost
+// performs no interpretation of the response body's JSON-RPC shape, but does
+// unwrap a text/event-stream response down to the one event that answers
+// raw's own JSON-RPC id (see extractSSEResult), since every caller needs the
+// same JSON payload regardless of which content type the upstream chose to
+// answer with.
+func (t *HTTPTransport) rawPost(ctx context.Context, target string, raw []byte, hdr MapHeader) (*httpResult, error) {
+	req, err := t.buildAuthedRequest(ctx, target, raw, hdr)
+	if err != nil {
+		return nil, err
+	}
 
 	resp, err := t.client.Do(req)
 	if err != nil {
@@ -721,6 +741,54 @@ func isSSEContentType(ct string) bool {
 	return strings.EqualFold(mediaType, "text/event-stream")
 }
 
+// errUnsolicitedContentEncoding is returned by Forward and Listen when
+// hasUnsolicitedContentEncoding reports true for their response — see that
+// function's own doc for what this guards against. A bare, static sentinel:
+// the upstream's own Content-Encoding value is upstream-controlled text with
+// no legitimate reason to end up in a VoidLLM log line, so neither caller
+// ever embeds it.
+var errUnsolicitedContentEncoding = errors.New("transport: upstream sent an unsolicited response Content-Encoding")
+
+// hasUnsolicitedContentEncoding reports whether header — a response's
+// header, exactly as returned by streamClient.Do — still carries a
+// Content-Encoding value. Neither Forward nor Listen ever sets
+// Accept-Encoding themselves, which leaves Go's own http.Transport free to
+// add "Accept-Encoding: gzip" on its own — and, for a response actually
+// encoded that way, to transparently decompress the body and strip this
+// header before RoundTrip returns (see net/http.Transport's
+// DisableCompression doc): that is why a gzip response never trips this
+// check, and why DisableCompression must stay false on this transport's
+// underlying *http.Transport (NewSSRFSafeTransport) — setting it would also
+// turn off that transparent decompression and break every upstream that
+// compresses by default.
+//
+// Anything that survives this check is therefore an encoding VoidLLM never
+// asked for (br, zstd, deflate, ...). On Forward's path, relaying it
+// byte-for-byte through HandleMCPProxy's own caller-facing pass-through
+// would let a malicious or misconfigured upstream turn
+// settings.mcp.stream_max_bytes — which counts WIRE bytes — into a
+// multi-gigabyte decompression bomb for the real MCP client on the other
+// end of the proxy, who negotiated no such encoding either (docs/mcp-v2.md,
+// review finding B; see also internal/proxy/headers.go's sibling reasoning
+// for the LLM proxy's own Accept-Encoding handling). Listen never relays
+// anything to a downstream client at all — it is VoidLLM itself acting as
+// the MCP client — but it shares this exact *http.Transport (and therefore
+// this exact "an unsolicited encoding survived" shape) with Forward, and an
+// upstream that answers this way is equally worth rejecting outright on
+// Listen's path rather than handing sseEventReader a body of
+// still-compressed bytes to parse as if it were plain SSE text: at best that
+// fails closed anyway once the parse cannot make sense of it, at worst it
+// wastes a full idle-timeout window on a stream that can never actually
+// produce a valid event.
+//
+// Both callers treat a true result exactly like any other failure their own
+// caller never gets to see response bytes for: the body is closed, the
+// stream's own idle-timeout/streamCtx is torn down, and errUnsolicitedContentEncoding
+// is returned — never the upstream's own Content-Encoding value.
+func hasUnsolicitedContentEncoding(header http.Header) bool {
+	return header.Get("Content-Encoding") != ""
+}
+
 // maxSSEEventsSkipped bounds how many SSE events extractSSEResult examines
 // and discards — because they carry no JSON-RPC id at all (a notification,
 // MCP 2026-07-28 §3.4) or an id that does not match the request this
@@ -790,6 +858,14 @@ func outboundRequestID(raw []byte) jsonx.RawMessage {
 // JSON-RPC message carried by the one event that answers wantID, or an error
 // if none does.
 //
+// The line-splitting (splitSSEBody) and per-line field recognition
+// (classifySSELine) below are shared with sseEventReader — the incremental,
+// live-connection reader HTTPTransport.Listen uses for a long-lived
+// subscriptions/listen stream (sse_reader.go) — so this package's SSE
+// framing rules exist in exactly one implementation regardless of which of
+// the two very different consumption models (whole body already buffered,
+// versus one event at a time off a live io.Reader) is reading it.
+//
 // Event framing follows the WHATWG "Server-Sent Events" interpretation
 // algorithm (https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation,
 // referenced but not restated by docs/mcp-v2.md, which assumes the
@@ -840,9 +916,7 @@ func outboundRequestID(raw []byte) jsonx.RawMessage {
 // docs/mcp-v2.md) is explicit that a silent, "leer, nicht fehlerhaft"
 // (empty, not erroring) result is the failure mode this replaces.
 func extractSSEResult(body []byte, wantID jsonx.RawMessage) ([]byte, error) {
-	normalized := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
-	normalized = bytes.ReplaceAll(normalized, []byte("\r"), []byte("\n"))
-	lines := bytes.Split(normalized, []byte("\n"))
+	lines := splitSSEBody(body)
 
 	var dataLines [][]byte
 	skipped := 0
@@ -865,8 +939,9 @@ func extractSSEResult(body []byte, wantID jsonx.RawMessage) ([]byte, error) {
 	}
 
 	for _, line := range lines {
-		switch {
-		case len(line) == 0:
+		kind, value := classifySSELine(line)
+		switch kind {
+		case sseLineBlank:
 			data, matched, err := dispatch()
 			if err != nil {
 				return nil, err
@@ -874,15 +949,11 @@ func extractSSEResult(body []byte, wantID jsonx.RawMessage) ([]byte, error) {
 			if matched {
 				return data, nil
 			}
-		case bytes.HasPrefix(line, []byte(":")):
-			// Comment line — ignored.
-		case bytes.HasPrefix(line, []byte("data: ")):
-			dataLines = append(dataLines, line[len("data: "):])
-		case bytes.HasPrefix(line, []byte("data:")):
-			dataLines = append(dataLines, line[len("data:"):])
+		case sseLineData:
+			dataLines = append(dataLines, value)
 		default:
-			// Some other SSE field ("event:", "id:", "retry:", or an
-			// unrecognized one) — ignored, see the function's own doc.
+			// Comment, "id:", "event:", or any other field — ignored, see
+			// classifySSELine's own doc.
 		}
 	}
 	// A final event with no terminating blank line at end-of-body still gets
@@ -1301,52 +1372,21 @@ func (t *HTTPTransport) Forward(ctx context.Context, raw []byte, hdr MapHeader) 
 		return nil, fmt.Errorf("resolve protocol era: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.postTarget(b), bytes.NewReader(raw))
+	// hdr here is forwardHeaders(c) (mcp_proxy.go): the caller's own
+	// already-validated MCP-Protocol-Version/Mcp-Method/Mcp-Name/
+	// Mcp-Session-Id, plus whatever Mcp-Param-{Name} headers the caller
+	// itself sent, collected via collectMCPParamHeaders — which already
+	// drops a candidate colliding with this server's own auth_header (its
+	// rule 5) before hdr is even built. buildAuthedRequest's own
+	// applyExtraHeaders call is still applied unconditionally regardless,
+	// rather than trusted to be redundant: it is the ONLY guard on this path
+	// (dialect2026Client.Prepare has no equivalent collision check of its
+	// own — see rawPost's doc) — see buildAuthedRequest's own doc for why
+	// that protection now lives in exactly one place shared with rawPost.
+	req, err := t.buildAuthedRequest(ctx, t.postTarget(b), raw, hdr)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-
-	// Authentication is applied BEFORE hdr below — see rawPost's identical
-	// ordering and its doc for why the merge (applyExtraHeaders) must still
-	// refuse to let hdr overwrite whichever header this switch just set
-	// (docs/mcp-v2.md, review finding C4). On this path hdr is
-	// forwardHeaders(c) (mcp_proxy.go): the caller's own already-validated
-	// MCP-Protocol-Version/Mcp-Method/Mcp-Name/Mcp-Session-Id, plus whatever
-	// Mcp-Param-{Name} headers the caller itself sent, collected via
-	// collectMCPParamHeaders — which already drops a candidate colliding
-	// with this server's own auth_header (its rule 5) before hdr is even
-	// built. applyExtraHeaders is still applied here, unconditionally,
-	// rather than trusted to be redundant: it is the ONLY guard on the
-	// rawPost/Call path (dialect2026Client.Prepare has no equivalent
-	// collision check of its own — see rawPost's doc), and duplicating this
-	// protection at the one place hdr is actually merged onto req, instead
-	// of in every function that builds an hdr, is what keeps the two paths
-	// from silently drifting apart again.
-	switch t.authType {
-	case "bearer":
-		if t.authToken == "" {
-			return nil, errEmptyAuthCredential
-		}
-		req.Header.Set("Authorization", "Bearer "+t.authToken)
-	case "header":
-		if t.authHeader == "" || t.authToken == "" {
-			return nil, errEmptyAuthCredential
-		}
-		req.Header.Set(t.authHeader, t.authToken)
-	case "oauth":
-		if t.oauthManager == nil || t.oauthConfig == nil {
-			return nil, errOAuthNotConfigured
-		}
-		oauthToken, oauthErr := t.oauthManager.GetToken(ctx, t.serverID, *t.oauthConfig)
-		if oauthErr != nil {
-			return nil, fmt.Errorf("oauth token: %w", oauthErr)
-		}
-		req.Header.Set("Authorization", "Bearer "+oauthToken)
-	}
-
-	applyExtraHeaders(req, hdr, t.protectedAuthHeaderName())
 
 	// streamCtx, not ctx: the idle timeout must be able to tear down THIS
 	// request specifically without depending on — or affecting — whatever
@@ -1362,33 +1402,15 @@ func (t *HTTPTransport) Forward(ctx context.Context, raw []byte, hdr MapHeader) 
 		return nil, fmt.Errorf("transport: %w", err)
 	}
 
-	// Any Content-Encoding still present here is unsolicited. Neither rawPost
-	// nor Forward ever set Accept-Encoding themselves, which leaves Go's own
-	// http.Transport free to add "Accept-Encoding: gzip" on its own — and,
-	// for a response actually encoded that way, to transparently decompress
-	// the body and strip this header before RoundTrip returns (see
-	// net/http.Transport's DisableCompression doc): that is why a gzip
-	// response never reaches this check, and why DisableCompression must
-	// stay false — setting it would also turn off that transparent
-	// decompression and break every upstream that compresses by default.
-	// Anything that survives is an encoding VoidLLM never asked for (br,
-	// zstd, deflate, ...). Forwarding it byte-for-byte through this
-	// function's caller-facing pass-through (HandleMCPProxy) would let a
-	// malicious or misconfigured upstream turn settings.mcp.stream_max_bytes
-	// — which counts WIRE bytes — into a multi-gigabyte decompression bomb
-	// for the real MCP client on the other end of the proxy, who negotiated
-	// no such encoding either (docs/mcp-v2.md, review finding B; see also
-	// internal/proxy/headers.go's sibling reasoning for the LLM proxy's own
-	// Accept-Encoding handling). Treated exactly like any other failure
-	// Forward's own caller never gets to see response bytes for: the body is
-	// closed, the stream's own idle-timeout context is torn down, and a
-	// plain error is returned — never the upstream's own Content-Encoding
-	// value, which is upstream-controlled text with no legitimate reason to
-	// end up in a VoidLLM log line.
-	if resp.Header.Get("Content-Encoding") != "" {
+	// See hasUnsolicitedContentEncoding's own doc for the decompression-bomb
+	// reasoning this guards against on this path, and for why Listen
+	// (listen_client.go), which shares this same streamClient, applies the
+	// identical check at its own equivalent call site rather than
+	// duplicating this reasoning a second time.
+	if hasUnsolicitedContentEncoding(resp.Header) {
 		resp.Body.Close() //nolint:errcheck // best-effort close; the body was never read
 		streamCancel()
-		return nil, errors.New("transport: upstream sent an unsolicited response Content-Encoding")
+		return nil, errUnsolicitedContentEncoding
 	}
 
 	// The upstream's own Mcp-Session-Id response header, if any, is recorded
@@ -1396,7 +1418,10 @@ func (t *HTTPTransport) Forward(ctx context.Context, raw []byte, hdr MapHeader) 
 	// not here. Forward itself no longer reads or interprets this response
 	// header at all; it is mirrored back to the caller unmodified as part of
 	// resp.Header below, exactly like every other response header.
-	body := newIdleTimeoutReader(resp.Body, t.streamIdleTimeout, streamCancel)
+	// Forward has no onIdle/closeCancel distinction to draw of its own (unlike
+	// Listen's idleFired — see idleTimeoutReader's own doc): the same
+	// streamCancel is passed for both.
+	body := newIdleTimeoutReader(resp.Body, t.streamIdleTimeout, streamCancel, streamCancel)
 
 	return &ForwardResult{Status: resp.StatusCode, Header: resp.Header, Body: body}, nil
 }

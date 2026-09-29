@@ -157,6 +157,17 @@ type Handler struct {
 	// to apply license changes immediately, independent of Redis pub/sub.
 	// Must be safe to call concurrently. May be nil — callers must nil-check.
 	ReloadModels func(context.Context) error
+	// AfterMCPCacheRefresh is called at the end of every refreshMCPCaches
+	// run — after MCPServerCache, MCPTransportCache, and MCPSessionRegistry
+	// have all already been reloaded from the same query — so a caller that
+	// needs to react to the active MCP server set changing (in particular
+	// internal/app wiring a *mcp.ListenManager's targets to the current set
+	// of active servers and their resolved transports) does so promptly
+	// after a mutation, rather than waiting for its own independent polling
+	// interval. Set once, in internal/app, only when that reaction is
+	// actually needed (e.g. Code Mode's ToolCache is enabled); nil is a
+	// perfectly ordinary configuration and callers must nil-check.
+	AfterMCPCacheRefresh func()
 }
 
 // swaggerErrorResponse is the standard API error envelope used in OpenAPI docs.
@@ -239,6 +250,9 @@ func (h *Handler) refreshMCPCaches(ctx context.Context) {
 			activeIDs[i] = servers[i].ID
 		}
 		h.MCPSessionRegistry.Reconcile(activeIDs)
+	}
+	if h.AfterMCPCacheRefresh != nil {
+		h.AfterMCPCacheRefresh()
 	}
 }
 

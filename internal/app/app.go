@@ -76,6 +76,10 @@ type Application struct {
 	mcpServerCache    *proxy.MCPServerCache
 	mcpAccessCache    *proxy.MCPAccessCache
 	mcpTransportCache *proxy.MCPTransportCache
+	// mcpListenManager holds one subscriptions/listen stream per modern-era
+	// external MCP server for Code Mode's ToolCache. Nil when Code Mode is
+	// disabled — see reconcileMCPListenTargets, which no-ops in that case.
+	mcpListenManager *mcp.ListenManager
 
 	rateLimiter      ratelimit.Checker
 	tokenCounter     *ratelimit.TokenCounter
@@ -759,6 +763,13 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// RegisterVoidLLMTools populates the server.
 	var builtinMCPServer *mcp.Server
 	var toolStore mcp.ToolStore
+	// mcpListenManager holds one subscriptions/listen stream per modern-era
+	// external MCP server, invalidating adminHandler.ToolCache's cached
+	// listing on a tools-changed notification (or a reconnect that could
+	// have missed one). Only built when Code Mode's ToolCache is enabled —
+	// see the assignment inside the Code Mode block below and
+	// reconcileMCPListenTargets' own doc.
+	var mcpListenManager *mcp.ListenManager
 
 	// Code Mode: create the runtime pool, executor, and tool cache when enabled.
 	// These are assigned to the handler before RegisterVoidLLMTools is called so
@@ -792,6 +803,18 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		if loadErr := adminHandler.ToolCache.LoadFromStore(ctx); loadErr != nil {
 			log.WarnContext(ctx, "failed to load cached tools from DB", slog.String("error", loadErr.Error()))
 		}
+
+		// One subscriptions/listen stream per modern-era external server,
+		// invalidating this exact ToolCache instance's cached listing (lazy
+		// refetch on next read — see ToolCache.Invalidate) whenever the
+		// upstream reports its tools changed. Reconcile is called below,
+		// from Start, from the periodic MCP cache reconcile tick, and from
+		// admin.Handler.AfterMCPCacheRefresh — see reconcileMCPListenTargets.
+		toolCacheForListen := adminHandler.ToolCache
+		mcpListenManager = mcp.NewListenManager(func(serverID string) {
+			toolCacheForListen.Invalidate(serverID)
+		})
+
 		log.LogAttrs(ctx, slog.LevelInfo, "code mode enabled",
 			slog.Int("pool_size", cfg.Settings.MCP.CodeMode.PoolSize),
 			slog.Int("memory_limit_mb", cfg.Settings.MCP.CodeMode.MemoryLimitMB),
@@ -1111,6 +1134,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		mcpServerCache:    mcpServerCache,
 		mcpAccessCache:    mcpAccessCache,
 		mcpTransportCache: mcpTransportCache,
+		mcpListenManager:  mcpListenManager,
 		rateLimiter:       rateLimiter,
 		tokenCounter:      tokenCounter,
 		loginThrottle:     loginThrottle,
@@ -1136,6 +1160,20 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 // Listener errors are handled asynchronously; the error return is reserved for
 // future synchronous startup checks and currently always returns nil.
 func (a *Application) Start() error {
+	// Wire and seed the MCP subscriptions/listen manager before the proxy
+	// begins accepting connections, so the first mutation-triggered
+	// refreshMCPCaches call (which can only happen once a listener socket is
+	// open) already finds AfterMCPCacheRefresh set. Reconcile's own Stop
+	// registration is appended alongside every other stopFunc below so it
+	// runs, in LIFO order, before a.mcpTransportCache.Close() — Reconcile's
+	// own doc explains why a listener otherwise outlives any one
+	// *HTTPTransport's lifetime.
+	if a.mcpListenManager != nil {
+		a.adminHandler.AfterMCPCacheRefresh = a.reconcileMCPListenTargets
+		a.reconcileMCPListenTargets()
+		a.stopFuncs = append(a.stopFuncs, a.mcpListenManager.Stop)
+	}
+
 	// Cache refresh tickers. Stop functions are registered in LIFO order so
 	// that the key refresh stops first on shutdown (matching startup order).
 	a.stopFuncs = append(a.stopFuncs,
@@ -1196,6 +1234,7 @@ func (a *Application) Start() error {
 					}
 					a.adminHandler.MCPSessionRegistry.Reconcile(activeIDs)
 				}
+				a.reconcileMCPListenTargets()
 			} else {
 				a.log.LogAttrs(context.Background(), slog.LevelError, "mcp server cache refresh failed",
 					slog.String("error", err.Error()),
@@ -1328,6 +1367,61 @@ func (a *Application) Start() error {
 	a.setupRoutes()
 	a.startListening()
 	return nil
+}
+
+// reconcileMCPListenTargets rebuilds the target list mcp.ListenManager.Reconcile
+// needs from the currently cached active MCP servers and their resolved
+// transports, and applies it. It is a no-op when Code Mode's ToolCache was
+// never enabled (a.mcpListenManager is nil in that case — see New's own
+// wiring in the Code Mode block).
+//
+// Called from three places: once, from Start, before the proxy begins
+// accepting connections; from the existing periodic 30-second MCP cache
+// reconcile tick (Start), which backstops a missed or failed mutation-driven
+// refresh exactly as it already does for MCPServerCache/MCPTransportCache/
+// MCPSessionRegistry; and from admin.Handler.AfterMCPCacheRefresh, so a
+// newly registered, updated, or deactivated server's listener starts or
+// stops promptly after the mutation that caused it, rather than waiting up
+// to 30s for the next tick.
+//
+// The built-in server (no URL, hence no *mcp.HTTPTransport in
+// mcpTransportCache) is skipped automatically: MCPTransportCache.Get simply
+// never has an entry for it — see that cache's own LoadAll doc ("servers
+// without a URL are skipped").
+//
+// A server whose mcp_servers.protocol_version column PINS it to a legacy
+// revision (mcp.ResolvePinnedVersion resolves to a non-empty Version whose
+// Era is mcp.EraLegacy) is also skipped: the legacy revisions have no
+// subscriptions/listen method at all (docs/mcp-v2.md §3.4, §1a), and this is
+// already known from the server's own configuration, with no need to probe
+// it (mcp.HTTPTransport.Listen would otherwise reach exactly this same
+// conclusion itself, but only after resolving the binding and, for a NEW
+// transport, potentially triggering that same probe). A server pinned to a
+// MODERN revision, or left unpinned ("auto" — mcp.ResolvePinnedVersion
+// returns "" either way), still gets a listener: for the unpinned case,
+// Listen itself resolves the era on first use and returns ErrListenUnsupported
+// if that turns out to be legacy after all (see runListener's own
+// reconnect-policy doc for how that outcome is handled).
+func (a *Application) reconcileMCPListenTargets() {
+	if a.mcpListenManager == nil {
+		return
+	}
+	servers := a.mcpServerCache.List()
+	targets := make([]mcp.ListenTarget, 0, len(servers))
+	for _, s := range servers {
+		if !s.IsActive {
+			continue
+		}
+		if pinned := mcp.ResolvePinnedVersion(s.ProtocolVersion); pinned != "" && pinned.Era() == mcp.EraLegacy {
+			continue
+		}
+		rs, ok := a.mcpTransportCache.Get(s.ID)
+		if !ok || rs.Transport == nil {
+			continue
+		}
+		targets = append(targets, mcp.ListenTarget{ServerID: s.ID, Transport: rs.Transport})
+	}
+	a.mcpListenManager.Reconcile(targets)
 }
 
 // WaitForShutdown blocks until SIGINT or SIGTERM is received, then performs a

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -69,7 +70,7 @@ func TestIdleTimeoutReader_ZeroByteReads_DoNotResetTimer(t *testing.T) {
 	}
 
 	underlying := newZeroThenSignalReader()
-	r := mcp.NewIdleTimeoutReader(underlying, idle, cancel)
+	r := mcp.NewIdleTimeoutReader(underlying, idle, cancel, cancel)
 	t.Cleanup(func() { _ = r.Close() })
 
 	start := time.Now()
@@ -161,7 +162,7 @@ func TestIdleTimeoutReader_NonZeroReads_ResetTimer(t *testing.T) {
 		remaining: []byte("abcdef")[:payloadLen],
 		unblock:   make(chan struct{}),
 	}
-	r := mcp.NewIdleTimeoutReader(underlying, idle, cancel)
+	r := mcp.NewIdleTimeoutReader(underlying, idle, cancel, cancel)
 	t.Cleanup(func() { _ = r.Close() })
 
 	buf := make([]byte, 1)
@@ -182,5 +183,41 @@ func TestIdleTimeoutReader_NonZeroReads_ResetTimer(t *testing.T) {
 
 	if string(got) != "abcdef" {
 		t.Errorf("read bytes = %q, want %q", got, "abcdef")
+	}
+}
+
+// noopReadCloser is an io.ReadCloser whose Read always reports io.EOF and
+// whose Close is a no-op — the minimal underlying reader
+// TestIdleTimeoutReader_Close_NeverInvokesOnIdle needs, since that test
+// exercises only Close itself, never a genuine Read.
+type noopReadCloser struct{}
+
+func (noopReadCloser) Read(_ []byte) (int, error) { return 0, io.EOF }
+func (noopReadCloser) Close() error               { return nil }
+
+// TestIdleTimeoutReader_Close_NeverInvokesOnIdle is the direct, white-box
+// regression test for item 4's own guarantee: Close invokes ONLY closeCancel,
+// never onIdle — structurally, not merely because of some caller's own
+// return-statement-before-defer evaluation order (see newIdleTimeoutReader's
+// own doc for why the two are now entirely separate callbacks). idle is set
+// far longer than this test could ever run, so the ONLY way onIdle could
+// possibly fire within it is via Close itself — which must never happen.
+func TestIdleTimeoutReader_Close_NeverInvokesOnIdle(t *testing.T) {
+	t.Parallel()
+
+	var onIdleCalled, closeCancelCalled atomic.Bool
+	onIdle := func() { onIdleCalled.Store(true) }
+	closeCancel := func() { closeCancelCalled.Store(true) }
+
+	r := mcp.NewIdleTimeoutReader(noopReadCloser{}, time.Hour, onIdle, closeCancel)
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close() error = %v, want nil", err)
+	}
+
+	if onIdleCalled.Load() {
+		t.Error("Close() invoked onIdle — it must invoke only closeCancel, never the idle-marking callback")
+	}
+	if !closeCancelCalled.Load() {
+		t.Error("Close() never invoked closeCancel")
 	}
 }

@@ -16,6 +16,12 @@ const (
 	metaClientInfo         = "io.modelcontextprotocol/clientInfo"
 	metaLogLevel           = "io.modelcontextprotocol/logLevel"
 	metaServerInfo         = "io.modelcontextprotocol/serverInfo"
+	// metaSubscriptionID is the _meta key a subscriptions/listen stream's
+	// acknowledgement and every subsequent notification on that stream carry
+	// (MCP 2026-07-28 §3.4): the JSON-RPC id of the subscriptions/listen
+	// request itself. HTTPTransport.Listen (listen_client.go) is the sole
+	// reader of this key on the client side.
+	metaSubscriptionID = "io.modelcontextprotocol/subscriptionId"
 )
 
 // dialect2026 implements ServerDialect for V20260728, which carries protocol

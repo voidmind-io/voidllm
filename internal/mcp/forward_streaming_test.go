@@ -156,7 +156,7 @@ func TestForward_SubscriptionsListen_PauseJustUnderIdleTimeout_NotificationStill
 	tr := newStreamTransport(srv.URL, idle)
 
 	res, err := tr.Forward(context.Background(),
-		[]byte(`{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen","params":{"toolsListChanged":true,"resourceSubscriptions":["file:///a"]}}`),
+		[]byte(`{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen","params":{"notifications":{"toolsListChanged":true,"resourceSubscriptions":["file:///a"]}}}`),
 		mcp.MapHeader{})
 	if err != nil {
 		t.Fatalf("Forward() error = %v, want nil", err)
