@@ -2,6 +2,13 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.29] - 2026-09-30
+
+### Security
+- Security hardening of MCP access scoping (#257)
+
+---
+
 ## [0.0.28] - 2026-09-28
 
 ### Security
