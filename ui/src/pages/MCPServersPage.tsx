@@ -41,6 +41,14 @@ const AUTH_TYPE_OPTIONS = [
   { value: 'oauth', label: 'OAuth (Client Credentials)' },
 ]
 
+const PROTOCOL_VERSION_OPTIONS = [
+  { value: 'auto', label: 'Auto-detect (recommended)' },
+  { value: '2026-07-28', label: '2026-07-28' },
+  { value: '2025-11-25', label: '2025-11-25' },
+  { value: '2025-06-18', label: '2025-06-18' },
+  { value: '2025-03-26', label: '2025-03-26' },
+]
+
 // ---------------------------------------------------------------------------
 // Icons
 // ---------------------------------------------------------------------------
@@ -308,6 +316,7 @@ function CreateMCPServerDialog({
   const [oauthClientId, setOauthClientId] = useState('')
   const [oauthClientSecret, setOauthClientSecret] = useState('')
   const [oauthScopes, setOauthScopes] = useState('')
+  const [protocolVersion, setProtocolVersion] = useState('auto')
   const [errors, setErrors] = useState<CreateFormErrors>({})
 
   const { data: teams } = useTeams(orgId)
@@ -331,6 +340,7 @@ function CreateMCPServerDialog({
     setOauthClientId('')
     setOauthClientSecret('')
     setOauthScopes('')
+    setProtocolVersion('auto')
     setErrors({})
     onClose()
   }
@@ -359,6 +369,7 @@ function CreateMCPServerDialog({
       alias: alias.trim(),
       url: url.trim(),
       auth_type: authType,
+      protocol_version: protocolVersion,
     }
     if ((authType === 'bearer' || authType === 'header') && authToken.trim()) {
       params.auth_token = authToken.trim()
@@ -545,6 +556,17 @@ function CreateMCPServerDialog({
             />
           </>
         )}
+        <Select
+          label="Protocol Version"
+          options={PROTOCOL_VERSION_OPTIONS}
+          value={protocolVersion}
+          onChange={setProtocolVersion}
+          disabled={isPending}
+        />
+        <p className="text-xs text-text-tertiary -mt-2">
+          VoidLLM auto-detects which MCP revision this server speaks. Only override this if
+          auto-detection misidentifies this specific server.
+        </p>
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="secondary" onClick={handleClose} disabled={isPending}>
             Cancel
@@ -585,6 +607,7 @@ function EditMCPServerDialog({ server, onClose }: EditMCPServerDialogProps) {
   const [oauthClientId, setOauthClientId] = useState(server.oauth_client_id ?? '')
   const [oauthClientSecret, setOauthClientSecret] = useState('')
   const [oauthScopes, setOauthScopes] = useState(server.oauth_scopes ?? '')
+  const [protocolVersion, setProtocolVersion] = useState(server.protocol_version || 'auto')
   const [errors, setErrors] = useState<EditFormErrors>({})
 
   const updateMCPServer = useUpdateMCPServer()
@@ -633,6 +656,9 @@ function EditMCPServerDialog({ server, onClose }: EditMCPServerDialogProps) {
       if (oauthScopes.trim() !== (server.oauth_scopes ?? '')) {
         params.oauth_scopes = oauthScopes.trim() || undefined
       }
+    }
+    if (protocolVersion !== (server.protocol_version || 'auto')) {
+      params.protocol_version = protocolVersion
     }
 
     if (Object.keys(params).length === 0) {
@@ -766,6 +792,17 @@ function EditMCPServerDialog({ server, onClose }: EditMCPServerDialogProps) {
             />
           </>
         )}
+        <Select
+          label="Protocol Version"
+          options={PROTOCOL_VERSION_OPTIONS}
+          value={protocolVersion}
+          onChange={setProtocolVersion}
+          disabled={isPending}
+        />
+        <p className="text-xs text-text-tertiary -mt-2">
+          VoidLLM auto-detects which MCP revision this server speaks. Only override this if
+          auto-detection misidentifies this specific server.
+        </p>
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="secondary" onClick={onClose} disabled={isPending}>
             Cancel

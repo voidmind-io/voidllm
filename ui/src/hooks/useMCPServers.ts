@@ -19,6 +19,12 @@ export interface MCPServerResponse {
   team_id?: string
   is_active: boolean
   code_mode_enabled: boolean
+  /**
+   * Effective MCP protocol era pin: "auto" (the default — VoidLLM probes the
+   * upstream and detects it automatically) or one of the explicit revisions
+   * ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26").
+   */
+  protocol_version: string
   created_at: string
   updated_at: string
 }
@@ -34,6 +40,8 @@ export interface CreateMCPServerParams {
   oauth_client_id?: string
   oauth_client_secret?: string
   oauth_scopes?: string
+  /** MCP protocol era override. Omit or send "auto" to keep auto-detection. */
+  protocol_version?: string
 }
 
 export interface UpdateMCPServerParams {
@@ -48,6 +56,8 @@ export interface UpdateMCPServerParams {
   oauth_client_secret?: string
   oauth_scopes?: string
   code_mode_enabled?: boolean
+  /** MCP protocol era override. Send "auto" to revert to auto-detection. */
+  protocol_version?: string
 }
 
 export interface ToolBlocklistEntry {

@@ -146,6 +146,143 @@ func (a *Application) warnIfSinglePortTLS(adminPort int) {
 	}
 }
 
+// warnIfMCPWriteTimeoutFinite emits one WARN at startup when the MCP gateway
+// is active and writeTimeout — the effective WriteTimeout of whichever Fiber
+// app serves the MCP routes (a.proxyApp in single-port mode, a.adminApp in
+// dual-port mode) — is finite.
+//
+// fasthttp's WriteTimeout is a single absolute per-socket write deadline set
+// once before response serialization begins; it is never refreshed by a
+// successful SSE flush (see tunnelStreamBudget's doc above and
+// docs/mcp-v2.md's review finding E). A long-lived MCP
+// subscriptions/listen stream (docs/mcp-v2.md §3.4) is therefore killed once
+// writeTimeout elapses no matter how healthy the traffic still flowing is,
+// and independent of settings.mcp.stream_idle_timeout, which only bounds
+// silence, not total duration. `write_timeout: 0` is not a fix — VoidLLM has
+// no way to configure an unlimited write deadline: a bare 0 fails config
+// parsing, and 0s is silently replaced by the 120s default (setDefaults,
+// internal/config/config.go). Operators who run subscriptions/listen in
+// production should instead raise write_timeout to an explicit duration
+// comfortably longer than their longest expected stream (e.g. 1h) — see
+// docs/configuration.md's "Write timeout and long-lived streams" for the
+// full trade-off, including the ~120s ceiling dual-port mode still imposes
+// regardless of this value.
+//
+// The warning fires exactly once, at startup, and only when the MCP gateway
+// is actually active (a.adminHandler.MCPServer != nil — the same gate
+// admin.RegisterRoutes uses to decide whether to register the MCP proxy
+// routes at all): for a deployment that never uses MCP, this would otherwise
+// be pure noise about a limit nothing on that deployment can ever hit.
+func (a *Application) warnIfMCPWriteTimeoutFinite(writeTimeout time.Duration) {
+	if a.adminHandler.MCPServer == nil {
+		return
+	}
+	if writeTimeout <= 0 {
+		return
+	}
+	a.log.LogAttrs(context.Background(), slog.LevelWarn,
+		"MCP gateway is active with a finite write_timeout: subscriptions/listen streams cannot outlive it",
+		slog.Duration("write_timeout", writeTimeout),
+		slog.String("fix", "raise write_timeout to an explicit duration (e.g. 1h); write_timeout: 0 is not supported and dual-port mode is capped at ~120s regardless"),
+	)
+}
+
+// mcpListenMaxDurationCap bounds a subscriptions/listen stream's max
+// duration (see mcpListenMaxDuration) when the hosting app's WriteTimeout is
+// 0 (unlimited) — an unlimited underlying socket deadline still needs a cap
+// of its own, so a stream is never left running with no upper bound at all.
+const mcpListenMaxDurationCap = 1 * time.Hour
+
+// mcpListenSafetyMargin is subtracted from the hosting app's own
+// WriteTimeout when deriving a subscriptions/listen stream's max duration
+// (see mcpListenMaxDuration), leaving enough time for the stream's own
+// handler to notice its timer fire, write the graceful-end response, and
+// flush it, strictly before the socket's own absolute WriteTimeout deadline
+// — the same reasoning as adminTunnelStreamHeadroom for the playground
+// tunnel, just a smaller margin since a graceful-end write is far smaller
+// than a streaming completion's remaining tokens.
+const mcpListenSafetyMargin = 5 * time.Second
+
+// mcpListenMinViableDuration is the smallest max duration mcpListenMaxDuration
+// will ever return as a viable value. A hosting WriteTimeout so short that
+// the computed budget falls below this floor cannot serve a
+// subscriptions/listen stream at all without it dying essentially
+// immediately after opening — worse than refusing the request outright — so
+// mcpListenMaxDuration returns 0 (refuse) instead of a technically-positive
+// but practically-unusable budget.
+const mcpListenMinViableDuration = 10 * time.Second
+
+// mcpListenMaxDuration derives the max duration a subscriptions/listen
+// stream on the app whose effective WriteTimeout is writeTimeout may run
+// before internal/api/admin/mcp_handler.go proactively ends it with a
+// graceful complete response — see tunnelStreamBudget above for the
+// identical reasoning applied to the playground tunnel, and
+// warnIfMCPWriteTimeoutFinite for why writeTimeout is itself already the
+// effective, already-clamped value for whichever app (a.proxyApp in
+// single-port mode, a.adminApp in dual-port mode, the latter itself clamped
+// to maxAdminTunnelTimeout) actually hosts the MCP routes.
+//
+// writeTimeout <= 0 means the hosting app has no write deadline at all (an
+// explicitly configured unlimited WriteTimeout) — mcpListenMaxDurationCap
+// (1h) is returned instead, so a subscriptions/listen stream is never left
+// running with no upper bound of its own even when the underlying socket
+// itself imposes none.
+//
+// A return value of 0 means "refuse every subscriptions/listen request on
+// this deployment": either the computed budget (writeTimeout minus
+// mcpListenSafetyMargin) is not positive at all, or it is positive but below
+// mcpListenMinViableDuration — see that constant's own doc for why a
+// technically-positive but impractically small budget is refused outright
+// rather than handed to a caller as a stream doomed to end almost
+// immediately.
+func mcpListenMaxDuration(writeTimeout time.Duration) time.Duration {
+	if writeTimeout <= 0 {
+		return mcpListenMaxDurationCap
+	}
+	budget := writeTimeout - mcpListenSafetyMargin
+	if budget < mcpListenMinViableDuration {
+		return 0
+	}
+	return budget
+}
+
+// warnIfMCPOriginAllowlistEmpty emits one WARN at startup when the MCP
+// gateway is active and settings.mcp.allowed_origins is empty, gated the
+// same way warnIfMCPWriteTimeoutFinite is (a.adminHandler.MCPServer != nil):
+// a deployment that never uses MCP would otherwise see pure noise about a
+// check nothing on it can ever hit.
+//
+// With the allowlist empty, mcpOriginMiddleware falls back to a built-in
+// localhost-only default (see mcp_origin.go's isDefaultAllowedOrigin): a
+// browser Origin from any domain other than localhost/127.0.0.1/[::1] is
+// rejected with 403. That is correct for a local dev instance and wrong for
+// almost every production deployment, since VoidLLM has no host-restricted
+// listen option — setupRoutes always binds every interface (see
+// startListening's proxyAddr/adminAddr, both built as
+// fmt.Sprintf(":%d", ...), with no configured bind host anywhere in
+// config.ProxyConfig or config.AdminConfig to inspect). Because there is no
+// listen address here to check for "is this actually loopback-only", this
+// warning intentionally does not try to guess one — it fires unconditionally
+// whenever the allowlist is empty and MCP is active, regardless of whether
+// the deployment happens to be loopback-only in practice (e.g. behind a
+// reverse proxy that only forwards from localhost): such a deployment sees
+// one harmless WARN at startup, while a deployment reachable from a real
+// domain gets the warning it needs before a browser-based MCP client starts
+// failing with 403s.
+func (a *Application) warnIfMCPOriginAllowlistEmpty() {
+	if a.adminHandler.MCPServer == nil {
+		return
+	}
+	if len(a.adminHandler.MCPAllowedOrigins) > 0 {
+		return
+	}
+	a.log.LogAttrs(context.Background(), slog.LevelWarn,
+		"MCP gateway is active with no settings.mcp.allowed_origins configured: "+
+			"browser-based MCP clients on any domain other than localhost will be rejected with 403",
+		slog.String("fix", "set settings.mcp.allowed_origins to the domain(s) browser clients connect from"),
+	)
+}
+
 // devCORSMiddleware returns a Fiber handler that sets permissive CORS headers
 // for every response. It is only installed when dev mode is active so that the
 // Vite development server can reach both the proxy and admin apps without
@@ -205,6 +342,13 @@ func (a *Application) setupRoutes() {
 		// Single-port mode: admin routes share the proxy app.
 		a.warnIfSinglePortTLS(adminPort)
 		admin.RegisterRoutes(a.proxyApp, a.adminHandler, a.keyCache, a.hmacSecret, a.auditLogger)
+
+		// MCP routes live on a.proxyApp in single-port mode, so its
+		// WriteTimeout is the one that bounds subscriptions/listen streams —
+		// see warnIfMCPWriteTimeoutFinite's doc.
+		a.warnIfMCPWriteTimeoutFinite(a.proxyApp.Config().WriteTimeout)
+		a.warnIfMCPOriginAllowlistEmpty()
+		a.adminHandler.MCPListenMaxDuration = mcpListenMaxDuration(a.proxyApp.Config().WriteTimeout)
 
 		// The playground tunnel shares a.proxyApp in single-port mode, so its
 		// stream budget is derived from a.proxyApp's own (uncapped) WriteTimeout
@@ -280,6 +424,13 @@ func (a *Application) setupRoutes() {
 	a.adminApp.Get("/health", health.Liveness())
 	a.adminApp.Get("/metrics", health.Metrics())
 	admin.RegisterRoutes(a.adminApp, a.adminHandler, a.keyCache, a.hmacSecret, a.auditLogger)
+
+	// MCP routes live on a.adminApp in dual-port mode, so its (clamped)
+	// WriteTimeout is the one that bounds subscriptions/listen streams —
+	// see warnIfMCPWriteTimeoutFinite's doc.
+	a.warnIfMCPWriteTimeoutFinite(a.adminApp.Config().WriteTimeout)
+	a.warnIfMCPOriginAllowlistEmpty()
+	a.adminHandler.MCPListenMaxDuration = mcpListenMaxDuration(a.adminApp.Config().WriteTimeout)
 
 	// The playground tunnel lives on a.adminApp in dual-port mode, so its
 	// stream budget is derived from a.adminApp's clamped WriteTimeout

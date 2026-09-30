@@ -1083,8 +1083,8 @@ func TestServerHandle_ToolsList_CallerScoping(t *testing.T) {
 		s := buildToolsListServer(f)
 		ctx := ctxWithIdentity(mcp.KeyIdentity{OrgID: "org-a", KeyID: "key-a-rpc", Role: "member"})
 
-		raw := s.Handle(ctx, []byte(toolsListRPCRequest))
-		desc := decodeExecuteCodeDescription(t, raw)
+		result := s.Handle(ctx, []byte(toolsListRPCRequest), mcp.MapHeader{})
+		desc := decodeExecuteCodeDescription(t, result.Body)
 
 		for _, want := range []string{"builtin_tool", "global_tool", "org_a_tool"} {
 			if !strings.Contains(desc, want) {
@@ -1103,8 +1103,8 @@ func TestServerHandle_ToolsList_CallerScoping(t *testing.T) {
 		f := newToolsListScopeFixture(t)
 		s := buildToolsListServer(f)
 
-		raw := s.Handle(context.Background(), []byte(toolsListRPCRequest))
-		desc := decodeExecuteCodeDescription(t, raw)
+		result := s.Handle(context.Background(), []byte(toolsListRPCRequest), mcp.MapHeader{})
+		desc := decodeExecuteCodeDescription(t, result.Body)
 
 		if desc != "original description" {
 			t.Errorf("Handle() with no identity in ctx changed description, want unchanged;\ngot: %s", desc)

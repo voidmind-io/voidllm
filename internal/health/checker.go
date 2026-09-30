@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -387,6 +388,43 @@ func execProbe(ctx context.Context, client *http.Client, t probeTarget, level pr
 	}
 }
 
+// upstreamHTTPStatusPattern extracts the numeric HTTP status from every
+// error message format an upstream-status failure can currently reach
+// sanitizeError under, across both probe paths sanitizeError serves:
+//
+//   - "http %d" (checker.go's own doProbeRequest, the LLM proxy's
+//     models-list/functional probes) — matched by the literal "http" branch.
+//   - "upstream returned HTTP %d[ with JSON-RPC error %d| with no valid
+//     JSON-RPC result]" (internal/mcp: doCall, and legacyClientDialect.Warmup
+//     via Call's "warmup: %w"/"session could not be re-established after
+//     retry: %v" wrapping) — matched by the "returned HTTP" branch.
+//   - "unexpected server/discover status %d" / "unexpected initialize status
+//     %d" (internal/mcp/probe.go's probeEra/probeLegacy, reached via Call's
+//     "resolve protocol era: %w" wrapping when era detection itself gets a
+//     status neither branch recognizes, e.g. every request — including the
+//     probe — failing auth) — matched by the "unexpected ... status" branch.
+//
+// The third branch is deliberately anchored to the exact "unexpected KNOWN-
+// METHOD status" phrasing probe.go uses, rather than a bare "status \d+",
+// so a future, unrelated error message that happens to contain the word
+// "status" followed by some other three-digit number is never misread as an
+// HTTP status here.
+//
+// Same-line alternation, rather than three separate regexps each re-run
+// against the full message, keeps this to one pass; MustCompile panics only
+// on a malformed pattern, which is a startup-time programming error, not a
+// runtime input this function ever needs to recover from.
+var upstreamHTTPStatusPattern = regexp.MustCompile(`(?:^http |upstream returned HTTP |unexpected (?:server/discover|initialize) status )(\d{3})\b`)
+
+// jsonRPCErrorCodePattern extracts the numeric JSON-RPC error code from
+// legacyClientDialect.Warmup's "... with JSON-RPC error %d" suffix (see
+// upstreamHTTPStatusPattern's doc). Unlike the upstream's own free-form
+// JSON-RPC error MESSAGE — deliberately never embedded in any error string
+// that reaches this function (docs/mcp-v2.md §11.2/§11.5) — the numeric code
+// alone identifies no content and is safe to surface alongside the HTTP
+// status.
+var jsonRPCErrorCodePattern = regexp.MustCompile(`JSON-RPC error (-?\d+)`)
+
 // sanitizeError converts a raw error message to a safe, low-information string
 // that does not expose internal URLs, IP addresses, or stack details.
 func sanitizeError(err error) string {
@@ -406,9 +444,17 @@ func sanitizeError(err error) string {
 	if strings.Contains(msg, "tls") || strings.Contains(msg, "certificate") {
 		return "tls error"
 	}
-	if strings.HasPrefix(msg, "http ") {
-		// e.g. "http 401" — safe to surface, contains no internal details.
-		return msg
+	if m := upstreamHTTPStatusPattern.FindStringSubmatch(msg); m != nil {
+		// Only the numeric status (and, if present, the numeric JSON-RPC
+		// code) ever leaves this function — never msg itself, which may carry
+		// upstream-controlled text elsewhere in the string (e.g. a wrapped
+		// "legacy warmup: initialize: ..." prefix) even though the specific
+		// upstreamHTTPStatusPattern branch that matched carries none.
+		out := "http " + m[1]
+		if rpc := jsonRPCErrorCodePattern.FindStringSubmatch(msg); rpc != nil {
+			out += " (json-rpc " + rpc[1] + ")"
+		}
+		return out
 	}
 	return "probe failed"
 }

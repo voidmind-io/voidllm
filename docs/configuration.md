@@ -23,7 +23,7 @@ server:
   proxy:
     port: 8080              # Proxy port — LLM clients connect here
     read_timeout: 30s
-    write_timeout: 120s     # Absolute response write deadline; raise for longer streams
+    write_timeout: 120s     # Absolute response write deadline; raise for longer streams - see MCP "Write timeout and long-lived streams" below for why this also caps MCP subscriptions/listen
     idle_timeout: 60s
     drain_timeout: 25s      # Graceful shutdown drain window (5s–120s)
     # Hard cap on a single streaming response, used when the model sets no
@@ -266,7 +266,12 @@ External server via VoidLLM proxy:
 settings:
   mcp:
     call_timeout: 30s            # Max duration per proxied tool call (default: 30s)
+    stream_idle_timeout: 120s    # Idle timeout for the streaming proxy path (default: 120s)
+    stream_max_bytes: 104857600  # Byte ceiling for the streaming proxy path (default: 100 MiB; 0 = unbounded)
+    tool_cache_ttl: 1h            # Fallback freshness window for the tool cache (default: 1h; 0 = never expires)
     allow_private_urls: false     # Allow localhost/private IPs for MCP server URLs
+    allowed_origins:              # Origin allowlist for MCP endpoints (default: empty)
+      - https://app.example.com
     health:
       enabled: true              # Enable MCP server health probing (default: true)
       interval: 60s              # Probe interval (default: 60s)
@@ -277,9 +282,91 @@ mcp_servers:
     url: https://mcp.github.com/sse
     auth_type: bearer
     auth_token: ${GITHUB_TOKEN}
+    protocol_version: auto        # MCP revision to pin this server to (default: auto)
 ```
 
 MCP servers declared here are synced to the database at startup with `source: yaml`. Servers created via the Admin API (`source: api`) are never overwritten by YAML entries.
+
+`protocol_version` (per server, also settable via the Admin API and the Admin UI) controls which MCP specification revision VoidLLM speaks to that upstream. `auto` (the default, and what an empty value normalizes to) probes the server automatically and needs no attention in the normal case. Set it explicitly, to one of `2025-03-26`, `2025-06-18`, `2025-11-25`, or `2026-07-28`, only when auto-detection misidentifies a specific upstream. See [MCP Server Setup](mcp/servers.md#protocol-version) for details.
+
+### Streaming
+
+Requests proxied to an external MCP server through `/api/v1/mcp/:alias` (`HandleMCPProxy`) are streamed through transparently rather than buffered: VoidLLM does not read the full response before forwarding it, so a `tools/call` that sends `notifications/progress` before its result, or a long-lived `subscriptions/listen` response, both pass through intact.
+
+Because of that, this path has no total-duration limit: `call_timeout` does not apply to it. Instead, `stream_idle_timeout` bounds how long the connection may go completely silent: the timer resets on every byte read from the upstream, so a healthy stream that keeps sending data, including the periodic SSE keep-alive comment lines the MCP spec recommends servers send on a long-lived stream, never trips it, no matter how long it has been open in total. Only genuine silence for the configured duration ends the stream. `call_timeout` continues to bound VoidLLM's own buffered calls to upstream servers (tool discovery, Code Mode tool execution) unchanged.
+
+`stream_max_bytes` bounds the total number of bytes a single streamed response may carry, independent of `stream_idle_timeout`: an idle timeout alone does not stop an upstream that keeps trickling small amounts of data forever, or that sends an unbounded amount of data quickly. Once the ceiling is exceeded the stream ends exactly like any other mid-stream break, no error event is invented, the caller simply sees a truncated stream and, per the MCP spec, must retry as a new request. The default is 100 MiB. Set it to `0` to disable the limit entirely for deployments that need very long-lived `subscriptions/listen` streams to carry more data than that; understand that this also removes VoidLLM's only defense against a malicious or misbehaving upstream MCP server pushing unbounded data through the proxy, so only disable it for upstreams you trust.
+
+#### Write timeout and long-lived streams
+
+The write timeout that bounds an MCP stream is derived from `server.proxy.write_timeout` in both single- and dual-port mode; there is no separate `server.admin.write_timeout` setting. In **single-port** mode (the default: `server.admin.port` unset or equal to `server.proxy.port`), the proxy app serves the MCP routes directly, so `server.proxy.write_timeout` applies unchanged. In **dual-port** mode, the admin app serves the MCP routes instead, and its own `WriteTimeout` is derived from `server.proxy.write_timeout` rather than configured separately: `max(30s, server.proxy.write_timeout)`, clamped to at most 120s. A generously configured `server.proxy.write_timeout` (e.g. `1h`) therefore does NOT carry over to the admin app in dual-port mode: it is capped at 120s there, same as the admin app's `ReadTimeout` and `BodyLimit`, all three shared with the authenticated playground tunnel.
+
+**`write_timeout: 0` is not supported: there is no way to configure an unlimited write deadline.** A bare `0` is not a valid YAML duration and fails config parsing at startup. A quoted/suffixed form that does parse, such as `write_timeout: 0s`, is then treated as "unset" and silently replaced with the 120s default before the server ever starts, in both single- and dual-port mode. Use an explicit duration comfortably longer than your longest expected stream instead (see the example below). In dual-port mode the effective deadline is additionally floored at 30 seconds and capped at 120 seconds by the derivation above, regardless of how large `server.proxy.write_timeout` is set: plan `subscriptions/listen` usage in dual-port mode around that fixed 30–120s ceiling, or run single-port mode if you need a longer one.
+
+Whichever value results is a **hard ceiling on every MCP stream**, including a healthy `subscriptions/listen` response that is still receiving data: fasthttp's `WriteTimeout` is a single absolute deadline on the socket, set once before the response starts and never refreshed by a successful flush. Neither `stream_idle_timeout` nor `stream_max_bytes` above can extend it: the connection is simply cut once it elapses, regardless of how much healthy traffic is still flowing. A `subscriptions/listen` stream itself ends gracefully well before that hard cutoff and a client simply reconnects - see "Serving `subscriptions/listen` on VoidLLM's own MCP servers" below for exactly how much headroom is reserved for that.
+
+If you run `subscriptions/listen` (or any other stream expected to outlive the default 120s) in production, raise the deadline to an explicit value instead:
+
+```yaml
+server:
+  proxy:
+    write_timeout: 1h   # comfortably longer than any expected subscriptions/listen stream
+```
+
+VoidLLM logs one WARN at startup whenever the MCP gateway is active, naming the currently configured `write_timeout`. Because no value ever makes it truly unlimited, this WARN fires on every MCP-enabled deployment regardless of how high `write_timeout` is raised: treat it as a reminder of the ceiling currently in effect, not as a sign of misconfiguration once you have deliberately chosen that ceiling. Raising `write_timeout` extends it for **every** route on that app, not just MCP, including the unauthenticated ones (login, invite redemption). This trades away one layer of defense against slow-client (slowloris-style) connection exhaustion on those routes; combine it with a reverse proxy or load balancer that enforces its own connection-level timeouts if that trade-off is a concern for your deployment.
+
+#### Serving `subscriptions/listen` on VoidLLM's own MCP servers
+
+Both built-in MCP servers (`/api/v1/mcp/voidllm`, the management server, and `/api/v1/mcp`, the Code Mode server) accept `subscriptions/listen` from clients. Only the Code Mode server honors `toolsListChanged`: its own `tools/list` content changes as upstream servers are added, removed, or have their tools change, and as an org's MCP access allowlist or tool blocklist is edited. The management server's tool list never changes at runtime, so it always acknowledges with an empty honored set: a client can still open the stream (it gets keep-alives and, eventually, a graceful end), but never receives a `notifications/tools/list_changed` event on it.
+
+**Notification scoping.** A notification on the Code Mode server is delivered only to subscribers who can see the affected MCP server either immediately before or immediately after the change - the identical visibility decision `search_tools`/`list_servers` themselves apply (including the alias-priority rule when a team-scoped and an org-scoped server share the same alias, and the `code_mode_enabled` flag). No subscriber is ever notified about a server it cannot see. This applies precisely, at the finest granularity each kind of change is actually known to affect:
+
+- A server's own tools change, or its blocklist changes: scoped to that one server's own visibility rules.
+- A tool's inferred output schema is (re-)computed and turns out to differ from what was previously stored: scoped to that one server's own visibility rules, same as a tools-changed notification - never fired for a re-check that leaves the stored schema unchanged.
+- An API key's own MCP access allowlist changes (`SetKeyMCPAccess`): scoped to that one key's own subscribers only.
+- A team's own MCP access allowlist changes (`SetTeamMCPAccess`): scoped to that one team's own subscribers only.
+- An org's own MCP access allowlist changes (`SetOrgMCPAccess`): scoped to that whole organization's own subscribers.
+- A server is created, activated, deactivated, deleted, or has its alias or `code_mode_enabled` changed via the Admin API: notified on BOTH sides independently, since either can be a non-empty set on its own. Whoever could see the server under its scope immediately BEFORE the change is notified from a snapshot of that pre-change row - evaluated by the exact SAME access rules a live lookup uses (the alias-priority rule, the `code_mode_enabled` flag, and the org-level allowlist check for a global, non-builtin server), never a looser or more conservative fallback. Whoever can see the server under its scope immediately AFTER the change is notified from the already-refreshed live cache. A brand-new server has no BEFORE side; a deleted or deactivated one has no AFTER side; a rename or flipping `code_mode_enabled` from false to true are exactly the cases where the two sides differ from each other. The Admin API has no way to move an existing server between organizations or teams once created - the update endpoint accepts no organization or team field, so a server's scope never changes through it.
+
+**Delivery is best effort, not guaranteed.** A `subscriptions/listen` notification is a hint that a client's own view may be stale, not a guarantee of exactly-once, exactly-complete delivery. Clients also pick up every change on their own next `tools/list` call regardless of whether a notification arrived, and should treat that as the source of truth. Two known ways a change can reach a client late:
+
+- When a server that was hiding another server with the same alias (the alias-priority rule above) is removed, only the removed server's own BEFORE/AFTER sides are notified - the now-newly-visible sibling's own subscribers are not separately notified, since the mutation names only the removed server. Those subscribers still pick up the now-visible server on their next `tools/list`.
+- If the cache refresh that runs after an admin change fails (for example a database error), the live cache used to resolve the AFTER side is not updated for that change, so the AFTER-side notification can be missed or delayed until a later refresh succeeds.
+
+Within the affected key/team/org scope, an event can also occasionally fire even though the rendered `tools/list` output did not actually change for a given subscriber.
+
+**Revoked credentials.** Every notification delivery re-checks the subscriber's own captured identity against the same in-memory API key cache the auth middleware itself uses, immediately before that one delivery: a subscriber whose key has since been revoked or deleted, has expired, or had its organization/team/role change receives no further events once that check reports it invalid. That check and the delivery it guards are not a single atomic operation, so one content-free event (a bare "your `tools/list` may have changed" signal, it never carries request or response content) racing an in-flight revocation within the very same instant is possible; VoidLLM does not claim otherwise. Independent of that per-delivery check, every open stream also re-validates on a fixed 10-second interval and ends gracefully (the same `resultType: "complete"` response described below) within that window once its own subscriber no longer validates, so a revoked subscriber's stream never stays open longer than that interval past its own key becoming invalid, even on a change that never sends it another notification at all.
+
+**Limits**, checked before a stream is ever opened, in addition to one another: at most 4 concurrent `subscriptions/listen` streams per API key, at most 64 for all keys belonging to one organization combined, and at most 1024 per built-in `*Server` instance in total. Exceeding any of the three is rejected with a JSON-RPC error and HTTP 429, before any stream is opened.
+
+A `subscriptions/listen` stream ends gracefully (a `resultType: "complete"` response, then the connection closes) strictly before the write timeout described above would otherwise kill it uncleanly: VoidLLM proactively closes it 5 seconds ahead of the effective write timeout for whichever app is serving it (`server.proxy.write_timeout` in single-port mode, or the 30s–120s dual-port floor/cap described above in dual-port mode). A client that wants to keep listening simply opens a new `subscriptions/listen` request when its stream ends this way, exactly as it would after any other graceful end. If the resulting budget would be less than 10 seconds (an unusually short `write_timeout`), VoidLLM refuses the `subscriptions/listen` request outright rather than opening a stream that would die almost immediately.
+
+A slow or unresponsive client (one that stops reading without closing its connection outright) cannot hold a stream (and its slot) open indefinitely either: the underlying connection's write deadline is refreshed, pushed 10 seconds into the future, immediately before every individual write this stream performs (the acknowledgement, each delivered notification, each keep-alive comment, and the final graceful-end response), not set once for the whole stream. A write that cannot complete within that refreshed 10-second bound ends the stream exactly like any other connection failure, releasing its slot immediately.
+
+**Shutdown.** At the very start of a graceful shutdown (before VoidLLM begins draining ordinary in-flight proxy/admin requests), every open `subscriptions/listen` stream on both built-in servers is signaled to end gracefully, and any NEW `subscriptions/listen` request from that point forward is refused with HTTP 503. Shutdown then waits up to 2 seconds (combined, across both servers) for those streams to actually finish sending their own graceful-end response before continuing with the rest of the shutdown sequence regardless.
+
+### Tool Caching
+
+Code Mode's tool cache (`GetTools`, `list_servers`, `search_tools`) refreshes each server's `tools/list` result lazily, on access, once it goes stale. How long a result stays fresh depends on whether the upstream sent a CacheableResult freshness hint (MCP `2026-07-28` §5, `ttlMs`/`cacheScope` on the `tools/list` response):
+
+- **Upstream sent no hint** (every MCP server that has not adopted `2026-07-28` yet, in practice most upstreams today): `tool_cache_ttl` applies. Default `1h`; set to `0` to never expire an entry automatically; it is then only refreshed by an explicit invalidation (server update via the Admin API, or a manual refresh).
+- **Upstream sent `ttlMs`**: that value is honored instead of `tool_cache_ttl`, clamped to a minimum of 1 second and a maximum of 24 hours. The minimum exists because Code Mode calls `GetTools` once per incoming request; without it, an upstream reporting `ttlMs: 0` would turn every incoming request into an upstream `tools/list` call. The maximum guards against an upstream hint effectively pinning a stale tool list forever.
+- **Upstream sent `cacheScope: "private"`**: the result is still cached in memory for the configured TTL (VoidLLM calls `tools/list` with a single server-wide credential, so the authorization context is the same for every caller), but it is never written to the database. Any copy from before the upstream started reporting `private` is deleted from the database on the next fetch. `cacheScope: "public"`, or no `cacheScope` at all, is persisted as before.
+
+Independent of TTL, VoidLLM also listens for change notifications on upstreams that speak the `2026-07-28` revision: when Code Mode is enabled, it opens one `subscriptions/listen` stream per such upstream and invalidates that server's cached tool listing as soon as a `notifications/tools/list_changed` event arrives, so the next `GetTools` call refetches immediately instead of waiting out `tool_cache_ttl`. A legacy upstream (anything older than `2026-07-28`) has no `subscriptions/listen` method to listen on at all, so it always relies on the TTL above. This stream reconnects on its own (with backoff) if the upstream drops it, and each VoidLLM instance in a multi-instance deployment holds its own stream per upstream independently: there is no cross-instance coordination for it, matching this repo's single-instance-without-Redis constraint for every other in-memory cache.
+
+### Origin Validation
+
+Every MCP endpoint (`/api/v1/mcp`, `/api/v1/mcp/voidllm`, `/api/v1/mcp/:alias`, both `POST` and `GET`) validates the `Origin` header when a caller sends one, per the MCP Streamable HTTP spec's mandatory DNS-rebinding protection. Requests with no `Origin` header (the normal case for CLIs, SDKs, and service-to-service integrations) are never affected.
+
+This check is explicit-allow, the same principle VoidLLM applies to model access (an empty allowlist grants nothing):
+
+- `allowed_origins` set: an `Origin` header must exactly match one of the listed values (e.g. `https://app.example.com`); anything else is rejected with HTTP 403. The request's own `Host` header plays no role.
+- `allowed_origins` empty (default): only a built-in localhost allowlist is accepted, `http` or `https` on `localhost`, `127.0.0.1`, or `[::1]`, each with or without a port; anything else is rejected with HTTP 403.
+
+**Why this doesn't compare against the request's `Host` header.** A naive fix (accept an `Origin` whose host matches the request's own `Host`) sounds like it should catch DNS rebinding, but it cannot: in that attack, an attacker's DNS record for e.g. `evil.example.com` first resolves to their own server, which serves a malicious page, and is then rebound to resolve to `127.0.0.1`, so the browser's *next* request from that same page goes to the local service instead. The browser's `Origin` header is fixed by the page's own URL (`https://evil.example.com`), and its `Host` header is generated from that identical URL, so the two headers agree by construction on every request, no matter what the DNS record currently resolves to. An attacker who controls the DNS record controls both headers identically; comparing one attacker-supplied value against another can never detect anything. This is exactly the gap the MCP Streamable HTTP conformance suite's `dns-rebinding-protection` scenario checks for. Restricting the default to a fixed set of hostnames (`localhost`/`127.0.0.1`/`[::1]`) closes it: no DNS record an attacker controls can make VoidLLM see one of those for a page the attacker's own server served.
+
+**This is a breaking change for real deployments.** If you serve VoidLLM under a real domain and reach the MCP endpoints from a browser, set `allowed_origins` to that domain: the request's `Host` no longer helps you. VoidLLM always binds every network interface (there is no host-restricted listen option), so it cannot tell whether a given deployment is "really" loopback-only; it logs one WARN at startup whenever the MCP gateway is active and `allowed_origins` is empty, so a production deployment relying on the old (incorrect) behavior finds out at startup instead of via a wave of 403s from its browser clients.
 
 ### Privacy
 
@@ -288,8 +375,8 @@ MCP tool call arguments and results are not logged or stored. Only metadata is t
 ### Metrics
 
 ```
-voidllm_mcp_tool_calls_total{server, tool, status}
-voidllm_mcp_tool_call_duration_seconds{server, tool}
+voidllm_mcp_tool_calls_total{server, method, status}
+voidllm_mcp_tool_call_duration_seconds{server, method}
 voidllm_mcp_transport_errors_total{server, error_type}
 ```
 

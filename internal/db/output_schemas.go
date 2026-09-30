@@ -37,6 +37,27 @@ func (d *DB) SaveOutputSchema(ctx context.Context, serverID, toolName string, sc
 	return nil
 }
 
+// GetOutputSchema returns the stored output schema for the given
+// (serverID, toolName) pair, or ErrNotFound if no row exists yet. Used by
+// codeModeService's own OnToolResult hook (internal/app/code_mode.go) to
+// detect whether a freshly inferred schema actually differs from what was
+// stored before overwriting it, so a subscriptions/listen notification fires
+// only on a genuine change, never on every tool call.
+func (d *DB) GetOutputSchema(ctx context.Context, serverID, toolName string) (jsonx.RawMessage, error) {
+	p := d.dialect.Placeholder
+	query := "SELECT schema_json FROM output_schemas WHERE server_id = " + p(1) + " AND tool_name = " + p(2)
+
+	var schemaJSON string
+	err := d.sql.QueryRowContext(ctx, query, serverID, toolName).Scan(&schemaJSON)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get output schema (%s, %s): %w", serverID, toolName, err)
+	}
+	return jsonx.RawMessage(schemaJSON), nil
+}
+
 // GetAllOutputSchemas returns all stored output schemas for the given MCP server
 // as a map of tool name to raw JSON schema. When maxAge is greater than zero,
 // rows whose inferred_at timestamp is older than maxAge are excluded from the

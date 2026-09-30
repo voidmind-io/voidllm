@@ -99,7 +99,7 @@ func (h *Handler) SetOrgMCPAccess(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to set org mcp access")
 	}
 
-	h.refreshMCPAccessCache(c.Context())
+	h.refreshMCPAccessCache(c.Context(), MCPAccessRefreshScope{OrgID: orgID})
 	h.publishAccessInvalidation(c.Context())
 
 	return c.JSON(mcpAccessResponse{Servers: req.Servers})
@@ -225,7 +225,7 @@ func (h *Handler) SetTeamMCPAccess(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to set team mcp access")
 	}
 
-	h.refreshMCPAccessCache(c.Context())
+	h.refreshMCPAccessCache(c.Context(), MCPAccessRefreshScope{TeamID: teamID})
 	h.publishAccessInvalidation(c.Context())
 
 	return c.JSON(mcpAccessResponse{Servers: req.Servers})
@@ -324,7 +324,7 @@ func (h *Handler) SetKeyMCPAccess(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to set key mcp access")
 	}
 
-	h.refreshMCPAccessCache(c.Context())
+	h.refreshMCPAccessCache(c.Context(), MCPAccessRefreshScope{KeyID: keyID})
 	h.publishAccessInvalidation(c.Context())
 
 	return c.JSON(mcpAccessResponse{Servers: req.Servers})

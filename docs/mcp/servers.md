@@ -96,6 +96,33 @@ System admins bypass access checks entirely.
 
 Auth tokens are encrypted at rest with AES-256-GCM.
 
+## Protocol Version
+
+VoidLLM auto-detects which MCP specification revision each upstream server speaks: it tries a modern `server/discover` request first and falls back to a legacy `initialize` handshake when the server doesn't understand it. This happens once per server (the result is cached for as long as the process runs) and needs no configuration.
+
+`protocol_version` exists for the rare case where that auto-detection guesses wrong for a specific upstream. Setting it pins the server to a single revision and skips the probe entirely:
+
+```yaml
+mcp_servers:
+  - name: Internal Tools
+    alias: tools
+    url: https://internal-mcp.company.com
+    auth_type: bearer
+    auth_token: ${MCP_TOOLS_TOKEN}
+    protocol_version: "2025-11-25"  # only set this if auto-detection misidentifies this server
+```
+
+Or via the Admin API:
+
+```bash
+curl -X PATCH https://voidllm.example.com/api/v1/mcp-servers/{id} \
+  -H "Authorization: Bearer vl_uk_..." \
+  -H "Content-Type: application/json" \
+  -d '{"protocol_version": "2025-11-25"}'
+```
+
+Leave it unset, or set it to `auto` (the default either way), for every normal setup. Valid values are `auto` or one of the specification revisions VoidLLM understands: `2025-03-26`, `2025-06-18`, `2025-11-25`, `2026-07-28`.
+
 ## Tool Blocklist
 
 Admins can block specific tools per server. Blocked tools are invisible to Code Mode and return an error when called directly.
@@ -119,8 +146,21 @@ curl -X DELETE https://voidllm.example.com/api/v1/mcp-servers/{id}/blocklist \
 settings:
   mcp:
     call_timeout: 30s           # timeout per proxied tool call
+    stream_idle_timeout: 120s   # idle timeout for the streaming proxy path (default: 120s)
+    stream_max_bytes: 104857600 # byte ceiling for the streaming proxy path (default: 100 MiB; 0 = unbounded)
     allow_private_urls: false   # block MCP servers on localhost/private IPs
 ```
+
+See [Configuration Reference](../configuration.md#mcp) for the full option list, including `allowed_origins` and `health`.
+
+### Long-lived streams (`subscriptions/listen`)
+
+The proxy path (`/api/v1/mcp/:alias`) streams responses through without buffering, so a `subscriptions/listen` response can stay open for as long as the upstream and caller both want it to. Two independent things can still end it early:
+
+- **`stream_idle_timeout`** ends the stream if the upstream goes completely silent for that long. A healthy stream that keeps sending data (including periodic SSE keep-alive comments) never trips it.
+- **`stream_max_bytes`** ends the stream once it has carried that many bytes in total, regardless of how it is paced. Default 100 MiB; set to `0` to disable for upstreams you trust with genuinely unbounded streams.
+
+Neither of these is the usual reason a `subscriptions/listen` stream gets cut short in practice: **`server.proxy.write_timeout`** (120s by default) is. It is an absolute per-connection deadline that fasthttp never refreshes on a successful flush, so it ends even a perfectly healthy stream once it elapses. `0` is not a way around this: VoidLLM has no way to configure an unlimited write timeout, and a bare `write_timeout: 0` fails to parse at startup (see [Configuration Reference](../configuration.md#write-timeout-and-long-lived-streams) for why). If you run `subscriptions/listen` in production, raise `server.proxy.write_timeout` to an explicit duration comfortably longer than your longest expected stream instead, e.g. `1h`; there is no separate `server.admin.write_timeout` setting; the same guide covers the dual-port clamp (the effective deadline never exceeds 120s there regardless of this value) and what raising it means for unauthenticated routes sharing the same port. A stream itself still ends gracefully a few seconds before whatever write timeout is actually in effect, and a client that wants to keep listening simply opens a new `subscriptions/listen` request. VoidLLM logs a startup warning whenever the MCP gateway is active and the effective write timeout on whichever port serves it is finite at all, not only when it is left at the 120s default. Raising `write_timeout` to a longer explicit duration still triggers the same warning, since a `subscriptions/listen` stream still cannot outlive whatever value ends up configured, however large.
 
 ## Client Config Snippets
 

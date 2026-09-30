@@ -76,6 +76,10 @@ type Application struct {
 	mcpServerCache    *proxy.MCPServerCache
 	mcpAccessCache    *proxy.MCPAccessCache
 	mcpTransportCache *proxy.MCPTransportCache
+	// mcpListenManager holds one subscriptions/listen stream per modern-era
+	// external MCP server for Code Mode's ToolCache. Nil when Code Mode is
+	// disabled — see reconcileMCPListenTargets, which no-ops in that case.
+	mcpListenManager *mcp.ListenManager
 
 	rateLimiter      ratelimit.Checker
 	tokenCounter     *ratelimit.TokenCounter
@@ -258,7 +262,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			}
 			// For the startup SSE probe, OAuth is not needed — we pass nil for the
 			// OAuth manager and config. The probe only detects deprecated SSE transport.
-			transport := mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, token, 10*time.Second, cfg.Settings.MCP.AllowPrivateURLs, "", nil, nil)
+			transport := mcp.NewHTTPTransport(s.URL, s.AuthType, s.AuthHeader, token, 10*time.Second, cfg.Settings.MCP.AllowPrivateURLs,
+				"", nil, nil, mcp.ClientInfo{Name: "voidllm", Version: apihealth.Version}, mcp.ResolvePinnedVersion(s.ProtocolVersion), cfg.Settings.MCP.StreamIdleTimeout)
 			_, probeErr := transport.ListTools(ctx)
 			transport.Close()
 			if errors.Is(probeErr, mcp.ErrSSENotSupported) {
@@ -517,12 +522,24 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		log.Error("load mcp access cache", slog.String("error", mcpAccessErr.Error()))
 	}
 
-	mcpTransportCache := proxy.NewMCPTransportCache(encKey, cfg.Settings.MCP.AllowPrivateURLs, cfg.Settings.MCP.CallTimeout, log)
+	mcpTransportCache := proxy.NewMCPTransportCache(encKey, cfg.Settings.MCP.AllowPrivateURLs, cfg.Settings.MCP.CallTimeout, cfg.Settings.MCP.StreamIdleTimeout, log)
 	if mcpServersForTransport, mcpTransportErr := database.LoadAllActiveMCPServers(ctx); mcpTransportErr == nil {
 		mcpTransportCache.LoadAll(mcpServersForTransport)
 	} else {
 		log.Error("load mcp transport cache", slog.String("error", mcpTransportErr.Error()))
 	}
+
+	// mcpSessionRegistry is constructed once here and held on adminHandler
+	// (see admin.Handler.MCPSessionRegistry's doc) so it outlives every
+	// individual *mcp.HTTPTransport — including the ad-hoc ones
+	// HandleMCPProxy builds on a transport-cache miss — for the lifetime of
+	// this process. It needs no seeding call here: Record still creates an
+	// entry for any server ID it has never seen (see SessionRegistry's own
+	// doc, docs/mcp-v2.md review round Fund 5) — Reconcile's role is only to
+	// tombstone a server that has since left the active set, closing the
+	// late-Record-after-removal race, not to gate creation for one that
+	// simply has not been reconciled yet.
+	mcpSessionRegistry := mcp.NewSessionRegistry()
 
 	// Step 10: connect Redis (optional). On failure, continue without Redis.
 	redisCtx, redisCancel := context.WithCancel(context.Background())
@@ -708,23 +725,24 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	loginThrottle := auth.NewLoginThrottle()
 
 	adminHandler := &admin.Handler{
-		DB:                database,
-		HMACSecret:        hmacSecret,
-		EncryptionKey:     encKey,
-		KeyCache:          keyCache,
-		Registry:          registry,
-		AccessCache:       accessCache,
-		AliasCache:        aliasCache,
-		MCPServerCache:    mcpServerCache,
-		MCPAccessCache:    mcpAccessCache,
-		MCPTransportCache: mcpTransportCache,
-		Redis:             redisClient,
-		AuditLogger:       auditLogger,
-		License:           licHolder,
-		Log:               log,
-		SSOProvider:       ssoProvider,
-		SSOConfig:         cfg.Settings.SSO,
-		LoginThrottle:     loginThrottle,
+		DB:                 database,
+		HMACSecret:         hmacSecret,
+		EncryptionKey:      encKey,
+		KeyCache:           keyCache,
+		Registry:           registry,
+		AccessCache:        accessCache,
+		AliasCache:         aliasCache,
+		MCPServerCache:     mcpServerCache,
+		MCPAccessCache:     mcpAccessCache,
+		MCPTransportCache:  mcpTransportCache,
+		MCPSessionRegistry: mcpSessionRegistry,
+		Redis:              redisClient,
+		AuditLogger:        auditLogger,
+		License:            licHolder,
+		Log:                log,
+		SSOProvider:        ssoProvider,
+		SSOConfig:          cfg.Settings.SSO,
+		LoginThrottle:      loginThrottle,
 	}
 	// Wire the in-process reload callback so SetLicense can re-gate the
 	// model registry immediately after storing a new license, even on
@@ -745,6 +763,13 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// RegisterVoidLLMTools populates the server.
 	var builtinMCPServer *mcp.Server
 	var toolStore mcp.ToolStore
+	// mcpListenManager holds one subscriptions/listen stream per modern-era
+	// external MCP server, eagerly refreshing adminHandler.ToolCache's cached
+	// listing on a tools-changed notification (or a reconnect that could
+	// have missed one). Only built when Code Mode's ToolCache is enabled —
+	// see the assignment inside the Code Mode block below and
+	// reconcileMCPListenTargets' own doc.
+	var mcpListenManager *mcp.ListenManager
 
 	// Code Mode: create the runtime pool, executor, and tool cache when enabled.
 	// These are assigned to the handler before RegisterVoidLLMTools is called so
@@ -764,15 +789,53 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		toolStore = &dbToolStore{db: database}
 		httpFetcher := adminHandler.MakeToolFetcher()
 		builtinServerID := builtinServer.ID
-		adminHandler.ToolCache = mcp.NewPersistentToolCache(func(fetchCtx context.Context, serverID string) ([]mcp.Tool, error) {
+		adminHandler.ToolCache = mcp.NewPersistentToolCache(func(fetchCtx context.Context, serverID string) (*mcp.ToolListing, error) {
 			if serverID == builtinServerID && builtinMCPServer != nil {
-				return builtinMCPServer.Tools(), nil
+				// The built-in server's schemas are all built via
+				// mcp.ObjectSchema (internal/mcp/voidllm.go's tool
+				// registrations), which has no way to emit "x-mcp-header" —
+				// so HeaderParams is correctly nil here, with nothing to
+				// filter.
+				return &mcp.ToolListing{Tools: builtinMCPServer.Tools()}, nil
 			}
 			return httpFetcher(fetchCtx, serverID)
-		}, time.Hour, toolStore)
+		}, cfg.Settings.MCP.EffectiveToolCacheTTL(), toolStore)
 		if loadErr := adminHandler.ToolCache.LoadFromStore(ctx); loadErr != nil {
 			log.WarnContext(ctx, "failed to load cached tools from DB", slog.String("error", loadErr.Error()))
 		}
+
+		// One subscriptions/listen stream per modern-era external server,
+		// eagerly refreshing this exact ToolCache instance's cached listing
+		// for a server whenever the upstream reports its tools changed.
+		// Deliberately RefreshServer, not Invalidate: toolsListHook
+		// (code_mode.go) reads ToolCache.GetAllTools, a pure snapshot that
+		// never triggers a fetch of its own, so a plain Invalidate here would
+		// leave the server missing from every tools/list response — not
+		// merely stale — until some UNRELATED caller (a CallTool, a
+		// SearchMCPTools) happened to call GetTools for it first. RefreshServer
+		// keeps the previous (soon to be stale, but present) entry visible for
+		// the duration of the fetch, and — via ToolCache.SetOnChange, wired
+		// below — notifies Code Mode subscribers only once the refreshed
+		// listing has actually been published, never before. ctx here is the
+		// bounded, listener-lifecycle-scoped one ListenManager itself
+		// constructs (see ListenManager.spawnToolsChangedRefresh's own doc),
+		// not this function's own ctx. On failure the previous entry is left
+		// untouched (see RefreshServer's own doc) — logged at warn with only
+		// the server ID, never the fetch error's own text, matching this
+		// package's zero-knowledge-logging discipline (runListener's own doc
+		// applies the identical rule to its own transport-error logging).
+		// Reconcile is called below, from Start, from the periodic MCP cache
+		// reconcile tick, and from admin.Handler.AfterMCPCacheRefresh — see
+		// reconcileMCPListenTargets.
+		toolCacheForListen := adminHandler.ToolCache
+		mcpListenManager = mcp.NewListenManager(func(refreshCtx context.Context, serverID string) {
+			if refreshErr := toolCacheForListen.RefreshServer(refreshCtx, serverID); refreshErr != nil {
+				log.LogAttrs(refreshCtx, slog.LevelWarn,
+					"mcp listen: tool cache refresh failed",
+					slog.String("server_id", serverID))
+			}
+		})
+
 		log.LogAttrs(ctx, slog.LevelInfo, "code mode enabled",
 			slog.Int("pool_size", cfg.Settings.MCP.CodeMode.PoolSize),
 			slog.Int("memory_limit_mb", cfg.Settings.MCP.CodeMode.MemoryLimitMB),
@@ -977,7 +1040,20 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		ListAccessibleMCPServers: cmService.ListAccessibleMCPServers,
 		SearchMCPTools:           cmService.SearchMCPTools,
 	}
-	mcp.RegisterVoidLLMTools(mcpServer, voidllmDeps)
+	// A non-nil error here means one of VoidLLM's own built-in tool schemas
+	// violates the x-mcp-header constraints RegisterTool enforces at
+	// registration time (MCP 2026-07-28 §4.3; docs/mcp-v2.md review round,
+	// Fund 6) — a VoidLLM programming error, not attacker input, that must
+	// fail startup loudly rather than start serving with that tool silently
+	// unregistered or registered without header/body validation.
+	if regErr := mcp.RegisterVoidLLMTools(mcpServer, voidllmDeps); regErr != nil {
+		redisCancel()
+		return nil, fmt.Errorf("register voidllm mcp tools: %w", regErr)
+	}
+	// KeyValidator applies to the built-in management server's own
+	// subscriptions/listen streams too — see the identical wiring, and
+	// keyRevalidator's own doc, in the Code Mode block below.
+	mcpServer.SetKeyValidator(keyRevalidator(keyCache))
 	adminHandler.MCPServer = mcpServer
 
 	// Expose the built-in server's tools through the ToolCache so Code Mode
@@ -996,11 +1072,16 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// /api/v1/mcp (distinct from the management server at /api/v1/mcp/voidllm).
 	if cfg.Settings.MCP.CodeMode.IsEnabled() {
 		codeModeServer := mcp.NewServer("voidllm-code-mode", apihealth.Version)
-		mcp.RegisterCodeModeTools(codeModeServer, mcp.VoidLLMDeps{
+		// See the identical RegisterVoidLLMTools check above for why a
+		// non-nil error here is fatal to startup.
+		if regErr := mcp.RegisterCodeModeTools(codeModeServer, mcp.VoidLLMDeps{
 			ExecuteCode:              voidllmDeps.ExecuteCode,
 			ListAccessibleMCPServers: voidllmDeps.ListAccessibleMCPServers,
 			SearchMCPTools:           voidllmDeps.SearchMCPTools,
-		})
+		}); regErr != nil {
+			redisCancel()
+			return nil, fmt.Errorf("register code mode mcp tools: %w", regErr)
+		}
 
 		// Inject TypeScript type declarations into the execute_code tool
 		// description so LLMs can generate correct tool calls without calling
@@ -1008,20 +1089,124 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		// declarations stay current as the ToolCache is populated lazily.
 		codeModeServer.SetOnToolsList(cmService.toolsListHook())
 
+		// subscriptions/listen support: the Code Mode server's own tools/list
+		// content DOES change at runtime (an upstream MCP server's tools
+		// change, or an admin mutates the blocklist/access allowlist — see
+		// the three wiring points below), unlike the built-in management
+		// server (mcpServer above), which is never given a
+		// SetToolsListChangedSource(true) and so always acknowledges an
+		// empty honored set.
+		codeModeServer.SetToolsListChangedSource(true)
+
+		// AccessChecker scopes every NotifyToolsListChanged delivery below to
+		// only the subscribers whose own caller identity can currently see
+		// the changed server — see codeModeAccessChecker's own doc for the
+		// exact per-server-scope rules this mirrors from
+		// codeModeService.accessibleServers.
+		codeModeServer.SetAccessChecker(codeModeAccessChecker(mcpServerCache, mcpAccessCache))
+
+		// KeyValidator ends a subscriptions/listen stream (and filters
+		// delivery to it) the moment its own captured identity no longer
+		// validates against the same in-memory key cache the auth middleware
+		// itself uses — see keyRevalidator's own doc.
+		codeModeServer.SetKeyValidator(keyRevalidator(keyCache))
+
+		// Trigger 1: a server's cached tool listing changes structurally
+		// (ToolCache.InvalidateWithStore, or a republish — via RefreshServer
+		// or an ordinary cache-miss fetch — that differs from the previous
+		// listing; see SetOnChange's own doc). This single hook covers both
+		// an admin-triggered refresh/mutation AND an upstream's own
+		// subscriptions/listen notification relayed through
+		// mcpListenManager's onToolsChanged callback above (which calls
+		// RefreshServer, publishing the new listing before this hook ever
+		// fires — never Invalidate, which would only clear the entry and
+		// leave nothing for toolsListHook's snapshot read to render), so
+		// VoidLLM's own subscribers learn about an upstream's change, only
+		// once the new listing is actually visible, without any additional
+		// wiring.
+		adminHandler.ToolCache.SetOnChange(func(serverID string) {
+			codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: serverID})
+		})
+
+		// Trigger 1b: cmService writes data toolsListHook renders that
+		// ToolCache itself never tracks — today, only a changed inferred
+		// output schema (item 3, ExecuteCode's own OnToolResult callback in
+		// code_mode.go). Wired identically to Trigger 1 above (the same
+		// ServerID-scoped NotifyToolsListChanged call), just from a
+		// different trigger source; cmService is constructed before
+		// codeModeServer exists (see its own construction above), so this
+		// field is set here rather than at construction time.
+		cmService.notifyServerChanged = func(serverID string) {
+			codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: serverID})
+		}
+
+		// Trigger 2: an org's MCP access allowlist changes (SetOrgMCPAccess,
+		// SetTeamMCPAccess, SetKeyMCPAccess) — each scoped as precisely as
+		// that mutation's own known blast radius (admin.MCPAccessRefreshScope's
+		// own doc): SetKeyMCPAccess reaches only that key's own subscribers,
+		// SetTeamMCPAccess only that team's, and SetOrgMCPAccess that whole
+		// org's, since no single server ID applies to any of the three.
+		adminHandler.AfterMCPAccessRefresh = func(scope admin.MCPAccessRefreshScope) {
+			switch {
+			case scope.KeyID != "":
+				codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{KeyID: scope.KeyID})
+			case scope.TeamID != "":
+				codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{TeamID: scope.TeamID})
+			case scope.OrgID != "":
+				codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{OrgID: scope.OrgID})
+			}
+		}
+
+		// Trigger 3: a server's tool blocklist changes (AddMCPServerBlocklist,
+		// RemoveMCPServerBlocklist) — scoped precisely to that server ID via
+		// the same AccessChecker installed above.
+		adminHandler.AfterMCPBlocklistChange = func(serverID string) {
+			codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: serverID})
+		}
+
+		// Trigger 4: any mutation that creates, deletes, activates,
+		// deactivates, or otherwise changes a server's own alias, scope, or
+		// CodeModeEnabled (item 1) — notifying BOTH sides independently:
+		// before (when non-nil) reaches whoever could see the server under
+		// its PRE-mutation scope, via a snapshot (Trigger 1's own
+		// AccessChecker resolves ServerID against the live cache, which may
+		// no longer have an entry for a deleted/deactivated/rescoped server
+		// at all by the time this fires — see mcp.NotifiedServerScope's own
+		// doc); serverID (when non-empty) reaches whoever can see it NOW,
+		// resolved against the live cache Handler.NotifyMCPServerScopeChange's
+		// own doc guarantees is already refreshed by this point. Both fire on
+		// every qualifying mutation — a rename or a CodeModeEnabled
+		// false->true flip changes who is in each set, so neither call can be
+		// skipped in favor of the other.
+		adminHandler.NotifyMCPServerScopeChange = func(before *mcp.NotifiedServerScope, serverID string) {
+			if before != nil {
+				codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{Server: before})
+			}
+			if serverID != "" {
+				codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: serverID})
+			}
+		}
+
 		adminHandler.CodeModeServer = codeModeServer
 	}
 
 	adminHandler.MCPCallTimeout = cfg.Settings.MCP.CallTimeout
+	adminHandler.MCPStreamIdleTimeout = cfg.Settings.MCP.StreamIdleTimeout
+	adminHandler.MCPStreamMaxBytes = cfg.Settings.MCP.EffectiveStreamMaxBytes()
 	adminHandler.MCPAllowPrivateURLs = cfg.Settings.MCP.AllowPrivateURLs
+	adminHandler.MCPAllowedOrigins = cfg.Settings.MCP.AllowedOrigins
 	adminHandler.FallbackMaxDepth = cfg.Settings.FallbackMaxDepth
 
 	mcpLogger := usage.NewMCPLogger(database, 1000, log)
 	adminHandler.MCPLogger = mcpLogger
 
 	// Build the MCP health checker when enabled. The servers callback reads
-	// from the in-memory MCPServerCache so no DB I/O occurs during probe cycles.
-	// Tokens are decrypted on each callback invocation so that key rotations are
-	// picked up without restarting the checker.
+	// from the in-memory MCPServerCache so no DB I/O occurs during probe
+	// cycles. transportFor resolves each target's persistent, already
+	// auth-configured *mcp.HTTPTransport from the MCPTransportCache — the
+	// same cache the proxy hot path uses — so the checker never builds its
+	// own HTTP client or decrypts credentials itself (internal/health,
+	// mcp_checker.go).
 	var mcpHealthChecker *health.MCPHealthChecker
 	if cfg.Settings.MCP.Health.Enabled != nil && *cfg.Settings.MCP.Health.Enabled {
 		mcpHealthChecker = health.NewMCPHealthChecker(
@@ -1032,38 +1217,24 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 					if !s.IsActive {
 						continue
 					}
-					t := health.MCPServerTarget{
-						ID:            s.ID,
-						Name:          s.Name,
-						Alias:         s.Alias,
-						URL:           s.URL,
-						AuthType:      s.AuthType,
-						AuthHeader:    s.AuthHeader,
-						Source:        s.Source,
-						OAuthTokenURL: s.OAuthTokenURL,
-						OAuthClientID: s.OAuthClientID,
-						OAuthScopes:   s.OAuthScopes,
-					}
-					if s.AuthTokenEnc != nil {
-						token, decErr := crypto.DecryptString(*s.AuthTokenEnc, encKey, []byte("mcp_server:"+s.ID))
-						if decErr == nil {
-							t.AuthToken = token
-						}
-					}
-					if s.OAuthClientSecretEnc != nil {
-						secret, decErr := crypto.DecryptString(*s.OAuthClientSecretEnc, encKey, []byte("mcp_server:"+s.ID))
-						if decErr == nil {
-							t.OAuthClientSecret = secret
-						}
-					}
-					targets = append(targets, t)
+					targets = append(targets, health.MCPServerTarget{
+						ID:     s.ID,
+						Name:   s.Name,
+						Alias:  s.Alias,
+						Source: s.Source,
+					})
 				}
 				return targets
 			},
+			func(serverID string) (*mcp.HTTPTransport, bool) {
+				rs, ok := mcpTransportCache.Get(serverID)
+				if !ok || rs.Transport == nil {
+					return nil, false
+				}
+				return rs.Transport, true
+			},
 			cfg.Settings.MCP.Health.Interval,
-			cfg.Settings.MCP.AllowPrivateURLs,
 			log.With(slog.String("component", "mcp_health")),
-			mcpTransportCache.OAuthManager(),
 		)
 		adminHandler.MCPHealthChecker = mcpHealthChecker
 	}
@@ -1086,6 +1257,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		mcpServerCache:    mcpServerCache,
 		mcpAccessCache:    mcpAccessCache,
 		mcpTransportCache: mcpTransportCache,
+		mcpListenManager:  mcpListenManager,
 		rateLimiter:       rateLimiter,
 		tokenCounter:      tokenCounter,
 		loginThrottle:     loginThrottle,
@@ -1111,6 +1283,20 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 // Listener errors are handled asynchronously; the error return is reserved for
 // future synchronous startup checks and currently always returns nil.
 func (a *Application) Start() error {
+	// Wire and seed the MCP subscriptions/listen manager before the proxy
+	// begins accepting connections, so the first mutation-triggered
+	// refreshMCPCaches call (which can only happen once a listener socket is
+	// open) already finds AfterMCPCacheRefresh set. Reconcile's own Stop
+	// registration is appended alongside every other stopFunc below so it
+	// runs, in LIFO order, before a.mcpTransportCache.Close() — Reconcile's
+	// own doc explains why a listener otherwise outlives any one
+	// *HTTPTransport's lifetime.
+	if a.mcpListenManager != nil {
+		a.adminHandler.AfterMCPCacheRefresh = a.reconcileMCPListenTargets
+		a.reconcileMCPListenTargets()
+		a.stopFuncs = append(a.stopFuncs, a.mcpListenManager.Stop)
+	}
+
 	// Cache refresh tickers. Stop functions are registered in LIFO order so
 	// that the key refresh stops first on shutdown (matching startup order).
 	a.stopFuncs = append(a.stopFuncs,
@@ -1154,9 +1340,24 @@ func (a *Application) Start() error {
 		startTicker(30*time.Second, func() {
 			ctx1, cancel1 := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel1()
+			// Reconcile here does not replace the mutation-triggered cleanup in
+			// admin.Handler.refreshMCPCaches — it backstops it. If a refresh
+			// after a mutation fails, or its context is cancelled, that
+			// cleanup never runs; this periodic call catches up within one
+			// tick. Only reconcile against a list that was actually loaded:
+			// reconciling against an empty list on error would prune every
+			// server the registry currently tracks.
 			if servers, err := a.database.LoadAllActiveMCPServers(ctx1); err == nil {
 				a.mcpServerCache.LoadAll(servers)
 				a.mcpTransportCache.LoadAll(servers)
+				if a.adminHandler != nil && a.adminHandler.MCPSessionRegistry != nil {
+					activeIDs := make([]string, len(servers))
+					for i := range servers {
+						activeIDs[i] = servers[i].ID
+					}
+					a.adminHandler.MCPSessionRegistry.Reconcile(activeIDs)
+				}
+				a.reconcileMCPListenTargets()
 			} else {
 				a.log.LogAttrs(context.Background(), slog.LevelError, "mcp server cache refresh failed",
 					slog.String("error", err.Error()),
@@ -1291,15 +1492,86 @@ func (a *Application) Start() error {
 	return nil
 }
 
+// reconcileMCPListenTargets rebuilds the target list mcp.ListenManager.Reconcile
+// needs from the currently cached active MCP servers and their resolved
+// transports, and applies it. It is a no-op when Code Mode's ToolCache was
+// never enabled (a.mcpListenManager is nil in that case — see New's own
+// wiring in the Code Mode block).
+//
+// Called from three places: once, from Start, before the proxy begins
+// accepting connections; from the existing periodic 30-second MCP cache
+// reconcile tick (Start), which backstops a missed or failed mutation-driven
+// refresh exactly as it already does for MCPServerCache/MCPTransportCache/
+// MCPSessionRegistry; and from admin.Handler.AfterMCPCacheRefresh, so a
+// newly registered, updated, or deactivated server's listener starts or
+// stops promptly after the mutation that caused it, rather than waiting up
+// to 30s for the next tick.
+//
+// The built-in server (no URL, hence no *mcp.HTTPTransport in
+// mcpTransportCache) is skipped automatically: MCPTransportCache.Get simply
+// never has an entry for it — see that cache's own LoadAll doc ("servers
+// without a URL are skipped").
+//
+// A server whose mcp_servers.protocol_version column PINS it to a legacy
+// revision (mcp.ResolvePinnedVersion resolves to a non-empty Version whose
+// Era is mcp.EraLegacy) is also skipped: the legacy revisions have no
+// subscriptions/listen method at all (docs/mcp-v2.md §3.4, §1a), and this is
+// already known from the server's own configuration, with no need to probe
+// it (mcp.HTTPTransport.Listen would otherwise reach exactly this same
+// conclusion itself, but only after resolving the binding and, for a NEW
+// transport, potentially triggering that same probe). A server pinned to a
+// MODERN revision, or left unpinned ("auto" — mcp.ResolvePinnedVersion
+// returns "" either way), still gets a listener: for the unpinned case,
+// Listen itself resolves the era on first use and returns ErrListenUnsupported
+// if that turns out to be legacy after all (see runListener's own
+// reconnect-policy doc for how that outcome is handled).
+func (a *Application) reconcileMCPListenTargets() {
+	if a.mcpListenManager == nil {
+		return
+	}
+	servers := a.mcpServerCache.List()
+	targets := make([]mcp.ListenTarget, 0, len(servers))
+	for _, s := range servers {
+		if !s.IsActive {
+			continue
+		}
+		if pinned := mcp.ResolvePinnedVersion(s.ProtocolVersion); pinned != "" && pinned.Era() == mcp.EraLegacy {
+			continue
+		}
+		rs, ok := a.mcpTransportCache.Get(s.ID)
+		if !ok || rs.Transport == nil {
+			continue
+		}
+		targets = append(targets, mcp.ListenTarget{ServerID: s.ID, Transport: rs.Transport})
+	}
+	a.mcpListenManager.Reconcile(targets)
+}
+
+// mcpListenShutdownDrainTimeout bounds how long WaitForShutdown waits, in
+// total across both built-in MCP servers combined, for every
+// subscriptions/listen stream that was open at the moment CloseSubscriptions
+// was called to actually finish (its own handler observing Done(), writing
+// the graceful-end response, and returning) before continuing with the rest
+// of the shutdown sequence regardless. A stream still open once this
+// elapses is cut off uncleanly by the Fiber server(s)' own Shutdown a few
+// steps later, exactly as it always was before CloseSubscriptions'
+// WaitForSubscriptionsDrain existed — this bound only shortens how long a
+// slow client can hold up the rest of shutdown, never how long a
+// well-behaved one is given to finish.
+const mcpListenShutdownDrainTimeout = 2 * time.Second
+
 // WaitForShutdown blocks until SIGINT or SIGTERM is received, then performs a
 // phased graceful shutdown:
 //
-//  1. Begin drain — signals load balancers via /readyz to stop sending traffic.
-//  2. Wait for in-flight requests to finish (up to DrainTimeout).
-//  3. Force-cancel any remaining requests if the timeout expires.
-//  4. Stop the Fiber server(s).
-//  5. LIFO cleanup: stop tickers, flush usage/audit loggers, close Redis, close DB.
-//  6. Zero sensitive key material from memory.
+//  1. Close MCP subscriptions/listen: new listen requests get 503 from this
+//     point forward, and every already-open stream is signaled to end
+//     gracefully — see mcpListenShutdownDrainTimeout's own doc.
+//  2. Begin drain — signals load balancers via /readyz to stop sending traffic.
+//  3. Wait for in-flight requests to finish (up to DrainTimeout).
+//  4. Force-cancel any remaining requests if the timeout expires.
+//  5. Stop the Fiber server(s).
+//  6. LIFO cleanup: stop tickers, flush usage/audit loggers, close Redis, close DB.
+//  7. Zero sensitive key material from memory.
 //
 // A second signal received while draining triggers an immediate os.Exit(1).
 // ctx is reserved for future use and may be context.Background().
@@ -1320,6 +1592,26 @@ func (a *Application) WaitForShutdown(ctx context.Context) {
 		)
 		os.Exit(1)
 	}()
+
+	// Phase 0: close every open MCP subscriptions/listen stream gracefully,
+	// and refuse every new one from this point forward — done FIRST, before
+	// the ordinary request drain below, so a long-lived stream (which the
+	// ordinary in-flight request counter does not track the same way a
+	// short-lived proxy/admin request is — see shutdownState's own doc) gets
+	// the maximum possible time to observe Done() and write its own
+	// graceful-end response before anything else in this sequence
+	// (including DrainTimeout, which could otherwise elapse first and race
+	// it) moves on. See mcp.Server.CloseSubscriptions' and
+	// WaitForSubscriptionsDrain's own docs.
+	mcpListenDeadline := time.Now().Add(mcpListenShutdownDrainTimeout)
+	if a.adminHandler.MCPServer != nil {
+		a.adminHandler.MCPServer.CloseSubscriptions()
+	}
+	if a.adminHandler.CodeModeServer != nil {
+		a.adminHandler.CodeModeServer.CloseSubscriptions()
+	}
+	waitForMCPListenDrain(a.adminHandler.MCPServer, mcpListenDeadline)
+	waitForMCPListenDrain(a.adminHandler.CodeModeServer, mcpListenDeadline)
 
 	// Phase 1: Begin drain — /readyz returns 503 from this point forward so
 	// load balancers stop routing new requests to this instance.
@@ -1349,7 +1641,7 @@ func (a *Application) WaitForShutdown(ctx context.Context) {
 	if drained {
 		a.log.LogAttrs(ctx, slog.LevelInfo, "all requests drained")
 	} else {
-		// Phase 3: Force-cancel remaining in-flight requests.
+		// Phase 4: Force-cancel remaining in-flight requests.
 		a.log.LogAttrs(ctx, slog.LevelWarn, "drain timeout exceeded, canceling in-flight requests",
 			slog.Int64("in_flight", a.shutdownState.InFlight()),
 		)
@@ -1357,7 +1649,7 @@ func (a *Application) WaitForShutdown(ctx context.Context) {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Phase 4: Stop the Fiber server(s).
+	// Phase 5: Stop the Fiber server(s).
 	if err := a.proxyApp.Shutdown(); err != nil {
 		a.log.LogAttrs(ctx, slog.LevelError, "proxy shutdown error",
 			slog.String("error", err.Error()),
@@ -1372,10 +1664,28 @@ func (a *Application) WaitForShutdown(ctx context.Context) {
 		}
 	}
 
-	// Phase 5: cleanup resources.
+	// Phase 6: cleanup resources.
 	a.cleanup(ctx)
 
 	a.log.LogAttrs(ctx, slog.LevelInfo, "shutdown complete")
+}
+
+// waitForMCPListenDrain calls server.WaitForSubscriptionsDrain, bounded by
+// whatever remains of deadline (a single mcpListenShutdownDrainTimeout
+// budget shared across both built-in servers — see that constant's own
+// doc), unless server is nil (Code Mode disabled, or no management server
+// configured — a Handler built without one) or the deadline has already
+// elapsed by the time this is called for the second server, in which case it
+// is a no-op: there is no time budget left to wait with.
+func waitForMCPListenDrain(server *mcp.Server, deadline time.Time) {
+	if server == nil {
+		return
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return
+	}
+	server.WaitForSubscriptionsDrain(remaining)
 }
 
 // PrintBootstrapCredentials writes the bootstrap credentials to stderr when a

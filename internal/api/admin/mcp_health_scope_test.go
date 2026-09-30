@@ -23,6 +23,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/health"
 	"github.com/voidmind-io/voidllm/internal/license"
+	"github.com/voidmind-io/voidllm/internal/mcp"
 )
 
 // openMCPHealthScopeDB opens an in-memory SQLite DB and runs migrations,
@@ -71,10 +72,12 @@ func buildMCPHealthApp(t *testing.T, database *db.DB, keyCache *cache.Cache[stri
 	}
 	checker := health.NewMCPHealthChecker(
 		func() []health.MCPServerTarget { return targets },
+		// Every target uses Source: "builtin", which runAll short-circuits
+		// before ever calling transportFor (see mcp_checker.go), so a
+		// stub that always reports "no transport" is safe here.
+		func(string) (*mcp.HTTPTransport, bool) { return nil, false },
 		24*time.Hour, // long enough that the background ticker never fires during the test
-		true,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		nil,
 	)
 	stop := checker.Start()
 	t.Cleanup(stop)

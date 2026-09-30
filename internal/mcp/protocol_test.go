@@ -381,20 +381,24 @@ func TestResponse_JSONRoundTrip(t *testing.T) {
 	}
 }
 
+// TestTool_JSONRoundTrip verifies Tool round-trips through JSON, including its
+// InputSchema — now a JSONSchema (raw JSON) built via ObjectSchema instead of
+// the removed InputSchema/Property struct pair (SEP-2106, docs/mcp-v2.md
+// §8/§11.2). The comparison is semantic (decode into map[string]any) rather
+// than byte-for-byte, since JSONSchema's own round-trip fidelity — that it
+// marshals as raw JSON, not base64 — is covered by TestJSONSchema_MarshalJSON
+// and TestJSONSchema_RoundTrip below; this test only needs to confirm Tool
+// carries the schema through unchanged.
 func TestTool_JSONRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	original := mcp.Tool{
 		Name:        "my_tool",
 		Description: "Does something useful.",
-		InputSchema: mcp.InputSchema{
-			Type: "object",
-			Properties: map[string]mcp.Property{
-				"query": {Type: "string", Description: "The search query."},
-				"limit": {Type: "integer"},
-			},
-			Required: []string{"query"},
-		},
+		InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{
+			"query": {Type: "string", Description: "The search query."},
+			"limit": {Type: "integer"},
+		}, "query"),
 	}
 
 	b, err := json.Marshal(original)
@@ -407,8 +411,22 @@ func TestTool_JSONRoundTrip(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	if !reflect.DeepEqual(decoded, original) {
-		t.Errorf("round-trip mismatch:\n got  %+v\n want %+v", decoded, original)
+	if decoded.Name != original.Name {
+		t.Errorf("Name mismatch: %q != %q", decoded.Name, original.Name)
+	}
+	if decoded.Description != original.Description {
+		t.Errorf("Description mismatch: %q != %q", decoded.Description, original.Description)
+	}
+
+	var wantSchema, gotSchema map[string]any
+	if err := json.Unmarshal(original.InputSchema, &wantSchema); err != nil {
+		t.Fatalf("unmarshal original schema: %v", err)
+	}
+	if err := json.Unmarshal(decoded.InputSchema, &gotSchema); err != nil {
+		t.Fatalf("unmarshal decoded schema: %v", err)
+	}
+	if !reflect.DeepEqual(gotSchema, wantSchema) {
+		t.Errorf("InputSchema round-trip mismatch:\n got  %+v\n want %+v", gotSchema, wantSchema)
 	}
 }
 
@@ -456,5 +474,226 @@ func TestToolResult_JSONRoundTrip(t *testing.T) {
 				t.Errorf("round-trip mismatch:\n got  %+v\n want %+v", decoded, *tc.original)
 			}
 		})
+	}
+}
+
+// ---- JSONSchema: raw JSON, NOT base64 ---------------------------------------
+//
+// JSONSchema is `type JSONSchema jsonx.RawMessage`, i.e. a named []byte type.
+// Without an explicit MarshalJSON/UnmarshalJSON pair, encoding/json treats any
+// named []byte type as arbitrary binary data and base64-encodes it — this is
+// the single most common pitfall of the RawMessage-alias pattern, and exactly
+// the bug SEP-2106's "full JSON Schema 2020-12" requirement would reintroduce
+// if JSONSchema forgot these methods. These tests lock in that JSONSchema
+// marshals as the literal JSON document it holds.
+
+// TestJSONSchema_MarshalJSON_IsRawNotBase64 is the load-bearing regression
+// test: it fails loudly (with a visibly wrong base64 string in the error) if
+// JSONSchema's MarshalJSON method is ever removed or shadowed.
+func TestJSONSchema_MarshalJSON_IsRawNotBase64(t *testing.T) {
+	t.Parallel()
+
+	schema := mcp.JSONSchema(`{"type":"string"}`)
+
+	b, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// A base64-encoding bug would produce a quoted string like
+	// "eyJ0eXBlIjoic3RyaW5nIn0=" instead of the raw object.
+	if string(b) != `{"type":"string"}` {
+		t.Errorf("Marshal(JSONSchema) = %s, want raw JSON %s (if this looks like a base64 string, "+
+			"JSONSchema's MarshalJSON method has regressed)", b, `{"type":"string"}`)
+	}
+
+	var probe map[string]any
+	if err := json.Unmarshal(b, &probe); err != nil {
+		t.Fatalf("marshaled JSONSchema is not valid JSON on its own: %v (raw: %s)", err, b)
+	}
+}
+
+// TestJSONSchema_MarshalJSON_Empty verifies an empty/nil JSONSchema marshals
+// to the JSON null literal rather than an empty base64 string or invalid JSON.
+func TestJSONSchema_MarshalJSON_Empty(t *testing.T) {
+	t.Parallel()
+
+	var schema mcp.JSONSchema
+	b, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b) != "null" {
+		t.Errorf("Marshal(empty JSONSchema) = %s, want %s", b, "null")
+	}
+}
+
+// TestJSONSchema_RoundTrip_NestedSchema verifies a JSON Schema 2020-12
+// document with enum, nested properties, and $ref survives a full
+// marshal/unmarshal round trip byte-for-byte-equivalent (semantically), the
+// exact vocabulary SEP-2106 requires VoidLLM to carry through without
+// dropping keywords.
+func TestJSONSchema_RoundTrip_NestedSchema(t *testing.T) {
+	t.Parallel()
+
+	const original = `{
+		"type": "object",
+		"properties": {
+			"status": {
+				"type": "string",
+				"enum": ["pending", "active", "done"]
+			},
+			"owner": {
+				"type": "object",
+				"properties": {
+					"id": {"type": "string"},
+					"role": {"$ref": "#/definitions/role"}
+				},
+				"required": ["id"]
+			}
+		},
+		"required": ["status"],
+		"definitions": {
+			"role": {"type": "string", "enum": ["admin", "member"]}
+		}
+	}`
+
+	schema := mcp.JSONSchema(original)
+
+	// Round-trip through a Tool, exactly as VoidLLM actually uses JSONSchema.
+	tool := mcp.Tool{Name: "assign_role", InputSchema: schema}
+
+	b, err := json.Marshal(tool)
+	if err != nil {
+		t.Fatalf("marshal Tool: %v", err)
+	}
+
+	var decodedTool mcp.Tool
+	if err := json.Unmarshal(b, &decodedTool); err != nil {
+		t.Fatalf("unmarshal Tool: %v", err)
+	}
+
+	var want, got map[string]any
+	if err := json.Unmarshal([]byte(original), &want); err != nil {
+		t.Fatalf("unmarshal original: %v", err)
+	}
+	if err := json.Unmarshal(decodedTool.InputSchema, &got); err != nil {
+		t.Fatalf("unmarshal decoded schema: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("nested schema round-trip mismatch:\n got  %+v\n want %+v", got, want)
+	}
+
+	// Spot-check the keywords SEP-2106 specifically calls out as needing full
+	// fidelity: enum, nested properties, and $ref must all still be present.
+	props := got["properties"].(map[string]any)
+	status := props["status"].(map[string]any)
+	if enum, ok := status["enum"].([]any); !ok || len(enum) != 3 {
+		t.Errorf("enum keyword lost or malformed after round-trip: %v", status["enum"])
+	}
+	owner := props["owner"].(map[string]any)
+	ownerProps := owner["properties"].(map[string]any)
+	role := ownerProps["role"].(map[string]any)
+	if role["$ref"] != "#/definitions/role" {
+		t.Errorf("$ref keyword lost after round-trip: %v", role["$ref"])
+	}
+}
+
+// TestJSONSchema_UnmarshalJSON_NilReceiver verifies UnmarshalJSON guards
+// against a nil pointer receiver, mirroring encoding/json.RawMessage's own
+// guard, instead of panicking.
+func TestJSONSchema_UnmarshalJSON_NilReceiver(t *testing.T) {
+	t.Parallel()
+
+	var s *mcp.JSONSchema
+	err := s.UnmarshalJSON([]byte(`{}`))
+	if err == nil {
+		t.Error("UnmarshalJSON on nil receiver: error = nil, want non-nil")
+	}
+}
+
+// ---- Capabilities: raw JSON, NOT base64 --------------------------------------
+
+// TestCapabilities_MarshalJSON_IsRawNotBase64 mirrors
+// TestJSONSchema_MarshalJSON_IsRawNotBase64 for Capabilities, which is the
+// same jsonx.RawMessage-alias pattern used to carry client/server capability
+// objects — including the open-ended "extensions" key (docs/mcp-v2.md §6) —
+// verbatim without VoidLLM needing to model every SDK's capability shape.
+func TestCapabilities_MarshalJSON_IsRawNotBase64(t *testing.T) {
+	t.Parallel()
+
+	caps := mcp.Capabilities(`{"tools":{},"extensions":{"io.modelcontextprotocol/tasks":{}}}`)
+
+	b, err := json.Marshal(caps)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b) != string(caps) {
+		t.Errorf("Marshal(Capabilities) = %s, want raw JSON %s (if this looks like a base64 string, "+
+			"Capabilities' MarshalJSON method has regressed)", b, caps)
+	}
+}
+
+// TestCapabilities_MarshalJSON_Empty verifies an empty/nil Capabilities
+// marshals to the JSON null literal.
+func TestCapabilities_MarshalJSON_Empty(t *testing.T) {
+	t.Parallel()
+
+	var caps mcp.Capabilities
+	b, err := json.Marshal(caps)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b) != "null" {
+		t.Errorf("Marshal(empty Capabilities) = %s, want %s", b, "null")
+	}
+}
+
+// TestCapabilities_RoundTrip verifies Capabilities survives a full
+// marshal/unmarshal round trip, including a nested "extensions" object —
+// exactly what dialect2026.Decode extracts from
+// params._meta["io.modelcontextprotocol/clientCapabilities"] into
+// Envelope.ClientCaps.
+func TestCapabilities_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	const original = `{"tools":{"listChanged":true},"extensions":{"io.modelcontextprotocol/tasks":{}}}`
+
+	type wrapper struct {
+		Caps mcp.Capabilities `json:"caps"`
+	}
+	w := wrapper{Caps: mcp.Capabilities(original)}
+
+	b, err := json.Marshal(w)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded wrapper
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	var want, got map[string]any
+	if err := json.Unmarshal([]byte(original), &want); err != nil {
+		t.Fatalf("unmarshal original: %v", err)
+	}
+	if err := json.Unmarshal(decoded.Caps, &got); err != nil {
+		t.Fatalf("unmarshal decoded: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Capabilities round-trip mismatch:\n got  %+v\n want %+v", got, want)
+	}
+}
+
+// TestCapabilities_UnmarshalJSON_NilReceiver verifies UnmarshalJSON guards
+// against a nil pointer receiver instead of panicking.
+func TestCapabilities_UnmarshalJSON_NilReceiver(t *testing.T) {
+	t.Parallel()
+
+	var c *mcp.Capabilities
+	err := c.UnmarshalJSON([]byte(`{}`))
+	if err == nil {
+		t.Error("UnmarshalJSON on nil receiver: error = nil, want non-nil")
 	}
 }

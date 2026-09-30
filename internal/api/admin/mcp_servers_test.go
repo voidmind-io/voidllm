@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -930,6 +931,247 @@ func TestCreateMCPServer_CannotSetSourceYAML(t *testing.T) {
 	}
 }
 
+// ---- protocol_version --------------------------------------------------------
+
+// TestCreateMCPServer_API_ProtocolVersion covers every accepted and rejected
+// protocol_version value on create: an omitted field, an empty string, and
+// "auto" must all normalize to "auto"; every value in mcp.SupportedVersions()
+// must be accepted verbatim; and any value that is neither "auto" nor a
+// recognized revision must be rejected with a 400 whose body names the
+// accepted choices — the field must be genuinely reachable through the API,
+// not merely present on the wire type.
+func TestCreateMCPServer_API_ProtocolVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		omit        bool // when true, protocol_version is not sent at all
+		value       string
+		wantStatus  int
+		wantVersion string // checked only when wantStatus == 201
+	}{
+		{name: "omitted field defaults to auto", omit: true, wantStatus: fiber.StatusCreated, wantVersion: "auto"},
+		{name: "empty string normalizes to auto", value: "", wantStatus: fiber.StatusCreated, wantVersion: "auto"},
+		{name: "explicit auto is valid", value: "auto", wantStatus: fiber.StatusCreated, wantVersion: "auto"},
+		{name: "pin to 2025-03-26 is valid", value: string(mcp.V20250326), wantStatus: fiber.StatusCreated, wantVersion: string(mcp.V20250326)},
+		{name: "pin to 2025-06-18 is valid", value: string(mcp.V20250618), wantStatus: fiber.StatusCreated, wantVersion: string(mcp.V20250618)},
+		{name: "pin to 2025-11-25 is valid", value: string(mcp.V20251125), wantStatus: fiber.StatusCreated, wantVersion: string(mcp.V20251125)},
+		{name: "pin to 2026-07-28 is valid", value: string(mcp.V20260728), wantStatus: fiber.StatusCreated, wantVersion: string(mcp.V20260728)},
+		{name: "unrecognized date rejected", value: "1999-01-01", wantStatus: fiber.StatusBadRequest},
+		{name: "garbage string rejected", value: "not-a-version", wantStatus: fiber.StatusBadRequest},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			slug := strings.ReplaceAll(tc.name, " ", "-")
+			dsn := fmt.Sprintf("file:TestCreateMCPServer_ProtoVer_%s?mode=memory&cache=private", slug)
+			app, _, keyCache := setupMCPServersTestApp(t, dsn)
+			key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-proto-create")
+
+			body := map[string]any{
+				"name":      "Proto Test",
+				"alias":     "proto-" + slug,
+				"url":       "https://proto.example.com",
+				"auth_type": "none",
+			}
+			if !tc.omit {
+				body["protocol_version"] = tc.value
+			}
+
+			resp := mcpServerRequest(t, app, http.MethodPost, "/api/v1/mcp-servers", key, body)
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tc.wantStatus {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d; body: %s", resp.StatusCode, tc.wantStatus, raw)
+			}
+
+			if tc.wantStatus == fiber.StatusBadRequest {
+				raw, _ := io.ReadAll(resp.Body)
+				if !strings.Contains(string(raw), "protocol_version must be one of") {
+					t.Errorf("error body = %s, want it to name the accepted protocol_version values", raw)
+				}
+				return
+			}
+
+			var got map[string]any
+			decodeBody(t, resp.Body, &got)
+			if got["protocol_version"] != tc.wantVersion {
+				t.Errorf("protocol_version = %v, want %q", got["protocol_version"], tc.wantVersion)
+			}
+		})
+	}
+}
+
+// TestUpdateMCPServer_API_ProtocolVersion mirrors
+// TestCreateMCPServer_API_ProtocolVersion for the PATCH path: a valid pin is
+// applied and echoed back, an empty string normalizes to "auto" rather than
+// being rejected or silently ignored, and an invalid value is rejected with
+// the same 400 message naming the accepted choices.
+func TestUpdateMCPServer_API_ProtocolVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		value       string
+		wantStatus  int
+		wantVersion string
+	}{
+		{name: "valid pin accepted", value: string(mcp.V20251125), wantStatus: fiber.StatusOK, wantVersion: string(mcp.V20251125)},
+		{name: "empty string normalizes to auto", value: "", wantStatus: fiber.StatusOK, wantVersion: "auto"},
+		{name: "invalid value rejected", value: "not-a-version", wantStatus: fiber.StatusBadRequest},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			slug := strings.ReplaceAll(tc.name, " ", "-")
+			dsn := fmt.Sprintf("file:TestUpdateMCPServer_ProtoVer_%s?mode=memory&cache=private", slug)
+			app, _, keyCache := setupMCPServersTestApp(t, dsn)
+			key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-proto-update")
+
+			created := createMCPServerViaAPI(t, app, key, map[string]any{
+				"name":             "Update Proto",
+				"alias":            "update-proto-" + slug,
+				"url":              "https://update-proto.example.com",
+				"auth_type":        "none",
+				"protocol_version": "auto",
+			})
+			serverID := created["id"].(string)
+
+			resp := mcpServerRequest(t, app, http.MethodPatch, "/api/v1/mcp-servers/"+serverID, key,
+				map[string]any{"protocol_version": tc.value})
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tc.wantStatus {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d; body: %s", resp.StatusCode, tc.wantStatus, raw)
+			}
+
+			if tc.wantStatus == fiber.StatusBadRequest {
+				raw, _ := io.ReadAll(resp.Body)
+				if !strings.Contains(string(raw), "protocol_version must be one of") {
+					t.Errorf("error body = %s, want it to name the accepted protocol_version values", raw)
+				}
+				return
+			}
+
+			got := decodeMCPServerResponse(t, resp.Body)
+			if got["protocol_version"] != tc.wantVersion {
+				t.Errorf("protocol_version = %v, want %q", got["protocol_version"], tc.wantVersion)
+			}
+		})
+	}
+}
+
+// TestGetMCPServer_API_ReturnsProtocolVersion verifies that a server created
+// with an explicit protocol_version pin echoes that exact value back through
+// GET, not just through the create response.
+func TestGetMCPServer_API_ReturnsProtocolVersion(t *testing.T) {
+	t.Parallel()
+
+	dsn := "file:TestGetMCPServer_API_ProtocolVersion?mode=memory&cache=private"
+	app, _, keyCache := setupMCPServersTestApp(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-get-proto")
+
+	created := createMCPServerViaAPI(t, app, key, map[string]any{
+		"name":             "Get Proto",
+		"alias":            "get-proto",
+		"url":              "https://get-proto.example.com",
+		"auth_type":        "none",
+		"protocol_version": string(mcp.V20250618),
+	})
+	serverID := created["id"].(string)
+	if created["protocol_version"] != string(mcp.V20250618) {
+		t.Fatalf("test setup: create response protocol_version = %v, want %q", created["protocol_version"], mcp.V20250618)
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodGet, "/api/v1/mcp-servers/"+serverID, key, nil)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+	got := decodeMCPServerResponse(t, resp.Body)
+	if got["protocol_version"] != string(mcp.V20250618) {
+		t.Errorf("protocol_version = %v, want %q", got["protocol_version"], mcp.V20250618)
+	}
+}
+
+// TestTestMCPServerConnection_API_ProtocolVersionPin_SkipsEraProbe is the
+// effectiveness test for protocol_version: it proves a pinned server actually
+// changes behavior, not just that the value round-trips through the API. The
+// fake upstream refuses server/discover outright (404) and would therefore
+// force the auto-probe path to fall back to a legacy initialize handshake —
+// which this upstream also does not implement, so an un-pinned server would
+// fail the connection test entirely. With protocol_version pinned to
+// 2026-07-28, mcp.ResolvePinnedVersion must make HTTPTransport skip probeEra
+// altogether and go straight to a modern-era tools/list, which the fake
+// upstream answers successfully. success=true here is only possible if the
+// probe was skipped; discoverCalled additionally pins down that
+// server/discover specifically was never even attempted.
+func TestTestMCPServerConnection_API_ProtocolVersionPin_SkipsEraProbe(t *testing.T) {
+	t.Parallel()
+
+	var discoverCalled atomic.Bool
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(body, &req)
+
+		switch req.Method {
+		case "server/discover":
+			discoverCalled.Store(true)
+			w.WriteHeader(http.StatusNotFound)
+		case "tools/list":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	dsn := "file:TestTestMCPServerConnection_ProtoVerPin?mode=memory&cache=private"
+	database, keyCache, app := setupMCPServersTestAppAllowPrivate(t, dsn)
+	key := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-proto-pin-skip")
+
+	s, err := database.CreateMCPServer(context.Background(), db.CreateMCPServerParams{
+		Name:            "Pinned Modern",
+		Alias:           "pinned-modern",
+		URL:             upstream.URL,
+		AuthType:        "none",
+		ProtocolVersion: string(mcp.V20260728),
+	})
+	if err != nil {
+		t.Fatalf("create test MCP server: %v", err)
+	}
+
+	resp := mcpServerRequest(t, app, http.MethodPost, "/api/v1/mcp-servers/"+s.ID+"/test", key, nil)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
+	}
+
+	var got map[string]any
+	decodeBody(t, resp.Body, &got)
+	if got["success"] != true {
+		t.Fatalf("success = %v, want true (a pin to 2026-07-28 must skip era probing and go straight to tools/list); error: %v", got["success"], got["error"])
+	}
+	if discoverCalled.Load() {
+		t.Error("server/discover was called even though protocol_version was pinned — the pin did not skip the era probe")
+	}
+}
+
 // setupMCPServersTestAppWithToolCache builds a Fiber app identical to
 // setupMCPServersTestAppAllowPrivate but with a ToolCache wired onto the
 // handler. The ToolCache uses a static fetcher that always returns the
@@ -957,8 +1199,8 @@ func setupMCPServersTestAppWithToolCache(t *testing.T, dsn string, staticTools [
 
 	keyCache := cache.New[string, auth.KeyInfo]()
 
-	fetcher := mcp.ToolFetcher(func(_ context.Context, _ string) ([]mcp.Tool, error) {
-		return staticTools, nil
+	fetcher := mcp.ToolFetcher(func(_ context.Context, _ string) (*mcp.ToolListing, error) {
+		return &mcp.ToolListing{Tools: staticTools}, nil
 	})
 	toolCache := mcp.NewToolCache(fetcher, time.Hour)
 
