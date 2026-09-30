@@ -170,16 +170,17 @@ type Handler struct {
 	AfterMCPCacheRefresh func()
 	// AfterMCPAccessRefresh is called at the end of every refreshMCPAccessCache
 	// run — after MCPAccessCache has already been reloaded — with the
-	// organization ID whose MCP access allowlist changed. SetOrgMCPAccess,
-	// SetTeamMCPAccess, and SetKeyMCPAccess all resolve one concrete org ID
-	// for this call even when the mutation itself targeted a team or key
-	// (a team or key always belongs to exactly one org). Set once, in
+	// precise scope the mutation itself is known to affect: SetKeyMCPAccess
+	// resolves a KeyID-only scope, SetTeamMCPAccess a TeamID-only scope, and
+	// SetOrgMCPAccess an OrgID-only scope — see MCPAccessRefreshScope's own
+	// doc for why each mutation can be scoped this precisely instead of
+	// always falling back to the whole organization. Set once, in
 	// internal/app, only when Code Mode is enabled — wired to notify a Code
-	// Mode *mcp.Server's subscriptions/listen subscribers in that org that
+	// Mode *mcp.Server's subscriptions/listen subscribers in that scope that
 	// their own view of tools/list may have changed (see NotifyScope's own
 	// doc in internal/mcp/subscriptions.go). nil is a perfectly ordinary
 	// configuration and callers must nil-check.
-	AfterMCPAccessRefresh func(orgID string)
+	AfterMCPAccessRefresh func(scope MCPAccessRefreshScope)
 	// AfterMCPBlocklistChange is called after every AddMCPServerBlocklist or
 	// RemoveMCPServerBlocklist mutation, with the MCP server ID whose
 	// blocklist changed. See AfterMCPAccessRefresh's own doc for why this
@@ -188,6 +189,39 @@ type Handler struct {
 	// Mode's own tools/list content is scoped by, rather than falling back
 	// to a whole organization. nil is a perfectly ordinary configuration.
 	AfterMCPBlocklistChange func(serverID string)
+	// NotifyMCPServerScopeChange is called after every mutation that may
+	// change what a caller can see on a Code Mode subscriptions/listen
+	// stream: CreateMCPServer (and its Org/Team variants), UpdateMCPServer
+	// (whenever the alias, OrgID, TeamID, or CodeModeEnabled changed),
+	// DeleteMCPServer, ActivateMCPServer, or DeactivateMCPServer — every one
+	// of them checked individually, since each has its own "before" state (or
+	// none at all, for a brand-new server).
+	//
+	// before is a snapshot of the server's scope captured BEFORE the
+	// mutation ran, or nil when there is no "before" to speak of (a
+	// newly-created server). serverID is the server's own (stable, immutable)
+	// database ID, used to notify whoever can see it under the LIVE,
+	// POST-mutation cache — refreshMCPCaches must have already run by the
+	// time this is called, or that half of the notification would resolve
+	// against stale state.
+	//
+	// The two halves are deliberately independent, not an if/else: a caller
+	// who could see the server BEFORE (via before) and a caller who can see
+	// it AFTER (via serverID, resolved live) are not necessarily the same
+	// set — an alias rename or a CodeModeEnabled false->true flip is exactly
+	// the case where they differ, and both sets must be told their own view
+	// of tools/list may have changed. See mcp.NotifiedServerScope's own doc
+	// for why a live-cache lookup alone cannot cover the "before" half: a
+	// deleted or deactivated server no longer resolves by ID in that cache at
+	// all, so a live-cache-based notification for it would silently reach
+	// nobody.
+	//
+	// Set once, in internal/app, only when Code Mode is enabled — wired to
+	// fire two independent mcp.Server.NotifyToolsListChanged calls, one
+	// Server-scoped against before (when non-nil) and one ServerID-scoped
+	// against serverID (when non-empty). nil is a perfectly ordinary
+	// configuration and every call site nil-checks before invoking.
+	NotifyMCPServerScopeChange func(before *mcp.NotifiedServerScope, serverID string)
 	// MCPListenMaxDuration bounds how long a subscriptions/listen stream on
 	// either built-in MCP server may run before mcp_handler.go proactively
 	// ends it with a graceful complete response, computed once at startup
@@ -287,16 +321,29 @@ func (h *Handler) refreshMCPCaches(ctx context.Context) {
 	}
 }
 
+// MCPAccessRefreshScope identifies which subscriptions/listen subscribers an
+// MCP access allowlist mutation should notify, mirroring how precisely each
+// Set*MCPAccess handler already knows its own blast radius: SetKeyMCPAccess
+// only ever changes one key's own effective access, SetTeamMCPAccess one
+// team's, and SetOrgMCPAccess one org's. Exactly one field is set per call —
+// see refreshMCPAccessCache's own callers (mcp_access.go) and
+// NotifyScope's own doc for the corresponding mcp package type this is
+// translated into by internal/app's wiring.
+type MCPAccessRefreshScope struct {
+	OrgID  string
+	TeamID string
+	KeyID  string
+}
+
 // refreshMCPAccessCache reloads all MCP access allowlists from the database
 // into the in-memory MCP access cache. It is called after any Set*MCPAccess
-// mutation so that the hot path immediately reflects the updated configuration.
-// orgID is the organization whose allowlist changed — forwarded to
-// AfterMCPAccessRefresh, if set, once the cache reload completes; every
-// caller of this method already knows a concrete orgID (see that field's own
-// doc). If MCPAccessCache is nil the call is a no-op — AfterMCPAccessRefresh
-// is not invoked in that case either, since nothing in the hot path actually
-// changed.
-func (h *Handler) refreshMCPAccessCache(ctx context.Context, orgID string) {
+// mutation so that the hot path immediately reflects the updated
+// configuration. scope identifies exactly which subscribers the mutation is
+// known to affect — forwarded to AfterMCPAccessRefresh, if set, once the
+// cache reload completes. If MCPAccessCache is nil the call is a no-op —
+// AfterMCPAccessRefresh is not invoked in that case either, since nothing in
+// the hot path actually changed.
+func (h *Handler) refreshMCPAccessCache(ctx context.Context, scope MCPAccessRefreshScope) {
 	if h.MCPAccessCache == nil {
 		return
 	}
@@ -307,6 +354,6 @@ func (h *Handler) refreshMCPAccessCache(ctx context.Context, orgID string) {
 	}
 	h.MCPAccessCache.Load(orgA, teamA, keyA)
 	if h.AfterMCPAccessRefresh != nil {
-		h.AfterMCPAccessRefresh(orgID)
+		h.AfterMCPAccessRefresh(scope)
 	}
 }

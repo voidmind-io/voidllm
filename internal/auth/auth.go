@@ -50,6 +50,19 @@ type KeyInfo struct {
 	// ExpiresAt is the expiration time of the key. Nil means no expiration.
 	ExpiresAt *time.Time
 
+	// Hash is the HMAC-SHA256(hmacSecret, rawKey) value Middleware used to look
+	// this KeyInfo up in keyCache — i.e. keyCache's own key for this exact
+	// entry. Populated by Middleware on every successful authentication (never
+	// persisted, never derivable from the DB row itself); it exists so a
+	// caller that captured a KeyInfo at one point in time (e.g. an MCP
+	// subscriptions/listen subscriber — see mcp.KeyIdentity.KeyHash) can later
+	// re-run the identical keyCache.Get(hash) lookup Middleware performed, to
+	// check whether the same key is still present, unexpired, and unchanged.
+	// It is derived from a server-side HMAC secret and cannot be reversed to
+	// recover the raw API key, so holding it in memory alongside the rest of
+	// KeyInfo carries no additional secrecy requirement beyond KeyInfo's own.
+	Hash string
+
 	// OrgDailyTokenLimit is the org-level daily token limit cached alongside the key.
 	// Zero means unlimited.
 	OrgDailyTokenLimit int64
@@ -123,6 +136,7 @@ func Middleware(keyCache *cache.Cache[string, KeyInfo], hmacSecret []byte) fiber
 			return apierror.Unauthorized(c, "invalid API key")
 		}
 
+		keyInfo.Hash = hash
 		c.Locals(keyInfoKey, &keyInfo)
 		return c.Next()
 	}

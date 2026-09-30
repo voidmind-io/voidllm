@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"sync"
+	"time"
 
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
@@ -16,6 +17,16 @@ import (
 // BEFORE a Subscriber (and therefore a stream) is ever handed back to a
 // caller — see that method's own doc.
 const maxListenStreamsPerKey = 4
+
+// maxListenStreamsPerOrg bounds how many concurrent subscriptions/listen
+// streams every API key belonging to a single organization may hold open
+// against one *Server instance in total — a middle tier between
+// maxListenStreamsPerKey (a single key) and maxListenStreamsPerServer (every
+// caller, every org), protecting against one organization with many keys
+// exhausting a large share of the server-wide budget on its own. Checked by
+// subscriberRegistry.register alongside the other two limits — see that
+// method's own doc.
+const maxListenStreamsPerOrg = 64
 
 // maxListenStreamsPerServer bounds how many concurrent subscriptions/listen
 // streams a single *Server instance will hold open in total, across every
@@ -40,51 +51,171 @@ type ListenFilter struct {
 }
 
 // AccessChecker reports whether the caller identified by id currently has
-// access to the MCP server identified by serverID — the same access
-// decision that determines what id would actually see in that server's own
-// tools/list content (see internal/app/code_mode.go's codeModeAccessChecker
-// for the concrete implementation VoidLLM wires here, which mirrors
-// codeModeService.accessibleServers for a single server ID). NotifyToolsListChanged
-// consults it, per subscriber, to implement the tenant scoping documented on
-// NotifyScope: a subscriber is only notified about a NotifyScope.ServerID
-// change when this reports true for its own identity.
+// access to an MCP server — either the LIVE server named by serverID
+// (snapshot == nil), or the server captured, pre-mutation, in snapshot
+// (serverID == "", snapshot != nil) — the same access decision that
+// determines what id would actually see in that server's own tools/list
+// content (see internal/app/code_mode.go's codeModeAccessChecker for the
+// concrete implementation VoidLLM wires here, which mirrors
+// codeModeService.accessibleServers for a single server, live or
+// snapshotted, applying the identical MCPAccessCache lookup, alias-winner
+// rule, and CodeModeEnabled check to both — this package deliberately keeps
+// no simplified copy of those rules of its own; see NotifiedServerScope's own
+// doc). NotifyToolsListChanged consults it, per subscriber, to implement the
+// tenant scoping documented on NotifyScope: a subscriber is only notified
+// about a NotifyScope.ServerID or NotifyScope.Server change when this
+// reports true for its own identity. NotifyScope.matches (this package's own
+// caller of this type) always sets exactly one of serverID (non-empty) or
+// snapshot (non-nil) on any given call — never both, never neither.
 //
 // Must not perform blocking I/O of unbounded duration, and production
 // implementations must be built exclusively from in-memory caches — never a
 // database call — since NotifyToolsListChanged may be invoked once per
 // subscriber on every qualifying change.
-type AccessChecker func(id KeyIdentity, serverID string) bool
+type AccessChecker func(id KeyIdentity, serverID string, snapshot *NotifiedServerScope) bool
+
+// KeyValidator reports whether the caller identity captured at
+// subscriptions/listen registration time (a Subscriber's own KeyIdentity) is
+// still current: the key it was captured from still exists in the live auth
+// key cache, is not expired, and its org/team/role have not since changed
+// out from under it. Server.NotifyToolsListChanged consults it, per
+// subscriber, to filter delivery (see Server.notify), and
+// internal/api/admin/mcp_handler.go's handleMCPListenStream consults it on a
+// fixed interval (mcpListenRevalidateInterval) to end a stream whose
+// subscriber no longer validates.
+//
+// Unlike AccessChecker, a nil KeyValidator is permissive, not fail-closed: it
+// means no revalidation source was wired at all (e.g. a Handler built
+// directly in a test that does not exercise this path), in which case every
+// subscriber is treated as still valid rather than none. Production wiring
+// (internal/app) always installs one; a security-relevant fail-closed
+// default is unnecessary here because the ORIGINAL registration already
+// authenticated the caller through the exact same key cache — this is a
+// revalidation of a once-valid identity, not the initial access decision
+// AccessChecker's fail-closed default protects.
+//
+// Must not perform blocking I/O of unbounded duration, and production
+// implementations must be built exclusively from in-memory caches — never a
+// database call — matching AccessChecker's identical constraint.
+type KeyValidator func(id KeyIdentity) bool
+
+// NotifiedServerScope is an immutable snapshot of an MCP server's own row —
+// ID, Alias, tenant scope, Source, CodeModeEnabled, and Active state —
+// captured by a caller at the exact moment of a mutation that may remove or
+// change a server's visibility (deletion, deactivation, or a scope-affecting
+// update) — BEFORE that mutation's effects propagate to any in-memory cache.
+// It exists so NotifyScope{Server: ...} can still decide which subscribers to
+// notify even though the mutation may already have made this server
+// impossible to look up by ID (a deleted or deactivated server no longer
+// appears in proxy.MCPServerCache, which internal/app's AccessChecker wiring
+// (codeModeAccessChecker) resolves ServerID-scoped notifications against).
+//
+// This package performs NO access-rule evaluation of its own against a
+// NotifiedServerScope: NotifyScope.matches hands it, verbatim, to the
+// Server's own installed AccessChecker (see that type's own doc) — the exact
+// same function that resolves a live NotifyScope{ServerID} — so both paths
+// share one implementation of every access rule (an MCPAccessCache lookup,
+// the alias-winner rule, CodeModeEnabled, tenant scoping) instead of this
+// package maintaining a second, simplified copy that could silently drift
+// from the live one. Every field below exists because codeModeAccessChecker
+// (internal/app/code_mode.go) needs it to reconstruct the pre-mutation row
+// well enough to apply those exact same rules.
+type NotifiedServerScope struct {
+	// ID is the server's own (immutable, stable) database ID at the moment of
+	// capture.
+	ID string
+	// Alias is the server's own alias at the moment of capture, needed to
+	// apply the same alias-winner rule the live path applies (see
+	// codeModeAccessChecker's own doc).
+	Alias string
+	// OrgID is the server's own OrgID at the moment of capture, or nil for a
+	// global server.
+	OrgID *string
+	// TeamID is the server's own TeamID at the moment of capture, or nil for
+	// an org-scoped or global server.
+	TeamID *string
+	// Source is the server's own Source field ("builtin", "yaml", "api") at
+	// the moment of capture.
+	Source string
+	// CodeModeEnabled is the server's own CodeModeEnabled flag at the moment
+	// of capture. A server for which this is false was never visible on any
+	// Code Mode subscriptions/listen stream to begin with — an AccessChecker
+	// must report false unconditionally for it, exactly as accessibleServers'
+	// own codeModeOnly filter would.
+	CodeModeEnabled bool
+	// Active is the server's own IsActive flag at the moment of capture. A
+	// deactivated (or soft-deleted, which is never active again) server was
+	// never returned by any of the DB queries codeModeService.accessibleServers
+	// itself issues — every one of them filters WHERE is_active = 1 — so an
+	// AccessChecker evaluating this snapshot must deny unconditionally when
+	// this is false, exactly as if the row had never existed for that query.
+	Active bool
+}
 
 // NotifyScope describes which subscribers a NotifyToolsListChanged call
-// should reach. Exactly one of ServerID or OrgID should be set; callers that
-// can name the specific MCP server a change affects should always prefer
-// ServerID — it is checked against the subscriber's OWN identity via the
-// Server's AccessChecker, the most precise scoping this package can
-// express. OrgID is for a mutation that affects a whole organization's
-// visibility without naming one specific server (an MCP access allowlist
-// change). A NotifyScope with neither field set matches nobody — see
-// NotifyScope.matches' own doc for the exact per-field decision.
+// should reach. Exactly one field should be set; callers that can name the
+// specific MCP server a change affects should always prefer ServerID — it is
+// checked against the subscriber's OWN identity via the Server's
+// AccessChecker, the most precise scoping this package can express, resolved
+// against the LIVE cache state. Server is for the same "one specific
+// server" case when the live cache can no longer be trusted to answer that
+// question (a deletion, deactivation, or scope-changing update — see
+// NotifiedServerScope's own doc). TeamID and KeyID scope a mutation whose own
+// blast radius is known precisely to be one team's or one key's own
+// subscribers (SetTeamMCPAccess, SetKeyMCPAccess). OrgID is for a mutation
+// that affects a whole organization's visibility without naming one specific
+// server (SetOrgMCPAccess). A NotifyScope with no field set matches nobody —
+// see NotifyScope.matches' own doc for the exact per-field decision and
+// precedence.
 type NotifyScope struct {
 	// ServerID scopes delivery to subscribers whose identity the Server's
-	// AccessChecker reports as having access to this MCP server ID.
+	// AccessChecker reports as having access to this MCP server ID, resolved
+	// against the live cache.
 	ServerID string
+	// Server scopes delivery to subscribers whose identity the Server's
+	// AccessChecker reports as having access to this captured, pre-mutation
+	// snapshot — see NotifiedServerScope's own doc for why this exists
+	// alongside ServerID, and AccessChecker's own doc for why both are
+	// resolved by the exact same function.
+	Server *NotifiedServerScope
 	// OrgID scopes delivery to subscribers whose own KeyIdentity.OrgID
 	// equals this value.
 	OrgID string
+	// TeamID scopes delivery to subscribers whose own KeyIdentity.TeamID
+	// equals this value.
+	TeamID string
+	// KeyID scopes delivery to subscribers whose own KeyIdentity.KeyID
+	// equals this value.
+	KeyID string
 }
 
 // matches reports whether a subscriber with the given identity should
 // receive a notification for this NotifyScope, consulting checker (the
-// Server's own AccessChecker, possibly nil) only for the ServerID case.
+// Server's own AccessChecker, possibly nil) for both the Server and the
+// ServerID cases — see AccessChecker's own doc for why both are resolved by
+// the same function, one with a live serverID and no snapshot, the other
+// with a snapshot and no serverID. Checked in the order the fields are
+// documented on NotifyScope: Server, then KeyID, then TeamID, then ServerID,
+// then OrgID — callers are expected to set exactly one field, so this order
+// only matters for a malformed NotifyScope setting more than one, and even
+// then picks a deterministic, documented winner rather than an unspecified
+// one.
 //
-// A NotifyScope naming a ServerID with no AccessChecker installed (checker
-// == nil) fails closed: matches returns false for every subscriber rather
-// than guessing. This is deliberate — see AccessChecker's own doc on why a
-// missing checker must never be treated as "allow everyone".
+// A NotifyScope naming a Server snapshot or a ServerID with no AccessChecker
+// installed (checker == nil) fails closed: matches returns false for every
+// subscriber rather than guessing. This is deliberate — see AccessChecker's
+// own doc on why a missing checker must never be treated as "allow
+// everyone", for either case.
 func (n NotifyScope) matches(id KeyIdentity, checker AccessChecker) bool {
 	switch {
+	case n.Server != nil:
+		return checker != nil && checker(id, "", n.Server)
+	case n.KeyID != "":
+		return n.KeyID == id.KeyID
+	case n.TeamID != "":
+		return n.TeamID == id.TeamID
 	case n.ServerID != "":
-		return checker != nil && checker(id, n.ServerID)
+		return checker != nil && checker(id, n.ServerID, nil)
 	case n.OrgID != "":
 		return n.OrgID == id.OrgID
 	default:
@@ -195,23 +326,30 @@ func (sub *Subscriber) deliver(body []byte) {
 type subscriberRegistry struct {
 	mu      sync.Mutex
 	byKey   map[string]int
+	byOrg   map[string]int
 	all     map[uint64]*Subscriber
 	nextID  uint64
 	closed  bool
 	closeCh chan struct{}
+	// wg counts currently registered Subscribers — Add(1) in register,
+	// Done in unregister — so wait (and therefore Server.
+	// WaitForSubscriptionsDrain) can block until every one of them has
+	// actually unregistered, not merely been told to via close/closeCh.
+	wg sync.WaitGroup
 }
 
 // newSubscriberRegistry returns a ready-to-use, empty subscriberRegistry.
 func newSubscriberRegistry() *subscriberRegistry {
 	return &subscriberRegistry{
 		byKey:   make(map[string]int),
+		byOrg:   make(map[string]int),
 		all:     make(map[uint64]*Subscriber),
 		closeCh: make(chan struct{}),
 	}
 }
 
 // errListenTooManyStreams is the JSON-RPC error register returns when
-// registering would exceed maxListenStreamsPerKey or
+// registering would exceed maxListenStreamsPerKey, maxListenStreamsPerOrg, or
 // maxListenStreamsPerServer. A single shared *Error value: it carries no
 // per-request state (the message is static, per this package's
 // zero-knowledge-logging rule — no caller-supplied data is ever embedded in
@@ -219,6 +357,17 @@ func newSubscriberRegistry() *subscriberRegistry {
 var errListenTooManyStreams = &Error{
 	Code:    CodeTooManyListenStreams,
 	Message: "too many concurrent subscriptions/listen streams",
+	Hint:    HintTooManyRequests,
+}
+
+// errListenTooManyStreamsOrg is the JSON-RPC error register returns when
+// registering would exceed maxListenStreamsPerOrg specifically — the same
+// code and HTTP hint as errListenTooManyStreams, but a distinct message so an
+// operator reading a rejected caller's own error response can tell the
+// per-organization limit apart from the per-key or per-server one.
+var errListenTooManyStreamsOrg = &Error{
+	Code:    CodeTooManyListenStreams,
+	Message: "too many concurrent subscriptions/listen streams for this organization",
 	Hint:    HintTooManyRequests,
 }
 
@@ -233,15 +382,16 @@ var errListenRegistryClosed = &Error{
 }
 
 // register creates and records a new Subscriber for identity, honoring
-// honored and acknowledging reqID, enforcing maxListenStreamsPerKey and
-// maxListenStreamsPerServer BEFORE the Subscriber is ever constructed or
-// handed back — a caller that receives a non-nil *Subscriber from this
-// method is guaranteed to have consumed exactly one slot under both limits,
-// and a caller that receives an error is guaranteed to have opened no stream
-// at all. identity.KeyID is the per-key bucket key; an empty KeyID (a
-// request with no authenticated identity attached — see KeyIdentityFromCtx)
-// shares a single bucket, which is a strictly more conservative limit for
-// that case, never a looser one.
+// honored and acknowledging reqID, enforcing maxListenStreamsPerKey,
+// maxListenStreamsPerOrg, and maxListenStreamsPerServer BEFORE the Subscriber
+// is ever constructed or handed back — a caller that receives a non-nil
+// *Subscriber from this method is guaranteed to have consumed exactly one
+// slot under all three limits, and a caller that receives an error is
+// guaranteed to have opened no stream at all. identity.KeyID and
+// identity.OrgID are the per-key and per-org bucket keys respectively; an
+// empty KeyID or OrgID (a request with no authenticated identity attached —
+// see KeyIdentityFromCtx) shares a single bucket, which is a strictly more
+// conservative limit for that case, never a looser one.
 func (r *subscriberRegistry) register(identity KeyIdentity, honored ListenFilter, reqID jsonx.RawMessage) (*Subscriber, *Error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -251,6 +401,9 @@ func (r *subscriberRegistry) register(identity KeyIdentity, honored ListenFilter
 	}
 	if len(r.all) >= maxListenStreamsPerServer {
 		return nil, errListenTooManyStreams
+	}
+	if r.byOrg[identity.OrgID] >= maxListenStreamsPerOrg {
+		return nil, errListenTooManyStreamsOrg
 	}
 	if r.byKey[identity.KeyID] >= maxListenStreamsPerKey {
 		return nil, errListenTooManyStreams
@@ -271,6 +424,8 @@ func (r *subscriberRegistry) register(identity KeyIdentity, honored ListenFilter
 	}
 	r.all[sub.id] = sub
 	r.byKey[identity.KeyID]++
+	r.byOrg[identity.OrgID]++
+	r.wg.Add(1)
 	return sub, nil
 }
 
@@ -289,6 +444,29 @@ func (r *subscriberRegistry) unregister(sub *Subscriber) {
 	if r.byKey[sub.identity.KeyID] <= 0 {
 		delete(r.byKey, sub.identity.KeyID)
 	}
+	r.byOrg[sub.identity.OrgID]--
+	if r.byOrg[sub.identity.OrgID] <= 0 {
+		delete(r.byOrg, sub.identity.OrgID)
+	}
+	r.wg.Done()
+}
+
+// wait blocks until every currently registered Subscriber has itself been
+// unregistered, or timeout elapses first, whichever comes first. Reports
+// whether every stream finished before the timeout. See
+// Server.WaitForSubscriptionsDrain's own doc for its production caller.
+func (r *subscriberRegistry) wait(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // close permanently disables this registry: closeCh is closed exactly once,
@@ -306,13 +484,16 @@ func (r *subscriberRegistry) close() {
 }
 
 // notify delivers body to every currently registered Subscriber that honors
-// toolsListChanged and whose identity scope matches, per checker (see
-// NotifyScope.matches). The registry's own lock is held only long enough to
-// snapshot the current subscriber list — never while calling checker or
-// Subscriber.deliver, both of which run outside it — so a slow or
-// long-running AccessChecker cannot block a concurrent register/unregister
-// call.
-func (r *subscriberRegistry) notify(scope NotifyScope, checker AccessChecker) {
+// toolsListChanged, whose identity scope matches per checker (see
+// NotifyScope.matches), and whose captured identity still revalidates
+// against keyValidator (see KeyValidator's own doc) — a subscriber whose key
+// has since been revoked, expired, or changed org/team/role never receives a
+// delivery, even one it would otherwise be in scope for. The registry's own
+// lock is held only long enough to snapshot the current subscriber list —
+// never while calling checker, keyValidator, or Subscriber.deliver, all of
+// which run outside it — so a slow or long-running AccessChecker or
+// KeyValidator cannot block a concurrent register/unregister call.
+func (r *subscriberRegistry) notify(scope NotifyScope, checker AccessChecker, keyValidator KeyValidator) {
 	r.mu.Lock()
 	subs := make([]*Subscriber, 0, len(r.all))
 	for _, sub := range r.all {
@@ -325,6 +506,9 @@ func (r *subscriberRegistry) notify(scope NotifyScope, checker AccessChecker) {
 			continue
 		}
 		if !scope.matches(sub.identity, checker) {
+			continue
+		}
+		if keyValidator != nil && !keyValidator(sub.identity) {
 			continue
 		}
 		sub.deliver(sub.toolsChangedBody)
@@ -385,6 +569,36 @@ func (s *Server) SetAccessChecker(checker AccessChecker) {
 	s.accessChecker = checker
 }
 
+// SetKeyValidator installs validator as this Server's KeyValidator (see that
+// type's own doc). A nil validator (the default) disables revalidation
+// entirely: NotifyToolsListChanged delivers to every subscriber in scope
+// regardless of whether its captured identity is still current, and
+// SubscriberValid always reports true. Safe to call concurrently with
+// Handle.
+func (s *Server) SetKeyValidator(validator KeyValidator) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keyValidator = validator
+}
+
+// SubscriberValid reports whether sub's own captured identity still
+// revalidates against this Server's installed KeyValidator — true
+// unconditionally when none is installed (see SetKeyValidator's own doc).
+// internal/api/admin/mcp_handler.go's handleMCPListenStream calls this on a
+// fixed interval (mcpListenRevalidateInterval) for the stream's own
+// Subscriber, ending the stream gracefully the first time it reports false.
+// Safe to call concurrently with Handle, with itself, and with the
+// subscriber's own Unregister.
+func (s *Server) SubscriberValid(sub *Subscriber) bool {
+	s.mu.RLock()
+	validator := s.keyValidator
+	s.mu.RUnlock()
+	if validator == nil {
+		return true
+	}
+	return validator(sub.identity)
+}
+
 // NotifyToolsListChanged delivers a notifications/tools/list_changed event
 // (MCP 2026-07-28 §3.4) to every currently open Subscriber that honored
 // toolsListChanged and whose identity scope matches scope, per this Server's
@@ -399,8 +613,9 @@ func (s *Server) SetAccessChecker(checker AccessChecker) {
 func (s *Server) NotifyToolsListChanged(scope NotifyScope) {
 	s.mu.RLock()
 	checker := s.accessChecker
+	validator := s.keyValidator
 	s.mu.RUnlock()
-	s.subscribers.notify(scope, checker)
+	s.subscribers.notify(scope, checker, validator)
 }
 
 // CloseSubscriptions signals every currently open subscriptions/listen
@@ -418,6 +633,26 @@ func (s *Server) NotifyToolsListChanged(scope NotifyScope) {
 // graceful-end response.
 func (s *Server) CloseSubscriptions() {
 	s.subscribers.close()
+}
+
+// WaitForSubscriptionsDrain blocks until every subscriptions/listen stream
+// that was open on this Server at the moment CloseSubscriptions was called
+// has itself finished — its own handler observed Done(), wrote the
+// graceful-end response, and called Subscriber.Unregister — or timeout
+// elapses first, whichever comes first. Reports whether every stream
+// finished before the timeout.
+//
+// Intended to be called immediately after CloseSubscriptions, before
+// stopping the HTTP server(s) hosting this Server's routes (see
+// internal/app.Application.WaitForShutdown), so an in-flight stream's own
+// graceful-end write has a bounded window to actually complete instead of
+// being cut off mid-write by the HTTP server's own Shutdown. Calling it
+// without a preceding CloseSubscriptions is not itself an error, but is
+// meaningless: no stream has been told to end yet, so this would simply
+// block for the full timeout waiting for streams that may never end on
+// their own.
+func (s *Server) WaitForSubscriptionsDrain(timeout time.Duration) bool {
+	return s.subscribers.wait(timeout)
 }
 
 // handleSubscriptionsListen implements the modern-era subscriptions/listen
@@ -477,18 +712,46 @@ type listenNotificationsField struct {
 	ResourceSubscriptions []string `json:"resourceSubscriptions"`
 }
 
+// listenFilterNullableFields lists params.notifications' own field names, in
+// the exact order decodeListenFilter checks them for an explicit JSON null —
+// see that function's own doc for why null is rejected rather than silently
+// treated as "field absent" for these four specifically.
+var listenFilterNullableFields = []string{
+	"toolsListChanged",
+	"promptsListChanged",
+	"resourcesListChanged",
+	"resourceSubscriptions",
+}
+
 // decodeListenFilter parses params — a subscriptions/listen request's raw
 // JSON-RPC params, verbatim (Envelope.Params) — into the ListenFilter it
-// requested. A missing or explicit-null params.notifications is treated as
-// an empty filter (matching this package's existing convention — see
-// bodyProtocolVersion's identical "absent means no value" treatment). A
-// params.notifications present but not a JSON object, or with a field of the
-// wrong type, is rejected with CodeInvalidParams and HintBadRequest — an
-// explicit override, mirroring dispatch's own tools/list cursor-rejection
-// precedent (see dispatch's own doc for the other case that already carries
-// this same override) — since a malformed subscriptions/listen request is
-// exactly the kind of caller-visible protocol violation the modern era
-// always reports as HTTP 400.
+// requested. A MISSING params.notifications key is treated as an empty
+// filter (matching this package's existing convention — see
+// bodyProtocolVersion's identical "absent means no value" treatment). An
+// explicit JSON null on params.notifications ITSELF is different, and
+// deliberately NOT treated the same as absent: a client sending
+// {"notifications": null} has made a visible, affirmative statement about
+// the field rather than simply omitting it, so this method rejects it
+// outright — CodeInvalidParams, HintBadRequest — for the same reason it
+// rejects an explicit null on one of notifications' OWN four fields below,
+// rather than silently coercing it to "no filter requested".
+//
+// Within a present, non-null params.notifications, an explicit JSON null on any one of
+// its own four fields (toolsListChanged, promptsListChanged,
+// resourcesListChanged, resourceSubscriptions) is different: encoding/json's
+// ordinary unmarshal behavior treats null-into-bool or null-into-[]string as
+// a silent no-op, leaving the zero value in place indistinguishable from the
+// field simply being absent — which would let a client that sent
+// {"toolsListChanged": null} intending to explicitly and visibly opt out
+// silently receive the exact same (unhonored) outcome as one that never
+// mentioned the field at all, an ambiguity this method resolves by rejecting
+// it outright instead. A params.notifications present but not a JSON object,
+// or with a field of the wrong (non-null) type, is likewise rejected — all
+// with CodeInvalidParams and HintBadRequest, mirroring dispatch's own
+// tools/list cursor-rejection precedent (see dispatch's own doc for the
+// other case that already carries this same override) — since a malformed
+// subscriptions/listen request is exactly the kind of caller-visible
+// protocol violation the modern era always reports as HTTP 400.
 func decodeListenFilter(params jsonx.RawMessage) (ListenFilter, *Error) {
 	if len(params) == 0 {
 		return ListenFilter{}, nil
@@ -498,8 +761,20 @@ func decodeListenFilter(params jsonx.RawMessage) (ListenFilter, *Error) {
 		return ListenFilter{}, &Error{Code: CodeInvalidParams, Message: "invalid params", Hint: HintBadRequest}
 	}
 	notifRaw, ok := top["notifications"]
-	if !ok || bytes.Equal(bytes.TrimSpace(notifRaw), []byte("null")) {
+	if !ok {
 		return ListenFilter{}, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(notifRaw), []byte("null")) {
+		return ListenFilter{}, &Error{Code: CodeInvalidParams, Message: "invalid params: notifications must not be null", Hint: HintBadRequest}
+	}
+	var fields map[string]jsonx.RawMessage
+	if err := jsonx.Unmarshal(notifRaw, &fields); err != nil {
+		return ListenFilter{}, &Error{Code: CodeInvalidParams, Message: "invalid params: notifications must be an object", Hint: HintBadRequest}
+	}
+	for _, key := range listenFilterNullableFields {
+		if raw, present := fields[key]; present && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return ListenFilter{}, &Error{Code: CodeInvalidParams, Message: "invalid params: notifications." + key + " must not be null", Hint: HintBadRequest}
+		}
 	}
 	var f listenNotificationsField
 	if err := jsonx.Unmarshal(notifRaw, &f); err != nil {

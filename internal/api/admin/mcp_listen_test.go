@@ -34,6 +34,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +47,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/license"
 	"github.com/voidmind-io/voidllm/internal/mcp"
+	"github.com/voidmind-io/voidllm/pkg/keygen"
 )
 
 // setupMCPListenApp builds a Fiber app with both the management server
@@ -77,7 +79,7 @@ func setupMCPListenApp(t *testing.T, dsn string, maxDuration time.Duration) (app
 	mgmtServer = mcp.NewServer("voidllm", "test")
 	codeModeServer = mcp.NewServer("code-mode", "test")
 	codeModeServer.SetToolsListChangedSource(true)
-	codeModeServer.SetAccessChecker(func(mcp.KeyIdentity, string) bool { return true })
+	codeModeServer.SetAccessChecker(func(mcp.KeyIdentity, string, *mcp.NotifiedServerScope) bool { return true })
 
 	handler := &admin.Handler{
 		DB:                   database,
@@ -839,5 +841,311 @@ func TestMCPListenHTTP_SlotsReleasedAfterStreamsEnd(t *testing.T) {
 	events := mcpListenAckOnly(t, app, mcpURL, key, map[string]any{"toolsListChanged": true}, 5)
 	if len(events) != 2 || events[0].body["method"] != "notifications/subscriptions/acknowledged" {
 		t.Fatalf("5th request after all 4 slots were released = %+v, want a successful ack+complete pair", events)
+	}
+}
+
+// ---- item 8: keep-alive fires (positive test) --------------------------------
+
+// readRawSSEBlock reads exactly one raw SSE block (any line(s) up to, but not
+// including, the terminating blank line) verbatim, without assuming a
+// "data: "-prefixed JSON payload — unlike readOneMCPListenEvent, which parses
+// only "event: message" blocks, this also accepts a bare comment line (e.g.
+// ": ping"), the shape a keep-alive uses.
+func readRawSSEBlock(t *testing.T, r *bufio.Reader) string {
+	t.Helper()
+	var lines []string
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read SSE block: %v (partial: %v)", err, lines)
+		}
+		trimmed := strings.TrimRight(line, "\n")
+		if trimmed == "" {
+			break
+		}
+		lines = append(lines, trimmed)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// TestMCPListenHTTP_KeepAlive_ActuallyFires is the positive counterpart the
+// existing TestMCPListenHTTP_KeepAlive_NoPrematureComment's own doc names as
+// a testability gap (item 8): with mcpListenKeepAliveInterval overridden to a
+// few milliseconds via admin.SetMCPListenKeepAliveIntervalForTest, a
+// real, long-lived stream (h.MCPListenMaxDuration set generously long so the
+// max-duration timer cannot fire first) receives a ": ping" comment as its
+// very next SSE block after the acknowledgement.
+//
+// Deliberately NOT t.Parallel(): it overrides the package-level
+// mcpListenKeepAliveInterval var for its duration. It also forces its own
+// stream closed (mgmtServer.CloseSubscriptions + WaitForSubscriptionsDrain)
+// before returning, rather than merely closing the client side and letting
+// h.MCPListenMaxDuration (10s) end it eventually — a defensive discipline
+// this file applies uniformly to every test that overrides one of these
+// package-level vars, even though mcpListenWriteDeadline specifically is no
+// longer at risk here: handleMCPListenStream now captures it into a LOCAL
+// exactly once, at the top of the call, before the loop below ever starts
+// (item 5) — setListenWriteDeadline is handed that captured value on every
+// write, never the package var itself, so a stream already running when a
+// later test restores mcpListenWriteDeadline can no longer observe the new
+// value at all. Still ending every stream before returning keeps this test
+// robust against a future var this file adds without the same discipline.
+func TestMCPListenHTTP_KeepAlive_ActuallyFires(t *testing.T) {
+	restore := admin.SetMCPListenKeepAliveIntervalForTest(20 * time.Millisecond)
+	defer restore()
+
+	app, mgmtServer, _, keyCache := setupMCPListenApp(t,
+		"file:TestMCPListenHTTP_KeepAliveFires?mode=memory&cache=private", 10*time.Second)
+	key := addTestKey(t, keyCache, auth.RoleMember, "org-listen-keepalive-positive")
+	baseURL := startMCPListenListener(t, app)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, reader, _ := openMCPListenStream(t, client, baseURL, mcpURL, key, 1)
+
+	block := readRawSSEBlock(t, reader)
+	if block != ": ping" {
+		t.Errorf("first block after the ack = %q, want the keep-alive comment %q", block, ": ping")
+	}
+
+	resp.Body.Close()
+	mgmtServer.CloseSubscriptions()
+	if !mgmtServer.WaitForSubscriptionsDrain(5 * time.Second) {
+		t.Fatal("stream did not finish before the bound — cannot safely restore shared test vars")
+	}
+}
+
+// ---- item 4: a slow, non-reading client is ended by the write deadline -----
+
+// openRawMCPListenStreamNonReading dials baseURL directly (bypassing
+// net/http entirely) and writes a well-formed subscriptions/listen request,
+// with the connection's own receive buffer shrunk to readBufferBytes — small
+// enough that this test's own rapid keep-alive pings (see the caller, which
+// overrides mcpListenKeepAliveInterval) fill the client's advertised TCP
+// window well within mcpListenWriteDeadline, without this test ever reading
+// a single byte back. The returned net.Conn is never read from by this
+// helper; the caller is responsible for closing it.
+func openRawMCPListenStreamNonReading(t *testing.T, baseURL, path, key string, id, readBufferBytes int) net.Conn {
+	t.Helper()
+	addr := strings.TrimPrefix(baseURL, "http://")
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		if err := tc.SetReadBuffer(readBufferBytes); err != nil {
+			t.Fatalf("SetReadBuffer: %v", err)
+		}
+	}
+	body := subscriptionsListenBody(id, map[string]any{"toolsListChanged": true})
+	req := "POST " + path + " HTTP/1.1\r\n" +
+		"Host: " + addr + "\r\n" +
+		"Content-Type: application/json\r\n" +
+		"MCP-Protocol-Version: 2026-07-28\r\n" +
+		"Mcp-Method: subscriptions/listen\r\n" +
+		"Authorization: Bearer " + key + "\r\n" +
+		"Content-Length: " + strconv.Itoa(len(body)) + "\r\n" +
+		"Connection: keep-alive\r\n\r\n" + body
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	return conn
+}
+
+// TestMCPListenHTTP_SlowNonReadingClient_WriteDeadlineFreesSlot verifies item
+// 4's full contract end to end: a client that stops reading (as opposed to
+// disconnecting outright, already covered by TestMCPListenHTTP_ClientDisconnect_SlotFreed)
+// eventually has its own stream ended by mcpListenWriteDeadline, releasing
+// its subscriberRegistry slot — proven the same way the disconnect test
+// proves it, by holding all 4 per-key slots (one of them this slow,
+// non-reading connection) and polling for a 5th to eventually succeed.
+//
+// Deliberately NOT t.Parallel(): it overrides two package-level vars
+// (mcpListenWriteDeadline, mcpListenKeepAliveInterval) for its duration.
+// handleMCPListenStream captures both into locals exactly once, at the top
+// of the call, before opening a stream (item 5) — so neither var is read
+// again for the lifetime of a stream already running when this test's own
+// deferred restores fire. This test still does not let those restores run
+// until mgmtServer.CloseSubscriptions + WaitForSubscriptionsDrain has proven
+// every stream it opened has actually finished, purely as the same
+// defensive discipline this whole file applies uniformly (see
+// TestMCPListenHTTP_KeepAlive_ActuallyFires's identical comment) — not
+// because either var is still at risk of the race this once guarded
+// against.
+func TestMCPListenHTTP_SlowNonReadingClient_WriteDeadlineFreesSlot(t *testing.T) {
+	restoreDeadline := admin.SetMCPListenWriteDeadlineForTest(150 * time.Millisecond)
+	defer restoreDeadline()
+	restoreKeepAlive := admin.SetMCPListenKeepAliveIntervalForTest(time.Millisecond)
+	defer restoreKeepAlive()
+
+	app, mgmtServer, _, keyCache := setupMCPListenApp(t,
+		"file:TestMCPListenHTTP_SlowClient?mode=memory&cache=private", 10*time.Second)
+	key := addTestKey(t, keyCache, auth.RoleMember, "org-listen-slowclient")
+	baseURL := startMCPListenListener(t, app)
+
+	// Slot 1: a raw connection that never reads anything after sending its
+	// own request — combined with the 1ms keep-alive override above, its
+	// tiny advertised TCP window fills almost immediately.
+	slowConn := openRawMCPListenStreamNonReading(t, baseURL, mcpURL, key, 1, 1)
+	t.Cleanup(func() { _ = slowConn.Close() })
+
+	// Slots 2-4: ordinary, well-behaved streams for the same key.
+	client := &http.Client{Timeout: 6 * time.Second}
+	var streams []*http.Response
+	t.Cleanup(func() {
+		for _, r := range streams {
+			r.Body.Close()
+		}
+	})
+	for i := 0; i < 3; i++ {
+		resp, _, _ := openMCPListenStream(t, client, baseURL, mcpURL, key, i+2)
+		streams = append(streams, resp)
+	}
+
+	deadline := time.Now().Add(8 * time.Second)
+	var lastStatus int
+	var lastBody []byte
+	succeeded := false
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequest(http.MethodPost, baseURL+mcpURL,
+			strings.NewReader(subscriptionsListenBody(10, map[string]any{"toolsListChanged": true})))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("MCP-Protocol-Version", "2026-07-28")
+		req.Header.Set("Mcp-Method", "subscriptions/listen")
+		req.Header.Set("Authorization", "Bearer "+key)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("retry request: %v", err)
+		}
+		lastStatus = resp.StatusCode
+		if resp.StatusCode == http.StatusOK {
+			readOneMCPListenEvent(t, bufio.NewReader(resp.Body))
+			resp.Body.Close()
+			succeeded = true
+			break
+		}
+		lastBody, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Force every remaining stream this test opened (the 3 well-behaved
+	// ones — the slow one's own slot is already known freed) to end NOW and
+	// block until they actually have, via the exact same mechanism item 5
+	// adds for production shutdown — see this test's own top-of-function
+	// doc for why this synchronization, not a guess or a sleep, is required
+	// before the deferred var restores above are allowed to run.
+	mgmtServer.CloseSubscriptions()
+	if !mgmtServer.WaitForSubscriptionsDrain(5 * time.Second) {
+		t.Fatal("not every subscriptions/listen stream this test opened finished before the bound — cannot safely restore shared test vars")
+	}
+
+	if !succeeded {
+		t.Fatalf("a 5th listen request never succeeded within the bound after the slow, non-reading "+
+			"connection should have exceeded its write deadline — last status %d, body: %s", lastStatus, lastBody)
+	}
+}
+
+// ---- item 1: revoked credentials end the stream and stop receiving events --
+
+// keyRevalidatorForTest builds a minimal mcp.KeyValidator directly from
+// keyCache, mirroring internal/app's own keyRevalidator closely enough for
+// this test's purposes (a key must still resolve by hash and match the
+// captured KeyID) without depending on the internal/app package.
+func keyRevalidatorForTest(keyCache *cache.Cache[string, auth.KeyInfo]) mcp.KeyValidator {
+	return func(id mcp.KeyIdentity) bool {
+		if id.KeyHash == "" {
+			return false
+		}
+		ki, ok := keyCache.Get(id.KeyHash)
+		return ok && ki.ID == id.KeyID
+	}
+}
+
+// TestMCPListenHTTP_RevokedKey_StreamEndsGracefullyAndStopsDelivering
+// verifies item 1's full contract: revoking a subscriber's own key (deleting
+// it from keyCache, exactly as key revocation does in production) makes its
+// subscriptions/listen stream end gracefully within
+// mcpListenRevalidateInterval, AND stops it from receiving any further event
+// even if one is triggered in the same instant the key is revoked (the
+// delivery-time filter, tested independently of the periodic end-the-stream
+// check by racing a notification against the revocation).
+//
+// Deliberately NOT t.Parallel(): overrides the package-level
+// mcpListenRevalidateInterval var.
+func TestMCPListenHTTP_RevokedKey_StreamEndsGracefullyAndStopsDelivering(t *testing.T) {
+	restore := admin.SetMCPListenRevalidateIntervalForTest(20 * time.Millisecond)
+	defer restore()
+
+	ctx := context.Background()
+	database, err := db.Open(ctx, config.DatabaseConfig{
+		Driver:          "sqlite",
+		DSN:             "file:TestMCPListenHTTP_RevokedKey?mode=memory&cache=private",
+		MaxOpenConns:    1,
+		MaxIdleConns:    1,
+		ConnMaxLifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("open test DB: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	keyCache := cache.New[string, auth.KeyInfo]()
+	codeModeServer := mcp.NewServer("code-mode", "test")
+	codeModeServer.SetToolsListChangedSource(true)
+	codeModeServer.SetAccessChecker(func(mcp.KeyIdentity, string, *mcp.NotifiedServerScope) bool { return true })
+	codeModeServer.SetKeyValidator(keyRevalidatorForTest(keyCache))
+
+	handler := &admin.Handler{
+		DB:                   database,
+		HMACSecret:           testHMACSecret,
+		KeyCache:             keyCache,
+		License:              license.NewHolder(license.Verify("", true)),
+		Log:                  noopLogger(t),
+		CodeModeServer:       codeModeServer,
+		MCPListenMaxDuration: 10 * time.Second,
+	}
+	app := fiber.New()
+	admin.RegisterRoutes(app, handler, keyCache, testHMACSecret, nil)
+
+	key := addTestKey(t, keyCache, auth.RoleMember, "org-listen-revoked")
+	keyHash := keygen.Hash(key, testHMACSecret)
+	baseURL := startMCPListenListener(t, app)
+
+	client := &http.Client{Timeout: 6 * time.Second}
+	resp, reader, _ := openMCPListenStream(t, client, baseURL, "/api/v1/mcp", key, 1)
+	defer resp.Body.Close()
+
+	// Revoke the key — exactly what happens on real key deletion/expiry (the
+	// next periodic auth.StartCacheRefresh reload, or an immediate Redis
+	// invalidation, evicts it from keyCache the same way).
+	keyCache.Delete(keyHash)
+
+	// Race a notification against the revocation: even though this fires
+	// well within mcpListenRevalidateInterval (so the PERIODIC check has not
+	// necessarily run yet), the now-revoked subscriber must not receive it —
+	// the delivery-time filter in subscriberRegistry.notify.
+	codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: "any-server"})
+
+	event := readOneMCPListenEvent(t, reader)
+	result, _ := event.body["result"].(map[string]any)
+	if result == nil || result["resultType"] != "complete" {
+		t.Fatalf("first event after revocation = %+v, want the graceful-end complete message "+
+			"(if this is instead notifications/tools/list_changed, the delivery-time KeyValidator filter did not hold)",
+			event.body)
+	}
+
+	// Defensive, cheap insurance against the identical -race hazard
+	// documented on TestMCPListenHTTP_KeepAlive_ActuallyFires: by the time
+	// the complete event above was read, this stream's own handler has
+	// already returned in practice (revalidateInterval is captured once at
+	// stream start, not re-read), but making that explicit and structural
+	// here too costs nothing and keeps this file's discipline uniform.
+	codeModeServer.CloseSubscriptions()
+	if !codeModeServer.WaitForSubscriptionsDrain(5 * time.Second) {
+		t.Fatal("stream did not finish before the bound — cannot safely restore shared test vars")
 	}
 }

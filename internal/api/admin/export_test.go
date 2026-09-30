@@ -1,5 +1,7 @@
 package admin
 
+import "time"
+
 // SanitizeOriginForLog exposes the internal sanitizeOriginForLog function for
 // white-box testing from the admin_test package.
 var SanitizeOriginForLog = sanitizeOriginForLog
@@ -47,3 +49,35 @@ const ReservedMCPParamHeaderPrefix = reservedMCPParamHeaderPrefix
 // external-server proxy path a byte-identical pass-through that never
 // reformats an upstream's response (see mcp.HTTPTransport.Forward's doc).
 var FormatSSEMessage = formatSSEMessage
+
+// SetMCPListenKeepAliveIntervalForTest overrides mcp_handler.go's
+// mcpListenKeepAliveInterval for the duration of a test and returns a
+// restore func the caller must invoke (via defer or t.Cleanup) to put the
+// real 30s production value back. Never call this from a test running in
+// parallel with another that also overrides this package-level var — see
+// mcpListenKeepAliveInterval's own doc.
+func SetMCPListenKeepAliveIntervalForTest(d time.Duration) (restore func()) {
+	prev := mcpListenKeepAliveInterval
+	mcpListenKeepAliveInterval = d
+	return func() { mcpListenKeepAliveInterval = prev }
+}
+
+// SetMCPListenRevalidateIntervalForTest overrides mcp_handler.go's
+// mcpListenRevalidateInterval for the duration of a test — see
+// SetMCPListenKeepAliveIntervalForTest's own doc for the identical
+// discipline this follows.
+func SetMCPListenRevalidateIntervalForTest(d time.Duration) (restore func()) {
+	prev := mcpListenRevalidateInterval
+	mcpListenRevalidateInterval = d
+	return func() { mcpListenRevalidateInterval = prev }
+}
+
+// SetMCPListenWriteDeadlineForTest overrides mcp_handler.go's
+// mcpListenWriteDeadline for the duration of a test — see
+// SetMCPListenKeepAliveIntervalForTest's own doc for the identical
+// discipline this follows.
+func SetMCPListenWriteDeadlineForTest(d time.Duration) (restore func()) {
+	prev := mcpListenWriteDeadline
+	mcpListenWriteDeadline = d
+	return func() { mcpListenWriteDeadline = prev }
+}

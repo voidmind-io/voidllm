@@ -588,6 +588,15 @@ func (h *Handler) CreateMCPServer(c fiber.Ctx) error {
 		}()
 	}
 
+	// There is no "before" (the server did not exist) — only the live
+	// serverID half applies, resolved against the just-refreshed cache
+	// above, so a subscriber already able to see a server with this scope
+	// (e.g. a system_admin's own global-server view) learns about the new
+	// entry immediately (item 1).
+	if h.NotifyMCPServerScopeChange != nil {
+		h.NotifyMCPServerScopeChange(nil, s.ID)
+	}
+
 	return c.Status(fiber.StatusCreated).JSON(mcpServerToResponse(s))
 }
 
@@ -661,6 +670,12 @@ func (h *Handler) CreateOrgMCPServer(c fiber.Ctx) error {
 			defer cancel()
 			h.ToolCache.RefreshServer(ctx, serverID) //nolint:errcheck
 		}()
+	}
+
+	// See CreateMCPServer's identical comment: no "before", only the live
+	// serverID half applies.
+	if h.NotifyMCPServerScopeChange != nil {
+		h.NotifyMCPServerScopeChange(nil, s.ID)
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(mcpServerToResponse(s))
@@ -739,6 +754,12 @@ func (h *Handler) CreateTeamMCPServer(c fiber.Ctx) error {
 			defer cancel()
 			h.ToolCache.RefreshServer(ctx, serverID) //nolint:errcheck
 		}()
+	}
+
+	// See CreateMCPServer's identical comment: no "before", only the live
+	// serverID half applies.
+	if h.NotifyMCPServerScopeChange != nil {
+		h.NotifyMCPServerScopeChange(nil, s.ID)
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(mcpServerToResponse(s))
@@ -1058,6 +1079,24 @@ func (h *Handler) UpdateMCPServer(c fiber.Ctx) error {
 		h.ToolCache.InvalidateWithStore(ctx, s.ID)
 	}
 
+	// A rename, scope change, or CodeModeEnabled flip can change both who
+	// could see this server BEFORE the mutation and who can see it AFTER —
+	// those are not necessarily the same set (item 1: a rename or a
+	// CodeModeEnabled false->true flip both change what a subscriber already
+	// in scope sees rendered without removing them from scope, while an
+	// OrgID/TeamID change can add or remove subscribers outright). before
+	// (existing, fetched above) and h.ToolCache.SetOnChange's own
+	// ServerID-scoped trigger are NOT redundant with each other here: that
+	// trigger only fires when the CACHED TOOL LISTING itself differs
+	// (toolsListingChanged), which an alias/scope/CodeModeEnabled-only change
+	// never touches — so this call is what actually reaches both sides for
+	// exactly this class of mutation. See NotifyMCPServerScopeChange's own
+	// doc.
+	if h.NotifyMCPServerScopeChange != nil && mcpVisibilityScopeChanged(existing, s) {
+		before := mcpServerScopeSnapshot(existing)
+		h.NotifyMCPServerScopeChange(&before, s.ID)
+	}
+
 	return c.JSON(mcpServerToResponse(s))
 }
 
@@ -1081,6 +1120,41 @@ func mcpAuthOrTransportFieldsChanged(before, after *db.MCPServer) bool {
 		before.OAuthClientID != after.OAuthClientID ||
 		before.OAuthScopes != after.OAuthScopes ||
 		before.ProtocolVersion != after.ProtocolVersion
+}
+
+// mcpVisibilityScopeChanged reports whether an UpdateMCPServer mutation
+// changed any field that affects what a caller sees rendered on a Code Mode
+// subscriptions/listen stream: Alias, OrgID, TeamID, or CodeModeEnabled.
+// Alias participates because it is rendered directly into the Code Mode
+// TypeScript type declarations (GenerateToolTypeDefs) and every tool
+// invocation surface — a rename changes what tools/list itself renders for a
+// caller who could already see this server, even though it does not change
+// WHO can see it (unlike mcpAuthOrTransportFieldsChanged, which excludes
+// Alias for the DIFFERENT reason that it never changes the credential or
+// transport a cached tool listing was fetched under).
+func mcpVisibilityScopeChanged(before, after *db.MCPServer) bool {
+	return before.Alias != after.Alias ||
+		strPtrValue(before.OrgID) != strPtrValue(after.OrgID) ||
+		strPtrValue(before.TeamID) != strPtrValue(after.TeamID) ||
+		before.CodeModeEnabled != after.CodeModeEnabled
+}
+
+// mcpServerScopeSnapshot captures sv's own ID, Alias, scope, Source,
+// CodeModeEnabled, and IsActive into an mcp.NotifiedServerScope — see that
+// type's own doc for why callers take this snapshot BEFORE a mutation that
+// may remove or change the server's visibility (deletion, deactivation, or a
+// scope-affecting update) runs, rather than resolving the server's scope
+// again afterward.
+func mcpServerScopeSnapshot(sv *db.MCPServer) mcp.NotifiedServerScope {
+	return mcp.NotifiedServerScope{
+		ID:              sv.ID,
+		Alias:           sv.Alias,
+		OrgID:           sv.OrgID,
+		TeamID:          sv.TeamID,
+		Source:          sv.Source,
+		CodeModeEnabled: sv.CodeModeEnabled,
+		Active:          sv.IsActive,
+	}
 }
 
 // strPtrValue dereferences p, or returns "" for a nil pointer — the same
@@ -1145,6 +1219,17 @@ func (h *Handler) DeleteMCPServer(c fiber.Ctx) error {
 
 	if h.ToolCache != nil {
 		h.ToolCache.InvalidateWithStore(ctx, existing.ID)
+	}
+
+	// existing's scope is captured from BEFORE the delete ran (fetched at the
+	// top of this handler) — see NotifyMCPServerScopeChange's own doc for why
+	// this snapshot, not a live cache lookup, is what a deleted server needs.
+	// The live-ServerID half is deliberately omitted (empty serverID): a
+	// deleted server can never again be visible to anyone after
+	// refreshMCPCaches above, so there is no "after" set to notify.
+	if h.NotifyMCPServerScopeChange != nil {
+		before := mcpServerScopeSnapshot(existing)
+		h.NotifyMCPServerScopeChange(&before, "")
 	}
 
 	return c.SendStatus(fiber.StatusNoContent)
@@ -1240,6 +1325,33 @@ func (h *Handler) setMCPServerActive(c fiber.Ctx, active bool) error {
 			}()
 		} else {
 			h.ToolCache.InvalidateWithStore(ctx, updated.ID)
+		}
+	}
+
+	// Both directions are checked explicitly (item 1) rather than relying on
+	// h.ToolCache.SetOnChange's own ServerID-scoped trigger to eventually
+	// cover activation: that trigger only fires once the RefreshServer
+	// goroutine above actually completes AND finds a tool listing that
+	// differs from what was cached before (toolsListingChanged) — neither is
+	// guaranteed (the fetch can fail, or the listing can come back byte-for-
+	// byte identical to what was cached before deactivation), so a
+	// subscriber gaining visibility here would otherwise not always be told
+	// promptly, or at all.
+	//
+	// Deactivation always removes this server from every subscriber's
+	// visible set (a deactivated server never appears in
+	// proxy.MCPServerCache — see refreshMCPCaches, which already ran above),
+	// so only the "before" half applies: server (fetched before this method's
+	// own UpdateMCPServer call ran) is the pre-deactivation snapshot
+	// NotifyMCPServerScopeChange needs — see its own doc. Activation is the
+	// mirror image: there is no "before" (nobody could see an inactive
+	// server), so only the live serverID half applies.
+	if h.NotifyMCPServerScopeChange != nil {
+		if active {
+			h.NotifyMCPServerScopeChange(nil, updated.ID)
+		} else {
+			before := mcpServerScopeSnapshot(server)
+			h.NotifyMCPServerScopeChange(&before, "")
 		}
 	}
 

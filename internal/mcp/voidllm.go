@@ -85,6 +85,15 @@ type KeyIdentity struct {
 	UserID string
 	// Role is the RBAC role of the caller.
 	Role string
+	// KeyHash is the HMAC-SHA256 hash the auth key cache is keyed by for this
+	// caller — auth.KeyInfo.Hash, verbatim, at the moment this identity was
+	// captured (see internal/api/admin/mcp_handler.go's handleMCPRequest,
+	// which populates it from auth.KeyInfoFromCtx). It exists solely so a
+	// long-lived subscriptions/listen Subscriber (internal/mcp/subscriptions.go)
+	// can later re-run the identical cache lookup to revalidate that the same
+	// key is still present, unexpired, and unchanged — see KeyValidator's own
+	// doc. Empty for a request with no authenticated identity attached.
+	KeyHash string
 }
 
 // WithKeyIdentity returns a new context carrying the given KeyIdentity.

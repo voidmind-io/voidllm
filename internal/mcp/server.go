@@ -49,6 +49,12 @@ type Server struct {
 	// and AccessChecker's own docs. Guarded by mu; nil by default (fails
 	// closed for any server-scoped NotifyScope).
 	accessChecker AccessChecker
+	// keyValidator revalidates a subscriptions/listen subscriber's captured
+	// identity against the live auth key cache — see SetKeyValidator's and
+	// KeyValidator's own docs. Guarded by mu; nil by default (no revalidation
+	// is performed, i.e. permissive — see KeyValidator's own doc for why this
+	// differs from accessChecker's fail-closed default).
+	keyValidator KeyValidator
 	// subscribers holds every currently open subscriptions/listen stream for
 	// this Server instance — see subscriberRegistry's own doc
 	// (subscriptions.go). Never nil once constructed by NewServer; has its

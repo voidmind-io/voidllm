@@ -1,7 +1,9 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -26,6 +28,7 @@ type codeModeDB interface {
 	CheckMCPAccess(ctx context.Context, orgID, teamID, keyID, serverID string) (bool, error)
 	ListBlockedToolNames(ctx context.Context, serverID string) ([]string, error)
 	SaveOutputSchema(ctx context.Context, serverID, toolName string, schema jsonx.RawMessage) error
+	GetOutputSchema(ctx context.Context, serverID, toolName string) (jsonx.RawMessage, error)
 	GetAllOutputSchemas(ctx context.Context, serverID string, maxAge time.Duration) (map[string]jsonx.RawMessage, error)
 	IsOutputSchemaStale(ctx context.Context, serverID, toolName string, maxAge time.Duration) (bool, error)
 }
@@ -34,6 +37,19 @@ type codeModeDB interface {
 // to resolve a server database ID to its alias for TypeScript type generation.
 type mcpServerByIDer interface {
 	GetByID(serverID string) (*db.MCPServer, bool)
+}
+
+// mcpServerCacheReader is the subset of proxy.MCPServerCache used by
+// codeModeAccessChecker to mirror codeModeService.accessibleServers' own
+// visibility decision from in-memory state only — GetByID for a
+// Server-scoped lookup by the notification's own trigger (unused by the
+// checker itself, kept here so every mcpServerByIDer caller can share one
+// interface) and List to build the same scoped, alias-deduplicated view
+// accessibleServers derives from a DB query (see visibleMCPServersForCaller
+// and aliasWinnerForCaller).
+type mcpServerCacheReader interface {
+	mcpServerByIDer
+	List() []db.MCPServer
 }
 
 // searchToolsLimit is the maximum number of matched tools returned by
@@ -67,6 +83,20 @@ type codeModeService struct {
 	// codePool is optional; when non-nil the pool's Available count is recorded
 	// in the CodeModePoolAvailable metric after each execution.
 	codePool interface{ Available() int }
+	// notifyServerChanged, when non-nil, is called with a server's own ID
+	// whenever this service writes data the Code Mode subscriptions/listen
+	// hook (toolsListHook) renders for that server, outside of ToolCache's
+	// own SetOnChange trigger — today, only ExecuteCode's own OnToolResult
+	// callback, the first time a tool's inferred output schema is saved or
+	// actually changes (item 3). Wired in internal/app to
+	// codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID:
+	// serverID}), the exact same call ToolCache.SetOnChange's own hook makes
+	// — see app.go's wiring comment for why this is a SEPARATE hook rather
+	// than reusing ToolCache.SetOnChange itself (output schemas are not
+	// tracked by ToolCache at all). nil is a perfectly ordinary configuration
+	// (Code Mode disabled, or a test that never exercises this path) and
+	// every call site nil-checks before invoking.
+	notifyServerChanged func(serverID string)
 }
 
 // accessibleServers returns the MCP servers visible to the caller identified by
@@ -326,11 +356,30 @@ func (s *codeModeService) ExecuteCode(ctx context.Context, code string, serverAl
 			if schema == nil {
 				return
 			}
+			// previous is read BEFORE the save below so it reflects the
+			// state a subscriber's own last tools/list render was built
+			// from — schemaChanged compares it against the newly inferred
+			// schema so the notification below (item 3) fires only when
+			// this write actually changes what toolsListHook renders next,
+			// never on every tool call whose output happens to be schema-
+			// identical to what was already stored (including the routine
+			// re-infer-on-staleness case, which very often IS identical).
+			previous, prevErr := s.db.GetOutputSchema(hctx, serverID, toolName)
+			if prevErr != nil && !errors.Is(prevErr, db.ErrNotFound) {
+				s.log.LogAttrs(hctx, slog.LevelWarn, "schema inference: read previous schema failed",
+					slog.String("server_id", serverID),
+					slog.String("tool", toolName),
+					slog.String("error", prevErr.Error()))
+			}
 			if saveErr := s.db.SaveOutputSchema(hctx, serverID, toolName, schema); saveErr != nil {
 				s.log.LogAttrs(hctx, slog.LevelWarn, "schema inference: save failed",
 					slog.String("server_id", serverID),
 					slog.String("tool", toolName),
 					slog.String("error", saveErr.Error()))
+				return
+			}
+			if s.notifyServerChanged != nil && !bytes.Equal(previous, schema) {
+				s.notifyServerChanged(serverID)
 			}
 		},
 	})
@@ -509,54 +558,209 @@ func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serv
 	return sb.String(), nil
 }
 
+// visibleMCPServersForCaller filters all — a full, unscoped snapshot of
+// every active MCP server this process knows about (proxy.MCPServerCache.List)
+// — down to exactly the subset one of the three DB queries
+// codeModeService.accessibleServers itself would have issued for id would
+// have returned, reimplementing each query's own WHERE clause in Go rather
+// than re-issuing it against the database:
+//
+//   - id.TeamID != "": mirrors db.DB.ListMCPServersByTeam(teamID, orgID) —
+//     (team_id = teamID AND org_id = orgID) OR (team_id IS NULL AND org_id =
+//     orgID) OR (team_id IS NULL AND org_id IS NULL).
+//   - id.TeamID == "" && id.OrgID != "": mirrors db.DB.ListMCPServersByOrg(orgID)
+//     — (org_id = orgID OR org_id IS NULL) AND team_id IS NULL.
+//   - neither set: mirrors db.DB.ListMCPServers() — org_id IS NULL AND
+//     team_id IS NULL.
+//
+// This is the visibility half of accessibleServers' own decision — the DB
+// query it issues before ever reaching its own per-server loop — kept here
+// as its own function so aliasWinnerForCaller can apply resolveServersByAlias
+// to exactly this same scoped subset, matching accessibleServers' own
+// "dedupe first, then filter" ordering (see resolveServersByAlias' own doc
+// for why that order matters).
+func visibleMCPServersForCaller(all []db.MCPServer, id mcp.KeyIdentity) []db.MCPServer {
+	visible := make([]db.MCPServer, 0, len(all))
+	for _, sv := range all {
+		switch {
+		case id.TeamID != "":
+			teamMatch := sv.TeamID != nil && *sv.TeamID == id.TeamID && sv.OrgID != nil && *sv.OrgID == id.OrgID
+			orgMatch := sv.TeamID == nil && sv.OrgID != nil && *sv.OrgID == id.OrgID
+			globalMatch := sv.TeamID == nil && sv.OrgID == nil
+			if teamMatch || orgMatch || globalMatch {
+				visible = append(visible, sv)
+			}
+		case id.OrgID != "":
+			if sv.TeamID == nil && (sv.OrgID == nil || *sv.OrgID == id.OrgID) {
+				visible = append(visible, sv)
+			}
+		default:
+			if sv.OrgID == nil && sv.TeamID == nil {
+				visible = append(visible, sv)
+			}
+		}
+	}
+	return visible
+}
+
+// aliasWinnerForCaller resolves serverID against the alias-deduplicated view
+// of all a caller with identity id would see — visibleMCPServersForCaller
+// followed by resolveServersByAlias, the identical two-step
+// codeModeService.accessibleServers itself performs — and reports the
+// resulting winning db.MCPServer, or false if serverID is not visible to id
+// at all, OR is visible but lost its own alias to a higher-priority sibling
+// (e.g. a team-scoped server of the SAME alias the caller's team also
+// happens to see) — exactly as accessibleServers itself would silently drop
+// a loser from its own returned slice.
+func aliasWinnerForCaller(all []db.MCPServer, id mcp.KeyIdentity, serverID string) (db.MCPServer, bool) {
+	winners := resolveServersByAlias(visibleMCPServersForCaller(all, id))
+	for _, sv := range winners {
+		if sv.ID == serverID {
+			return sv, true
+		}
+	}
+	return db.MCPServer{}, false
+}
+
+// accessDecisionForWinner applies the remaining accessibleServers per-server
+// branches, in order, to winner — an already alias-resolved db.MCPServer row,
+// either the LIVE winner aliasWinnerForCaller returned for a serverID lookup,
+// or the synthetic row snapshotCandidate built for a NotifiedServerScope —
+// exactly mirroring codeModeService.accessibleServers' own per-server loop:
+//
+//   - CodeModeEnabled must be true (accessibleServers' own codeModeOnly=true
+//     filter, applied identically regardless of which branch below grants
+//     access).
+//   - A team- or org-scoped server is accessible unconditionally once it is
+//     the alias winner in id's own visible set — visibleMCPServersForCaller
+//     already established that id's own org/team matches, so no further
+//     check is needed here (matching accessibleServers' own unconditional
+//     append for this branch).
+//   - A builtin server is always accessible.
+//   - Otherwise (a global, non-builtin server) falls back to
+//     mcpAccessCache.Check — the SAME access decision the transparent MCP
+//     proxy's own hot path (mcp_proxy.go) applies for this identical case.
+//     Unlike accessibleServers itself, this branch does NOT special-case
+//     auth.RoleSystemAdmin: accessibleServers' own isSystemAdmin bypass only
+//     ever applies within this same global-server branch too (a system
+//     admin gains no wider organizational reach through Code Mode's
+//     tools/list than the very DB query that already scoped `all` to id's
+//     own org/team would allow), so this applies it identically here, not as
+//     a blanket bypass of every branch above.
+func accessDecisionForWinner(winner db.MCPServer, id mcp.KeyIdentity, mcpAccessCache *proxy.MCPAccessCache) bool {
+	if !winner.CodeModeEnabled {
+		return false
+	}
+	if winner.TeamID != nil || winner.OrgID != nil {
+		return true
+	}
+	if winner.Source == "builtin" {
+		return true
+	}
+	if id.Role == auth.RoleSystemAdmin {
+		return true
+	}
+	if mcpAccessCache == nil {
+		return false
+	}
+	return mcpAccessCache.Check(id.OrgID, id.TeamID, id.KeyID, winner.ID)
+}
+
+// excludeServerID returns all with every server whose ID equals serverID
+// removed — used by snapshotAccessible to keep a stale, LIVE entry for the
+// very server a NotifiedServerScope snapshot describes from shadowing the
+// snapshot's own, pre-mutation row in the alias-winner resolution below (see
+// that function's own doc for why this matters specifically for an
+// UpdateMCPServer rescope, where the live cache already reflects the NEW
+// row under the SAME ID by the time the snapshot-scoped notification fires).
+func excludeServerID(all []db.MCPServer, serverID string) []db.MCPServer {
+	out := make([]db.MCPServer, 0, len(all))
+	for _, sv := range all {
+		if sv.ID != serverID {
+			out = append(out, sv)
+		}
+	}
+	return out
+}
+
+// snapshotCandidate reconstructs the db.MCPServer row a NotifiedServerScope
+// snapshot describes — exactly the fields aliasWinnerForCaller and
+// accessDecisionForWinner need (ID, Alias, OrgID, TeamID, Source,
+// CodeModeEnabled) — so snapshotAccessible can run the identical
+// alias-resolution and access-decision code the live serverID path uses,
+// rather than a second, hand-rolled copy of those rules.
+func snapshotCandidate(snapshot mcp.NotifiedServerScope) db.MCPServer {
+	return db.MCPServer{
+		ID:              snapshot.ID,
+		Alias:           snapshot.Alias,
+		OrgID:           snapshot.OrgID,
+		TeamID:          snapshot.TeamID,
+		Source:          snapshot.Source,
+		CodeModeEnabled: snapshot.CodeModeEnabled,
+	}
+}
+
+// snapshotAccessible reports whether id could have seen the server snapshot
+// describes, applying the exact same alias-winner rule and access decision
+// (accessDecisionForWinner) the live serverID path applies — see item 2's own
+// requirement that snapshot evaluation must never drift from the live
+// checker's rules. snapshot.Active false is checked first and short-circuits
+// to false unconditionally: every DB query accessibleServers itself issues
+// filters WHERE is_active = 1, so an inactive row was never a candidate for
+// any caller's own visible set to begin with (see NotifiedServerScope.Active's
+// own doc).
+//
+// The alias-winner resolution runs against serverCache.List() with the
+// snapshot's own (possibly stale) ID excluded (excludeServerID) plus the
+// reconstructed snapshot row appended (snapshotCandidate) — representing
+// "the world as it was immediately before this one mutation", since every
+// OTHER live sibling is unaffected by a mutation to this single server.
+func snapshotAccessible(serverCache mcpServerCacheReader, mcpAccessCache *proxy.MCPAccessCache, id mcp.KeyIdentity, snapshot mcp.NotifiedServerScope) bool {
+	if !snapshot.Active {
+		return false
+	}
+	candidate := snapshotCandidate(snapshot)
+	siblings := excludeServerID(serverCache.List(), candidate.ID)
+	all := append(siblings, candidate)
+	winner, ok := aliasWinnerForCaller(all, id, candidate.ID)
+	if !ok {
+		return false
+	}
+	return accessDecisionForWinner(winner, id, mcpAccessCache)
+}
+
 // codeModeAccessChecker returns an mcp.AccessChecker that mirrors
-// codeModeService.accessibleServers' own access decision (see that method's
-// own doc) for a single server ID, built entirely from in-memory state —
-// never a database call — so it is safe to invoke once per subscriber from
-// mcp.Server.NotifyToolsListChanged's own delivery loop:
+// codeModeService.accessibleServers(ctx, true)'s own access decision (see
+// that method's own doc) for a single server — either LIVE (snapshot == nil,
+// serverID names it) or a pre-mutation NotifiedServerScope (serverID == "",
+// snapshot != nil; see NotifyScope's own doc for when each is used) — built
+// entirely from in-memory state — never a database call — so it is safe to
+// invoke once per subscriber from mcp.Server.NotifyToolsListChanged's own
+// delivery loop.
 //
-//   - serverCache.GetByID is proxy.MCPServerCache's in-memory lookup (loaded
-//     by Handler.refreshMCPCaches — the same cache the proxy hot path and
-//     reconcileMCPListenTargets already use).
-//   - mcpAccessCache.Check is proxy.MCPAccessCache's own in-memory allowlist
-//     lookup (the same cache the transparent MCP proxy's hot path —
-//     mcp_proxy.go — already uses for this exact global-server access
-//     decision).
-//
-// A subscriber whose Role is auth.RoleSystemAdmin always has access,
-// matching accessibleServers' own isSystemAdmin bypass. A server whose
-// Source is "builtin" is always accessible, matching accessibleServers'
-// own builtin bypass. A team-scoped server (TeamID set) is accessible only
-// to a subscriber whose own KeyIdentity.TeamID matches exactly. An
-// org-scoped server (OrgID set, TeamID nil) is accessible to any subscriber
-// in that org, matching ListMCPServersByOrg's implicit, no-explicit-
-// allowlist-entry-needed org-wide visibility. A global, non-builtin server
-// (both nil) falls back to mcpAccessCache.Check. A server ID this
-// serverCache does not currently know about (e.g. one just deleted) reports
-// no access: there is nothing left to notify a subscriber about being
-// unable to see anyway.
-func codeModeAccessChecker(serverCache mcpServerByIDer, mcpAccessCache *proxy.MCPAccessCache) mcp.AccessChecker {
-	return func(id mcp.KeyIdentity, serverID string) bool {
-		sv, ok := serverCache.GetByID(serverID)
+// For the live case, serverCache.List stands in for whichever of
+// ListMCPServersByTeam/ByOrg/ListMCPServers accessibleServers itself would
+// have queried for this exact identity (see visibleMCPServersForCaller), and
+// aliasWinnerForCaller applies the identical alias-deduplication
+// accessibleServers performs before its own per-server loop — a server that
+// is visible in scope but lost its alias to a higher-priority sibling is
+// correctly reported as inaccessible, since accessibleServers' own returned
+// slice would never have included it either. For the snapshot case,
+// snapshotAccessible applies the exact same two steps against a
+// reconstructed, pre-mutation row — see that function's own doc. Both cases
+// converge on the same accessDecisionForWinner once a winning row is
+// resolved, so the two paths can never drift on what "accessible" means, only
+// on which row they resolve it for.
+func codeModeAccessChecker(serverCache mcpServerCacheReader, mcpAccessCache *proxy.MCPAccessCache) mcp.AccessChecker {
+	return func(id mcp.KeyIdentity, serverID string, snapshot *mcp.NotifiedServerScope) bool {
+		if snapshot != nil {
+			return snapshotAccessible(serverCache, mcpAccessCache, id, *snapshot)
+		}
+		winner, ok := aliasWinnerForCaller(serverCache.List(), id, serverID)
 		if !ok {
 			return false
 		}
-		if id.Role == auth.RoleSystemAdmin {
-			return true
-		}
-		if sv.Source == "builtin" {
-			return true
-		}
-		if sv.TeamID != nil {
-			return id.TeamID == *sv.TeamID
-		}
-		if sv.OrgID != nil {
-			return id.OrgID == *sv.OrgID
-		}
-		if mcpAccessCache == nil {
-			return false
-		}
-		return mcpAccessCache.Check(id.OrgID, id.TeamID, id.KeyID, serverID)
+		return accessDecisionForWinner(winner, id, mcpAccessCache)
 	}
 }
 

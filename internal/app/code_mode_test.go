@@ -62,6 +62,12 @@ type mockCodeModeDB struct {
 	// outputSchemasByServerID maps serverID → (toolName → schema JSON) for
 	// GetAllOutputSchemas. When nil the method returns nil, nil (no schemas).
 	outputSchemasByServerID map[string]map[string]jsonx.RawMessage
+	// prevOutputSchema maps "serverID|toolName" → the schema JSON
+	// GetOutputSchema should report as already stored — standing in for
+	// whatever a PRIOR SaveOutputSchema call would have persisted. A missing
+	// key means db.ErrNotFound (nothing stored yet), the real *db.DB's own
+	// behavior for a (serverID, toolName) pair with no row.
+	prevOutputSchema map[string]jsonx.RawMessage
 }
 
 func (m *mockCodeModeDB) ListMCPServers(_ context.Context) ([]db.MCPServer, error) {
@@ -109,6 +115,14 @@ func (m *mockCodeModeDB) ListBlockedToolNames(_ context.Context, serverID string
 
 func (m *mockCodeModeDB) SaveOutputSchema(_ context.Context, _, _ string, _ jsonx.RawMessage) error {
 	return m.saveErr
+}
+
+func (m *mockCodeModeDB) GetOutputSchema(_ context.Context, serverID, toolName string) (jsonx.RawMessage, error) {
+	schema, ok := m.prevOutputSchema[serverID+"|"+toolName]
+	if !ok {
+		return nil, db.ErrNotFound
+	}
+	return schema, nil
 }
 
 func (m *mockCodeModeDB) GetAllOutputSchemas(_ context.Context, serverID string, _ time.Duration) (map[string]jsonx.RawMessage, error) {
@@ -1452,8 +1466,9 @@ func TestFinalizeToolsList_WithinDeadline_InstallsDescription(t *testing.T) {
 // Schema inference integration tests — real SQLite DB, real Executor
 // ---------------------------------------------------------------------------
 
-// staticServerCache is a minimal mcpServerByIDer that serves a fixed map of
-// server ID → MCPServer for use in schema-inference tests.
+// staticServerCache is a minimal mcpServerCacheReader that serves a fixed map
+// of server ID → MCPServer for use in schema-inference and access-checker
+// tests.
 type staticServerCache struct {
 	byID map[string]*db.MCPServer
 }
@@ -1461,6 +1476,18 @@ type staticServerCache struct {
 func (s *staticServerCache) GetByID(serverID string) (*db.MCPServer, bool) {
 	sv, ok := s.byID[serverID]
 	return sv, ok
+}
+
+// List returns every server in byID, in unspecified order — order does not
+// matter to resolveServersByAlias' own callers here, since every fixture in
+// this package's tests uses distinct aliases unless a test is specifically
+// exercising alias-collision priority.
+func (s *staticServerCache) List() []db.MCPServer {
+	out := make([]db.MCPServer, 0, len(s.byID))
+	for _, sv := range s.byID {
+		out = append(out, *sv)
+	}
+	return out
 }
 
 // openTestDBForSchemaTests opens an isolated in-memory SQLite DB, runs all
@@ -1541,6 +1568,64 @@ func readInferredAt(t *testing.T, database *db.DB, serverID, toolName string) st
 		t.Fatalf("readInferredAt(%s, %s): %v", serverID, toolName, err)
 	}
 	return inferredAt
+}
+
+// forceOutputSchemaStale rewrites the inferred_at column for a (serverID,
+// toolName) row to a fixed, far-past timestamp, directly via SQL — the same
+// mechanism a real, long-elapsed schemaTTL would produce, without a test
+// actually waiting one out. Used to force IsOutputSchemaStale to report true
+// again on a SECOND ExecuteCode call, so the notifyServerChanged tests below
+// can observe the "re-inferred, but did the schema actually CHANGE" decision
+// deterministically.
+func forceOutputSchemaStale(t *testing.T, database *db.DB, serverID, toolName string) {
+	t.Helper()
+	_, err := database.SQL().ExecContext(
+		context.Background(),
+		"UPDATE output_schemas SET inferred_at = '2000-01-01 00:00:00' WHERE server_id = ? AND tool_name = ?",
+		serverID, toolName,
+	)
+	if err != nil {
+		t.Fatalf("forceOutputSchemaStale(%s, %s): %v", serverID, toolName, err)
+	}
+}
+
+// notifyServerChangedRecorder collects every serverID a codeModeService's own
+// notifyServerChanged callback was invoked with, safe for concurrent use —
+// ExecuteCode's own OnToolResult callback runs in a goroutine that outlives
+// the request (see ExecuteCode's own doc).
+type notifyServerChangedRecorder struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *notifyServerChangedRecorder) record(serverID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, serverID)
+}
+
+func (r *notifyServerChangedRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.calls...)
+}
+
+// waitForNotifyServerChangedCalls polls rec until it has recorded at least
+// want calls, or timeout elapses — a bounded wait for the async OnToolResult
+// goroutine's own notifyServerChanged call, deterministic in the sense that
+// it returns the moment the expected state is observed rather than sleeping
+// a fixed duration, but still bounded so a genuine failure (the call never
+// happens) fails the test promptly instead of hanging.
+func waitForNotifyServerChangedCalls(t *testing.T, rec *notifyServerChangedRecorder, want int, timeout time.Duration) []string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if got := rec.snapshot(); len(got) >= want {
+			return got
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return rec.snapshot()
 }
 
 // setupSchemaInferenceTest builds a codeModeService wired to a real SQLite DB
@@ -1720,6 +1805,141 @@ func TestCodeMode_ZeroTTLAllowsIndefiniteCache(t *testing.T) {
 	secondInferredAt := readInferredAt(t, database, sv.ID, "my_tool")
 	if firstInferredAt != secondInferredAt {
 		t.Errorf("inferred_at changed with schemaTTL=0 (should never re-infer):\n  first  = %s\n  second = %s", firstInferredAt, secondInferredAt)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// notifyServerChanged: item 3's "fire only on an actual schema change"
+// ---------------------------------------------------------------------------
+
+// TestCodeMode_NotifyServerChanged_FiresOnFirstInference verifies item 3: the
+// very first time a tool's output schema is ever inferred and saved for a
+// server, notifyServerChanged fires with that server's own ID — there is no
+// previous schema to compare against (GetOutputSchema reports db.ErrNotFound),
+// so this is unconditionally treated as a change.
+func TestCodeMode_NotifyServerChanged_FiresOnFirstInference(t *testing.T) {
+	t.Parallel()
+
+	const alias = "notifysrv-first"
+	toolPayload := json.RawMessage(`{"users":[{"id":1,"name":"a"}]}`)
+	svc, database, sv := setupSchemaInferenceTest(t, alias, time.Hour, toolPayload)
+
+	rec := &notifyServerChangedRecorder{}
+	svc.notifyServerChanged = rec.record
+
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-notify-first", Role: "system_admin"})
+	if _, err := svc.ExecuteCode(ctx, `
+		async function run() {
+			const r = await tools["`+alias+`"].my_tool({});
+			return JSON.stringify(r);
+		}
+		await run();
+	`, nil); err != nil {
+		t.Fatalf("ExecuteCode: %v", err)
+	}
+	pollUntilSchemaInferred(t, database, sv.ID, "my_tool", 500*time.Millisecond)
+
+	if got := waitForNotifyServerChangedCalls(t, rec, 1, 500*time.Millisecond); len(got) != 1 || got[0] != sv.ID {
+		t.Errorf("notifyServerChanged calls = %v, want exactly one call for %q", got, sv.ID)
+	}
+}
+
+// TestCodeMode_NotifyServerChanged_NotFiredWhenSchemaUnchanged verifies item
+// 3's own "fire only on change" requirement: a second inference run — forced
+// stale via forceOutputSchemaStale, so SaveOutputSchema runs again — whose
+// tool payload (and therefore inferred schema) is BYTE-FOR-BYTE identical to
+// what was already stored must not fire notifyServerChanged a second time.
+func TestCodeMode_NotifyServerChanged_NotFiredWhenSchemaUnchanged(t *testing.T) {
+	t.Parallel()
+
+	const alias = "notifysrv-unchanged"
+	toolPayload := json.RawMessage(`{"users":[{"id":1,"name":"a"}]}`)
+	svc, database, sv := setupSchemaInferenceTest(t, alias, time.Hour, toolPayload)
+
+	rec := &notifyServerChangedRecorder{}
+	svc.notifyServerChanged = rec.record
+
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-notify-unchanged", Role: "system_admin"})
+	callScript := `
+		async function run() {
+			const r = await tools["` + alias + `"].my_tool({});
+			return JSON.stringify(r);
+		}
+		await run();
+	`
+
+	if _, err := svc.ExecuteCode(ctx, callScript, nil); err != nil {
+		t.Fatalf("first ExecuteCode: %v", err)
+	}
+	pollUntilSchemaInferred(t, database, sv.ID, "my_tool", 500*time.Millisecond)
+	waitForNotifyServerChangedCalls(t, rec, 1, 500*time.Millisecond)
+
+	// forceOutputSchemaStale rewinds inferred_at to year 2000, so
+	// IsOutputSchemaStale reports true again regardless of the real clock's
+	// sub-second resolution — pollUntilSchemaInferred below therefore only
+	// returns once the SECOND SaveOutputSchema call has actually overwritten
+	// it with a current timestamp, deterministically proving that write
+	// happened (rather than comparing timestamp strings directly, which
+	// SQLite's second-granularity CURRENT_TIMESTAMP cannot reliably
+	// distinguish between two saves a few milliseconds apart).
+	forceOutputSchemaStale(t, database, sv.ID, "my_tool")
+	if _, err := svc.ExecuteCode(ctx, callScript, nil); err != nil {
+		t.Fatalf("second ExecuteCode: %v", err)
+	}
+	pollUntilSchemaInferred(t, database, sv.ID, "my_tool", 500*time.Millisecond)
+
+	// notifyServerChanged's own decision is made in the same synchronous
+	// goroutine, immediately after SaveOutputSchema returns — by the time
+	// pollUntilSchemaInferred above observed the second write, that decision
+	// has already been made too.
+	if got := rec.snapshot(); len(got) != 1 {
+		t.Errorf("notifyServerChanged calls = %v, want exactly one (from the first inference only) since the second inference's schema was unchanged", got)
+	}
+}
+
+// TestCodeMode_NotifyServerChanged_FiresWhenSchemaChanges verifies the
+// positive counterpart: a second inference run whose tool payload shape
+// differs from the first (an added field changes the inferred JSON Schema)
+// fires notifyServerChanged again.
+func TestCodeMode_NotifyServerChanged_FiresWhenSchemaChanges(t *testing.T) {
+	t.Parallel()
+
+	const alias = "notifysrv-changed"
+	firstPayload := json.RawMessage(`{"users":[{"id":1,"name":"a"}]}`)
+	svc, database, sv := setupSchemaInferenceTest(t, alias, time.Hour, firstPayload)
+
+	rec := &notifyServerChangedRecorder{}
+	svc.notifyServerChanged = rec.record
+
+	ctx := ctxWithIdentity(mcp.KeyIdentity{KeyID: "key-notify-changed", Role: "system_admin"})
+	callScript := `
+		async function run() {
+			const r = await tools["` + alias + `"].my_tool({});
+			return JSON.stringify(r);
+		}
+		await run();
+	`
+
+	if _, err := svc.ExecuteCode(ctx, callScript, nil); err != nil {
+		t.Fatalf("first ExecuteCode: %v", err)
+	}
+	pollUntilSchemaInferred(t, database, sv.ID, "my_tool", 500*time.Millisecond)
+	waitForNotifyServerChangedCalls(t, rec, 1, 500*time.Millisecond)
+
+	// Swap in a payload whose inferred schema differs (an added, differently
+	// typed field) and force staleness so the second call actually re-infers.
+	forceOutputSchemaStale(t, database, sv.ID, "my_tool")
+	changedCaller := func(_ context.Context, _ *auth.KeyInfo, _, _ string, _ json.RawMessage, _ bool, _ string) (json.RawMessage, error) {
+		return json.RawMessage(`{"users":[{"id":1,"name":"a"}],"total_count":42}`), nil
+	}
+	svc.callMCPTool = changedCaller
+
+	if _, err := svc.ExecuteCode(ctx, callScript, nil); err != nil {
+		t.Fatalf("second ExecuteCode: %v", err)
+	}
+
+	if got := waitForNotifyServerChangedCalls(t, rec, 2, 500*time.Millisecond); len(got) != 2 || got[0] != sv.ID || got[1] != sv.ID {
+		t.Errorf("notifyServerChanged calls = %v, want exactly two calls for %q (one per genuinely differing inference)", got, sv.ID)
 	}
 }
 

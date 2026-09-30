@@ -105,8 +105,8 @@ func assertScopingNoEvent(t *testing.T, sub *mcp.Subscriber) {
 func newNotifyScopingFixture(t *testing.T) (codeModeServer *mcp.Server, toolCache *mcp.ToolCache) {
 	t.Helper()
 
-	svA := db.MCPServer{ID: "sv-a", OrgID: ptrStr("org-a")}
-	svB := db.MCPServer{ID: "sv-b", OrgID: ptrStr("org-b")}
+	svA := db.MCPServer{ID: "sv-a", Alias: "alias-a", OrgID: ptrStr("org-a"), CodeModeEnabled: true}
+	svB := db.MCPServer{ID: "sv-b", Alias: "alias-b", OrgID: ptrStr("org-b"), CodeModeEnabled: true}
 	serverCache := &staticServerCache{byID: map[string]*db.MCPServer{
 		"sv-a": &svA,
 		"sv-b": &svB,
@@ -164,7 +164,7 @@ func TestMCPNotifyScoping_ToolCacheInvalidate_OnlyNotifiesSubscribersWithAccess(
 func TestMCPNotifyScoping_ToolCacheInvalidate_TeamScopedServer_OnlyThatTeam(t *testing.T) {
 	t.Parallel()
 
-	teamServer := db.MCPServer{ID: "sv-team", OrgID: ptrStr("org-1"), TeamID: ptrStr("team-1")}
+	teamServer := db.MCPServer{ID: "sv-team", Alias: "team-alias", OrgID: ptrStr("org-1"), TeamID: ptrStr("team-1"), CodeModeEnabled: true}
 	serverCache := &staticServerCache{byID: map[string]*db.MCPServer{"sv-team": &teamServer}}
 
 	codeModeServer := mcp.NewServer("code-mode", "test")
@@ -199,7 +199,7 @@ func TestMCPNotifyScoping_ToolCacheInvalidate_TeamScopedServer_OnlyThatTeam(t *t
 func TestMCPNotifyScoping_ToolCacheInvalidate_GlobalServer_RespectsMCPAccessCache(t *testing.T) {
 	t.Parallel()
 
-	globalServer := db.MCPServer{ID: "sv-global"}
+	globalServer := db.MCPServer{ID: "sv-global", Alias: "global-alias", CodeModeEnabled: true}
 	serverCache := &staticServerCache{byID: map[string]*db.MCPServer{"sv-global": &globalServer}}
 
 	accessCache := proxy.NewMCPAccessCache()
@@ -229,21 +229,64 @@ func TestMCPNotifyScoping_ToolCacheInvalidate_GlobalServer_RespectsMCPAccessCach
 	assertScopingNoEvent(t, denied)
 }
 
-// TestMCPNotifyScoping_SystemAdmin_SeesEveryOrgsEvent verifies
-// codeModeAccessChecker's system-admin bypass holds inside the full
-// ToolCache → NotifyToolsListChanged triangle too, not only in isolation
-// (TestCodeModeAccessChecker): a system_admin subscriber receives a
-// notification for an org-scoped server belonging to an org it does not
-// itself belong to.
-func TestMCPNotifyScoping_SystemAdmin_SeesEveryOrgsEvent(t *testing.T) {
+// TestMCPNotifyScoping_SystemAdmin_DoesNotBypassOrgScoping verifies
+// codeModeAccessChecker's own corrected doc holds inside the full ToolCache →
+// NotifyToolsListChanged triangle too, not only in isolation
+// (TestCodeModeAccessChecker): a system_admin subscriber belonging to an
+// UNRELATED org does NOT receive a notification for an org-scoped server —
+// accessibleServers' own isSystemAdmin bypass only ever applies within the
+// global-server/MCPAccessCache branch, never as a blanket bypass of org/team
+// scoping — while a system_admin who DOES belong to the affected org still
+// sees it, exactly like any other role would.
+func TestMCPNotifyScoping_SystemAdmin_DoesNotBypassOrgScoping(t *testing.T) {
 	t.Parallel()
 
 	codeModeServer, toolCache := newNotifyScopingFixture(t)
 
-	admin := registerNotifyScopingListener(t, codeModeServer,
-		mcp.KeyIdentity{OrgID: "org-unrelated", KeyID: "key-admin", Role: "system_admin"}, 1)
+	unrelatedAdmin := registerNotifyScopingListener(t, codeModeServer,
+		mcp.KeyIdentity{OrgID: "org-unrelated", KeyID: "key-admin-unrelated", Role: "system_admin"}, 1)
+	sameOrgAdmin := registerNotifyScopingListener(t, codeModeServer,
+		mcp.KeyIdentity{OrgID: "org-a", KeyID: "key-admin-same-org", Role: "system_admin"}, 2)
 
 	toolCache.Invalidate("sv-a")
+
+	assertScopingNoEvent(t, unrelatedAdmin)
+	assertScopingEventPending(t, sameOrgAdmin)
+}
+
+// TestMCPNotifyScoping_SystemAdmin_BypassesMCPAccessCache verifies the one
+// case accessibleServers' own isSystemAdmin bypass DOES apply: a global,
+// non-builtin server whose org has no MCPAccessCache allowlist entry at
+// all — ordinarily denied (TestMCPNotifyScoping_ToolCacheInvalidate_GlobalServer_RespectsMCPAccessCache)
+// — still reaches a system_admin subscriber.
+func TestMCPNotifyScoping_SystemAdmin_BypassesMCPAccessCache(t *testing.T) {
+	t.Parallel()
+
+	globalServer := db.MCPServer{ID: "sv-global-admin", Alias: "global-admin-alias", CodeModeEnabled: true}
+	serverCache := &staticServerCache{byID: map[string]*db.MCPServer{"sv-global-admin": &globalServer}}
+
+	accessCache := proxy.NewMCPAccessCache()
+	accessCache.Load(map[string][]string{"org-allowed": {"sv-global-admin"}}, nil, nil)
+
+	codeModeServer := mcp.NewServer("code-mode", "test")
+	codeModeServer.SetToolsListChangedSource(true)
+	codeModeServer.SetAccessChecker(codeModeAccessChecker(serverCache, accessCache))
+
+	fetcher := func(_ context.Context, serverID string) (*mcp.ToolListing, error) {
+		return &mcp.ToolListing{Tools: []mcp.Tool{{Name: "tool-" + serverID}}}, nil
+	}
+	toolCache := mcp.NewToolCache(fetcher, time.Hour)
+	toolCache.SetOnChange(func(serverID string) {
+		codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: serverID})
+	})
+	if _, err := toolCache.GetTools(context.Background(), "sv-global-admin"); err != nil {
+		t.Fatalf("warm sv-global-admin: %v", err)
+	}
+
+	admin := registerNotifyScopingListener(t, codeModeServer,
+		mcp.KeyIdentity{OrgID: "org-closed-to-admin", KeyID: "key-admin", Role: "system_admin"}, 1)
+
+	toolCache.Invalidate("sv-global-admin")
 
 	assertScopingEventPending(t, admin)
 }

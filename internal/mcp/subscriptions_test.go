@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/voidmind-io/voidllm/internal/mcp"
 )
@@ -376,9 +378,13 @@ func TestSubscriberRegistry_PerServerLimit_1025thStreamRejected(t *testing.T) {
 		}
 	})
 
+	// Spread registrations across many distinct orgs (one key per org) so
+	// this test proves the SERVER-wide cap specifically, never tripping the
+	// per-org cap (maxListenStreamsPerOrg, 64 — see its own test) along the
+	// way to 1024.
 	const maxListenStreamsPerServer = 1024
 	for i := 0; i < maxListenStreamsPerServer; i++ {
-		id := mcp.KeyIdentity{OrgID: "org-1", KeyID: fmt.Sprintf("server-limit-key-%d", i)}
+		id := mcp.KeyIdentity{OrgID: fmt.Sprintf("server-limit-org-%d", i), KeyID: fmt.Sprintf("server-limit-key-%d", i)}
 		res := listenOnce(t, s, id, i+1)
 		if res.Listen == nil {
 			t.Fatalf("registration %d/%d failed before reaching the server-wide cap: %s", i+1, maxListenStreamsPerServer, res.Body)
@@ -386,10 +392,11 @@ func TestSubscriberRegistry_PerServerLimit_1025thStreamRejected(t *testing.T) {
 		subs = append(subs, res.Listen.Sub)
 	}
 
-	// The 1025th registration, for a KeyID that has never registered before
-	// (so it cannot be hitting the PER-KEY limit instead), must be rejected —
-	// the server-wide cap, not the per-key one, is what is under test here.
-	over := listenOnce(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "server-limit-key-overflow"}, maxListenStreamsPerServer+1)
+	// The 1025th registration, for an org/KeyID pair that has never
+	// registered before (so it cannot be hitting the per-key or per-org limit
+	// instead), must be rejected — the server-wide cap is what is under test
+	// here.
+	over := listenOnce(t, s, mcp.KeyIdentity{OrgID: "server-limit-org-overflow", KeyID: "server-limit-key-overflow"}, maxListenStreamsPerServer+1)
 	if over.Listen != nil {
 		over.Listen.Sub.Unregister()
 		t.Fatal("1025th registration succeeded, want CodeTooManyListenStreams")
@@ -527,7 +534,7 @@ func TestNotifyToolsListChanged_Coalesces(t *testing.T) {
 
 	s := newTestServer("voidllm", "0.1.0")
 	s.SetToolsListChangedSource(true)
-	s.SetAccessChecker(func(mcp.KeyIdentity, string) bool { return true })
+	s.SetAccessChecker(func(mcp.KeyIdentity, string, *mcp.NotifiedServerScope) bool { return true })
 
 	id := mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-coalesce"}
 	sub := registerListener(t, s, id, 1)
@@ -568,8 +575,8 @@ func TestNotifyToolsListChanged_ServerIDScope_OnlyMatchingAccessDelivers(t *test
 	s := newTestServer("voidllm", "0.1.0")
 	s.SetToolsListChangedSource(true)
 	// Only "key-allowed" has access to "server-x".
-	s.SetAccessChecker(func(id mcp.KeyIdentity, serverID string) bool {
-		return id.KeyID == "key-allowed" && serverID == "server-x"
+	s.SetAccessChecker(func(id mcp.KeyIdentity, serverID string, snapshot *mcp.NotifiedServerScope) bool {
+		return snapshot == nil && id.KeyID == "key-allowed" && serverID == "server-x"
 	})
 
 	allowed := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-allowed"}, 1)
@@ -615,7 +622,7 @@ func TestNotifyToolsListChanged_EmptyScope_MatchesNobody(t *testing.T) {
 
 	s := newTestServer("voidllm", "0.1.0")
 	s.SetToolsListChangedSource(true)
-	s.SetAccessChecker(func(mcp.KeyIdentity, string) bool { return true })
+	s.SetAccessChecker(func(mcp.KeyIdentity, string, *mcp.NotifiedServerScope) bool { return true })
 
 	sub := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-empty-scope"}, 1)
 
@@ -636,7 +643,7 @@ func TestNotifyToolsListChanged_UnhonoredSubscriberNeverDelivered(t *testing.T) 
 	// Deliberately never call SetToolsListChangedSource(true): mirrors the
 	// built-in management server, which always acknowledges an empty honored
 	// set (subscriptions.go, SetToolsListChangedSource's own doc).
-	s.SetAccessChecker(func(mcp.KeyIdentity, string) bool { return true })
+	s.SetAccessChecker(func(mcp.KeyIdentity, string, *mcp.NotifiedServerScope) bool { return true })
 
 	res := listenOnce(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-mgmt"}, 1)
 	if res.Listen == nil {
@@ -691,12 +698,433 @@ func TestSubscriptionsListen_NoContentInLogs(t *testing.T) {
 	if res.Listen == nil {
 		t.Fatalf("well-formed registration failed: %s", res.Body)
 	}
-	s.SetAccessChecker(func(mcp.KeyIdentity, string) bool { return true })
+	s.SetAccessChecker(func(mcp.KeyIdentity, string, *mcp.NotifiedServerScope) bool { return true })
 	s.NotifyToolsListChanged(mcp.NotifyScope{ServerID: "server-" + marker})
 	res.Listen.Sub.Unregister()
 	s.CloseSubscriptions()
 
 	if strings.Contains(buf.String(), marker) {
 		t.Errorf("log output contains the content marker, want it never logged:\n%s", buf.String())
+	}
+}
+
+// ---- maxListenStreamsPerOrg -------------------------------------------------
+
+// TestSubscriberRegistry_PerOrgLimit_65thStreamRejected verifies
+// maxListenStreamsPerOrg (64): every API key belonging to one organization
+// may hold at most 64 concurrent subscriptions/listen registrations against
+// one Server instance IN TOTAL, even though each individual key is well
+// under its own maxListenStreamsPerKey (4) limit — 64 distinct keys, one
+// stream each, all in the same org. The 65th (a brand new key in the same
+// org) is refused with CodeTooManyListenStreams/HintTooManyRequests before
+// ever opening a stream; a key in a DIFFERENT org is unaffected.
+func TestSubscriberRegistry_PerOrgLimit_65thStreamRejected(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+
+	const maxListenStreamsPerOrg = 64
+	var subs []*mcp.Subscriber
+	t.Cleanup(func() {
+		for _, sub := range subs {
+			sub.Unregister()
+		}
+	})
+	for i := 0; i < maxListenStreamsPerOrg; i++ {
+		id := mcp.KeyIdentity{OrgID: "org-per-org-limit", KeyID: fmt.Sprintf("org-limit-key-%d", i)}
+		res := listenOnce(t, s, id, i+1)
+		if res.Listen == nil {
+			t.Fatalf("registration %d/%d failed before reaching the per-org cap: %s", i+1, maxListenStreamsPerOrg, res.Body)
+		}
+		subs = append(subs, res.Listen.Sub)
+	}
+
+	over := listenOnce(t, s, mcp.KeyIdentity{OrgID: "org-per-org-limit", KeyID: "org-limit-key-overflow"}, maxListenStreamsPerOrg+1)
+	if over.Listen != nil {
+		over.Listen.Sub.Unregister()
+		t.Fatal("65th registration for the same org succeeded, want CodeTooManyListenStreams")
+	}
+	if over.Hint != mcp.HintTooManyRequests {
+		t.Errorf("Hint = %v, want HintTooManyRequests", over.Hint)
+	}
+	var resp mcp.Response
+	if err := json.Unmarshal(over.Body, &resp); err != nil {
+		t.Fatalf("unmarshal: %v; raw: %s", err, over.Body)
+	}
+	if resp.Error == nil || resp.Error.Code != mcp.CodeTooManyListenStreams {
+		t.Fatalf("Error = %+v, want CodeTooManyListenStreams", resp.Error)
+	}
+
+	// A different org, and a different key within it, is unaffected.
+	other := listenOnce(t, s, mcp.KeyIdentity{OrgID: "org-per-org-limit-other", KeyID: "unaffected-key"}, maxListenStreamsPerOrg+2)
+	if other.Listen == nil {
+		t.Fatalf("a different org's registration failed: %s", other.Body)
+	}
+	other.Listen.Sub.Unregister()
+}
+
+// TestSubscriberRegistry_PerOrgLimit_SlotReleasedAfterUnregister verifies
+// that Subscriber.Unregister frees its maxListenStreamsPerOrg slot exactly
+// as it already does for maxListenStreamsPerKey.
+func TestSubscriberRegistry_PerOrgLimit_SlotReleasedAfterUnregister(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+
+	const maxListenStreamsPerOrg = 64
+	var subs []*mcp.Subscriber
+	for i := 0; i < maxListenStreamsPerOrg; i++ {
+		id := mcp.KeyIdentity{OrgID: "org-per-org-release", KeyID: fmt.Sprintf("org-release-key-%d", i)}
+		res := listenOnce(t, s, id, i+1)
+		if res.Listen == nil {
+			t.Fatalf("registration %d failed: %s", i+1, res.Body)
+		}
+		subs = append(subs, res.Listen.Sub)
+	}
+
+	blocked := listenOnce(t, s, mcp.KeyIdentity{OrgID: "org-per-org-release", KeyID: "org-release-key-overflow"}, maxListenStreamsPerOrg+1)
+	if blocked.Listen != nil {
+		blocked.Listen.Sub.Unregister()
+		t.Fatal("registration beyond the per-org cap succeeded before any slot was released")
+	}
+
+	subs[0].Unregister()
+	t.Cleanup(func() {
+		for _, sub := range subs[1:] {
+			sub.Unregister()
+		}
+	})
+
+	freed := listenOnce(t, s, mcp.KeyIdentity{OrgID: "org-per-org-release", KeyID: "org-release-key-freed"}, maxListenStreamsPerOrg+2)
+	if freed.Listen == nil {
+		t.Fatalf("registration after releasing a slot failed: %s", freed.Body)
+	}
+	t.Cleanup(freed.Listen.Sub.Unregister)
+}
+
+// ---- NotifyScope: TeamID, KeyID, and Server (snapshot) variants -------------
+
+// TestNotifyToolsListChanged_TeamIDScope_OnlyMatchingTeamDelivers verifies
+// NotifyScope{TeamID}: delivery reaches only a subscriber whose own
+// KeyIdentity.TeamID equals the scope's TeamID — used for SetTeamMCPAccess's
+// own precisely-scoped trigger (item 3).
+func TestNotifyToolsListChanged_TeamIDScope_OnlyMatchingTeamDelivers(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+
+	teamA := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", TeamID: "team-a", KeyID: "key-a"}, 1)
+	teamB := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", TeamID: "team-b", KeyID: "key-b"}, 2)
+
+	s.NotifyToolsListChanged(mcp.NotifyScope{TeamID: "team-a"})
+
+	requirePendingEvent(t, teamA)
+	assertNoPendingEvent(t, teamB)
+}
+
+// TestNotifyToolsListChanged_KeyIDScope_OnlyMatchingKeyDelivers verifies
+// NotifyScope{KeyID}: delivery reaches only the subscriber whose own
+// KeyIdentity.KeyID equals the scope's KeyID — used for SetKeyMCPAccess's
+// own precisely-scoped trigger (item 3).
+func TestNotifyToolsListChanged_KeyIDScope_OnlyMatchingKeyDelivers(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+
+	keyA := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-a"}, 1)
+	keyB := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-b"}, 2)
+
+	s.NotifyToolsListChanged(mcp.NotifyScope{KeyID: "key-a"})
+
+	requirePendingEvent(t, keyA)
+	assertNoPendingEvent(t, keyB)
+}
+
+// TestNotifyToolsListChanged_ServerScope_NoAccessChecker_MatchesNobody
+// verifies NotifyScope.matches' own fail-closed doc for the Server case, the
+// exact same guarantee TestNotifyToolsListChanged_NoAccessChecker_MatchesNobody
+// already proves for ServerID: item 2 moved ALL access-rule evaluation for a
+// NotifiedServerScope snapshot out of this package and into the caller's own
+// AccessChecker, so a Server-scoped notification with no checker installed
+// must fail closed exactly like a ServerID-scoped one, never fall back to a
+// permissive default of its own.
+func TestNotifyToolsListChanged_ServerScope_NoAccessChecker_MatchesNobody(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+	// Deliberately never call SetAccessChecker.
+
+	sub := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", TeamID: "team-1", KeyID: "key-1"}, 1)
+
+	orgID := "org-1"
+	s.NotifyToolsListChanged(mcp.NotifyScope{Server: &mcp.NotifiedServerScope{
+		ID:              "sv-x",
+		OrgID:           &orgID,
+		CodeModeEnabled: true,
+		Active:          true,
+	}})
+
+	assertNoPendingEvent(t, sub)
+}
+
+// TestNotifyToolsListChanged_ServerScope_DelegatesToAccessChecker verifies
+// that a Server-scoped NotifyToolsListChanged call hands the snapshot,
+// verbatim, to the installed AccessChecker as its third argument (serverID
+// empty, snapshot non-nil) — this package performs no access-rule evaluation
+// of its own against a NotifiedServerScope (see that type's own doc); every
+// rule (MCPAccessCache, the alias-winner rule, CodeModeEnabled, tenant
+// scoping) lives entirely in the AccessChecker the caller installs
+// (internal/app's codeModeAccessChecker in production).
+func TestNotifyToolsListChanged_ServerScope_DelegatesToAccessChecker(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+
+	// subscriberRegistry.notify snapshots its subscribers from a Go map
+	// (subscriptions.go), so the ORDER the checker is invoked in across
+	// "key-granted" and "key-denied" is not deterministic — every field
+	// captured below is instead checked per-call, keyed by which identity
+	// that particular call was for, rather than assuming a fixed call order.
+	var mu sync.Mutex
+	gotServerIDByKey := map[string]string{}
+	gotSnapshotByKey := map[string]*mcp.NotifiedServerScope{}
+	s.SetAccessChecker(func(id mcp.KeyIdentity, serverID string, snapshot *mcp.NotifiedServerScope) bool {
+		mu.Lock()
+		gotServerIDByKey[id.KeyID] = serverID
+		gotSnapshotByKey[id.KeyID] = snapshot
+		mu.Unlock()
+		return snapshot != nil && id.KeyID == "key-granted"
+	})
+
+	granted := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-granted"}, 1)
+	denied := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-denied"}, 2)
+
+	orgID := "org-1"
+	snapshot := mcp.NotifiedServerScope{ID: "sv-x", OrgID: &orgID, CodeModeEnabled: true, Active: true}
+	s.NotifyToolsListChanged(mcp.NotifyScope{Server: &snapshot})
+
+	requirePendingEvent(t, granted)
+	assertNoPendingEvent(t, denied)
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, keyID := range []string{"key-granted", "key-denied"} {
+		if gotServerIDByKey[keyID] != "" {
+			t.Errorf("checker's serverID argument for %q = %q, want empty for a Server-scoped call", keyID, gotServerIDByKey[keyID])
+		}
+		got := gotSnapshotByKey[keyID]
+		if got == nil || got.ID != "sv-x" {
+			t.Errorf("checker's snapshot argument for %q = %+v, want the exact NotifiedServerScope passed to NotifyScope{Server: ...}", keyID, got)
+		}
+	}
+}
+
+// ---- KeyValidator: revalidation-driven delivery filtering -------------------
+
+// TestNotifyToolsListChanged_KeyValidator_InvalidSubscriberNeverDelivered
+// verifies notify's own doc: a subscriber whose captured identity fails the
+// installed KeyValidator never receives a delivery, even when scope and
+// AccessChecker both otherwise grant it.
+func TestNotifyToolsListChanged_KeyValidator_InvalidSubscriberNeverDelivered(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+	s.SetAccessChecker(func(mcp.KeyIdentity, string, *mcp.NotifiedServerScope) bool { return true })
+	s.SetKeyValidator(func(id mcp.KeyIdentity) bool { return id.KeyID != "key-revoked" })
+
+	valid := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-valid"}, 1)
+	revoked := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-revoked"}, 2)
+
+	s.NotifyToolsListChanged(mcp.NotifyScope{ServerID: "server-x"})
+
+	requirePendingEvent(t, valid)
+	assertNoPendingEvent(t, revoked)
+}
+
+// TestNotifyToolsListChanged_NilKeyValidator_IsPermissive verifies
+// KeyValidator's own doc: a nil validator (the default, e.g. a Handler built
+// directly in a test) never suppresses delivery — unlike AccessChecker's
+// fail-closed default.
+func TestNotifyToolsListChanged_NilKeyValidator_IsPermissive(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+	s.SetAccessChecker(func(mcp.KeyIdentity, string, *mcp.NotifiedServerScope) bool { return true })
+	// Deliberately never call SetKeyValidator.
+
+	sub := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-1"}, 1)
+
+	s.NotifyToolsListChanged(mcp.NotifyScope{ServerID: "server-x"})
+
+	requirePendingEvent(t, sub)
+}
+
+// TestServer_SubscriberValid mirrors the KeyValidator tests above at the
+// Server.SubscriberValid/mcp_handler.go-facing level: it reports true when
+// no validator is installed, and reflects the installed validator's own
+// verdict once one is.
+func TestServer_SubscriberValid(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+
+	sub := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-1"}, 1)
+
+	if !s.SubscriberValid(sub) {
+		t.Error("SubscriberValid() = false with no KeyValidator installed, want true")
+	}
+
+	s.SetKeyValidator(func(mcp.KeyIdentity) bool { return false })
+	if s.SubscriberValid(sub) {
+		t.Error("SubscriberValid() = true, want false once the installed KeyValidator rejects this identity")
+	}
+
+	s.SetKeyValidator(func(mcp.KeyIdentity) bool { return true })
+	if !s.SubscriberValid(sub) {
+		t.Error("SubscriberValid() = false, want true once the installed KeyValidator accepts this identity again")
+	}
+}
+
+// ---- decodeListenFilter: explicit JSON null on a notifications field -------
+
+// TestSubscriptionsListen_ExplicitNullNotificationField_Rejected verifies
+// decodeListenFilter's own doc: an explicit JSON null on any one of
+// params.notifications' own four fields is rejected with CodeInvalidParams
+// and HintBadRequest — never silently treated as "field absent" (the
+// ordinary, and very different, encoding/json null-into-bool/[]string
+// no-op).
+func TestSubscriptionsListen_ExplicitNullNotificationField_Rejected(t *testing.T) {
+	t.Parallel()
+
+	fields := []string{"toolsListChanged", "promptsListChanged", "resourcesListChanged", "resourceSubscriptions"}
+
+	for _, field := range fields {
+		t.Run(field, func(t *testing.T) {
+			t.Parallel()
+
+			s := newTestServer("voidllm", "0.1.0")
+			s.SetToolsListChangedSource(true)
+
+			body := modernRequestBody(1, "subscriptions/listen",
+				map[string]any{"notifications": json.RawMessage(`{"` + field + `":null}`)}, nil)
+			result := s.Handle(context.Background(), []byte(body), modernHeader())
+
+			if result.Listen != nil {
+				t.Cleanup(result.Listen.Sub.Unregister)
+				t.Fatalf("field %q: Listen != nil, want the explicit null rejected before ever opening a stream", field)
+			}
+			if result.Hint != mcp.HintBadRequest {
+				t.Errorf("field %q: Hint = %v, want HintBadRequest (HTTP 400)", field, result.Hint)
+			}
+			var resp mcp.Response
+			if err := json.Unmarshal(result.Body, &resp); err != nil {
+				t.Fatalf("field %q: unmarshal error body: %v; raw: %s", field, err, result.Body)
+			}
+			if resp.Error == nil || resp.Error.Code != mcp.CodeInvalidParams {
+				t.Errorf("field %q: Error = %+v, want CodeInvalidParams", field, resp.Error)
+			}
+		})
+	}
+}
+
+// TestSubscriptionsListen_NullNotificationsItself_Rejected verifies
+// decodeListenFilter's own doc for the OUTER field: params.notifications
+// itself being an explicit JSON null is rejected with CodeInvalidParams and
+// HintBadRequest, never silently treated as "field absent" — unlike a
+// MISSING params.notifications key, which stays allowed (see
+// TestSubscriptionsListen_Dispatch_HonoredFilter's "missing params.notifications
+// entirely" case).
+func TestSubscriptionsListen_NullNotificationsItself_Rejected(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+
+	body := modernRequestBody(1, "subscriptions/listen", map[string]any{"notifications": nil}, nil)
+	result := s.Handle(context.Background(), []byte(body), modernHeader())
+
+	if result.Listen != nil {
+		t.Cleanup(result.Listen.Sub.Unregister)
+		t.Fatalf("Listen != nil, want an explicit null params.notifications rejected before ever opening a stream")
+	}
+	if result.Hint != mcp.HintBadRequest {
+		t.Errorf("Hint = %v, want HintBadRequest (HTTP 400)", result.Hint)
+	}
+	var resp mcp.Response
+	if err := json.Unmarshal(result.Body, &resp); err != nil {
+		t.Fatalf("unmarshal error body: %v; raw: %s", err, result.Body)
+	}
+	if resp.Error == nil || resp.Error.Code != mcp.CodeInvalidParams {
+		t.Errorf("Error = %+v, want CodeInvalidParams", resp.Error)
+	}
+}
+
+// TestSubscriptionsListen_MissingNotifications_StaysAllowed verifies the
+// counterpart of TestSubscriptionsListen_NullNotificationsItself_Rejected: a
+// params.notifications key that is simply ABSENT (as opposed to present and
+// explicitly null) is still treated as an empty filter and the stream still
+// opens — decodeListenFilter's "missing means no value" convention is
+// unchanged by the explicit-null rejection above.
+func TestSubscriptionsListen_MissingNotifications_StaysAllowed(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+
+	body := modernRequestBody(1, "subscriptions/listen", map[string]any{}, nil)
+	result := s.Handle(context.Background(), []byte(body), modernHeader())
+	if result.Listen == nil {
+		t.Fatalf("registration failed: %s", result.Body)
+	}
+	t.Cleanup(result.Listen.Sub.Unregister)
+	if result.Listen.Sub.Honored().ToolsListChanged {
+		t.Error("Honored().ToolsListChanged = true, want false when params.notifications is absent")
+	}
+}
+
+// ---- Server.WaitForSubscriptionsDrain ---------------------------------------
+
+// TestServer_WaitForSubscriptionsDrain_WaitsThenReportsResult verifies both
+// outcomes: it blocks until every currently registered Subscriber has been
+// unregistered and reports true when that happens before the timeout, and
+// reports false when at least one is still registered once the timeout
+// elapses — the mechanism internal/app.Application.WaitForShutdown relies on
+// (item 5) to bound how long shutdown waits for in-flight subscriptions/listen
+// streams to finish after CloseSubscriptions.
+func TestServer_WaitForSubscriptionsDrain_WaitsThenReportsResult(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+
+	sub := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-drain"}, 1)
+
+	// Not yet unregistered: a short wait must time out (false).
+	if s.WaitForSubscriptionsDrain(20 * time.Millisecond) {
+		t.Fatal("WaitForSubscriptionsDrain() = true before the subscriber was ever unregistered, want false")
+	}
+
+	// Unregister concurrently, after a short delay, proving this call
+	// actually BLOCKS until that happens rather than merely polling once.
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		sub.Unregister()
+	}()
+	if !s.WaitForSubscriptionsDrain(2 * time.Second) {
+		t.Fatal("WaitForSubscriptionsDrain() = false, want true once the only registered subscriber unregistered")
+	}
+
+	// Nothing left registered: an immediate call reports true with no wait.
+	if !s.WaitForSubscriptionsDrain(time.Millisecond) {
+		t.Error("WaitForSubscriptionsDrain() = false with nothing registered, want true")
 	}
 }

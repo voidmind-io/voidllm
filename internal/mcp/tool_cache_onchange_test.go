@@ -180,6 +180,39 @@ func TestToolCache_OnChange_FiresOnDifferingRefetch_SchemaBytesChanged(t *testin
 	}
 }
 
+// TestToolCache_OnChange_FiresOnDifferingRefetch_DescriptionChanged verifies
+// toolsListingChanged's Description comparison (item 6): a forced refetch
+// whose tool names AND InputSchema bytes are identical, but whose
+// Description differs for one of them, still fires the hook — Description is
+// rendered directly into the Code Mode TypeScript declarations
+// (codemode_types.go's truncateDescription), so a description-only change is
+// still a change a subscriptions/listen subscriber must be told about.
+func TestToolCache_OnChange_FiresOnDifferingRefetch_DescriptionChanged(t *testing.T) {
+	t.Parallel()
+
+	schema := mcp.ObjectSchema(map[string]mcp.SchemaProp{"a": {Type: "string"}})
+	fetcher := toggleFetcher(
+		[]mcp.Tool{{Name: "t1", Description: "old description", InputSchema: schema}},
+		[]mcp.Tool{{Name: "t1", Description: "new description", InputSchema: schema}},
+	)
+	cache := mcp.NewToolCache(fetcher, time.Hour)
+	rec := &onChangeRecorder{}
+	cache.SetOnChange(rec.record)
+
+	if _, err := cache.GetTools(context.Background(), "srv"); err != nil {
+		t.Fatalf("initial GetTools: %v", err)
+	}
+	rec.reset()
+
+	if err := cache.RefreshServer(context.Background(), "srv"); err != nil {
+		t.Fatalf("RefreshServer: %v", err)
+	}
+
+	if got := rec.snapshot(); len(got) != 1 || got[0] != "srv" {
+		t.Errorf("onChange calls = %v, want exactly one call for %q after a description-only change", got, "srv")
+	}
+}
+
 // TestToolCache_OnChange_NotFiredOnIdenticalRefetch verifies the negative:
 // most upstreams' tools rarely change, and an ordinary TTL/force-driven
 // refetch that returns byte-for-byte the same listing must NOT fire the hook
@@ -204,6 +237,68 @@ func TestToolCache_OnChange_NotFiredOnIdenticalRefetch(t *testing.T) {
 
 	if got := rec.snapshot(); len(got) != 0 {
 		t.Errorf("onChange calls = %v, want none for a byte-for-byte identical refetch", got)
+	}
+}
+
+// ---- SetTools fires the change hook too (item 3) ----------------------------
+
+// TestToolCache_OnChange_SetTools_FiresOnFirstPublish verifies SetTools' own
+// doc: the very first SetTools call for a server ID — oldEntry == nil, per
+// toolsListingChanged's own doc — always fires the hook, exactly like
+// fetchAndPublish's first publish does.
+func TestToolCache_OnChange_SetTools_FiresOnFirstPublish(t *testing.T) {
+	t.Parallel()
+
+	cache := mcp.NewToolCache(makeStaticFetcher(nil), time.Hour)
+	rec := &onChangeRecorder{}
+	cache.SetOnChange(rec.record)
+
+	cache.SetTools("srv", []mcp.Tool{{Name: "t1"}})
+
+	if got := rec.snapshot(); len(got) != 1 || got[0] != "srv" {
+		t.Errorf("onChange calls = %v, want exactly one call for %q on first SetTools", got, "srv")
+	}
+}
+
+// TestToolCache_OnChange_SetTools_FiresWhenListingDiffers verifies SetTools
+// now uses the SAME toolsListingChanged comparison fetchAndPublish uses (item
+// 3): re-populating an already-published server's tools with a genuinely
+// different listing fires the hook.
+func TestToolCache_OnChange_SetTools_FiresWhenListingDiffers(t *testing.T) {
+	t.Parallel()
+
+	cache := mcp.NewToolCache(makeStaticFetcher(nil), time.Hour)
+	rec := &onChangeRecorder{}
+	cache.SetOnChange(rec.record)
+
+	cache.SetTools("srv", []mcp.Tool{{Name: "t1"}})
+	rec.reset() // the first publish always fires — not under test here.
+
+	cache.SetTools("srv", []mcp.Tool{{Name: "t1"}, {Name: "t2"}})
+
+	if got := rec.snapshot(); len(got) != 1 || got[0] != "srv" {
+		t.Errorf("onChange calls = %v, want exactly one call for %q after a differing SetTools", got, "srv")
+	}
+}
+
+// TestToolCache_OnChange_SetTools_NotFiredWhenListingIdentical verifies the
+// negative: re-populating a server with a byte-for-byte identical listing
+// must not fire the hook, exactly like an identical upstream refetch.
+func TestToolCache_OnChange_SetTools_NotFiredWhenListingIdentical(t *testing.T) {
+	t.Parallel()
+
+	tools := []mcp.Tool{{Name: "t1", InputSchema: mcp.ObjectSchema(map[string]mcp.SchemaProp{"a": {Type: "string"}})}}
+	cache := mcp.NewToolCache(makeStaticFetcher(nil), time.Hour)
+	rec := &onChangeRecorder{}
+	cache.SetOnChange(rec.record)
+
+	cache.SetTools("srv", tools)
+	rec.reset()
+
+	cache.SetTools("srv", tools)
+
+	if got := rec.snapshot(); len(got) != 0 {
+		t.Errorf("onChange calls = %v, want none for a byte-for-byte identical SetTools", got)
 	}
 }
 

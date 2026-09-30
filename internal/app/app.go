@@ -1029,6 +1029,10 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		redisCancel()
 		return nil, fmt.Errorf("register voidllm mcp tools: %w", regErr)
 	}
+	// KeyValidator applies to the built-in management server's own
+	// subscriptions/listen streams too — see the identical wiring, and
+	// keyRevalidator's own doc, in the Code Mode block below.
+	mcpServer.SetKeyValidator(keyRevalidator(keyCache))
 	adminHandler.MCPServer = mcpServer
 
 	// Expose the built-in server's tools through the ToolCache so Code Mode
@@ -1080,6 +1084,12 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		// codeModeService.accessibleServers.
 		codeModeServer.SetAccessChecker(codeModeAccessChecker(mcpServerCache, mcpAccessCache))
 
+		// KeyValidator ends a subscriptions/listen stream (and filters
+		// delivery to it) the moment its own captured identity no longer
+		// validates against the same in-memory key cache the auth middleware
+		// itself uses — see keyRevalidator's own doc.
+		codeModeServer.SetKeyValidator(keyRevalidator(keyCache))
+
 		// Trigger 1: a server's cached tool listing changes structurally
 		// (ToolCache.Invalidate/InvalidateWithStore, or a republish that
 		// differs from the previous listing — see SetOnChange's own doc).
@@ -1092,11 +1102,33 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: serverID})
 		})
 
+		// Trigger 1b: cmService writes data toolsListHook renders that
+		// ToolCache itself never tracks — today, only a changed inferred
+		// output schema (item 3, ExecuteCode's own OnToolResult callback in
+		// code_mode.go). Wired identically to Trigger 1 above (the same
+		// ServerID-scoped NotifyToolsListChanged call), just from a
+		// different trigger source; cmService is constructed before
+		// codeModeServer exists (see its own construction above), so this
+		// field is set here rather than at construction time.
+		cmService.notifyServerChanged = func(serverID string) {
+			codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: serverID})
+		}
+
 		// Trigger 2: an org's MCP access allowlist changes (SetOrgMCPAccess,
-		// SetTeamMCPAccess, SetKeyMCPAccess) — scoped to the org whose
-		// allowlist changed, since no single server ID applies.
-		adminHandler.AfterMCPAccessRefresh = func(orgID string) {
-			codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{OrgID: orgID})
+		// SetTeamMCPAccess, SetKeyMCPAccess) — each scoped as precisely as
+		// that mutation's own known blast radius (admin.MCPAccessRefreshScope's
+		// own doc): SetKeyMCPAccess reaches only that key's own subscribers,
+		// SetTeamMCPAccess only that team's, and SetOrgMCPAccess that whole
+		// org's, since no single server ID applies to any of the three.
+		adminHandler.AfterMCPAccessRefresh = func(scope admin.MCPAccessRefreshScope) {
+			switch {
+			case scope.KeyID != "":
+				codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{KeyID: scope.KeyID})
+			case scope.TeamID != "":
+				codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{TeamID: scope.TeamID})
+			case scope.OrgID != "":
+				codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{OrgID: scope.OrgID})
+			}
 		}
 
 		// Trigger 3: a server's tool blocklist changes (AddMCPServerBlocklist,
@@ -1104,6 +1136,29 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		// the same AccessChecker installed above.
 		adminHandler.AfterMCPBlocklistChange = func(serverID string) {
 			codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: serverID})
+		}
+
+		// Trigger 4: any mutation that creates, deletes, activates,
+		// deactivates, or otherwise changes a server's own alias, scope, or
+		// CodeModeEnabled (item 1) — notifying BOTH sides independently:
+		// before (when non-nil) reaches whoever could see the server under
+		// its PRE-mutation scope, via a snapshot (Trigger 1's own
+		// AccessChecker resolves ServerID against the live cache, which may
+		// no longer have an entry for a deleted/deactivated/rescoped server
+		// at all by the time this fires — see mcp.NotifiedServerScope's own
+		// doc); serverID (when non-empty) reaches whoever can see it NOW,
+		// resolved against the live cache Handler.NotifyMCPServerScopeChange's
+		// own doc guarantees is already refreshed by this point. Both fire on
+		// every qualifying mutation — a rename or a CodeModeEnabled
+		// false->true flip changes who is in each set, so neither call can be
+		// skipped in favor of the other.
+		adminHandler.NotifyMCPServerScopeChange = func(before *mcp.NotifiedServerScope, serverID string) {
+			if before != nil {
+				codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{Server: before})
+			}
+			if serverID != "" {
+				codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: serverID})
+			}
 		}
 
 		adminHandler.CodeModeServer = codeModeServer
@@ -1466,15 +1521,31 @@ func (a *Application) reconcileMCPListenTargets() {
 	a.mcpListenManager.Reconcile(targets)
 }
 
+// mcpListenShutdownDrainTimeout bounds how long WaitForShutdown waits, in
+// total across both built-in MCP servers combined, for every
+// subscriptions/listen stream that was open at the moment CloseSubscriptions
+// was called to actually finish (its own handler observing Done(), writing
+// the graceful-end response, and returning) before continuing with the rest
+// of the shutdown sequence regardless. A stream still open once this
+// elapses is cut off uncleanly by the Fiber server(s)' own Shutdown a few
+// steps later, exactly as it always was before CloseSubscriptions'
+// WaitForSubscriptionsDrain existed — this bound only shortens how long a
+// slow client can hold up the rest of shutdown, never how long a
+// well-behaved one is given to finish.
+const mcpListenShutdownDrainTimeout = 2 * time.Second
+
 // WaitForShutdown blocks until SIGINT or SIGTERM is received, then performs a
 // phased graceful shutdown:
 //
-//  1. Begin drain — signals load balancers via /readyz to stop sending traffic.
-//  2. Wait for in-flight requests to finish (up to DrainTimeout).
-//  3. Force-cancel any remaining requests if the timeout expires.
-//  4. Stop the Fiber server(s).
-//  5. LIFO cleanup: stop tickers, flush usage/audit loggers, close Redis, close DB.
-//  6. Zero sensitive key material from memory.
+//  1. Close MCP subscriptions/listen: new listen requests get 503 from this
+//     point forward, and every already-open stream is signaled to end
+//     gracefully — see mcpListenShutdownDrainTimeout's own doc.
+//  2. Begin drain — signals load balancers via /readyz to stop sending traffic.
+//  3. Wait for in-flight requests to finish (up to DrainTimeout).
+//  4. Force-cancel any remaining requests if the timeout expires.
+//  5. Stop the Fiber server(s).
+//  6. LIFO cleanup: stop tickers, flush usage/audit loggers, close Redis, close DB.
+//  7. Zero sensitive key material from memory.
 //
 // A second signal received while draining triggers an immediate os.Exit(1).
 // ctx is reserved for future use and may be context.Background().
@@ -1495,6 +1566,26 @@ func (a *Application) WaitForShutdown(ctx context.Context) {
 		)
 		os.Exit(1)
 	}()
+
+	// Phase 0: close every open MCP subscriptions/listen stream gracefully,
+	// and refuse every new one from this point forward — done FIRST, before
+	// the ordinary request drain below, so a long-lived stream (which the
+	// ordinary in-flight request counter does not track the same way a
+	// short-lived proxy/admin request is — see shutdownState's own doc) gets
+	// the maximum possible time to observe Done() and write its own
+	// graceful-end response before anything else in this sequence
+	// (including DrainTimeout, which could otherwise elapse first and race
+	// it) moves on. See mcp.Server.CloseSubscriptions' and
+	// WaitForSubscriptionsDrain's own docs.
+	mcpListenDeadline := time.Now().Add(mcpListenShutdownDrainTimeout)
+	if a.adminHandler.MCPServer != nil {
+		a.adminHandler.MCPServer.CloseSubscriptions()
+	}
+	if a.adminHandler.CodeModeServer != nil {
+		a.adminHandler.CodeModeServer.CloseSubscriptions()
+	}
+	waitForMCPListenDrain(a.adminHandler.MCPServer, mcpListenDeadline)
+	waitForMCPListenDrain(a.adminHandler.CodeModeServer, mcpListenDeadline)
 
 	// Phase 1: Begin drain — /readyz returns 503 from this point forward so
 	// load balancers stop routing new requests to this instance.
@@ -1524,7 +1615,7 @@ func (a *Application) WaitForShutdown(ctx context.Context) {
 	if drained {
 		a.log.LogAttrs(ctx, slog.LevelInfo, "all requests drained")
 	} else {
-		// Phase 3: Force-cancel remaining in-flight requests.
+		// Phase 4: Force-cancel remaining in-flight requests.
 		a.log.LogAttrs(ctx, slog.LevelWarn, "drain timeout exceeded, canceling in-flight requests",
 			slog.Int64("in_flight", a.shutdownState.InFlight()),
 		)
@@ -1532,19 +1623,7 @@ func (a *Application) WaitForShutdown(ctx context.Context) {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Phase 3.5: close every open MCP subscriptions/listen stream gracefully
-	// — before stopping the Fiber server(s) below — so an in-flight stream's
-	// own handler observes Subscriber.Done() and writes its graceful-end
-	// response well ahead of Shutdown terminating the underlying connection
-	// uncleanly. See mcp.Server.CloseSubscriptions' own doc.
-	if a.adminHandler.MCPServer != nil {
-		a.adminHandler.MCPServer.CloseSubscriptions()
-	}
-	if a.adminHandler.CodeModeServer != nil {
-		a.adminHandler.CodeModeServer.CloseSubscriptions()
-	}
-
-	// Phase 4: Stop the Fiber server(s).
+	// Phase 5: Stop the Fiber server(s).
 	if err := a.proxyApp.Shutdown(); err != nil {
 		a.log.LogAttrs(ctx, slog.LevelError, "proxy shutdown error",
 			slog.String("error", err.Error()),
@@ -1559,10 +1638,28 @@ func (a *Application) WaitForShutdown(ctx context.Context) {
 		}
 	}
 
-	// Phase 5: cleanup resources.
+	// Phase 6: cleanup resources.
 	a.cleanup(ctx)
 
 	a.log.LogAttrs(ctx, slog.LevelInfo, "shutdown complete")
+}
+
+// waitForMCPListenDrain calls server.WaitForSubscriptionsDrain, bounded by
+// whatever remains of deadline (a single mcpListenShutdownDrainTimeout
+// budget shared across both built-in servers — see that constant's own
+// doc), unless server is nil (Code Mode disabled, or no management server
+// configured — a Handler built without one) or the deadline has already
+// elapsed by the time this is called for the second server, in which case it
+// is a no-op: there is no time budget left to wait with.
+func waitForMCPListenDrain(server *mcp.Server, deadline time.Time) {
+	if server == nil {
+		return
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return
+	}
+	server.WaitForSubscriptionsDrain(remaining)
 }
 
 // PrintBootstrapCredentials writes the bootstrap credentials to stderr when a

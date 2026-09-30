@@ -49,11 +49,39 @@ func (r *hookRecorder) snapshot() []string {
 	return append([]string(nil), r.calls...)
 }
 
+// scopeRecorder collects every admin.MCPAccessRefreshScope a hook under test
+// was invoked with — the typed counterpart of hookRecorder for
+// AfterMCPAccessRefresh, whose argument is now a scope struct rather than a
+// bare org ID string (item 3: SetKeyMCPAccess/SetTeamMCPAccess/
+// SetOrgMCPAccess each resolve their own precise scope, not always OrgID).
+type scopeRecorder struct {
+	mu    sync.Mutex
+	calls []admin.MCPAccessRefreshScope
+}
+
+func (r *scopeRecorder) record(v admin.MCPAccessRefreshScope) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, v)
+}
+
+func (r *scopeRecorder) snapshot() []admin.MCPAccessRefreshScope {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]admin.MCPAccessRefreshScope(nil), r.calls...)
+}
+
+func (r *scopeRecorder) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = nil
+}
+
 // setupMCPAccessHooksApp builds a Fiber app wired with AfterMCPAccessRefresh
-// and AfterMCPBlocklistChange recording into the returned *hookRecorder
+// and AfterMCPBlocklistChange recording into the returned recorders
 // (accessCalls, blocklistCalls respectively), and an EncryptionKey so MCP
 // server creation works.
-func setupMCPAccessHooksApp(t *testing.T, dsn string) (app *fiber.App, database *db.DB, keyCache *cache.Cache[string, auth.KeyInfo], accessCalls, blocklistCalls *hookRecorder) {
+func setupMCPAccessHooksApp(t *testing.T, dsn string) (app *fiber.App, database *db.DB, keyCache *cache.Cache[string, auth.KeyInfo], accessCalls *scopeRecorder, blocklistCalls *hookRecorder) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -74,7 +102,7 @@ func setupMCPAccessHooksApp(t *testing.T, dsn string) (app *fiber.App, database 
 	}
 
 	keyCache = cache.New[string, auth.KeyInfo]()
-	accessCalls = &hookRecorder{}
+	accessCalls = &scopeRecorder{}
 	blocklistCalls = &hookRecorder{}
 
 	handler := &admin.Handler{
@@ -88,8 +116,8 @@ func setupMCPAccessHooksApp(t *testing.T, dsn string) (app *fiber.App, database 
 		// AfterMCPAccessRefresh — when MCPAccessCache is nil; every test in
 		// this file needs a real one so the hook under test actually fires.
 		MCPAccessCache: proxy.NewMCPAccessCache(),
-		AfterMCPAccessRefresh: func(orgID string) {
-			accessCalls.record(orgID)
+		AfterMCPAccessRefresh: func(scope admin.MCPAccessRefreshScope) {
+			accessCalls.record(scope)
 		},
 		AfterMCPBlocklistChange: func(serverID string) {
 			blocklistCalls.record(serverID)
@@ -120,14 +148,15 @@ func TestAfterMCPAccessRefresh_SetOrgMCPAccess_CalledWithOrgID(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
 	}
 
-	if got := accessCalls.snapshot(); len(got) != 1 || got[0] != org.ID {
-		t.Errorf("AfterMCPAccessRefresh calls = %v, want exactly one call with org ID %q", got, org.ID)
+	want := admin.MCPAccessRefreshScope{OrgID: org.ID}
+	if got := accessCalls.snapshot(); len(got) != 1 || got[0] != want {
+		t.Errorf("AfterMCPAccessRefresh calls = %+v, want exactly one call with %+v", got, want)
 	}
 }
 
-// ---- AfterMCPAccessRefresh: SetTeamMCPAccess resolves the team's own org ----
+// ---- AfterMCPAccessRefresh: SetTeamMCPAccess scopes to that team only ------
 
-func TestAfterMCPAccessRefresh_SetTeamMCPAccess_CalledWithTeamsOwnOrgID(t *testing.T) {
+func TestAfterMCPAccessRefresh_SetTeamMCPAccess_ScopedToTeamOnly(t *testing.T) {
 	t.Parallel()
 
 	app, database, keyCache, accessCalls, _ := setupMCPAccessHooksApp(t,
@@ -152,17 +181,19 @@ func TestAfterMCPAccessRefresh_SetTeamMCPAccess_CalledWithTeamsOwnOrgID(t *testi
 		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
 	}
 
-	// SetTeamMCPAccess resolves ONE concrete org ID for this call — the
-	// team's own org, per orgID passed to refreshMCPAccessCache in
-	// mcp_access.go — even though the mutation itself targeted a team.
-	if got := accessCalls.snapshot(); len(got) != 1 || got[0] != org.ID {
-		t.Errorf("AfterMCPAccessRefresh calls = %v, want exactly one call with the team's own org ID %q", got, org.ID)
+	// SetTeamMCPAccess resolves a TeamID-only scope — its own blast radius is
+	// known precisely to be that one team's subscribers, not the whole org
+	// (item 3) — even though requireSubsetOfOrgMCPServers also reads the
+	// org's own allowlist as part of validation.
+	want := admin.MCPAccessRefreshScope{TeamID: team.ID}
+	if got := accessCalls.snapshot(); len(got) != 1 || got[0] != want {
+		t.Errorf("AfterMCPAccessRefresh calls = %+v, want exactly one call with %+v", got, want)
 	}
 }
 
-// ---- AfterMCPAccessRefresh: SetKeyMCPAccess resolves the key's own org ------
+// ---- AfterMCPAccessRefresh: SetKeyMCPAccess scopes to that key only --------
 
-func TestAfterMCPAccessRefresh_SetKeyMCPAccess_CalledWithKeysOwnOrgID(t *testing.T) {
+func TestAfterMCPAccessRefresh_SetKeyMCPAccess_ScopedToKeyOnly(t *testing.T) {
 	t.Parallel()
 
 	app, database, keyCache, accessCalls, _ := setupMCPAccessHooksApp(t,
@@ -186,8 +217,9 @@ func TestAfterMCPAccessRefresh_SetKeyMCPAccess_CalledWithKeysOwnOrgID(t *testing
 		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, raw)
 	}
 
-	if got := accessCalls.snapshot(); len(got) != 1 || got[0] != org.ID {
-		t.Errorf("AfterMCPAccessRefresh calls = %v, want exactly one call with the key's own org ID %q", got, org.ID)
+	want := admin.MCPAccessRefreshScope{KeyID: targetKey.ID}
+	if got := accessCalls.snapshot(); len(got) != 1 || got[0] != want {
+		t.Errorf("AfterMCPAccessRefresh calls = %+v, want exactly one call with %+v", got, want)
 	}
 }
 

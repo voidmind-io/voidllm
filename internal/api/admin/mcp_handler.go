@@ -3,6 +3,7 @@ package admin
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -73,18 +74,19 @@ func (h *Handler) handleMCPRequest(c fiber.Ctx, server *mcp.Server) error {
 	ctx := c.Context()
 	if ki != nil {
 		ctx = mcp.WithKeyIdentity(ctx, mcp.KeyIdentity{
-			OrgID:  ki.OrgID,
-			TeamID: ki.TeamID,
-			KeyID:  ki.ID,
-			UserID: ki.UserID,
-			Role:   ki.Role,
+			OrgID:   ki.OrgID,
+			TeamID:  ki.TeamID,
+			KeyID:   ki.ID,
+			UserID:  ki.UserID,
+			Role:    ki.Role,
+			KeyHash: ki.Hash,
 		})
 	}
 
 	result := server.Handle(ctx, body, fiberHeader{c})
 
 	if result.Listen != nil {
-		return h.handleMCPListenStream(c, result.Listen)
+		return h.handleMCPListenStream(c, server, result.Listen)
 	}
 
 	switch result.Hint {
@@ -130,19 +132,89 @@ func (h *Handler) handleMCPRequest(c fiber.Ctx, server *mcp.Server) error {
 // open subscriptions/listen stream — the same 30s cadence handleMCPSSE
 // already uses for its own legacy keep-alive pings (MCP Streamable HTTP
 // spec: SSE comment lines are allowed and recommended on a long-lived
-// stream).
-const mcpListenKeepAliveInterval = 30 * time.Second
+// stream). A package-level var, not a const, purely so a test can shrink it
+// to observe a keep-alive comment without waiting out the real 30s —
+// production code never mutates it after startup, and no test overriding it
+// runs concurrently with another (the same discipline
+// internal/mcp/listen_manager.go's listenMinBackoff and siblings already
+// document).
+var mcpListenKeepAliveInterval = 30 * time.Second
+
+// mcpListenRevalidateInterval is how often handleMCPListenStream re-validates
+// its own Subscriber's captured identity against the live auth key cache
+// (mcp.Server.SubscriberValid, backed by the KeyValidator internal/app wires
+// via mcp.Server.SetKeyValidator) — ending the stream gracefully the first
+// time that identity no longer validates: the key was revoked or has
+// expired, or its org/team/role has since changed. A package-level var for
+// the same test-overridability reason as mcpListenKeepAliveInterval above.
+var mcpListenRevalidateInterval = 10 * time.Second
+
+// mcpListenWriteDeadline bounds every individual write+flush this stream
+// performs (the ack, each delivered notification, each keep-alive comment,
+// and the final graceful-end response): immediately before each one, the
+// underlying TCP connection's write deadline is pushed forward by this
+// duration (net.Conn.SetWriteDeadline). A client that stops reading — as
+// opposed to one that closes the connection outright, which an ordinary
+// write already fails on promptly — would otherwise let a write block
+// indefinitely once the kernel's own send buffer fills, pinning this
+// goroutine, its timers, and its subscriberRegistry slot forever. A
+// deadline-exceeded write is treated exactly like any other write error:
+// the stream ends and every resource it holds is released (see the deferred
+// Unregister/timer-Stop calls below). A package-level var for the same
+// test-overridability reason as mcpListenKeepAliveInterval above.
+var mcpListenWriteDeadline = 10 * time.Second
+
+// listenConn resolves the net.Conn a subscriptions/listen stream will
+// actually write to, captured once, before SendStreamWriter is called — the
+// same connection fasthttp's own SetBodyStreamWriter machinery writes the
+// response to on this same request-serving goroutine, so it remains valid
+// for the whole lifetime of the stream this call opens. c.RequestCtx()
+// (distinct from c.Context(), which returns a plain context.Context, not a
+// connection handle) exposes the underlying *fasthttp.RequestCtx, whose own
+// Conn method returns the raw connection.
+//
+// A nil return means no connection could be resolved (c.RequestCtx() itself
+// is nil, which does not happen against a real or pipe-simulated fasthttp
+// server — every production and test caller of this handler goes through
+// one) — the caller skips SetWriteDeadline entirely in that case rather than
+// panicking, trading the slow-client protection this mechanism exists for,
+// for availability of the stream itself.
+func listenConn(c fiber.Ctx) net.Conn {
+	rc := c.RequestCtx()
+	if rc == nil {
+		return nil
+	}
+	return rc.Conn()
+}
+
+// setListenWriteDeadline pushes conn's write deadline deadline into the
+// future, if conn is non-nil — see listenConn's own doc for the one case it
+// can be nil. Called immediately before every write+flush pair in
+// handleMCPListenStream's own loop, always with the SAME deadline value
+// captured once at the top of that call — see that function's own doc for
+// why the package-level mcpListenWriteDeadline var is never read directly
+// mid-stream.
+func setListenWriteDeadline(conn net.Conn, deadline time.Duration) {
+	if conn == nil {
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(deadline)) //nolint:errcheck // a failing SetWriteDeadline call surfaces as the next write's own error instead
+}
 
 // handleMCPListenStream drives the SSE stream for a successful
 // subscriptions/listen dispatch (mcp.HandleResult.Listen != nil): writes the
 // pre-encoded acknowledgement as the stream's first event, then loops
 // delivering listen.Sub.Events() notifications, sending periodic keep-alive
-// comments, and ending the stream — with a graceful "resultType":"complete"
-// response — when either h.MCPListenMaxDuration elapses or listen.Sub.Done()
-// is signaled (mcp.Server.CloseSubscriptions, called during process
-// shutdown — see internal/app.Application.WaitForShutdown). Any write or
-// flush error (the client disconnected) simply returns without writing a
-// complete response, exactly like handleMCPSSE's own keep-alive loop.
+// comments, periodically re-validating the subscriber's own captured
+// identity (mcpListenRevalidateInterval), and ending the stream — with a
+// graceful "resultType":"complete" response — when h.MCPListenMaxDuration
+// elapses, listen.Sub.Done() is signaled (mcp.Server.CloseSubscriptions,
+// called during process shutdown — see internal/app.Application.
+// WaitForShutdown), or SubscriberValid reports the identity no longer valid.
+// Any write or flush error (the client disconnected, stopped reading long
+// enough to exceed mcpListenWriteDeadline, or any other connection failure)
+// simply returns without writing a complete response, exactly like
+// handleMCPSSE's own keep-alive loop.
 //
 // h.MCPListenMaxDuration <= 0 means this deployment cannot serve a
 // subscriptions/listen stream at all (see that field's own doc) — the
@@ -153,7 +225,16 @@ const mcpListenKeepAliveInterval = 30 * time.Second
 // listen.Sub.Unregister is called exactly once, via defer, on every path
 // that opens the stream — see Subscriber's own doc for why this must never
 // be skipped.
-func (h *Handler) handleMCPListenStream(c fiber.Ctx, listen *mcp.ListenRequest) error {
+//
+// mcpListenWriteDeadline, like mcpListenKeepAliveInterval and
+// mcpListenRevalidateInterval, is read from the package-level var exactly
+// once here, at the top of the call, into a local — never read directly
+// mid-stream by setListenWriteDeadline or writeMCPListenComplete. This keeps
+// one stream's write deadline fixed for its whole lifetime and avoids a data
+// race against a test (export_test.go's overrideListenWriteDeadline) that
+// restores the package var while a still-open stream from an earlier
+// subtest is concurrently calling SetWriteDeadline.
+func (h *Handler) handleMCPListenStream(c fiber.Ctx, server *mcp.Server, listen *mcp.ListenRequest) error {
 	maxDuration := h.MCPListenMaxDuration
 	if maxDuration <= 0 {
 		listen.Sub.Unregister()
@@ -166,9 +247,16 @@ func (h *Handler) handleMCPListenStream(c fiber.Ctx, listen *mcp.ListenRequest) 
 	c.Set("Cache-Control", "no-cache")
 	c.Set("X-Accel-Buffering", "no")
 
+	conn := listenConn(c)
+
+	keepAliveInterval := mcpListenKeepAliveInterval
+	revalidateInterval := mcpListenRevalidateInterval
+	writeDeadline := mcpListenWriteDeadline
+
 	return c.SendStreamWriter(func(w *bufio.Writer) {
 		defer listen.Sub.Unregister()
 
+		setListenWriteDeadline(conn, writeDeadline)
 		if _, err := w.WriteString(formatSSEMessage(listen.Ack)); err != nil {
 			return
 		}
@@ -179,12 +267,16 @@ func (h *Handler) handleMCPListenStream(c fiber.Ctx, listen *mcp.ListenRequest) 
 		maxTimer := time.NewTimer(maxDuration)
 		defer maxTimer.Stop()
 
-		ticker := time.NewTicker(mcpListenKeepAliveInterval)
+		ticker := time.NewTicker(keepAliveInterval)
 		defer ticker.Stop()
+
+		revalidate := time.NewTicker(revalidateInterval)
+		defer revalidate.Stop()
 
 		for {
 			select {
 			case body := <-listen.Sub.Events():
+				setListenWriteDeadline(conn, writeDeadline)
 				if _, err := w.WriteString(formatSSEMessage(body)); err != nil {
 					return
 				}
@@ -192,17 +284,23 @@ func (h *Handler) handleMCPListenStream(c fiber.Ctx, listen *mcp.ListenRequest) 
 					return
 				}
 			case <-ticker.C:
+				setListenWriteDeadline(conn, writeDeadline)
 				if _, err := w.WriteString(": ping\n\n"); err != nil {
 					return
 				}
 				if err := w.Flush(); err != nil {
 					return
 				}
+			case <-revalidate.C:
+				if !server.SubscriberValid(listen.Sub) {
+					h.writeMCPListenComplete(conn, w, listen.Sub, writeDeadline)
+					return
+				}
 			case <-maxTimer.C:
-				h.writeMCPListenComplete(w, listen.Sub)
+				h.writeMCPListenComplete(conn, w, listen.Sub, writeDeadline)
 				return
 			case <-listen.Sub.Done():
-				h.writeMCPListenComplete(w, listen.Sub)
+				h.writeMCPListenComplete(conn, w, listen.Sub, writeDeadline)
 				return
 			}
 		}
@@ -211,11 +309,14 @@ func (h *Handler) handleMCPListenStream(c fiber.Ctx, listen *mcp.ListenRequest) 
 
 // writeMCPListenComplete writes and flushes the graceful-end SSE event for a
 // server-initiated subscriptions/listen stream end (the max-duration timer,
-// or process shutdown — see handleMCPListenStream's own doc). Both the write
-// and the flush are best-effort: by this point the stream is ending
-// regardless of whether the client is still there to receive it, so neither
-// error is actionable beyond what has already been decided.
-func (h *Handler) writeMCPListenComplete(w *bufio.Writer, sub *mcp.Subscriber) {
+// process shutdown, or a failed revalidation — see handleMCPListenStream's
+// own doc). Both the write and the flush are best-effort: by this point the
+// stream is ending regardless of whether the client is still there to
+// receive it, so neither error is actionable beyond what has already been
+// decided. deadline is the SAME value handleMCPListenStream captured once at
+// the top of its own call — see that function's own doc.
+func (h *Handler) writeMCPListenComplete(conn net.Conn, w *bufio.Writer, sub *mcp.Subscriber, deadline time.Duration) {
+	setListenWriteDeadline(conn, deadline)
 	if _, err := w.WriteString(formatSSEMessage(sub.CompleteMessage())); err != nil {
 		return
 	}

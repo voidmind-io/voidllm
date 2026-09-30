@@ -315,11 +315,18 @@ func (tc *ToolCache) fireOnChange(serverID string) {
 
 // toolsListingChanged reports whether newEntry's tool listing differs from
 // oldEntry's — by tool name set and, for each name present in both, its
-// InputSchema bytes — the comparison fetchAndPublish uses to decide whether
-// a republished listing is "materially different" enough to fire the
-// onChange hook (see SetOnChange's own doc): an identical refetch (the
-// common case — most upstreams' tools rarely change) must not trigger a
-// subscriptions/listen notification for every ordinary TTL-driven refresh.
+// InputSchema bytes AND its Description — the comparison fetchAndPublish
+// uses to decide whether a republished listing is "materially different"
+// enough to fire the onChange hook (see SetOnChange's own doc): an identical
+// refetch (the common case — most upstreams' tools rarely change) must not
+// trigger a subscriptions/listen notification for every ordinary TTL-driven
+// refresh. Description participates because it — truncated, via
+// truncateDescription — is rendered directly into the Code Mode TypeScript
+// declarations GenerateToolTypeDefs produces (codemode_types.go); an
+// upstream that changes only a tool's description, with an identical
+// InputSchema, still changes what a Code Mode caller sees on its next
+// tools/list, and must not be silently missed by a subscriber relying on
+// this notification instead of polling.
 //
 // oldEntry == nil — this server's very first published entry, with no
 // predecessor to compare against — is always reported as changed: there is
@@ -331,13 +338,17 @@ func toolsListingChanged(oldEntry, newEntry *cacheEntry) bool {
 	if len(oldEntry.tools) != len(newEntry.tools) {
 		return true
 	}
-	oldByName := make(map[string][]byte, len(oldEntry.tools))
+	type toolFields struct {
+		schema      []byte
+		description string
+	}
+	oldByName := make(map[string]toolFields, len(oldEntry.tools))
 	for _, t := range oldEntry.tools {
-		oldByName[t.Name] = t.InputSchema
+		oldByName[t.Name] = toolFields{schema: t.InputSchema, description: t.Description}
 	}
 	for _, t := range newEntry.tools {
-		oldSchema, ok := oldByName[t.Name]
-		if !ok || !bytes.Equal(oldSchema, t.InputSchema) {
+		old, ok := oldByName[t.Name]
+		if !ok || !bytes.Equal(old.schema, t.InputSchema) || old.description != t.Description {
 			return true
 		}
 	}
@@ -1313,6 +1324,15 @@ func (tc *ToolCache) RefreshAll(ctx context.Context) error {
 // deep copies GetTools and GetAllTools hand back on read) — the caller
 // retains full ownership of tools and may keep using or mutating it after
 // this call without affecting the cached entry.
+//
+// Like fetchAndPublish, this fires the installed SetOnChange hook (see that
+// method's own doc) when the new listing differs from whatever was
+// immediately cached before it, using the identical toolsListingChanged
+// comparison — a caller that re-populates an already-published server's
+// tools this way (e.g. a licence change that adds or removes a built-in
+// tool at runtime) reaches Code Mode subscribers exactly like an ordinary
+// upstream refetch would, rather than only ever firing on the very first
+// call.
 func (tc *ToolCache) SetTools(serverID string, tools []Tool) {
 	// The built-in server has no CacheableResult hint to read here — it isn't
 	// fetched over HTTP at all — so this resolves to the same fallback
@@ -1320,13 +1340,20 @@ func (tc *ToolCache) SetTools(serverID string, tools []Tool) {
 	// neverExpires = tc.maxAge == 0. That is what keeps this method's own
 	// "fresh until maxAge elapses" doc true after ttl became per-entry.
 	ttl, neverExpires := tc.resolveTTL(CacheHint{})
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	tc.entries[serverID] = &cacheEntry{
+	newEntry := &cacheEntry{
 		tools:        copyTools(tools),
 		fetchedAt:    time.Now(),
 		ttl:          ttl,
 		neverExpires: neverExpires,
+	}
+
+	tc.mu.Lock()
+	oldEntry := tc.entries[serverID]
+	tc.entries[serverID] = newEntry
+	tc.mu.Unlock()
+
+	if toolsListingChanged(oldEntry, newEntry) {
+		tc.fireOnChange(serverID)
 	}
 }
 
