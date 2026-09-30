@@ -28,6 +28,15 @@ type KeyInfo struct {
 	UserID string
 	// ServiceAccountID is the service account this key belongs to. Empty if not a SA key.
 	ServiceAccountID string
+	// ServiceAccountTeamID is the team the owning service account is bound
+	// to, sourced from db.KeyRecord.ServiceAccountTeamID. It is populated
+	// only for sa_key records whose service account is team-bound; it is
+	// empty for org-scoped service accounts and for every other key type.
+	// Unlike TeamID, this field is never derived from the key row itself —
+	// api_keys.team_id is never populated on sa_key rows — so callers that
+	// need to know which team a team-bound service-account key acts for must
+	// read this field instead of TeamID. See KeyInfoFromRecord.
+	ServiceAccountTeamID string
 	// Name is the human-readable label for the key.
 	Name string
 	// DailyTokenLimit is the maximum number of tokens allowed per day. Zero means unlimited.

@@ -23,10 +23,11 @@ const defaultResultTTLMs int64 = 60000
 type ToolHandler func(ctx context.Context, args jsonx.RawMessage) (*ToolResult, error)
 
 // OnToolsListHook is an optional callback invoked inside tools/list before the
-// tool list is returned to the caller. It receives a copy of the registered
-// tools and may return a modified slice. The hook must not retain references to
-// the slice after it returns.
-type OnToolsListHook func(tools []Tool) []Tool
+// tool list is returned to the caller. It receives the request context (which
+// carries the caller's KeyIdentity, see WithKeyIdentity) and a copy of the
+// registered tools, and may return a modified slice. The hook must not retain
+// references to the slice after it returns.
+type OnToolsListHook func(ctx context.Context, tools []Tool) []Tool
 
 // Server is an MCP server that handles JSON-RPC 2.0 requests across both the
 // legacy (initialize-handshake) and modern (per-request metadata) protocol
@@ -440,7 +441,7 @@ func (s *Server) dispatch(ctx context.Context, dialect ServerDialect, env *Envel
 			}
 			return nil, e
 		}
-		return s.handleToolsList(), nil
+		return s.handleToolsList(ctx), nil
 	case "tools/call":
 		payload, err := s.handleToolsCall(ctx, env, hdr, dialect.Version().Era())
 		if err != nil {
@@ -566,11 +567,12 @@ func (s *Server) handleDiscover() *Result {
 // handleToolsList returns the list of registered tools, sorted
 // deterministically by name (SHOULD, per the 2026-07-28 minor changes —
 // deterministic ordering improves LLM prompt-cache hits). If an
-// OnToolsListHook has been set via SetOnToolsList, the hook is invoked with a
-// copy of the tool list and its return value is used as the response
+// OnToolsListHook has been set via SetOnToolsList, the hook is invoked with
+// ctx (which carries the caller's KeyIdentity, see WithKeyIdentity) and a
+// copy of the tool list, and its return value is used as the response
 // payload.
 //
-// Because the hook filters by caller role, the result is scoped
+// Because the hook filters by caller identity, the result is scoped
 // CacheScopePrivate under CacheableResult: even though the tool schemas
 // themselves are caller-agnostic, which subset of them a given caller may
 // see is not, and a public cache would leak an admin-only tool's existence
@@ -586,7 +588,7 @@ func (s *Server) handleDiscover() *Result {
 // silently get the same single, complete, unpaginated list back, which
 // could read as "the cursor advanced past the end" rather than "the cursor
 // was never valid to begin with".
-func (s *Server) handleToolsList() *Result {
+func (s *Server) handleToolsList(ctx context.Context) *Result {
 	s.mu.RLock()
 	tools := make([]Tool, len(s.tools))
 	for i, t := range s.tools {
@@ -597,7 +599,7 @@ func (s *Server) handleToolsList() *Result {
 	s.mu.RUnlock()
 
 	if hook != nil {
-		tools = hook(tools)
+		tools = hook(ctx, tools)
 	}
 	sort.Slice(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
 

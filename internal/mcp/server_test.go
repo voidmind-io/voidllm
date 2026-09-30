@@ -1130,7 +1130,7 @@ func TestServer_OnToolsListHook_MutatingHookDoesNotCorruptServerState(t *testing
 	})
 
 	var hookRan bool
-	s.SetOnToolsList(func(tools []mcp.Tool) []mcp.Tool {
+	s.SetOnToolsList(func(_ context.Context, tools []mcp.Tool) []mcp.Tool {
 		hookRan = true
 		for i := range tools {
 			// Mutate letters only, leaving JSON punctuation (quotes, braces,

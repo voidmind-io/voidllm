@@ -450,6 +450,25 @@ func checkMCPServerReadPermission(c fiber.Ctx, server *db.MCPServer, ki *auth.Ke
 	if *server.OrgID != ki.OrgID {
 		return apierror.Forbidden(c, "access denied")
 	}
+	if server.TeamID != nil {
+		// Team-scoped: readable by org_admin (or higher) of the server's org,
+		// or by a caller whose key is scoped to the same team. This mirrors
+		// the team check in checkMCPServerScopePermission.
+		//
+		// effectiveTeamID falls back to the caller's service-account team
+		// when the key itself is not team-scoped: a team-bound
+		// service-account key never has KeyInfo.TeamID set (api_keys.team_id
+		// is never populated on sa_key rows — see auth.KeyInfoFromRecord),
+		// so without this fallback such a key could never read its own
+		// team's server.
+		effectiveTeamID := ki.TeamID
+		if effectiveTeamID == "" {
+			effectiveTeamID = ki.ServiceAccountTeamID
+		}
+		if ki.Role != auth.RoleOrgAdmin && effectiveTeamID != *server.TeamID {
+			return apierror.Forbidden(c, "access denied: server belongs to a different team")
+		}
+	}
 	return nil
 }
 
@@ -1647,5 +1666,38 @@ func (h *Handler) ListMCPServerHealth(c fiber.Ctx) error {
 	if results == nil {
 		results = []health.MCPServerHealth{}
 	}
-	return c.JSON(results)
+
+	ki := auth.KeyInfoFromCtx(c)
+	if ki == nil {
+		return apierror.Unauthorized(c, "authentication required")
+	}
+	if ki.Role == auth.RoleSystemAdmin {
+		return c.JSON(results)
+	}
+
+	// Mirror the visibility rule ListOrgMCPServers applies via
+	// db.ListMCPServersByOrg: org-scoped and global servers visible to the
+	// caller's organization. Team-scoped servers are excluded, matching that
+	// query's "AND team_id IS NULL" clause. On lookup failure, fail closed by
+	// returning no entries rather than the unfiltered set.
+	ctx := c.Context()
+	visibleServers, err := h.DB.ListMCPServersByOrg(ctx, ki.OrgID)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "list mcp server health: list visible servers",
+			slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to list MCP server health")
+	}
+
+	visibleIDs := make(map[string]struct{}, len(visibleServers))
+	for _, s := range visibleServers {
+		visibleIDs[s.ID] = struct{}{}
+	}
+
+	filtered := make([]health.MCPServerHealth, 0, len(results))
+	for _, r := range results {
+		if _, ok := visibleIDs[r.ServerID]; ok {
+			filtered = append(filtered, r)
+		}
+	}
+	return c.JSON(filtered)
 }

@@ -305,6 +305,39 @@ func TestKeyInfoFromRecord_NilIDsMapToEmptyString(t *testing.T) {
 	if ki.ServiceAccountID != "" {
 		t.Errorf("ServiceAccountID = %q, want empty", ki.ServiceAccountID)
 	}
+	if ki.ServiceAccountTeamID != "" {
+		t.Errorf("ServiceAccountTeamID = %q, want empty", ki.ServiceAccountTeamID)
+	}
+}
+
+// TestKeyInfoFromRecord_ServiceAccountTeamIDMapping verifies that
+// KeyInfo.ServiceAccountTeamID is copied from KeyRecord.ServiceAccountTeamID
+// for a team-bound sa_key, independently of KeyInfo.TeamID — which stays
+// empty, since api_keys.team_id is never populated on sa_key rows. Callers
+// that need to authorize a team-bound service-account key against its own
+// team (e.g. checkMCPServerReadPermission) must read ServiceAccountTeamID,
+// not TeamID.
+func TestKeyInfoFromRecord_ServiceAccountTeamIDMapping(t *testing.T) {
+	t.Parallel()
+
+	teamID := "team-sa-42"
+	record := db.KeyRecord{
+		KeyType:              keygen.KeyTypeSA,
+		OrgID:                "org-sa-42",
+		ServiceAccountActive: true,
+		ServiceAccountTeamID: &teamID,
+	}
+
+	ki, ok := KeyInfoFromRecord(record)
+	if !ok {
+		t.Fatal("KeyInfoFromRecord() ok = false, want true")
+	}
+	if ki.ServiceAccountTeamID != teamID {
+		t.Errorf("ServiceAccountTeamID = %q, want %q", ki.ServiceAccountTeamID, teamID)
+	}
+	if ki.TeamID != "" {
+		t.Errorf("TeamID = %q, want empty (sa_key never sets TeamID from the service account)", ki.TeamID)
+	}
 }
 
 // ptrEmptyString returns a pointer to an empty string, for exercising the
