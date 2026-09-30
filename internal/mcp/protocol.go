@@ -75,6 +75,29 @@ const (
 	// disagreement between header and body (CodeHeaderMismatch, -32020) since
 	// the body is never inspected for this check either.
 	CodeParamHeaderValueTooLong = -32002
+
+	// CodeTooManyListenStreams indicates a subscriptions/listen request was
+	// refused because it would exceed maxListenStreamsPerKey (per API key) or
+	// maxListenStreamsPerServer (per Server instance) — see
+	// subscriberRegistry.register's own doc (subscriptions.go). The check
+	// runs, and this code is returned, BEFORE any stream is opened. Its
+	// accompanying Error.Hint is always HintTooManyRequests, so an
+	// HTTP-aware caller answers 429 rather than the ordinary HintOK (200)
+	// JSON-RPC-error convention.
+	//
+	// Allocated from the -32000..-32019 implementation-defined range for the
+	// same reason as CodeTooManyParamHeaders: the specification itself
+	// assigns no code to a local concurrency ceiling.
+	CodeTooManyListenStreams = -32003
+
+	// CodeSubscriptionsClosed indicates a subscriptions/listen request was
+	// refused because Server.CloseSubscriptions has already been called — the
+	// process is shutting down and no longer accepts new subscription
+	// registrations. See subscriberRegistry.close's own doc (subscriptions.go).
+	//
+	// Allocated from the -32000..-32019 implementation-defined range, for the
+	// same reason as CodeTooManyListenStreams above.
+	CodeSubscriptionsClosed = -32004
 )
 
 // Request is a JSON-RPC 2.0 request.

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -222,6 +223,17 @@ type ToolCache struct {
 	// data race under -race the moment a test overrides it concurrently
 	// with a fetch already in flight.
 	fetchTimeout atomic.Int64
+	// onChange, when installed via SetOnChange, is called whenever a
+	// server's cached tool listing changes structurally — see SetOnChange's
+	// own doc for exactly which mutations qualify and the guarantees around
+	// when and how it is called. atomic.Pointer, not a plain field guarded
+	// by tc.mu: every call site fires it AFTER already releasing tc.mu (see
+	// Invalidate, InvalidateWithStore, and fetchAndPublish), so reading it
+	// under the same lock it is written under is neither necessary nor
+	// desirable — SetOnChange must be safe to call concurrently with every
+	// other ToolCache method, including while a fetch is calling the
+	// previously-installed hook.
+	onChange atomic.Pointer[func(serverID string)]
 }
 
 // NewToolCache creates a ToolCache that uses fetcher to retrieve tool schemas
@@ -255,6 +267,81 @@ func NewPersistentToolCache(fetcher ToolFetcher, maxAge time.Duration, store Too
 	}
 	tc.fetchTimeout.Store(int64(toolsListFetchTimeout))
 	return tc
+}
+
+// SetOnChange installs fn to be called whenever a server's cached tool
+// listing changes structurally:
+//
+//   - Invalidate or InvalidateWithStore discards it outright (an admin
+//     mutation, or ListenManager reacting to an upstream's own
+//     notifications/tools/list_changed — see NewListenManager's onToolsChanged
+//     parameter, which app.go wires straight to Invalidate).
+//   - fetchAndPublish republishes a listing for serverID whose tool names or
+//     InputSchema bytes differ from the immediately-preceding entry — see
+//     toolsListingChanged. An ordinary TTL-driven refetch that returns an
+//     unchanged listing does NOT fire fn: most upstreams' tools rarely
+//     change, and firing on every routine refresh would turn this into
+//     noise no different from polling.
+//
+// fn is called synchronously, on whichever goroutine triggered the change —
+// an admin mutation's own request goroutine for Invalidate/
+// InvalidateWithStore, or whichever goroutine's GetTools/RefreshServer call
+// happened to be singleflight's leader for a republish — and always AFTER
+// this cache has released every lock of its own (tc.mu and, where
+// applicable, tc.storeMu): fn must not block for long, but it is free to
+// call back into this same ToolCache without deadlocking. A nil fn (the
+// default) disables the callback entirely. Safe to call concurrently with
+// every other ToolCache method.
+//
+// The only production caller wires this to a Code Mode *mcp.Server's own
+// NotifyToolsListChanged, scoped to the changed serverID (internal/app
+// wiring, code_mode.go) — the trigger side of this package's
+// subscriptions/listen support (subscriptions.go).
+func (tc *ToolCache) SetOnChange(fn func(serverID string)) {
+	if fn == nil {
+		tc.onChange.Store(nil)
+		return
+	}
+	tc.onChange.Store(&fn)
+}
+
+// fireOnChange invokes the installed onChange hook for serverID, if any.
+// Callers must never hold tc.mu or tc.storeMu when calling this.
+func (tc *ToolCache) fireOnChange(serverID string) {
+	if hook := tc.onChange.Load(); hook != nil {
+		(*hook)(serverID)
+	}
+}
+
+// toolsListingChanged reports whether newEntry's tool listing differs from
+// oldEntry's — by tool name set and, for each name present in both, its
+// InputSchema bytes — the comparison fetchAndPublish uses to decide whether
+// a republished listing is "materially different" enough to fire the
+// onChange hook (see SetOnChange's own doc): an identical refetch (the
+// common case — most upstreams' tools rarely change) must not trigger a
+// subscriptions/listen notification for every ordinary TTL-driven refresh.
+//
+// oldEntry == nil — this server's very first published entry, with no
+// predecessor to compare against — is always reported as changed: there is
+// no meaningful "unchanged" for a listing that did not previously exist.
+func toolsListingChanged(oldEntry, newEntry *cacheEntry) bool {
+	if oldEntry == nil {
+		return true
+	}
+	if len(oldEntry.tools) != len(newEntry.tools) {
+		return true
+	}
+	oldByName := make(map[string][]byte, len(oldEntry.tools))
+	for _, t := range oldEntry.tools {
+		oldByName[t.Name] = t.InputSchema
+	}
+	for _, t := range newEntry.tools {
+		oldSchema, ok := oldByName[t.Name]
+		if !ok || !bytes.Equal(oldSchema, t.InputSchema) {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadFromStore populates the in-memory cache from the backing store.
@@ -581,8 +668,16 @@ func (tc *ToolCache) fetchAndPublish(ctx context.Context, serverID string) (*cac
 			slog.String("server_id", serverID))
 		return nil, nil
 	}
+	oldEntry := tc.entries[serverID]
 	tc.entries[serverID] = entry
 	tc.mu.Unlock()
+
+	if toolsListingChanged(oldEntry, entry) {
+		// Fired outside tc.mu (already released above) and before the store
+		// write below — see SetOnChange's own doc for why this must never run
+		// under any lock this cache holds.
+		tc.fireOnChange(serverID)
+	}
 
 	if tc.store != nil {
 		// See tc.storeMu's own doc for why the store write happens under a
@@ -1247,6 +1342,7 @@ func (tc *ToolCache) Invalidate(serverID string) {
 	delete(tc.entries, serverID)
 	tc.generations[serverID]++
 	tc.mu.Unlock()
+	tc.fireOnChange(serverID)
 }
 
 // InvalidateWithStore removes a server from the cache and deletes its
@@ -1276,6 +1372,7 @@ func (tc *ToolCache) InvalidateWithStore(ctx context.Context, serverID string) {
 		_ = tc.store.Delete(ctx, serverID) //nolint:errcheck
 		tc.storeMu.Unlock()
 	}
+	tc.fireOnChange(serverID)
 }
 
 // FreshFor returns how long the cache entry for serverID has been fresh,

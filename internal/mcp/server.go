@@ -39,6 +39,20 @@ type Server struct {
 	handlers    map[string]registeredTool
 	onToolsList OnToolsListHook
 	resultTTLMs int64
+	// toolsListChangedSource reports whether this Server actually has a
+	// source of tools/list_changed events to deliver — see
+	// SetToolsListChangedSource's own doc. Guarded by mu.
+	toolsListChangedSource bool
+	// accessChecker scopes NotifyToolsListChanged deliveries to subscribers
+	// whose own identity may see the changed server — see SetAccessChecker's
+	// and AccessChecker's own docs. Guarded by mu; nil by default (fails
+	// closed for any server-scoped NotifyScope).
+	accessChecker AccessChecker
+	// subscribers holds every currently open subscriptions/listen stream for
+	// this Server instance — see subscriberRegistry's own doc
+	// (subscriptions.go). Never nil once constructed by NewServer; has its
+	// own internal mutex, independent of mu above.
+	subscribers *subscriberRegistry
 }
 
 // NewServer creates a new MCP server with the given name and version.
@@ -48,6 +62,7 @@ func NewServer(name, version string) *Server {
 		version:     version,
 		handlers:    make(map[string]registeredTool),
 		resultTTLMs: defaultResultTTLMs,
+		subscribers: newSubscriberRegistry(),
 	}
 }
 
@@ -146,6 +161,18 @@ const (
 	// the ONLY case in which Body is nil; an internal encoding failure never
 	// produces this hint (or a nil Body) — see the fallback in Handle.
 	HintNotification
+	// HintTooManyRequests indicates CodeTooManyListenStreams: a
+	// subscriptions/listen request was refused before opening a stream
+	// because it would exceed maxListenStreamsPerKey or
+	// maxListenStreamsPerServer (subscriptions.go). HTTP callers should
+	// respond 429 Too Many Requests.
+	HintTooManyRequests
+	// HintServiceUnavailable indicates CodeSubscriptionsClosed: a
+	// subscriptions/listen request was refused because Server.CloseSubscriptions
+	// has already been called — the process is shutting down and no longer
+	// accepts new subscription registrations (subscriptions.go). HTTP callers
+	// should respond 503 Service Unavailable.
+	HintServiceUnavailable
 	// HintBadRequest indicates CodeUnsupportedProtocolVersion,
 	// CodeHeaderMismatch, or CodeMissingRequiredClientCapability. HTTP
 	// callers should respond 400 Bad Request (MCP Streamable HTTP §4.5,
@@ -177,6 +204,14 @@ type HandleResult struct {
 	// only consulted by callers — when Hint is HintMethodNotFound, to decide
 	// between 404 (modern) and 200 (legacy). Zero value is EraLegacy.
 	Era Era
+	// Listen is non-nil only for a successful subscriptions/listen dispatch
+	// (MCP 2026-07-28 §3.4). When set, Body is always nil and Hint is
+	// meaningless — an HTTP-aware caller must not encode a JSON response at
+	// all, but instead open a Server-Sent Events stream: write Listen.Ack as
+	// the first event, then deliver Listen.Sub.Events() until the stream
+	// ends, unregistering Listen.Sub on every exit path. See ListenRequest's
+	// own doc (subscriptions.go).
+	Listen *ListenRequest
 }
 
 // Handle processes a raw JSON-RPC 2.0 request or notification and returns
@@ -234,6 +269,14 @@ func (s *Server) Handle(ctx context.Context, raw []byte, hdr Header) HandleResul
 			out = encodeFallback(env.ID)
 		}
 		return HandleResult{Body: out, Hint: statusHintFor(dispatchErr, era), Era: era}
+	}
+
+	if result.Listen != nil {
+		// See HandleResult.Listen's own doc: a subscriptions/listen dispatch
+		// carries no ordinary JSON-RPC response to encode — the caller opens
+		// an SSE stream instead. Body and Hint are left at their zero values;
+		// only Listen and Era are meaningful here.
+		return HandleResult{Listen: result.Listen, Era: era}
 	}
 
 	out, err := dialect.EncodeResult(env.ID, result)
@@ -407,7 +450,7 @@ func (s *Server) dispatch(ctx context.Context, dialect ServerDialect, env *Envel
 	}
 
 	if dialect.Version().Era() == EraModern {
-		return s.dispatchModern(env)
+		return s.dispatchModern(ctx, env)
 	}
 	return s.dispatchLegacy(env)
 }
@@ -447,21 +490,12 @@ func (s *Server) dispatchLegacy(env *Envelope) (*Result, *Error) {
 
 // dispatchModern routes the modern-era methods: server/discover and
 // subscriptions/listen.
-func (s *Server) dispatchModern(env *Envelope) (*Result, *Error) {
+func (s *Server) dispatchModern(ctx context.Context, env *Envelope) (*Result, *Error) {
 	switch env.Method {
 	case "server/discover":
 		return s.handleDiscover(), nil
 	case "subscriptions/listen":
-		// Phase 1 does not hold response streams open: Handle returns a
-		// single, immediately-final []byte per call, and a spec-faithful
-		// subscriptions/listen requires delivering
-		// notifications/subscriptions/acknowledged as the first message on a
-		// stream that then stays open for further notifications. Reporting
-		// MethodNotFound here is an honest "not yet supported" rather than
-		// acknowledging a subscription this server can never deliver
-		// notifications on or gracefully close — see the Phase 1 report.
-		// Real support is Phase 4 (streaming passthrough) work.
-		return nil, &Error{Code: CodeMethodNotFound, Message: "method not found: subscriptions/listen (streaming not yet supported)"}
+		return s.handleSubscriptionsListen(ctx, env)
 	default:
 		// See dispatchLegacy's identical default case for why
 		// truncateForError plus %q, not env.Method plus %s, is used here.
@@ -498,7 +532,7 @@ func (s *Server) handleInitialize(env *Envelope) any {
 // caller identity.
 func (s *Server) handleDiscover() *Result {
 	s.mu.RLock()
-	name, ttl := s.name, s.resultTTLMs
+	name, ttl, toolsSource := s.name, s.resultTTLMs, s.toolsListChangedSource
 	s.mu.RUnlock()
 
 	supported := SupportedVersions()
@@ -507,10 +541,18 @@ func (s *Server) handleDiscover() *Result {
 		versions[i] = string(v)
 	}
 
+	// tools.listChanged MUST only be advertised when this Server actually
+	// emits notifications/tools/list_changed — see SetToolsListChangedSource's
+	// own doc for why the two can never drift apart.
+	toolsCap := map[string]any{}
+	if toolsSource {
+		toolsCap["listChanged"] = true
+	}
+
 	payload := map[string]any{
 		"supportedVersions": versions,
 		"capabilities": map[string]any{
-			"tools":      map[string]any{},
+			"tools":      toolsCap,
 			"extensions": map[string]any{},
 		},
 		"instructions": fmt.Sprintf("%s MCP server. Call tools/list to discover available tools.", name),

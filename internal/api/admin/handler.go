@@ -168,6 +168,37 @@ type Handler struct {
 	// actually needed (e.g. Code Mode's ToolCache is enabled); nil is a
 	// perfectly ordinary configuration and callers must nil-check.
 	AfterMCPCacheRefresh func()
+	// AfterMCPAccessRefresh is called at the end of every refreshMCPAccessCache
+	// run — after MCPAccessCache has already been reloaded — with the
+	// organization ID whose MCP access allowlist changed. SetOrgMCPAccess,
+	// SetTeamMCPAccess, and SetKeyMCPAccess all resolve one concrete org ID
+	// for this call even when the mutation itself targeted a team or key
+	// (a team or key always belongs to exactly one org). Set once, in
+	// internal/app, only when Code Mode is enabled — wired to notify a Code
+	// Mode *mcp.Server's subscriptions/listen subscribers in that org that
+	// their own view of tools/list may have changed (see NotifyScope's own
+	// doc in internal/mcp/subscriptions.go). nil is a perfectly ordinary
+	// configuration and callers must nil-check.
+	AfterMCPAccessRefresh func(orgID string)
+	// AfterMCPBlocklistChange is called after every AddMCPServerBlocklist or
+	// RemoveMCPServerBlocklist mutation, with the MCP server ID whose
+	// blocklist changed. See AfterMCPAccessRefresh's own doc for why this
+	// exists and where it is wired — the server ID here lets the wiring
+	// scope the notification precisely, via the same AccessChecker Code
+	// Mode's own tools/list content is scoped by, rather than falling back
+	// to a whole organization. nil is a perfectly ordinary configuration.
+	AfterMCPBlocklistChange func(serverID string)
+	// MCPListenMaxDuration bounds how long a subscriptions/listen stream on
+	// either built-in MCP server may run before mcp_handler.go proactively
+	// ends it with a graceful complete response, computed once at startup
+	// from the effective WriteTimeout of whichever Fiber app actually hosts
+	// the MCP routes (internal/app/routes.go's mcpListenMaxDuration — see
+	// its own doc). The zero value (a Handler built directly, e.g. in a test
+	// that never exercises this path, without app wiring) refuses every
+	// subscriptions/listen request rather than opening an unbounded stream —
+	// fail closed, not fail open, matching MCPSessionRegistry's identical
+	// zero-value discipline above.
+	MCPListenMaxDuration time.Duration
 }
 
 // swaggerErrorResponse is the standard API error envelope used in OpenAPI docs.
@@ -259,8 +290,13 @@ func (h *Handler) refreshMCPCaches(ctx context.Context) {
 // refreshMCPAccessCache reloads all MCP access allowlists from the database
 // into the in-memory MCP access cache. It is called after any Set*MCPAccess
 // mutation so that the hot path immediately reflects the updated configuration.
-// If MCPAccessCache is nil the call is a no-op.
-func (h *Handler) refreshMCPAccessCache(ctx context.Context) {
+// orgID is the organization whose allowlist changed — forwarded to
+// AfterMCPAccessRefresh, if set, once the cache reload completes; every
+// caller of this method already knows a concrete orgID (see that field's own
+// doc). If MCPAccessCache is nil the call is a no-op — AfterMCPAccessRefresh
+// is not invoked in that case either, since nothing in the hot path actually
+// changed.
+func (h *Handler) refreshMCPAccessCache(ctx context.Context, orgID string) {
 	if h.MCPAccessCache == nil {
 		return
 	}
@@ -270,4 +306,7 @@ func (h *Handler) refreshMCPAccessCache(ctx context.Context) {
 		return
 	}
 	h.MCPAccessCache.Load(orgA, teamA, keyA)
+	if h.AfterMCPAccessRefresh != nil {
+		h.AfterMCPAccessRefresh(orgID)
+	}
 }

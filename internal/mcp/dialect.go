@@ -239,6 +239,13 @@ const (
 type Result struct {
 	Payload any
 	Cache   CacheHint
+	// Listen is non-nil only for a successful subscriptions/listen dispatch
+	// (Server.handleSubscriptionsListen, subscriptions.go). Server.Handle
+	// recognizes this and returns it via HandleResult.Listen instead of
+	// calling a ServerDialect's EncodeResult — see HandleResult.Listen's own
+	// doc for why: this Result carries no ordinary JSON-RPC response to
+	// encode at all. Every other dispatch path always leaves this nil.
+	Listen *ListenRequest
 }
 
 // ServerDialect renders inbound wire messages to Envelopes and Results back

@@ -1064,6 +1064,48 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		// declarations stay current as the ToolCache is populated lazily.
 		codeModeServer.SetOnToolsList(cmService.toolsListHook())
 
+		// subscriptions/listen support: the Code Mode server's own tools/list
+		// content DOES change at runtime (an upstream MCP server's tools
+		// change, or an admin mutates the blocklist/access allowlist — see
+		// the three wiring points below), unlike the built-in management
+		// server (mcpServer above), which is never given a
+		// SetToolsListChangedSource(true) and so always acknowledges an
+		// empty honored set.
+		codeModeServer.SetToolsListChangedSource(true)
+
+		// AccessChecker scopes every NotifyToolsListChanged delivery below to
+		// only the subscribers whose own caller identity can currently see
+		// the changed server — see codeModeAccessChecker's own doc for the
+		// exact per-server-scope rules this mirrors from
+		// codeModeService.accessibleServers.
+		codeModeServer.SetAccessChecker(codeModeAccessChecker(mcpServerCache, mcpAccessCache))
+
+		// Trigger 1: a server's cached tool listing changes structurally
+		// (ToolCache.Invalidate/InvalidateWithStore, or a republish that
+		// differs from the previous listing — see SetOnChange's own doc).
+		// This single hook covers both an admin-triggered refresh/mutation
+		// AND an upstream's own subscriptions/listen notification relayed
+		// through mcpListenManager's onToolsChanged callback above (which
+		// calls Invalidate), so VoidLLM's own subscribers learn about an
+		// upstream's change without any additional wiring.
+		adminHandler.ToolCache.SetOnChange(func(serverID string) {
+			codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: serverID})
+		})
+
+		// Trigger 2: an org's MCP access allowlist changes (SetOrgMCPAccess,
+		// SetTeamMCPAccess, SetKeyMCPAccess) — scoped to the org whose
+		// allowlist changed, since no single server ID applies.
+		adminHandler.AfterMCPAccessRefresh = func(orgID string) {
+			codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{OrgID: orgID})
+		}
+
+		// Trigger 3: a server's tool blocklist changes (AddMCPServerBlocklist,
+		// RemoveMCPServerBlocklist) — scoped precisely to that server ID via
+		// the same AccessChecker installed above.
+		adminHandler.AfterMCPBlocklistChange = func(serverID string) {
+			codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: serverID})
+		}
+
 		adminHandler.CodeModeServer = codeModeServer
 	}
 
@@ -1488,6 +1530,18 @@ func (a *Application) WaitForShutdown(ctx context.Context) {
 		)
 		a.shutdownState.CancelInflight()
 		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Phase 3.5: close every open MCP subscriptions/listen stream gracefully
+	// — before stopping the Fiber server(s) below — so an in-flight stream's
+	// own handler observes Subscriber.Done() and writes its graceful-end
+	// response well ahead of Shutdown terminating the underlying connection
+	// uncleanly. See mcp.Server.CloseSubscriptions' own doc.
+	if a.adminHandler.MCPServer != nil {
+		a.adminHandler.MCPServer.CloseSubscriptions()
+	}
+	if a.adminHandler.CodeModeServer != nil {
+		a.adminHandler.CodeModeServer.CloseSubscriptions()
 	}
 
 	// Phase 4: Stop the Fiber server(s).

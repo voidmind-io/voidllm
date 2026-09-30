@@ -14,6 +14,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/internal/metrics"
+	"github.com/voidmind-io/voidllm/internal/proxy"
 )
 
 // codeModeDB is the subset of database methods needed by Code Mode.
@@ -423,6 +424,57 @@ func (s *codeModeService) SearchMCPTools(ctx context.Context, query string, serv
 		fmt.Fprintf(&sb, "\n(showing %d of %d tools)\n", matchCount, totalAvailable)
 	}
 	return sb.String(), nil
+}
+
+// codeModeAccessChecker returns an mcp.AccessChecker that mirrors
+// codeModeService.accessibleServers' own access decision (see that method's
+// own doc) for a single server ID, built entirely from in-memory state —
+// never a database call — so it is safe to invoke once per subscriber from
+// mcp.Server.NotifyToolsListChanged's own delivery loop:
+//
+//   - serverCache.GetByID is proxy.MCPServerCache's in-memory lookup (loaded
+//     by Handler.refreshMCPCaches — the same cache the proxy hot path and
+//     reconcileMCPListenTargets already use).
+//   - mcpAccessCache.Check is proxy.MCPAccessCache's own in-memory allowlist
+//     lookup (the same cache the transparent MCP proxy's hot path —
+//     mcp_proxy.go — already uses for this exact global-server access
+//     decision).
+//
+// A subscriber whose Role is auth.RoleSystemAdmin always has access,
+// matching accessibleServers' own isSystemAdmin bypass. A server whose
+// Source is "builtin" is always accessible, matching accessibleServers'
+// own builtin bypass. A team-scoped server (TeamID set) is accessible only
+// to a subscriber whose own KeyIdentity.TeamID matches exactly. An
+// org-scoped server (OrgID set, TeamID nil) is accessible to any subscriber
+// in that org, matching ListMCPServersByOrg's implicit, no-explicit-
+// allowlist-entry-needed org-wide visibility. A global, non-builtin server
+// (both nil) falls back to mcpAccessCache.Check. A server ID this
+// serverCache does not currently know about (e.g. one just deleted) reports
+// no access: there is nothing left to notify a subscriber about being
+// unable to see anyway.
+func codeModeAccessChecker(serverCache mcpServerByIDer, mcpAccessCache *proxy.MCPAccessCache) mcp.AccessChecker {
+	return func(id mcp.KeyIdentity, serverID string) bool {
+		sv, ok := serverCache.GetByID(serverID)
+		if !ok {
+			return false
+		}
+		if id.Role == auth.RoleSystemAdmin {
+			return true
+		}
+		if sv.Source == "builtin" {
+			return true
+		}
+		if sv.TeamID != nil {
+			return id.TeamID == *sv.TeamID
+		}
+		if sv.OrgID != nil {
+			return id.OrgID == *sv.OrgID
+		}
+		if mcpAccessCache == nil {
+			return false
+		}
+		return mcpAccessCache.Check(id.OrgID, id.TeamID, id.KeyID, serverID)
+	}
 }
 
 // toolsListHook returns an mcp.OnToolsListHook that injects TypeScript type

@@ -905,28 +905,59 @@ func TestServer_EraMismatch_MethodNotFound(t *testing.T) {
 	}
 }
 
-// TestServer_SubscriptionsListen_NotYetSupportedInPhase1 documents and locks
-// in the CURRENT, INTENTIONAL Phase 1 behavior: subscriptions/listen resolves
-// to CodeMethodNotFound under the modern era. This is NOT a bug — VoidLLM's
-// Handle returns a single, immediately-final []byte per call, and a
-// spec-faithful subscriptions/listen requires a long-lived response stream
-// that delivers notifications/subscriptions/acknowledged first and then stays
-// open. That streaming passthrough is explicitly out of scope until Phase 4
-// (see the Phase 1 report and dispatchModern's doc comment in server.go). If
-// this test starts failing because subscriptions/listen now succeeds, update
-// this test — don't treat the failure as a regression to revert.
-func TestServer_SubscriptionsListen_NotYetSupportedInPhase1(t *testing.T) {
+// TestServer_SubscriptionsListen_OpensStream verifies the Phase 4 behavior:
+// a well-formed subscriptions/listen request under the modern era returns a
+// HandleResult carrying a non-nil Listen (never an ordinary JSON-RPC Body),
+// with an Ack acknowledging the requested, and enabled, toolsListChanged
+// filter. Unlike every other test in this file, it calls s.Handle directly
+// rather than through callRawHdr, since callRawHdr's own contract (parse
+// Body as a JSON-RPC Response) does not apply to a Listen result — see
+// HandleResult.Listen's own doc.
+func TestServer_SubscriptionsListen_OpensStream(t *testing.T) {
 	t.Parallel()
 
 	s := newTestServer("voidllm", "0.1.0")
-	resp := callRawHdr(t, s, context.Background(),
-		modernRequestBody(1, "subscriptions/listen", map[string]any{"toolsListChanged": true}, nil),
+	s.SetToolsListChangedSource(true)
+
+	result := s.Handle(context.Background(),
+		[]byte(modernRequestBody(1, "subscriptions/listen",
+			map[string]any{"notifications": map[string]any{"toolsListChanged": true}}, nil)),
 		modernHeader())
 
-	assertErrorCode(t, resp, mcp.CodeMethodNotFound)
-	if resp.Error != nil && !strings.Contains(resp.Error.Message, "not yet supported") {
-		t.Errorf("error message = %q, want it to explain streaming is not yet supported (Phase 4)", resp.Error.Message)
+	if result.Body != nil {
+		t.Fatalf("Body = %s, want nil for a Listen result", result.Body)
 	}
+	if result.Listen == nil {
+		t.Fatal("Listen = nil, want a non-nil ListenRequest")
+	}
+	t.Cleanup(result.Listen.Sub.Unregister)
+
+	if !result.Listen.Sub.Honored().ToolsListChanged {
+		t.Error("Sub.Honored().ToolsListChanged = false, want true (source enabled, filter requested)")
+	}
+	if len(result.Listen.Ack) == 0 {
+		t.Error("Ack is empty, want an encoded acknowledgement event")
+	}
+	if !strings.Contains(string(result.Listen.Ack), "notifications/subscriptions/acknowledged") {
+		t.Errorf("Ack = %s, want it to name the acknowledgement method", result.Listen.Ack)
+	}
+	if !strings.Contains(string(result.Listen.Ack), `"toolsListChanged":true`) {
+		t.Errorf("Ack = %s, want the honored toolsListChanged filter present", result.Listen.Ack)
+	}
+}
+
+// TestServer_SubscriptionsListen_LegacyEraStillMethodNotFound verifies the
+// legacy era's own handling of subscriptions/listen is unchanged by Phase 4:
+// a legacy-era request (no modern MCP-Protocol-Version) still resolves to
+// CodeMethodNotFound — the legacy revisions have no such method at all — and
+// never opens a stream.
+func TestServer_SubscriptionsListen_LegacyEraStillMethodNotFound(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	resp := callRaw(t, s, `{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen"}`)
+
+	assertErrorCode(t, resp, mcp.CodeMethodNotFound)
 }
 
 // ---- hintForError / StatusHint mapping (FIX 2, MCP Streamable HTTP §4.5/§4.6) ---

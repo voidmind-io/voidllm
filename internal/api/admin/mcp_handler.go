@@ -83,6 +83,10 @@ func (h *Handler) handleMCPRequest(c fiber.Ctx, server *mcp.Server) error {
 
 	result := server.Handle(ctx, body, fiberHeader{c})
 
+	if result.Listen != nil {
+		return h.handleMCPListenStream(c, result.Listen)
+	}
+
 	switch result.Hint {
 	case mcp.HintNotification:
 		return c.SendStatus(fiber.StatusAccepted)
@@ -98,6 +102,17 @@ func (h *Handler) handleMCPRequest(c fiber.Ctx, server *mcp.Server) error {
 		if result.Era == mcp.EraModern {
 			c.Status(fiber.StatusNotFound)
 		}
+	case mcp.HintTooManyRequests:
+		// subscriptions/listen was refused before opening a stream because it
+		// would exceed a concurrency limit — see mcp.CodeTooManyListenStreams'
+		// own doc.
+		c.Status(fiber.StatusTooManyRequests)
+	case mcp.HintServiceUnavailable:
+		// subscriptions/listen was refused because mcp.Server.CloseSubscriptions
+		// has already been called — the process is shutting down and no
+		// longer accepts new subscriptions — see mcp.CodeSubscriptionsClosed's
+		// own doc.
+		c.Status(fiber.StatusServiceUnavailable)
 	}
 
 	if acceptsSSE(c.Get("Accept")) {
@@ -109,6 +124,102 @@ func (h *Handler) handleMCPRequest(c fiber.Ctx, server *mcp.Server) error {
 
 	c.Set("Content-Type", "application/json")
 	return c.Send(result.Body)
+}
+
+// mcpListenKeepAliveInterval is the SSE keep-alive comment interval for an
+// open subscriptions/listen stream — the same 30s cadence handleMCPSSE
+// already uses for its own legacy keep-alive pings (MCP Streamable HTTP
+// spec: SSE comment lines are allowed and recommended on a long-lived
+// stream).
+const mcpListenKeepAliveInterval = 30 * time.Second
+
+// handleMCPListenStream drives the SSE stream for a successful
+// subscriptions/listen dispatch (mcp.HandleResult.Listen != nil): writes the
+// pre-encoded acknowledgement as the stream's first event, then loops
+// delivering listen.Sub.Events() notifications, sending periodic keep-alive
+// comments, and ending the stream — with a graceful "resultType":"complete"
+// response — when either h.MCPListenMaxDuration elapses or listen.Sub.Done()
+// is signaled (mcp.Server.CloseSubscriptions, called during process
+// shutdown — see internal/app.Application.WaitForShutdown). Any write or
+// flush error (the client disconnected) simply returns without writing a
+// complete response, exactly like handleMCPSSE's own keep-alive loop.
+//
+// h.MCPListenMaxDuration <= 0 means this deployment cannot serve a
+// subscriptions/listen stream at all (see that field's own doc) — the
+// registration mcp.Server.Handle already performed is unwound via
+// listen.Sub.Unregister and a static, HTTP 503 error is returned instead of
+// ever opening the stream.
+//
+// listen.Sub.Unregister is called exactly once, via defer, on every path
+// that opens the stream — see Subscriber's own doc for why this must never
+// be skipped.
+func (h *Handler) handleMCPListenStream(c fiber.Ctx, listen *mcp.ListenRequest) error {
+	maxDuration := h.MCPListenMaxDuration
+	if maxDuration <= 0 {
+		listen.Sub.Unregister()
+		c.Status(fiber.StatusServiceUnavailable)
+		return c.JSON(mcp.NewErrorResponse(listen.Sub.ID(), mcp.CodeInternalError,
+			"subscriptions/listen is not available on this deployment"))
+	}
+
+	c.Set("Content-Type", "text/event-stream")
+	c.Set("Cache-Control", "no-cache")
+	c.Set("X-Accel-Buffering", "no")
+
+	return c.SendStreamWriter(func(w *bufio.Writer) {
+		defer listen.Sub.Unregister()
+
+		if _, err := w.WriteString(formatSSEMessage(listen.Ack)); err != nil {
+			return
+		}
+		if err := w.Flush(); err != nil {
+			return
+		}
+
+		maxTimer := time.NewTimer(maxDuration)
+		defer maxTimer.Stop()
+
+		ticker := time.NewTicker(mcpListenKeepAliveInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case body := <-listen.Sub.Events():
+				if _, err := w.WriteString(formatSSEMessage(body)); err != nil {
+					return
+				}
+				if err := w.Flush(); err != nil {
+					return
+				}
+			case <-ticker.C:
+				if _, err := w.WriteString(": ping\n\n"); err != nil {
+					return
+				}
+				if err := w.Flush(); err != nil {
+					return
+				}
+			case <-maxTimer.C:
+				h.writeMCPListenComplete(w, listen.Sub)
+				return
+			case <-listen.Sub.Done():
+				h.writeMCPListenComplete(w, listen.Sub)
+				return
+			}
+		}
+	})
+}
+
+// writeMCPListenComplete writes and flushes the graceful-end SSE event for a
+// server-initiated subscriptions/listen stream end (the max-duration timer,
+// or process shutdown — see handleMCPListenStream's own doc). Both the write
+// and the flush are best-effort: by this point the stream is ending
+// regardless of whether the client is still there to receive it, so neither
+// error is actionable beyond what has already been decided.
+func (h *Handler) writeMCPListenComplete(w *bufio.Writer, sub *mcp.Subscriber) {
+	if _, err := w.WriteString(formatSSEMessage(sub.CompleteMessage())); err != nil {
+		return
+	}
+	_ = w.Flush() //nolint:errcheck // best-effort final flush; the stream is ending regardless
 }
 
 // formatSSEMessage renders body as a single SSE "message" event. Per the SSE

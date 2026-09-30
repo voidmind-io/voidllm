@@ -299,7 +299,9 @@ Because of that, this path has no total-duration limit — `call_timeout` does n
 
 #### Write timeout and long-lived streams
 
-`server.proxy.write_timeout` (or `server.admin.write_timeout` in dual-port mode, whichever app serves `/api/v1/mcp/*`) is a **hard ceiling on every MCP stream**, including a healthy `subscriptions/listen` response that is still receiving data: fasthttp's `WriteTimeout` is a single absolute deadline on the socket, set once before the response starts and never refreshed by a successful flush. Neither `stream_idle_timeout` nor `stream_max_bytes` above can extend it — the connection is simply cut once it elapses, regardless of how much healthy traffic is still flowing.
+The write timeout that bounds an MCP stream is derived from `server.proxy.write_timeout` in both single- and dual-port mode — there is no separate `server.admin.write_timeout` setting. In **single-port** mode (the default: `server.admin.port` unset or equal to `server.proxy.port`), the proxy app serves the MCP routes directly, so `server.proxy.write_timeout` applies unchanged. In **dual-port** mode, the admin app serves the MCP routes instead, and its own `WriteTimeout` is derived from `server.proxy.write_timeout` rather than configured separately: `max(30s, server.proxy.write_timeout)`, clamped to at most 120s. A generously configured `server.proxy.write_timeout` (e.g. `300s`) therefore does NOT carry over to the admin app in dual-port mode — it is capped at 120s there, same as the admin app's `ReadTimeout` and `BodyLimit`, all three shared with the authenticated playground tunnel.
+
+Whichever value results is a **hard ceiling on every MCP stream**, including a healthy `subscriptions/listen` response that is still receiving data: fasthttp's `WriteTimeout` is a single absolute deadline on the socket, set once before the response starts and never refreshed by a successful flush. Neither `stream_idle_timeout` nor `stream_max_bytes` above can extend it — the connection is simply cut once it elapses, regardless of how much healthy traffic is still flowing.
 
 If you run `subscriptions/listen` (or any other stream expected to outlive the default 120s) in production, set:
 
@@ -310,6 +312,16 @@ server:
 ```
 
 VoidLLM logs one WARN at startup if the MCP gateway is active and `write_timeout` is finite, naming the configured value. Setting it to `0` removes the ceiling for **every** route on that app, not just MCP — including the unauthenticated ones (login, invite redemption). This trades away one layer of defense against slow-client (slowloris-style) connection exhaustion on those routes; combine it with a reverse proxy or load balancer that enforces its own connection-level timeouts if that trade-off is a concern for your deployment.
+
+#### Serving `subscriptions/listen` on VoidLLM's own MCP servers
+
+Both built-in MCP servers (`/api/v1/mcp/voidllm`, the management server, and `/api/v1/mcp`, the Code Mode server) accept `subscriptions/listen` from clients. Only the Code Mode server honors `toolsListChanged` — its own `tools/list` content changes as upstream servers are added, removed, or have their tools change, and as an org's MCP access allowlist or tool blocklist is edited. The management server's tool list never changes at runtime, so it always acknowledges with an empty honored set: a client can still open the stream (it gets keep-alives and, eventually, a graceful end), but never receives a `notifications/tools/list_changed` event on it.
+
+A notification on the Code Mode server is delivered only to subscribers whose own API key currently has access to the MCP server that changed (the same access check `search_tools`/`list_servers` themselves apply) — never across organizations, and never to a subscriber whose own visibility into `tools/list` would be unaffected by the change.
+
+Two limits apply per built-in `*Server` instance, checked before a stream is ever opened: at most 4 concurrent `subscriptions/listen` streams per API key, and at most 1024 in total. Exceeding either is rejected with a JSON-RPC error and HTTP 429, before any stream is opened.
+
+A `subscriptions/listen` stream ends gracefully — a `resultType: "complete"` response, then the connection closes — strictly before the write timeout described above would otherwise kill it uncleanly: VoidLLM proactively closes it 5 seconds ahead of that deadline (or after 1 hour, if `write_timeout` is `0`/unlimited). A client that wants to keep listening simply opens a new `subscriptions/listen` request when its stream ends this way — exactly as it would after any other graceful end. If the resulting budget would be less than 10 seconds (an unusually short `write_timeout`), VoidLLM refuses the `subscriptions/listen` request outright rather than opening a stream that would die almost immediately. Every open stream is also closed gracefully, the same way, during a graceful server shutdown, before the underlying HTTP server itself stops accepting connections.
 
 ### Tool Caching
 

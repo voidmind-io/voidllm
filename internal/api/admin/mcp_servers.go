@@ -1350,6 +1350,10 @@ func (h *Handler) AddMCPServerBlocklist(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to add tool to blocklist")
 	}
 
+	if h.AfterMCPBlocklistChange != nil {
+		h.AfterMCPBlocklistChange(serverID)
+	}
+
 	return c.Status(fiber.StatusCreated).JSON(entry)
 }
 
@@ -1403,6 +1407,10 @@ func (h *Handler) RemoveMCPServerBlocklist(c fiber.Ctx) error {
 			slog.String("tool_name", toolName),
 			slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to remove tool from blocklist")
+	}
+
+	if h.AfterMCPBlocklistChange != nil {
+		h.AfterMCPBlocklistChange(serverID)
 	}
 
 	return c.SendStatus(fiber.StatusNoContent)
