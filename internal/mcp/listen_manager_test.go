@@ -1,6 +1,8 @@
 package mcp_test
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -148,7 +150,7 @@ func TestListenManager_Reconcile_StartsOneListenerPerTarget(t *testing.T) {
 	srv1 := newRecordingServer(t, connected1, ackThenBlock)
 	srv2 := newRecordingServer(t, connected2, ackThenBlock)
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 	t.Cleanup(manager.Stop)
 
 	manager.Reconcile([]mcp.ListenTarget{
@@ -179,7 +181,7 @@ func TestListenManager_Reconcile_RemovingTargetCancelsIt_UpstreamSeesDisconnect(
 		disconnected <- struct{}{}
 	})
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 	t.Cleanup(manager.Stop)
 
 	manager.Reconcile([]mcp.ListenTarget{
@@ -207,7 +209,7 @@ func TestListenManager_Reconcile_ChangedTransportPointerRestarts(t *testing.T) {
 	newConnected := make(chan time.Time, 8)
 	newSrv := newRecordingServer(t, newConnected, ackThenBlock)
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 	t.Cleanup(manager.Stop)
 
 	manager.Reconcile([]mcp.ListenTarget{
@@ -241,7 +243,7 @@ func TestListenManager_Reconcile_TransportChange_NewListenerWaitsForOldGoroutine
 	newConnected := make(chan time.Time, 8)
 	newSrv := newRecordingServer(t, newConnected, ackThenBlock)
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 	// Registered BEFORE the hook-clearing cleanup below, so it runs AFTER
 	// that one during t.Cleanup's LIFO unwind: Stop() also cancels the NEW
 	// listener, which would otherwise re-enter the still-installed hook
@@ -300,7 +302,7 @@ func TestListenManager_Reconcile_SupersessionChain_ThirdListenerWaitsForOriginal
 	cConnected := make(chan time.Time, 8)
 	cSrv := newRecordingServer(t, cConnected, ackThenBlock)
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 	// Registered BEFORE the hook-clearing cleanup below, so it runs AFTER
 	// that one during t.Cleanup's LIFO unwind — see the sibling
 	// single-supersession test's own doc for why this ordering matters.
@@ -361,7 +363,7 @@ func TestListenManager_Stop_CancelsAll_WaitsForHandlersToExit_NoLeaks(t *testing
 	connected := make(chan time.Time, n*4)
 	done := make(chan struct{}, n*4)
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 
 	targets := make([]mcp.ListenTarget, 0, n)
 	for i := 0; i < n; i++ {
@@ -395,7 +397,7 @@ func TestListenManager_Reconcile_AfterStop_NoOp(t *testing.T) {
 	connected := make(chan time.Time, 8)
 	srv := newRecordingServer(t, connected, ackThenBlock)
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 	manager.Stop() // stop before ever starting anything
 
 	manager.Reconcile([]mcp.ListenTarget{
@@ -424,7 +426,7 @@ func TestListenManager_ConcurrentReconcileAndStop_RaceSafe(t *testing.T) {
 	tr1 := newModernTransport(srv1.URL, "none", "", "")
 	tr2 := newModernTransport(srv2.URL, "none", "", "")
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 
 	const reconcilers = 8
 	const itersPerGoroutine = 50
@@ -477,7 +479,7 @@ func TestListenManager_ReconnectAfterGracefulEnd(t *testing.T) {
 	connected := make(chan time.Time, 8)
 	srv := newRecordingServer(t, connected, ackThenGracefulEnd)
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 	t.Cleanup(manager.Stop)
 
 	manager.Reconcile([]mcp.ListenTarget{
@@ -510,7 +512,7 @@ func TestListenManager_SecondAckTriggersOnToolsChanged_FirstAckDoesNot(t *testin
 	srv := newRecordingServer(t, connected, ackThenGracefulEnd)
 
 	toolsChanged := make(chan string, 8)
-	manager := mcp.NewListenManager(func(serverID string) { toolsChanged <- serverID })
+	manager := mcp.NewListenManager(func(_ context.Context, serverID string) { toolsChanged <- serverID })
 	t.Cleanup(manager.Stop)
 
 	manager.Reconcile([]mcp.ListenTarget{
@@ -567,7 +569,7 @@ func TestListenManager_AbruptDisconnectAfterAck_ReconnectsAndFiresOnNextAck(t *t
 	})
 
 	toolsChanged := make(chan string, 8)
-	manager := mcp.NewListenManager(func(serverID string) { toolsChanged <- serverID })
+	manager := mcp.NewListenManager(func(_ context.Context, serverID string) { toolsChanged <- serverID })
 	t.Cleanup(manager.Stop)
 
 	manager.Reconcile([]mcp.ListenTarget{
@@ -600,7 +602,7 @@ func TestListenManager_Unsupported_NoRetryWithinWindow_ThenRetryAfter(t *testing
 	connected := make(chan time.Time, 8)
 	srv := newRecordingServer(t, connected, alwaysUnsupported404)
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 	t.Cleanup(manager.Stop)
 
 	manager.Reconcile([]mcp.ListenTarget{
@@ -678,7 +680,7 @@ func TestListenManager_BackoffGrowsWithoutAck_ResetsAfterAck(t *testing.T) {
 		}
 	})
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 	t.Cleanup(manager.Stop)
 
 	manager.Reconcile([]mcp.ListenTarget{
@@ -716,4 +718,280 @@ func TestListenManager_BackoffGrowsWithoutAck_ResetsAfterAck(t *testing.T) {
 	// must be exactly minBackoff again — onAck resets backoff synchronously,
 	// before this attempt's own failure computes its wait.
 	wantGap(preAckFailures+1, minBackoff)
+}
+
+// ---- Refresh dedup: a signal arriving while a refresh is already running --
+//
+// The two tests below are the direct regression coverage for
+// spawnToolsChangedRefresh's toolsChangedRefreshState guarantee
+// (listen_manager.go): a notifications/tools/list_changed signal that
+// arrives while the refresh triggered by an EARLIER one is still running
+// must never start a second, concurrent onToolsChanged call for the same
+// server — it must coalesce into the running one instead, guaranteeing
+// whatever follow-up round eventually runs starts strictly after the
+// in-flight one has finished, so it cannot share that earlier round's
+// already-stale ToolCache singleflight result. Both drive a real
+// ToolCache.RefreshServer as onToolsChanged, over a real subscriptions/listen
+// HTTP stream, and use SetListenRefreshDedupHookForTest (export_test.go) as
+// their synchronization point: it fires synchronously, exactly once per
+// spawnToolsChangedRefresh call, so waiting on it (rather than sleeping, or
+// waiting only on the eventual fetch count) proves the ORDERING the fix
+// guarantees, not merely a final state that happens to look right under
+// lucky scheduling.
+
+// drainBoolUntilQuiet consumes every value already on, or arriving on, ch
+// until quiet elapses with nothing new — a bounded settling wait for a
+// channel that may receive an a-priori-unknown number of values (here:
+// however many of a burst's signals listenThrottle's own window happened to
+// coalesce before ever reaching spawnToolsChangedRefresh at all — see
+// toolsChangedRefreshState's own doc for why that count is not this file's
+// concern). Unlike assertNoneWithin, this is not itself an assertion: it
+// exists purely so a caller can be confident every dedup decision a burst of
+// already-sent signals will ever produce has been drained before the caller
+// moves on to the part of the test that DOES assert something.
+func drainBoolUntilQuiet(t *testing.T, ch <-chan bool, quiet time.Duration) {
+	t.Helper()
+	for {
+		select {
+		case <-ch:
+		case <-time.After(quiet):
+			return
+		}
+	}
+}
+
+// newToolsChangedListenServer builds an httptest.Server that acknowledges a
+// subscriptions/listen request (honoring toolsListChanged), then — for each
+// channel in events, in order — blocks until that channel is closed and then
+// writes one notifications/tools/list_changed event (listChangedEventCorrectSubID,
+// listen_client_test.go) before moving on to the next, finally blocking until
+// the request's own context ends. This lets a test control exactly when each
+// signal in a sequence reaches the client, one at a time, independent of the
+// ackThenBlock/ackThenGracefulEnd fixed shapes this file's other tests use.
+func newToolsChangedListenServer(t *testing.T, connected chan<- time.Time, events []chan struct{}) *httptest.Server {
+	t.Helper()
+	return newRecordingServer(t, connected, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, ackEvent(true))
+		w.(http.Flusher).Flush()
+
+		for _, sig := range events {
+			<-sig
+			fmt.Fprint(w, listChangedEventCorrectSubID)
+			w.(http.Flusher).Flush()
+		}
+
+		<-r.Context().Done()
+	})
+}
+
+// TestListenManager_SecondSignalDuringRefresh_NotLost_ExactlyTwoFetches is
+// the direct regression test for item 1's own guarantee: a second
+// notifications/tools/list_changed signal arriving while the refresh the
+// FIRST one triggered is still running must not be lost. The fetcher's
+// first call blocks until this test has confirmed — via the dedup hook,
+// never a sleep — that the second signal was actually observed and
+// coalesced (not lost to a second, concurrent refresh silently joining the
+// first's already in-flight ToolCache singleflight round and inheriting its
+// pre-change result). Only once that is confirmed does the first fetch
+// return its (by now stale) pre-change listing; the fix's own guarantee is
+// what makes the follow-up round this must still trigger start a genuinely
+// NEW singleflight round — one that actually observes the post-change
+// listing — rather than being satisfied by the stale one already published.
+func TestListenManager_SecondSignalDuringRefresh_NotLost_ExactlyTwoFetches(t *testing.T) {
+	withShrunkListenTimings(t)
+	mcp.SetListenThrottleIntervalForTest(2 * time.Millisecond)
+	t.Cleanup(func() { mcp.SetListenThrottleIntervalForTest(1 * time.Second) })
+
+	dedup := make(chan bool, 8)
+	mcp.SetListenRefreshDedupHookForTest(func(_ string, startedNew bool) { dedup <- startedNew })
+	t.Cleanup(func() { mcp.SetListenRefreshDedupHookForTest(nil) })
+
+	var fetchCount atomic.Int32
+	fetchStarted := make(chan struct{}, 8)
+	unblockFirstFetch := make(chan struct{})
+	fetcher := func(_ context.Context, _ string) (*mcp.ToolListing, error) {
+		n := fetchCount.Add(1)
+		if n == 1 {
+			fetchStarted <- struct{}{}
+			<-unblockFirstFetch
+			return &mcp.ToolListing{Tools: []mcp.Tool{{Name: "pre_change_tool"}}}, nil
+		}
+		return &mcp.ToolListing{Tools: []mcp.Tool{{Name: "post_change_tool"}}}, nil
+	}
+	cache := mcp.NewToolCache(fetcher, time.Hour)
+
+	var refreshErrsMu sync.Mutex
+	var refreshErrs []error
+	manager := mcp.NewListenManager(func(ctx context.Context, serverID string) {
+		if err := cache.RefreshServer(ctx, serverID); err != nil {
+			refreshErrsMu.Lock()
+			refreshErrs = append(refreshErrs, err)
+			refreshErrsMu.Unlock()
+		}
+	})
+
+	firstEvent := make(chan struct{})
+	secondEvent := make(chan struct{})
+	connected := make(chan time.Time, 8)
+	srv := newToolsChangedListenServer(t, connected, []chan struct{}{firstEvent, secondEvent})
+
+	// Registered AFTER newToolsChangedListenServer's own t.Cleanup(srv.Close)
+	// (see newRecordingServer's own doc) so LIFO teardown runs manager.Stop
+	// FIRST: it cancels the listener, closing this test's one connection
+	// cleanly, before srv.Close ever has to wait for it — matching every
+	// other test in this file's identical cleanup ordering.
+	t.Cleanup(manager.Stop)
+
+	manager.Reconcile([]mcp.ListenTarget{
+		{ServerID: "srv-dedup", Transport: newModernTransport(srv.URL, "none", "", "")},
+	})
+	recvWithin(t, connected, 2*time.Second, "the initial connection")
+
+	// First signal: starts the first refresh round.
+	close(firstEvent)
+	if startedNew := recvWithin(t, dedup, 2*time.Second, "the first signal's dedup decision"); !startedNew {
+		t.Fatal("the first signal should have started a new refresh round")
+	}
+	recvWithin(t, fetchStarted, 2*time.Second, "the first fetch to actually start")
+
+	// Second signal: must arrive — and be fully processed by
+	// spawnToolsChangedRefresh — while the first fetch is still blocked
+	// inside the fetcher.
+	close(secondEvent)
+	if startedNew := recvWithin(t, dedup, 2*time.Second, "the second signal's dedup decision"); startedNew {
+		t.Fatal("the second signal started a NEW concurrent refresh instead of coalescing into the running one — it can now join the running one's already in-flight (pre-change) result")
+	}
+
+	// Only now let the first (blocked) fetch return its pre-change result.
+	close(unblockFirstFetch)
+
+	// The coalesced second signal must still trigger exactly one follow-up
+	// round, strictly after the first one finished.
+	if startedNew := recvWithin(t, dedup, 2*time.Second, "the follow-up round the coalesced second signal must still trigger"); !startedNew {
+		t.Fatal("the follow-up round did not start a new refresh goroutine")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		tools := cache.GetAllTools()["srv-dedup"]
+		if len(tools) == 1 && tools[0].Name == "post_change_tool" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cache never converged on the post-change listing; last seen: %+v", tools)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if got := fetchCount.Load(); got != 2 {
+		t.Errorf("fetchCount = %d, want exactly 2", got)
+	}
+
+	refreshErrsMu.Lock()
+	defer refreshErrsMu.Unlock()
+	for _, err := range refreshErrs {
+		t.Errorf("onToolsChanged reported an unexpected error: %v", err)
+	}
+}
+
+// TestListenManager_BurstDuringRefresh_CausesOnlyOneFollowUpFetch is the
+// direct regression test for item 1's own "loop, not recursion" and "at
+// most one follow-up round" requirements: several signals landing while one
+// refresh is running — not merely two — must still only ever produce ONE
+// follow-up round once that refresh finishes, never one per signal.
+func TestListenManager_BurstDuringRefresh_CausesOnlyOneFollowUpFetch(t *testing.T) {
+	withShrunkListenTimings(t)
+	mcp.SetListenThrottleIntervalForTest(2 * time.Millisecond)
+	t.Cleanup(func() { mcp.SetListenThrottleIntervalForTest(1 * time.Second) })
+
+	dedup := make(chan bool, 32)
+	mcp.SetListenRefreshDedupHookForTest(func(_ string, startedNew bool) { dedup <- startedNew })
+	t.Cleanup(func() { mcp.SetListenRefreshDedupHookForTest(nil) })
+
+	var fetchCount atomic.Int32
+	fetchStarted := make(chan struct{}, 8)
+	unblockFirstFetch := make(chan struct{})
+	fetcher := func(_ context.Context, _ string) (*mcp.ToolListing, error) {
+		n := fetchCount.Add(1)
+		if n == 1 {
+			fetchStarted <- struct{}{}
+			<-unblockFirstFetch
+		}
+		return &mcp.ToolListing{Tools: []mcp.Tool{{Name: fmt.Sprintf("tool_%d", n)}}}, nil
+	}
+	cache := mcp.NewToolCache(fetcher, time.Hour)
+
+	manager := mcp.NewListenManager(func(ctx context.Context, serverID string) {
+		if err := cache.RefreshServer(ctx, serverID); err != nil && ctx.Err() == nil {
+			t.Errorf("onToolsChanged reported an unexpected error: %v", err)
+		}
+	})
+
+	const burstEvents = 4 // 1 initial (starts the refresh) + 3 more while it runs
+	eventSignals := make([]chan struct{}, burstEvents)
+	for i := range eventSignals {
+		eventSignals[i] = make(chan struct{})
+	}
+	connected := make(chan time.Time, 8)
+	srv := newToolsChangedListenServer(t, connected, eventSignals)
+
+	// See the sibling dedup test's own comment for why manager.Stop's
+	// cleanup is registered AFTER newToolsChangedListenServer's own
+	// t.Cleanup(srv.Close): LIFO teardown must cancel the listener before
+	// srv.Close waits on its connection.
+	t.Cleanup(manager.Stop)
+
+	manager.Reconcile([]mcp.ListenTarget{
+		{ServerID: "srv-burst", Transport: newModernTransport(srv.URL, "none", "", "")},
+	})
+	recvWithin(t, connected, 2*time.Second, "the initial connection")
+
+	close(eventSignals[0])
+	if startedNew := recvWithin(t, dedup, 2*time.Second, "the first signal's dedup decision"); !startedNew {
+		t.Fatal("the first signal should have started a new refresh round")
+	}
+	recvWithin(t, fetchStarted, 2*time.Second, "the first fetch to actually start")
+
+	// The rest of the burst, all landing while the first fetch is still
+	// blocked. Drained (not asserted per-event) before unblocking: how many
+	// of these listenThrottle's own window coalesces before ever reaching
+	// spawnToolsChangedRefresh — as opposed to toolsChangedRefreshState
+	// itself coalescing them — is not this test's concern (see
+	// drainBoolUntilQuiet's own doc); only the single follow-up round below
+	// is.
+	for i := 1; i < burstEvents; i++ {
+		close(eventSignals[i])
+	}
+	drainBoolUntilQuiet(t, dedup, 300*time.Millisecond)
+
+	close(unblockFirstFetch)
+
+	if startedNew := recvWithin(t, dedup, 2*time.Second, "the single follow-up round starting"); !startedNew {
+		t.Fatal("the follow-up round did not start a new refresh goroutine")
+	}
+
+	select {
+	case extra := <-dedup:
+		t.Fatalf("an extra dedup decision (startedNew=%v) fired — the burst produced more than one follow-up round", extra)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if fetchCount.Load() == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fetchCount = %d, want exactly 2", fetchCount.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// No further fetch should follow either.
+	time.Sleep(200 * time.Millisecond)
+	if got := fetchCount.Load(); got != 2 {
+		t.Errorf("fetchCount = %d after settling, want exactly 2", got)
+	}
 }

@@ -473,6 +473,18 @@ func SetListenExitDelayHookForTest(fn func()) {
 	listenExitDelayHookForTest.Store(&fn)
 }
 
+// SetListenRefreshDedupHookForTest installs fn (or, when fn is nil, clears
+// the previously installed hook) as spawnToolsChangedRefresh's own dedup
+// test hook — see listenRefreshDedupHookForTest's own doc (listen_manager.go).
+// Same single-package-level-hook discipline as SetListenAckHookForTest.
+func SetListenRefreshDedupHookForTest(fn func(serverID string, startedNew bool)) {
+	if fn == nil {
+		listenRefreshDedupHookForTest.Store(nil)
+		return
+	}
+	listenRefreshDedupHookForTest.Store(&fn)
+}
+
 // NewListenThrottleForTest exposes newListenThrottle (listen_manager.go) for
 // direct testing of its own leading-edge/trailing-edge coalescing and Stop
 // semantics, independent of a full ListenManager/runListener/HTTP round

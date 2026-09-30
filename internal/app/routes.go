@@ -158,10 +158,15 @@ func (a *Application) warnIfSinglePortTLS(adminPort int) {
 // subscriptions/listen stream (docs/mcp-v2.md §3.4) is therefore killed once
 // writeTimeout elapses no matter how healthy the traffic still flowing is,
 // and independent of settings.mcp.stream_idle_timeout, which only bounds
-// silence, not total duration. Operators who run subscriptions/listen in
-// production must set write_timeout to 0 — an explicitly unlimited deadline,
-// see the fiber.Config wiring below — to allow such a stream to run
-// arbitrarily long.
+// silence, not total duration. `write_timeout: 0` is not a fix — VoidLLM has
+// no way to configure an unlimited write deadline: a bare 0 fails config
+// parsing, and 0s is silently replaced by the 120s default (setDefaults,
+// internal/config/config.go). Operators who run subscriptions/listen in
+// production should instead raise write_timeout to an explicit duration
+// comfortably longer than their longest expected stream (e.g. 1h) — see
+// docs/configuration.md's "Write timeout and long-lived streams" for the
+// full trade-off, including the ~120s ceiling dual-port mode still imposes
+// regardless of this value.
 //
 // The warning fires exactly once, at startup, and only when the MCP gateway
 // is actually active (a.adminHandler.MCPServer != nil — the same gate
@@ -178,7 +183,7 @@ func (a *Application) warnIfMCPWriteTimeoutFinite(writeTimeout time.Duration) {
 	a.log.LogAttrs(context.Background(), slog.LevelWarn,
 		"MCP gateway is active with a finite write_timeout: subscriptions/listen streams cannot outlive it",
 		slog.Duration("write_timeout", writeTimeout),
-		slog.String("fix", "set write_timeout to 0 to allow unbounded MCP streams"),
+		slog.String("fix", "raise write_timeout to an explicit duration (e.g. 1h); write_timeout: 0 is not supported and dual-port mode is capped at ~120s regardless"),
 	)
 }
 

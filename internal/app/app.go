@@ -764,7 +764,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	var builtinMCPServer *mcp.Server
 	var toolStore mcp.ToolStore
 	// mcpListenManager holds one subscriptions/listen stream per modern-era
-	// external MCP server, invalidating adminHandler.ToolCache's cached
+	// external MCP server, eagerly refreshing adminHandler.ToolCache's cached
 	// listing on a tools-changed notification (or a reconnect that could
 	// have missed one). Only built when Code Mode's ToolCache is enabled —
 	// see the assignment inside the Code Mode block below and
@@ -805,14 +805,35 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		}
 
 		// One subscriptions/listen stream per modern-era external server,
-		// invalidating this exact ToolCache instance's cached listing (lazy
-		// refetch on next read — see ToolCache.Invalidate) whenever the
-		// upstream reports its tools changed. Reconcile is called below,
-		// from Start, from the periodic MCP cache reconcile tick, and from
-		// admin.Handler.AfterMCPCacheRefresh — see reconcileMCPListenTargets.
+		// eagerly refreshing this exact ToolCache instance's cached listing
+		// for a server whenever the upstream reports its tools changed.
+		// Deliberately RefreshServer, not Invalidate: toolsListHook
+		// (code_mode.go) reads ToolCache.GetAllTools, a pure snapshot that
+		// never triggers a fetch of its own, so a plain Invalidate here would
+		// leave the server missing from every tools/list response — not
+		// merely stale — until some UNRELATED caller (a CallTool, a
+		// SearchMCPTools) happened to call GetTools for it first. RefreshServer
+		// keeps the previous (soon to be stale, but present) entry visible for
+		// the duration of the fetch, and — via ToolCache.SetOnChange, wired
+		// below — notifies Code Mode subscribers only once the refreshed
+		// listing has actually been published, never before. ctx here is the
+		// bounded, listener-lifecycle-scoped one ListenManager itself
+		// constructs (see ListenManager.spawnToolsChangedRefresh's own doc),
+		// not this function's own ctx. On failure the previous entry is left
+		// untouched (see RefreshServer's own doc) — logged at warn with only
+		// the server ID, never the fetch error's own text, matching this
+		// package's zero-knowledge-logging discipline (runListener's own doc
+		// applies the identical rule to its own transport-error logging).
+		// Reconcile is called below, from Start, from the periodic MCP cache
+		// reconcile tick, and from admin.Handler.AfterMCPCacheRefresh — see
+		// reconcileMCPListenTargets.
 		toolCacheForListen := adminHandler.ToolCache
-		mcpListenManager = mcp.NewListenManager(func(serverID string) {
-			toolCacheForListen.Invalidate(serverID)
+		mcpListenManager = mcp.NewListenManager(func(refreshCtx context.Context, serverID string) {
+			if refreshErr := toolCacheForListen.RefreshServer(refreshCtx, serverID); refreshErr != nil {
+				log.LogAttrs(refreshCtx, slog.LevelWarn,
+					"mcp listen: tool cache refresh failed",
+					slog.String("server_id", serverID))
+			}
 		})
 
 		log.LogAttrs(ctx, slog.LevelInfo, "code mode enabled",
@@ -1091,13 +1112,18 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		codeModeServer.SetKeyValidator(keyRevalidator(keyCache))
 
 		// Trigger 1: a server's cached tool listing changes structurally
-		// (ToolCache.Invalidate/InvalidateWithStore, or a republish that
-		// differs from the previous listing — see SetOnChange's own doc).
-		// This single hook covers both an admin-triggered refresh/mutation
-		// AND an upstream's own subscriptions/listen notification relayed
-		// through mcpListenManager's onToolsChanged callback above (which
-		// calls Invalidate), so VoidLLM's own subscribers learn about an
-		// upstream's change without any additional wiring.
+		// (ToolCache.InvalidateWithStore, or a republish — via RefreshServer
+		// or an ordinary cache-miss fetch — that differs from the previous
+		// listing; see SetOnChange's own doc). This single hook covers both
+		// an admin-triggered refresh/mutation AND an upstream's own
+		// subscriptions/listen notification relayed through
+		// mcpListenManager's onToolsChanged callback above (which calls
+		// RefreshServer, publishing the new listing before this hook ever
+		// fires — never Invalidate, which would only clear the entry and
+		// leave nothing for toolsListHook's snapshot read to render), so
+		// VoidLLM's own subscribers learn about an upstream's change, only
+		// once the new listing is actually visible, without any additional
+		// wiring.
 		adminHandler.ToolCache.SetOnChange(func(serverID string) {
 			codeModeServer.NotifyToolsListChanged(mcp.NotifyScope{ServerID: serverID})
 		})

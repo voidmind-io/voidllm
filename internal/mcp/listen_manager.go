@@ -58,6 +58,24 @@ var listenAckHookForTest atomic.Pointer[func(serverID string)]
 // discipline as listenAckHookForTest.
 var listenExitDelayHookForTest atomic.Pointer[func()]
 
+// listenRefreshDedupHookForTest, when non-nil, is called with serverID and a
+// bool at two distinct points around toolsChangedRefreshState's own dedup
+// decision (see that type's own doc): synchronously, on the calling
+// goroutine, with startedNew=false, whenever spawnToolsChangedRefresh finds
+// a refresh already running for this target and merely sets
+// toolsChangedRefreshState.dirty instead of starting a new one; and, on the
+// refresh loop's own goroutine, with startedNew=true, immediately before
+// EVERY round that loop runs — its very first (when spawnToolsChangedRefresh
+// itself started the goroutine) and every subsequent one the loop drains
+// from a dirty flag a burst set while the previous round was still running.
+// Together these let a test observe, deterministically rather than by
+// sleeping, both that a signal arriving mid-refresh was coalesced rather
+// than starting a second concurrent one, and that the coalesced signal still
+// went on to produce exactly the one follow-up round it is owed. nil in
+// production, so this adds no overhead there. Same single-package-level-hook
+// discipline as listenAckHookForTest.
+var listenRefreshDedupHookForTest atomic.Pointer[func(serverID string, startedNew bool)]
+
 // listenThrottleInterval bounds how often ListenManager invokes its own
 // onToolsChanged callback for a single server: at most once per this
 // duration — see listenThrottle's own doc for the coalescing behavior this
@@ -101,16 +119,31 @@ type listenerHandle struct {
 
 // ListenManager holds one subscriptions/listen stream open per modern-era
 // upstream MCP server that has Code Mode's ToolCache enabled, reconnecting
-// automatically per runListener's own reconnect policy, and invalidating
+// automatically per runListener's own reconnect policy, and refreshing
 // ToolCache's cached listing for a server (via the onToolsChanged callback
-// given to NewListenManager) whenever that upstream reports its tools
-// changed, or whenever a reconnect makes it possible that such a change was
-// missed while the listener was down — see runListener's own doc for the
-// exact triggers. Every call to onToolsChanged for a given server passes
-// through that server's own listenThrottle first (see start's own doc): at
-// most one call per listenThrottleInterval reaches the caller-supplied
-// callback, with a burst's LAST call always eventually delivered rather than
-// dropped.
+// given to NewListenManager — in production wired to ToolCache.RefreshServer,
+// never to Invalidate; see spawnToolsChangedRefresh's own doc for why an
+// eager refresh, not a lazy invalidate-then-refetch-on-next-read, is what
+// this callback must do) whenever that upstream reports its tools changed,
+// or whenever a reconnect makes it possible that such a change was missed
+// while the listener was down — see runListener's own doc for the exact
+// triggers. Every call to onToolsChanged for a given server passes through
+// that server's own listenThrottle first (see start's own doc): at most one
+// call per listenThrottleInterval reaches the caller-supplied callback, with
+// a burst's LAST call always eventually delivered rather than dropped.
+//
+// listenThrottle's own coalescing only bounds how often a NEW round is
+// STARTED; it says nothing about how long a started round takes to actually
+// run onToolsChanged, which in production is an upstream tools/list round
+// trip (ToolCache.RefreshServer) that can easily outlast a single throttle
+// window. spawnToolsChangedRefresh applies a second, independent guarantee
+// on top of the throttle's own: for a given ServerID, at most one
+// onToolsChanged call ever runs at a time, however many throttle windows a
+// slow refresh spans — see toolsChangedRefreshState's own doc for why this
+// matters beyond merely wasted work. Two overlapping calls sharing the same
+// underlying ToolCache would let the second one join the first's already
+// in-flight singleflight round and be handed a result that predates the
+// very change it was meant to report, silently losing it.
 //
 // Reconcile and Stop may be called from any goroutine, including
 // concurrently with each other and with themselves: every mutation of this
@@ -129,14 +162,14 @@ type listenerHandle struct {
 // (this repo's v0.1 single-instance-without-Redis constraint,
 // docs/development.md, still applies — nothing here changes it). This is
 // deliberately harmless, not merely tolerated: every instance's ToolCache is
-// itself a purely local, in-memory cache, so each instance invalidating its
+// itself a purely local, in-memory cache, so each instance refreshing its
 // OWN cache in response to its OWN copy of the upstream's notification
 // stream is exactly the isolation this codebase already assumes for every
 // other in-memory cache — an upstream simply answers as many concurrent
 // subscriptions/listen streams as it has instances calling it, precisely as
 // it would answer any other number of concurrent clients.
 type ListenManager struct {
-	onToolsChanged func(serverID string)
+	onToolsChanged func(ctx context.Context, serverID string)
 
 	mu        sync.Mutex
 	listeners map[string]*listenerHandle
@@ -145,13 +178,18 @@ type ListenManager struct {
 }
 
 // NewListenManager returns a ready-to-use ListenManager with no listeners
-// running yet — call Reconcile to start them. onToolsChanged is called
-// synchronously, from whichever listener goroutine observed the change or
-// reconnect, once per qualifying event (subject to that server's own
-// listenThrottle — see ListenManager's own doc); it must not block for long
-// (see HTTPTransport.Listen's identical constraint on its own
-// onToolsChanged parameter).
-func NewListenManager(onToolsChanged func(serverID string)) *ListenManager {
+// running yet — call Reconcile to start them. onToolsChanged is called once
+// per qualifying event (subject to that server's own listenThrottle — see
+// ListenManager's own doc), from a dedicated goroutine spawnToolsChangedRefresh
+// starts for that call alone — never from the listener's own runListener
+// goroutine — so it is free to block for as long as a genuine refresh takes
+// (in production it is wired to ToolCache.RefreshServer, an upstream round
+// trip) without ever stalling that target's own listen stream. ctx is
+// bounded by listenToolsChangedRefreshTimeout and is cancelled early if this
+// target's listener is superseded or removed by a later Reconcile call, or
+// if Stop is called, whichever happens first — see spawnToolsChangedRefresh's
+// own doc.
+func NewListenManager(onToolsChanged func(ctx context.Context, serverID string)) *ListenManager {
 	return &ListenManager{
 		onToolsChanged: onToolsChanged,
 		listeners:      make(map[string]*listenerHandle),
@@ -240,19 +278,32 @@ func (m *ListenManager) Reconcile(targets []ListenTarget) {
 //
 // Every call to onToolsChanged this target's listener would otherwise make
 // — both transport.Listen's own onToolsChanged callback and runListener's
-// post-ack invalidation (see that function's own doc) — is routed through a
-// single per-target listenThrottle instead, so both triggers share one
+// post-ack refresh trigger (see that function's own doc) — is routed through
+// a single per-target listenThrottle instead, so both triggers share one
 // coalescing window rather than each bypassing the other's throttle state.
-// The throttle is stopped (releasing its own timer) as the goroutine exits,
-// before done closes and before m.wg.Done is recorded — see listenThrottle's
-// own Stop doc for why this ordering leaves no timer able to fire, and so no
-// call to onToolsChanged able to happen, after that point.
+// The throttle's own fire callback is spawnToolsChangedRefresh, bound to this
+// target's own ctx and this target's own toolsChangedRefreshState (see that
+// method's own doc for why the actual onToolsChanged call always runs in its
+// own tracked goroutine, never inline on this listener's own goroutine, and
+// toolsChangedRefreshState's own doc for the separate, throttle-window-
+// independent guarantee that state provides: this target never has two
+// onToolsChanged calls running at once, no matter how many throttle windows
+// a slow one spans). The throttle is stopped (releasing its own timer) as
+// the goroutine exits, before done closes and before m.wg.Done is recorded —
+// see listenThrottle's own Stop doc for why this ordering leaves no timer
+// able to fire, and so no NEW call to spawnToolsChangedRefresh able to
+// start, after that point; a refresh goroutine already spawned before then
+// is unaffected by throttle.Stop (it is tracked by m.wg independently — see
+// spawnToolsChangedRefresh's own doc — not by the throttle) and keeps
+// running, draining its own toolsChangedRefreshState's dirty flag one round
+// at a time, until ctx itself ends it.
 //
 // Callers must already hold m.mu.
 func (m *ListenManager) start(target ListenTarget, waitFor <-chan struct{}) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	throttle := newListenThrottle(func() { m.onToolsChanged(target.ServerID) })
+	refreshState := &toolsChangedRefreshState{}
+	throttle := newListenThrottle(func() { m.spawnToolsChangedRefresh(ctx, target.ServerID, refreshState) })
 	m.listeners[target.ServerID] = &listenerHandle{cancel: cancel, transport: target.Transport, done: done}
 	m.wg.Add(1)
 	go func() {
@@ -276,6 +327,141 @@ func (m *ListenManager) start(target ListenTarget, waitFor <-chan struct{}) {
 		}
 		runListener(ctx, target.ServerID, target.Transport, throttle.Call)
 	}()
+}
+
+// listenToolsChangedRefreshTimeout bounds how long a single onToolsChanged
+// call spawned by spawnToolsChangedRefresh may run before it is abandoned —
+// a named constant, not an inline literal, so the bound is documented once
+// rather than duplicated at spawnToolsChangedRefresh's own call site. In
+// production onToolsChanged is wired to ToolCache.RefreshServer, an upstream
+// tools/list round trip; 30s comfortably covers a healthy upstream's own
+// response time while still bounding a hung one.
+const listenToolsChangedRefreshTimeout = 30 * time.Second
+
+// toolsChangedRefreshState is spawnToolsChangedRefresh's per-target dedup
+// state: at most one onToolsChanged call may be running for a given target
+// at any time. A signal that arrives while one is already running does not
+// start a second, concurrent call — it merely sets dirty, under mu, and
+// returns; the ALREADY-running call, once its current round finishes,
+// checks dirty and — if set — clears it and runs exactly one more round
+// before checking again, looping until a round finishes with dirty still
+// false. This is deliberately a loop, not recursion: an unbounded burst
+// arriving one signal at a time, each landing after the previous round has
+// already finished, must not grow this goroutine's own call stack.
+//
+// This closes a gap listenThrottle's own coalescing leaves open on its own
+// (see ListenManager's own doc): the throttle bounds how often a round is
+// STARTED, but a round that runs longer than listenThrottleInterval — the
+// normal case for onToolsChanged, an upstream round trip via
+// ToolCache.RefreshServer — lets the throttle's window close and reopen
+// while that round is still in flight, so a signal arriving in the new
+// window would otherwise start a second, genuinely concurrent
+// onToolsChanged call for the same target. Two such calls sharing the same
+// underlying ToolCache is exactly the hazard this type exists to prevent:
+// the second could join the first's already in-flight ToolCache singleflight
+// round (keyed only by serverID, with no notion of "this caller's own
+// trigger is newer") and be handed back a result that predates the very
+// change it was meant to report — silently losing it, rather than merely
+// wasting an upstream round trip. Serializing every onToolsChanged call for
+// a target through this state, in addition to (not instead of) the
+// throttle's own window, guarantees the round that eventually observes a
+// given signal always starts strictly after any round already in flight
+// when that signal arrived has itself finished — so it can never share that
+// earlier round's now-stale result.
+type toolsChangedRefreshState struct {
+	mu      sync.Mutex
+	running bool
+	dirty   bool
+}
+
+// spawnToolsChangedRefresh ensures exactly one onToolsChanged call is
+// running for this target, per toolsChangedRefreshState's own guarantee: if
+// one is already running (state.running), this call merely marks state
+// dirty and returns without starting anything — never inline on the
+// caller's own goroutine (this target's listener, via throttle.Call — see
+// start's own doc) either way, so a caller here never blocks on a refresh
+// that talks to the upstream. Otherwise it starts the one goroutine that
+// will run onToolsChanged, in a loop, until a round finishes with nothing
+// pending — see toolsChangedRefreshState's own doc for exactly how the loop
+// drains a burst that arrives faster than refreshes complete.
+//
+// listenerCtx is the exact per-target context start created for this
+// listener: cancelled the instant a later Reconcile call supersedes or
+// removes this target, or Stop is called, whichever comes first. Each
+// round's own ctx, the one actually handed to onToolsChanged, derives from
+// listenerCtx via context.WithTimeout(listenerCtx,
+// listenToolsChangedRefreshTimeout) — so a round already in flight when this
+// listener is torn down is cancelled immediately rather than continuing to
+// run past that point, and a round against an upstream that accepted the
+// connection but never answers tools/list cannot hold this goroutine (and so
+// m.wg) open indefinitely even while listenerCtx itself stays alive. Once
+// listenerCtx itself has ended, every subsequent round in the same loop
+// (draining an already-set dirty flag) receives an already-cancelled ctx and
+// so returns immediately — bounding the whole loop by listenerCtx even for a
+// burst that was still arriving right as the listener was torn down; no
+// further signal can extend it once throttle.Stop (start's own doc) has
+// made every further Call a no-op.
+//
+// Tracked under m.wg — Add is called here, once per goroutine THIS call
+// actually starts (never once per signal — a signal that only sets dirty
+// does not call Add again, since the loop it will feed is already counted),
+// exactly like every listener goroutine's own launch in start already does
+// — so Stop's own wg.Wait() does not return until every refresh loop this
+// method has started has also exited, not merely until every listener
+// goroutine itself has. This Add is safe under the same "m.wg's counter is
+// never observed at zero" reasoning start's own goroutine launch already
+// relies on: this method is only ever called (via throttle.Call, itself only
+// ever invoked from within runListener, or from listenThrottle's own
+// trailing-edge timer goroutine — see listenThrottle's own doc) while this
+// target's own listener goroutine has not yet reached throttle.Stop (see
+// start's own doc for that ordering), so m.wg's counter cannot be zero at
+// the moment this Add executes.
+func (m *ListenManager) spawnToolsChangedRefresh(listenerCtx context.Context, serverID string, state *toolsChangedRefreshState) {
+	state.mu.Lock()
+	if state.running {
+		state.dirty = true
+		state.mu.Unlock()
+		if hook := listenRefreshDedupHookForTest.Load(); hook != nil {
+			(*hook)(serverID, false)
+		}
+		return
+	}
+	state.running = true
+	state.mu.Unlock()
+
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		for {
+			if hook := listenRefreshDedupHookForTest.Load(); hook != nil {
+				(*hook)(serverID, true)
+			}
+			runOneToolsChangedRound(listenerCtx, serverID, m.onToolsChanged)
+
+			state.mu.Lock()
+			if state.dirty {
+				state.dirty = false
+				state.mu.Unlock()
+				continue
+			}
+			state.running = false
+			state.mu.Unlock()
+			return
+		}
+	}()
+}
+
+// runOneToolsChangedRound runs onToolsChanged(ctx, serverID) exactly once,
+// with ctx bounded by listenToolsChangedRefreshTimeout as derived from
+// listenerCtx (see spawnToolsChangedRefresh's own doc) — split out from
+// spawnToolsChangedRefresh's own loop purely so the deferred cancel() the
+// timeout requires runs at the end of EACH round, not only once the whole
+// loop exits, which a defer placed directly in that loop's body could not do
+// without leaking one context per round drained from a long burst.
+func runOneToolsChangedRound(listenerCtx context.Context, serverID string, onToolsChanged func(ctx context.Context, serverID string)) {
+	ctx, cancel := context.WithTimeout(listenerCtx, listenToolsChangedRefreshTimeout)
+	defer cancel()
+	onToolsChanged(ctx, serverID)
 }
 
 // Stop cancels every currently running listener goroutine and blocks until
@@ -493,11 +679,11 @@ var listenJitterFuncForTest atomic.Pointer[func(time.Duration) time.Duration]
 // always eventually delivered — a trailing-edge call — rather than dropped:
 // a plain leading-edge-only throttle would silently lose whatever change
 // arrived last in a burst that landed inside the current window, which is
-// exactly the class of tools-changed notification ToolCache's own
-// invalidation must not miss. Every ListenManager target owns exactly one
+// exactly the class of tools-changed notification ToolCache's own cached
+// listing must not miss. Every ListenManager target owns exactly one
 // listenThrottle (see start's own doc), shared by every trigger that would
 // otherwise call onToolsChanged for that server — transport.Listen's own
-// notification callback and runListener's post-ack invalidation alike.
+// notification callback and runListener's post-ack refresh trigger alike.
 //
 // Safe for concurrent use: Call may run on the listener's own goroutine, and
 // the trailing-edge fire it can schedule runs on a time.AfterFunc timer's

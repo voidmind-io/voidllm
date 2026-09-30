@@ -8,10 +8,12 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -97,7 +99,7 @@ func TestReconcileMCPListenTargets_SkipsInactiveServers(t *testing.T) {
 	t.Cleanup(transportCache.Close)
 	transportCache.LoadAll(servers)
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 	t.Cleanup(manager.Stop)
 
 	a := &Application{
@@ -149,7 +151,7 @@ func TestReconcileMCPListenTargets_SkipsPinnedLegacyServer(t *testing.T) {
 	t.Cleanup(transportCache.Close)
 	transportCache.LoadAll(servers)
 
-	manager := mcp.NewListenManager(func(string) {})
+	manager := mcp.NewListenManager(func(context.Context, string) {})
 	t.Cleanup(manager.Stop)
 
 	a := &Application{
@@ -173,15 +175,48 @@ func TestReconcileMCPListenTargets_SkipsPinnedLegacyServer(t *testing.T) {
 }
 
 // ---- reconcileMCPListenTargets + real ListenManager + real ToolCache ------
+//
+// These four tests are the end-to-end wiring tests for the Code Mode /
+// ListenManager / ToolCache triangle app.go's New wires together, mirroring
+// that wiring's own callback exactly: on a tools-changed notification it
+// calls ToolCache.RefreshServer — never Invalidate. See app.go's own comment
+// at that wiring for why: Code Mode's toolsListHook (code_mode.go) reads
+// ToolCache.GetAllTools, a pure snapshot that never triggers a fetch of its
+// own, so a plain Invalidate would leave a changed server missing from every
+// tools/list response — not merely stale — until some UNRELATED caller
+// happened to call GetTools for it first.
 
-// TestReconcileMCPListenTargets_ListChanged_InvalidatesToolCache_LazyRefetch
-// is the end-to-end wiring test for the Code Mode / ListenManager /
-// ToolCache triangle app.go's New wires together: a
-// notifications/tools/list_changed event on a reconciled target's stream
-// must invalidate ToolCache's cached listing for that exact server, so the
-// NEXT GetTools call refetches from upstream instead of returning the
-// already-cached listing.
-func TestReconcileMCPListenTargets_ListChanged_InvalidatesToolCache_LazyRefetch(t *testing.T) {
+// newWiringToolCacheTarget builds the db.MCPServer/MCPServerCache/
+// MCPTransportCache triple every test below needs to give serverID's
+// listenWiringServer a subscriptions/listen connection via
+// reconcileMCPListenTargets, returning the Application ready for that call.
+func newWiringToolCacheTarget(t *testing.T, serverID, url string, manager *mcp.ListenManager) *Application {
+	t.Helper()
+	servers := []db.MCPServer{
+		{ID: serverID, Alias: serverID, URL: url, AuthType: "none", IsActive: true, ProtocolVersion: "2026-07-28"},
+	}
+	serverCache := proxy.NewMCPServerCache()
+	serverCache.LoadAll(servers)
+	transportCache := newWiringTransportCache()
+	t.Cleanup(transportCache.Close)
+	transportCache.LoadAll(servers)
+
+	return &Application{
+		mcpServerCache:    serverCache,
+		mcpTransportCache: transportCache,
+		mcpListenManager:  manager,
+	}
+}
+
+// TestReconcileMCPListenTargets_ListChanged_RefreshesToolCacheEagerly is the
+// direct regression test for the bug this wiring used to have: a
+// notifications/tools/list_changed event must EAGERLY re-fetch and publish
+// serverID's tool listing — proven here by reading ToolCache.GetAllTools
+// (the exact snapshot toolsListHook itself reads) without this test, or
+// anyone else, ever calling GetTools again. The old Invalidate-based wiring
+// would have left GetAllTools reporting nothing at all for serverID at that
+// point instead.
+func TestReconcileMCPListenTargets_ListChanged_RefreshesToolCacheEagerly(t *testing.T) {
 	t.Parallel()
 
 	const serverID = "wired-server"
@@ -194,7 +229,7 @@ func TestReconcileMCPListenTargets_ListChanged_InvalidatesToolCache_LazyRefetch(
 		fetchCount.Add(1)
 		return &mcp.ToolListing{Tools: []mcp.Tool{{Name: fmt.Sprintf("tool-%d", fetchCount.Load())}}}, nil
 	}
-	toolCache := mcp.NewToolCache(fetcher, time.Hour) // long maxAge: only Invalidate should force a refetch
+	toolCache := mcp.NewToolCache(fetcher, time.Hour) // long maxAge: only RefreshServer should force a refetch
 
 	if _, err := toolCache.GetTools(context.Background(), serverID); err != nil {
 		t.Fatalf("initial GetTools() error = %v", err)
@@ -203,27 +238,13 @@ func TestReconcileMCPListenTargets_ListChanged_InvalidatesToolCache_LazyRefetch(
 		t.Fatalf("fetchCount after initial GetTools() = %d, want 1", got)
 	}
 
-	invalidated := make(chan string, 4)
-	manager := mcp.NewListenManager(func(id string) {
-		toolCache.Invalidate(id)
-		invalidated <- id
+	refreshed := make(chan error, 4)
+	manager := mcp.NewListenManager(func(ctx context.Context, id string) {
+		refreshed <- toolCache.RefreshServer(ctx, id)
 	})
 	t.Cleanup(manager.Stop)
 
-	servers := []db.MCPServer{
-		{ID: serverID, Alias: serverID, URL: srv.URL, AuthType: "none", IsActive: true, ProtocolVersion: "2026-07-28"},
-	}
-	serverCache := proxy.NewMCPServerCache()
-	serverCache.LoadAll(servers)
-	transportCache := newWiringTransportCache()
-	t.Cleanup(transportCache.Close)
-	transportCache.LoadAll(servers)
-
-	a := &Application{
-		mcpServerCache:    serverCache,
-		mcpTransportCache: transportCache,
-		mcpListenManager:  manager,
-	}
+	a := newWiringToolCacheTarget(t, serverID, srv.URL, manager)
 	a.reconcileMCPListenTargets()
 
 	select {
@@ -233,18 +254,211 @@ func TestReconcileMCPListenTargets_ListChanged_InvalidatesToolCache_LazyRefetch(
 	}
 
 	select {
-	case got := <-invalidated:
-		if got != serverID {
-			t.Errorf("invalidated serverID = %q, want %q", got, serverID)
+	case err := <-refreshed:
+		if err != nil {
+			t.Fatalf("RefreshServer triggered by list_changed returned error: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("ToolCache.Invalidate was never called after the list_changed notification")
+		t.Fatal("ToolCache.RefreshServer was never called after the list_changed notification")
 	}
 
-	if _, err := toolCache.GetTools(context.Background(), serverID); err != nil {
-		t.Fatalf("post-invalidation GetTools() error = %v", err)
+	// No GetTools call happens between the wait above and this read: the
+	// refreshed listing must already be published by the time RefreshServer
+	// itself returned.
+	tools := toolCache.GetAllTools()[serverID]
+	if len(tools) != 1 || tools[0].Name != "tool-2" {
+		t.Fatalf("GetAllTools()[%q] = %v, want a single tool-2 entry published by the eager refresh", serverID, tools)
 	}
 	if got := fetchCount.Load(); got != 2 {
-		t.Errorf("fetchCount after post-invalidation GetTools() = %d, want 2 (a lazy refetch triggered by the invalidation)", got)
+		t.Errorf("fetchCount after the list_changed refresh = %d, want 2", got)
+	}
+}
+
+// TestReconcileMCPListenTargets_ListChanged_FailedRefreshKeepsOldListing
+// verifies that when the upstream fetch RefreshServer triggers fails, the
+// previously cached listing is left untouched — never cleared — matching
+// RefreshServer's own documented contract ("on fetch failure the existing
+// cache entry is preserved").
+func TestReconcileMCPListenTargets_ListChanged_FailedRefreshKeepsOldListing(t *testing.T) {
+	t.Parallel()
+
+	const serverID = "wired-server-fail"
+
+	connected := make(chan struct{}, 4)
+	srv := listenWiringServer(t, connected, listenWiringAckEvent+listenWiringListChangedEvent)
+
+	var fetchCount atomic.Int32
+	fetcher := func(_ context.Context, _ string) (*mcp.ToolListing, error) {
+		if fetchCount.Add(1) == 1 {
+			return &mcp.ToolListing{Tools: []mcp.Tool{{Name: "tool-1"}}}, nil
+		}
+		return nil, errors.New("upstream unavailable")
+	}
+	toolCache := mcp.NewToolCache(fetcher, time.Hour)
+
+	if _, err := toolCache.GetTools(context.Background(), serverID); err != nil {
+		t.Fatalf("initial GetTools() error = %v", err)
+	}
+
+	refreshed := make(chan error, 4)
+	manager := mcp.NewListenManager(func(ctx context.Context, id string) {
+		refreshed <- toolCache.RefreshServer(ctx, id)
+	})
+	t.Cleanup(manager.Stop)
+
+	a := newWiringToolCacheTarget(t, serverID, srv.URL, manager)
+	a.reconcileMCPListenTargets()
+
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the server never received its subscriptions/listen connection")
+	}
+
+	select {
+	case err := <-refreshed:
+		if err == nil {
+			t.Fatal("expected the list_changed-triggered RefreshServer to fail, got nil error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ToolCache.RefreshServer was never called after the list_changed notification")
+	}
+
+	tools := toolCache.GetAllTools()[serverID]
+	if len(tools) != 1 || tools[0].Name != "tool-1" {
+		t.Fatalf("GetAllTools()[%q] = %v, want the pre-refresh tool-1 entry preserved after a failed refresh", serverID, tools)
+	}
+}
+
+// TestReconcileMCPListenTargets_ListChanged_OnChangeFiresOnlyAfterPublish
+// verifies the ordering app.go's own "Trigger 1" wiring comment documents:
+// ToolCache.SetOnChange's hook — which production wires to
+// codeModeServer.NotifyToolsListChanged — must never fire before the
+// refreshed listing it is announcing has actually been published; by the
+// time the hook installed here runs, GetAllTools must already report the new
+// listing, not the old one.
+func TestReconcileMCPListenTargets_ListChanged_OnChangeFiresOnlyAfterPublish(t *testing.T) {
+	t.Parallel()
+
+	const serverID = "wired-server-notify"
+
+	connected := make(chan struct{}, 4)
+	srv := listenWiringServer(t, connected, listenWiringAckEvent+listenWiringListChangedEvent)
+
+	var fetchCount atomic.Int32
+	fetcher := func(_ context.Context, _ string) (*mcp.ToolListing, error) {
+		return &mcp.ToolListing{Tools: []mcp.Tool{{Name: fmt.Sprintf("tool-%d", fetchCount.Add(1))}}}, nil
+	}
+	toolCache := mcp.NewToolCache(fetcher, time.Hour)
+
+	if _, err := toolCache.GetTools(context.Background(), serverID); err != nil {
+		t.Fatalf("initial GetTools() error = %v", err)
+	}
+
+	publishedBeforeNotify := make(chan bool, 4)
+	toolCache.SetOnChange(func(id string) {
+		tools := toolCache.GetAllTools()[id]
+		publishedBeforeNotify <- len(tools) == 1 && tools[0].Name == "tool-2"
+	})
+
+	manager := mcp.NewListenManager(func(ctx context.Context, id string) {
+		_ = toolCache.RefreshServer(ctx, id)
+	})
+	t.Cleanup(manager.Stop)
+
+	a := newWiringToolCacheTarget(t, serverID, srv.URL, manager)
+	a.reconcileMCPListenTargets()
+
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the server never received its subscriptions/listen connection")
+	}
+
+	select {
+	case ok := <-publishedBeforeNotify:
+		if !ok {
+			t.Fatal("SetOnChange fired before the refreshed listing was published")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ToolCache.SetOnChange was never called after the list_changed notification")
+	}
+}
+
+// TestListenManager_Stop_DoesNotBlockOnStuckToolsChangedRefresh_NoLeak is the
+// direct regression test for spawnToolsChangedRefresh's own "no leak" claim
+// (listen_manager.go): the goroutine ListenManager itself spawns to run a
+// tools-changed refresh (tracked under m.wg) must not be held open by Stop
+// past the moment Stop cancels this target's own listener context, even when
+// the upstream fetch that refresh triggered never returns at all.
+//
+// This deliberately does NOT assert that the underlying upstream fetch
+// itself gets cancelled — it does not, by ToolCache's own design: sharedFetch
+// (tool_cache.go) runs the actual fetch against a context "fully detached
+// from every caller's context" specifically so one caller's cancellation can
+// never sever a shared fetch other callers are still joined to, and only
+// races the CALLER's own ctx against that detached fetch to decide when to
+// return to THAT caller. What ends the goroutine ListenManager itself owns —
+// and so what this test proves — is that RefreshServer (via sharedFetch's
+// same ctx-losing-race path) returns to spawnToolsChangedRefresh's goroutine
+// promptly once ctx ends, letting it call m.wg.Done() and so let Stop's own
+// wg.Wait() return, regardless of how long the now-orphaned upstream fetch
+// keeps running on its own, separately bounded by tc.fetchTimeout.
+func TestListenManager_Stop_DoesNotBlockOnStuckToolsChangedRefresh_NoLeak(t *testing.T) {
+	t.Parallel()
+
+	const serverID = "wired-server-stop"
+
+	connected := make(chan struct{}, 4)
+	srv := listenWiringServer(t, connected, listenWiringAckEvent+listenWiringListChangedEvent)
+
+	fetcherEntered := make(chan struct{})
+	// release is deliberately never closed within the test body itself — this
+	// fetcher stands in for an upstream that has stopped answering entirely,
+	// ignoring ctx exactly as an upstream naturally would (a real HTTP round
+	// trip only ends because the underlying net.Conn errors or the resolved
+	// fetchCtx's own timeout eventually fires, not because SOME OTHER
+	// caller's ctx ended). t.Cleanup unblocks it after the test's own
+	// assertions are done, purely so this goroutine does not outlive the test
+	// binary itself.
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var fetcherEnteredOnce sync.Once
+	fetcher := func(_ context.Context, _ string) (*mcp.ToolListing, error) {
+		fetcherEnteredOnce.Do(func() { close(fetcherEntered) })
+		<-release
+		return nil, errors.New("unreachable: release is only closed by t.Cleanup, after every assertion below")
+	}
+	toolCache := mcp.NewToolCache(fetcher, time.Hour)
+
+	manager := mcp.NewListenManager(func(ctx context.Context, id string) {
+		_ = toolCache.RefreshServer(ctx, id)
+	})
+
+	a := newWiringToolCacheTarget(t, serverID, srv.URL, manager)
+	a.reconcileMCPListenTargets()
+
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the server never received its subscriptions/listen connection")
+	}
+
+	select {
+	case <-fetcherEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the list_changed-triggered refresh never reached the (blocking) fetcher")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		defer close(stopDone)
+		manager.Stop()
+	}()
+
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() blocked on a tools-changed refresh whose upstream fetch never returns — spawnToolsChangedRefresh's own goroutine leaked past Stop")
 	}
 }
