@@ -2,6 +2,21 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.30] - 2026-09-30
+
+### Features
+- MCP protocol revision 2026-07-28 alongside the legacy era on the same endpoints, as MCP server, MCP client and transparent intermediary; the protocol version is negotiated per request and can be pinned per MCP server (#219)
+- MCP `tools/list` against upstreams follows `nextCursor` pagination (#219)
+- With Code Mode enabled, VoidLLM listens to modern upstreams via `subscriptions/listen` and refreshes a server's tools when it announces a change; the built-in Code Mode server offers `subscriptions/listen` with `toolsListChanged` to its own clients (#219)
+- Streaming pass-through for MCP responses with an idle timeout and a byte cap (#219)
+
+### Upgrade notes
+- **Breaking:** MCP endpoints validate a browser `Origin` header only against `settings.mcp.allowed_origins`; with no list configured, only localhost origins are accepted. Serving MCP to a browser under a real domain requires listing that domain. Requests without an `Origin` header (SDKs, CLI clients) are unaffected. VoidLLM warns at startup when the list is empty (#219)
+- Database migration `0019_mcp_protocol_version` adds the per-server protocol version (#219)
+- `server.proxy.write_timeout: 0` is not supported (it falls back to 120s); raise it to an explicit duration such as `1h` for long-lived MCP streams. In dual-port mode MCP streams are capped at 120s and end gracefully so clients reconnect (#219)
+
+---
+
 ## [0.0.29] - 2026-09-30
 
 ### Security
