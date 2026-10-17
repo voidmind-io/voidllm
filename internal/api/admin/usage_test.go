@@ -1094,19 +1094,21 @@ func TestCacheSavings(t *testing.T) {
 	tests := []struct {
 		name        string
 		pricing     config.PricingConfig
+		prompt      int64
 		read, write int64
 		want        *float64
 	}{
-		{"cached price unset falls back to input", config.PricingConfig{InputPer1M: 3}, 1000, 0, f(0)},
-		{"write price unset has no premium", config.PricingConfig{InputPer1M: 3, CachedInputPer1M: 0.3}, 1000, 500, f(0.0027)},
-		{"write premium makes savings negative", config.PricingConfig{InputPer1M: 3, CacheWritePer1M: 3.75}, 0, 1000, f(-0.00075)},
-		{"read and write combined", config.PricingConfig{InputPer1M: 3, CachedInputPer1M: 0.3, CacheWritePer1M: 3.75}, 1000, 200, f(0.00255)},
-		{"no input price", config.PricingConfig{CachedInputPer1M: 0.3}, 1000, 200, nil},
+		{"cached price unset falls back to input", config.PricingConfig{InputPer1M: 3}, 5000, 1000, 0, f(0)},
+		{"write price unset has no premium", config.PricingConfig{InputPer1M: 3, CachedInputPer1M: 0.3}, 5000, 1000, 500, f(0.0027)},
+		{"write premium makes savings negative", config.PricingConfig{InputPer1M: 3, CacheWritePer1M: 3.75}, 5000, 0, 1000, f(-0.00075)},
+		{"read and write combined", config.PricingConfig{InputPer1M: 3, CachedInputPer1M: 0.3, CacheWritePer1M: 3.75}, 5000, 1000, 200, f(0.00255)},
+		{"no input price", config.PricingConfig{CachedInputPer1M: 0.3}, 5000, 1000, 200, nil},
+		{"fresh clamped at zero", config.PricingConfig{InputPer1M: 10, CachedInputPer1M: 5, CacheWritePer1M: 8}, 100, 80, 50, f(0.0002)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := admin.CacheSavings(tt.pricing, tt.read, tt.write)
+			got := admin.CacheSavings(tt.pricing, tt.prompt, tt.read, tt.write)
 			if tt.want == nil {
 				if got != nil {
 					t.Fatalf("got %v, want nil", *got)
@@ -1125,24 +1127,41 @@ func TestCacheSavings(t *testing.T) {
 
 // TestCacheSavings_ConsistentWithHandlerCost verifies that savings equal the
 // no-cache cost of the prompt minus the cost computed with the proxy handler's
-// formula (fresh*in + read*rr + write*wr + completion*out).
+// formula (fresh*in + read*rr + write*wr + completion*out, fresh clamped at
+// zero). The proxy computes cost inline in logUsageEvent and no shared pure
+// function exists, so the formula is restated explicitly here, for both a
+// normal and a clamped case.
 func TestCacheSavings_ConsistentWithHandlerCost(t *testing.T) {
 	t.Parallel()
 
-	p := config.PricingConfig{InputPer1M: 3, OutputPer1M: 15, CachedInputPer1M: 0.3, CacheWritePer1M: 3.75}
-	const prompt, completion, read, write = int64(5000), int64(700), int64(1000), int64(200)
-
-	fresh := prompt - read - write
-	cost := (float64(fresh)*p.InputPer1M + float64(read)*p.CachedInputPer1M +
-		float64(write)*p.CacheWritePer1M + float64(completion)*p.OutputPer1M) / 1e6
-	noCache := (float64(prompt)*p.InputPer1M + float64(completion)*p.OutputPer1M) / 1e6
-
-	got := admin.CacheSavings(p, read, write)
-	if got == nil {
-		t.Fatal("got nil savings")
+	tests := []struct {
+		name                            string
+		p                               config.PricingConfig
+		prompt, completion, read, write int64
+	}{
+		{"normal", config.PricingConfig{InputPer1M: 3, OutputPer1M: 15, CachedInputPer1M: 0.3, CacheWritePer1M: 3.75}, 5000, 700, 1000, 200},
+		{"clamped", config.PricingConfig{InputPer1M: 10, OutputPer1M: 20, CachedInputPer1M: 5, CacheWritePer1M: 8}, 100, 30, 80, 50},
 	}
-	if want := noCache - cost; math.Abs(*got-want) > 1e-12 {
-		t.Errorf("savings = %v, want %v", *got, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			p := tt.p
+			fresh := tt.prompt - tt.read - tt.write
+			if fresh < 0 {
+				fresh = 0
+			}
+			cost := (float64(fresh)*p.InputPer1M + float64(tt.read)*p.CachedInputPer1M +
+				float64(tt.write)*p.CacheWritePer1M + float64(tt.completion)*p.OutputPer1M) / 1e6
+			noCache := (float64(tt.prompt)*p.InputPer1M + float64(tt.completion)*p.OutputPer1M) / 1e6
+
+			got := admin.CacheSavings(p, tt.prompt, tt.read, tt.write)
+			if got == nil {
+				t.Fatal("got nil savings")
+			}
+			if want := noCache - cost; math.Abs(*got-want) > 1e-12 {
+				t.Errorf("savings = %v, want %v", *got, want)
+			}
+		})
 	}
 }
 

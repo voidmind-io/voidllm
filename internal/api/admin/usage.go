@@ -174,12 +174,15 @@ func aggregatesToDataPoints(aggs []db.UsageAggregate) []usageDataPoint {
 }
 
 // cacheSavings returns the estimated savings from prompt caching for the given
-// pricing and cached token counts: the cost without caching (all prompt tokens
-// at the input price) minus the actual cost. Fresh and completion tokens cancel
-// out; the cache-write premium is subtracted. A zero cached-input or
-// cache-write price falls back to the input price. It returns nil when no
-// input price is configured. The result may be negative.
-func cacheSavings(p config.PricingConfig, read, write int64) *float64 {
+// pricing and token counts: the cost without caching (all prompt tokens at the
+// input price) minus the actual cost. Completion tokens cancel out and are
+// omitted. The fresh portion is prompt-read-write, clamped at zero, and a zero
+// cached-input or cache-write price falls back to the input price, both
+// mirroring the proxy's per-request cost computation. Applied to aggregated
+// buckets the result is an estimate, since per-event clamping can differ from
+// clamping the sums. It returns nil when no input price is configured. The
+// result may be negative.
+func cacheSavings(p config.PricingConfig, prompt, read, write int64) *float64 {
 	if p.InputPer1M <= 0 {
 		return nil
 	}
@@ -191,7 +194,13 @@ func cacheSavings(p config.PricingConfig, read, write int64) *float64 {
 	if wr == 0 {
 		wr = p.InputPer1M
 	}
-	s := float64(read)*(p.InputPer1M-rr)/1e6 - float64(write)*(wr-p.InputPer1M)/1e6
+	fresh := prompt - read - write
+	if fresh < 0 {
+		fresh = 0
+	}
+	noCache := float64(prompt) * p.InputPer1M
+	actual := float64(fresh)*p.InputPer1M + float64(read)*rr + float64(write)*wr
+	s := (noCache - actual) / 1e6
 	return &s
 }
 
@@ -208,7 +217,7 @@ func (h *Handler) attachCacheSavings(groupBy string, data []usageDataPoint) {
 		if err != nil {
 			continue
 		}
-		data[i].CacheSavings = cacheSavings(m.Pricing, data[i].CachedReadTokens, data[i].CacheWriteTokens)
+		data[i].CacheSavings = cacheSavings(m.Pricing, data[i].PromptTokens, data[i].CachedReadTokens, data[i].CacheWriteTokens)
 	}
 }
 

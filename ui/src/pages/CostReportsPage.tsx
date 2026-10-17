@@ -398,7 +398,7 @@ export default function CostReportsPage() {
       <div className="mb-8">
         <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wider mb-4">Cost by Model</h2>
         <p className="text-xs text-text-tertiary mb-4">
-          Cache savings use current model prices. Models without an input price show -.
+          Cache savings use current model prices. Models without an input price, or no longer configured, show -.
         </p>
         <Table<ModelCostRow>
           columns={modelColumns}
