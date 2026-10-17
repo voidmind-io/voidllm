@@ -1049,6 +1049,17 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 
 	adapter := GetAdapter(model.Provider)
 
+	// Rerank and score have no translation for the Anthropic and Gemini/Vertex
+	// adapters, which only understand chat requests. Reject them here instead of
+	// forwarding a malformed chat request upstream.
+	if adapter != nil && !isAzureAdapter(adapter) && (upstreamPath == "rerank" || upstreamPath == "score") {
+		if err := apierror.Send(c, fiber.StatusBadRequest,
+			"bad_request", "endpoint not supported for this provider"); err != nil {
+			return nil, nil, nil, err
+		}
+		return nil, nil, nil, errResponseSent
+	}
+
 	// Determine if body needs mutation.
 	needsModelReplace := envelope.Model != model.Name
 	needsStreamOpts := envelope.Stream && (adapter == nil || isAzureAdapter(adapter))
@@ -1899,7 +1910,7 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 	}
 
 	if p.UsageLogger != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		ui := extractUsage(usageBody)
+		ui := normalizeRerankScoreUsage(path.Clean(strings.TrimPrefix(c.Path(), "/v1/")), extractUsage(usageBody))
 		durationMS := int(time.Since(startTime).Milliseconds())
 		// For non-streaming responses TTFT equals total duration: the entire
 		// response body is the first (and only) "token delivery".
@@ -2199,6 +2210,22 @@ func extractUsage(body []byte) UsageInfo {
 	if resp.Usage.PromptTokensDetails != nil {
 		ui.CachedReadTokens = resp.Usage.PromptTokensDetails.CachedTokens
 		ui.CacheWriteTokens = resp.Usage.PromptTokensDetails.CacheCreationTokens
+	}
+	return ui
+}
+
+// normalizeRerankScoreUsage maps a total_tokens-only usage object to prompt
+// tokens for the rerank and score endpoints. vLLM's /rerank reports just
+// usage.total_tokens; without this mapping the event would carry zero prompt
+// tokens and a zero cost although the client was billed. Responses that
+// already carry prompt or completion tokens, and all other paths, are
+// returned unchanged.
+func normalizeRerankScoreUsage(upstreamPath string, ui UsageInfo) UsageInfo {
+	if upstreamPath != "rerank" && upstreamPath != "score" {
+		return ui
+	}
+	if ui.PromptTokens == 0 && ui.CompletionTokens == 0 && ui.TotalTokens > 0 {
+		ui.PromptTokens = ui.TotalTokens
 	}
 	return ui
 }

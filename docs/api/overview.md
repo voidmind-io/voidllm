@@ -27,6 +27,8 @@ The proxy forwards requests to upstream LLM providers. Any OpenAI-compatible end
 | `POST /v1/chat/completions` | Chat completions (streaming supported) |
 | `POST /v1/completions` | Text completions |
 | `POST /v1/embeddings` | Text embeddings |
+| `POST /v1/rerank` | Document reranking (OpenAI-compatible backends such as vLLM; not available for Anthropic, Gemini or Vertex models) |
+| `POST /v1/score` | Text pair scoring (OpenAI-compatible backends such as vLLM; not available for Anthropic, Gemini or Vertex models) |
 | `POST /v1/images/generations` | Image generation |
 | `POST /v1/audio/transcriptions` | Audio transcription |
 | `POST /v1/audio/speech` | Text to speech |
