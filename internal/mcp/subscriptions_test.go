@@ -1128,3 +1128,72 @@ func TestServer_WaitForSubscriptionsDrain_WaitsThenReportsResult(t *testing.T) {
 		t.Error("WaitForSubscriptionsDrain() = false with nothing registered, want true")
 	}
 }
+
+// TestServer_WaitForSubscriptionsDrain_EmptyRegistryReportsTrueImmediately
+// verifies that with nothing registered the result is true for every timeout,
+// including zero and negative ones, because there is nothing to wait for.
+func TestServer_WaitForSubscriptionsDrain_EmptyRegistryReportsTrueImmediately(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{name: "zero timeout", timeout: 0},
+		{name: "negative timeout", timeout: -time.Second},
+		{name: "one nanosecond", timeout: time.Nanosecond},
+		{name: "one millisecond", timeout: time.Millisecond},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newTestServer("voidllm", "0.1.0")
+			if !s.WaitForSubscriptionsDrain(tc.timeout) {
+				t.Errorf("WaitForSubscriptionsDrain(%v) = false on an empty registry, want true", tc.timeout)
+			}
+		})
+	}
+}
+
+// TestServer_WaitForSubscriptionsDrain_RepeatedImmediateCallsAfterDrain
+// verifies that once the last subscriber has unregistered, every immediate
+// zero-timeout call reports true. A goroutine-versus-timer implementation
+// would intermittently lose that race across this many iterations.
+func TestServer_WaitForSubscriptionsDrain_RepeatedImmediateCallsAfterDrain(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+
+	sub := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-drain-repeat"}, 1)
+	sub.Unregister()
+
+	for i := range 1000 {
+		if !s.WaitForSubscriptionsDrain(0) {
+			t.Fatalf("iteration %d: WaitForSubscriptionsDrain(0) = false after drain, want true", i)
+		}
+	}
+}
+
+// TestServer_WaitForSubscriptionsDrain_NonEmptyZeroTimeoutReportsFalse verifies
+// the fast path does not apply while a subscriber is still registered: a zero
+// timeout reports false, and the call succeeds once the subscriber is gone.
+func TestServer_WaitForSubscriptionsDrain_NonEmptyZeroTimeoutReportsFalse(t *testing.T) {
+	t.Parallel()
+
+	s := newTestServer("voidllm", "0.1.0")
+	s.SetToolsListChangedSource(true)
+
+	sub := registerListener(t, s, mcp.KeyIdentity{OrgID: "org-1", KeyID: "key-drain-nonempty"}, 1)
+
+	if s.WaitForSubscriptionsDrain(0) {
+		t.Fatal("WaitForSubscriptionsDrain(0) = true with a registered subscriber, want false")
+	}
+
+	sub.Unregister()
+	if !s.WaitForSubscriptionsDrain(0) {
+		t.Error("WaitForSubscriptionsDrain(0) = false after the subscriber unregistered, want true")
+	}
+}
