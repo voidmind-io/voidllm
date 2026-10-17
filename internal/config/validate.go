@@ -166,7 +166,9 @@ func (c *Config) validate() error {
 				errs = append(errs, fmt.Errorf("%s.provider: must be one of %v, got %q", prefix, provider.Names(), m.Provider))
 			}
 
-			if m.BaseURL == "" {
+			if m.Provider == provider.Bedrock {
+				errs = append(errs, validateBedrock(prefix, prefix, m.BaseURL, m.Region, m.BedrockModelID, m.Type)...)
+			} else if m.BaseURL == "" {
 				errs = append(errs, fmt.Errorf("%s.base_url: must not be empty", prefix))
 			} else if !strings.HasPrefix(m.BaseURL, "http://") && !strings.HasPrefix(m.BaseURL, "https://") {
 				errs = append(errs, fmt.Errorf("%s.base_url: must start with http:// or https://", prefix))
@@ -214,7 +216,9 @@ func (c *Config) validate() error {
 					errs = append(errs, fmt.Errorf("%s.provider: must be one of %v, got %q", dprefix, provider.Names(), d.Provider))
 				}
 
-				if d.BaseURL == "" {
+				if d.Provider == provider.Bedrock {
+					errs = append(errs, validateBedrock(dprefix, prefix, d.BaseURL, d.Region, d.BedrockModelID, m.Type)...)
+				} else if d.BaseURL == "" {
 					errs = append(errs, fmt.Errorf("%s.base_url: must not be empty", dprefix))
 				} else if !strings.HasPrefix(d.BaseURL, "http://") && !strings.HasPrefix(d.BaseURL, "https://") {
 					errs = append(errs, fmt.Errorf("%s.base_url: must start with http:// or https://", dprefix))
@@ -556,4 +560,28 @@ func (c *Config) validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// validateBedrock validates the fields of a bedrock model or deployment.
+// prefix addresses the entry itself, modelPrefix addresses the owning model
+// (the type field lives on the model).
+func validateBedrock(prefix, modelPrefix, baseURL, region, modelID, modelType string) []error {
+	var errs []error
+	if region == "" {
+		errs = append(errs, fmt.Errorf("%s.region: must not be empty for bedrock provider", prefix))
+	} else if !provider.ValidBedrockRegion(region) {
+		errs = append(errs, fmt.Errorf("%s.region: invalid AWS region %q", prefix, region))
+	}
+	if modelID == "" {
+		errs = append(errs, fmt.Errorf("%s.bedrock_model_id: must not be empty for bedrock provider", prefix))
+	} else if !provider.ValidBedrockModelID(modelID) {
+		errs = append(errs, fmt.Errorf("%s.bedrock_model_id: invalid Bedrock model ID", prefix))
+	}
+	if baseURL != "" && !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+		errs = append(errs, fmt.Errorf("%s.base_url: must start with http:// or https://", prefix))
+	}
+	if modelType != "" && modelType != "chat" {
+		errs = append(errs, fmt.Errorf("%s.type: bedrock supports only chat models", modelPrefix))
+	}
+	return errs
 }

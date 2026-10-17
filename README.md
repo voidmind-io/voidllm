@@ -12,7 +12,7 @@
 
 **A privacy-first LLM proxy and AI gateway for teams that take control seriously.**
 
-VoidLLM is a self-hosted LLM proxy that sits between your applications and LLM providers - OpenAI, Anthropic, Azure, Ollama, vLLM, or any custom endpoint. It gives you organization-wide access control, API key management, usage tracking, rate limiting, and multi-deployment load balancing. One Go binary, sub-2ms proxy overhead, zero knowledge of your prompts.
+VoidLLM is a self-hosted LLM proxy that sits between your applications and LLM providers - OpenAI, Anthropic, Azure, AWS Bedrock, Ollama, vLLM, or any custom endpoint. It gives you organization-wide access control, API key management, usage tracking, rate limiting, and multi-deployment load balancing. One Go binary, sub-2ms proxy overhead, zero knowledge of your prompts.
 
 ![VoidLLM Dashboard](docs/screenshots/VoidLLM-Dashboard.jpg)
 
@@ -47,7 +47,7 @@ flowchart LR
     App[Your app / SDK] -->|OpenAI-compatible| Proxy[VoidLLM proxy]
     Proxy --> Gate[API key + RBAC<br/>rate limits + budgets]
     Gate --> Router[Model alias + load balancing]
-    Router --> Providers[OpenAI / Anthropic / Azure<br/>Ollama / vLLM / custom]
+    Router --> Providers[OpenAI / Anthropic / Azure / Bedrock<br/>Ollama / vLLM / custom]
     Proxy -. metadata only .-> DB[(SQLite / PostgreSQL)]
 ```
 
@@ -248,7 +248,7 @@ This connects your IDE (Claude Code, Cursor, Windsurf) to the Code Mode endpoint
 | Configuration | [All YAML settings](docs/configuration.md) |
 | Docker | [Docker deployment](docs/deployment/docker.md) |
 | Kubernetes | [Helm chart](docs/deployment/kubernetes.md) |
-| Providers | [OpenAI, Anthropic, Azure, Ollama, vLLM](docs/models/providers.md) |
+| Providers | [OpenAI, Anthropic, Azure, AWS Bedrock, Ollama, vLLM](docs/models/providers.md) |
 | Load Balancing | [Strategies, failover, circuit breakers](docs/models/load-balancing.md) |
 | MCP Gateway | [Overview](docs/mcp/overview.md) - [Servers](docs/mcp/servers.md) - [Code Mode](docs/mcp/code-mode.md) - [IDE Setup](docs/mcp/ide-integration.md) |
 | RBAC | [Roles and permissions](docs/security/rbac.md) |
@@ -306,7 +306,7 @@ settings:
       enabled: true
 ```
 
-Supported providers: `openai` · `anthropic` · `azure` · `vllm` · `ollama` · `custom`
+Supported providers: `openai` · `anthropic` · `azure` · `bedrock` · `vllm` · `ollama` · `custom`
 
 Environment variables are interpolated with `${VAR}` syntax. Secrets never hardcoded.
 

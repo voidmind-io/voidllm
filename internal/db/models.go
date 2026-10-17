@@ -17,7 +17,7 @@ import (
 const modelSelectColumns = "id, name, provider, model_type, base_url, api_key_encrypted, " +
 	"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 	"cached_input_price_per_1m, cache_write_price_per_1m, " +
-	"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
+	"azure_deployment, azure_api_version, gcp_project, gcp_location, region, bedrock_model_id, " +
 	"is_active, source, created_by, created_at, updated_at, deleted_at, aliases, timeout, " +
 	"strategy, max_retries, fallback_model_id, pii_filter"
 
@@ -49,12 +49,17 @@ type Model struct {
 	GCPProject string
 	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
 	GCPLocation string
-	IsActive    bool
-	Source      string
-	CreatedBy   *string
-	CreatedAt   string
-	UpdatedAt   string
-	DeletedAt   *string
+	// Region is the AWS region. Non-empty only for provider "bedrock".
+	Region string
+	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
+	// Non-empty only for provider "bedrock".
+	BedrockModelID string
+	IsActive       bool
+	Source         string
+	CreatedBy      *string
+	CreatedAt      string
+	UpdatedAt      string
+	DeletedAt      *string
 	// Aliases is a comma-separated list of alias names, e.g. "default,gpt4".
 	// An empty string means no aliases are configured.
 	Aliases string
@@ -100,6 +105,11 @@ type CreateModelParams struct {
 	GCPProject string
 	// GCPLocation is the Google Cloud region. Required when Provider is "vertex".
 	GCPLocation string
+	// Region is the AWS region. Required when Provider is "bedrock".
+	Region string
+	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
+	// Required when Provider is "bedrock".
+	BedrockModelID string
 	// Source is "yaml" for config-file-sourced models or "api" for Admin API-created models.
 	Source    string
 	CreatedBy *string
@@ -146,6 +156,10 @@ type UpdateModelParams struct {
 	GCPProject *string
 	// GCPLocation, when non-nil, replaces the stored Google Cloud region.
 	GCPLocation *string
+	// Region, when non-nil, replaces the stored AWS region.
+	Region *string
+	// BedrockModelID, when non-nil, replaces the stored Bedrock model ID.
+	BedrockModelID *string
 	// Aliases, when non-nil, replaces the stored comma-separated alias list.
 	// Set to a pointer to an empty string to clear all aliases.
 	Aliases *string
@@ -206,16 +220,16 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 		"(id, name, provider, model_type, base_url, api_key_encrypted, " +
 		"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 		"cached_input_price_per_1m, cache_write_price_per_1m, " +
-		"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
+		"azure_deployment, azure_api_version, gcp_project, gcp_location, region, bedrock_model_id, " +
 		"is_active, source, created_by, aliases, timeout, strategy, max_retries, " +
 		"fallback_model_id, pii_filter, created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
 		p(7) + ", " + p(8) + ", " + p(9) + ", " +
 		p(10) + ", " + p(11) + ", " +
-		p(12) + ", " + p(13) + ", " + p(14) + ", " + p(15) + ", " +
-		"1, " + p(16) + ", " + p(17) + ", " + p(18) + ", " + p(19) + ", " + p(20) + ", " + p(21) + ", " +
-		p(22) + ", " + p(23) + ", " +
+		p(12) + ", " + p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " +
+		"1, " + p(18) + ", " + p(19) + ", " + p(20) + ", " + p(21) + ", " + p(22) + ", " + p(23) + ", " +
+		p(24) + ", " + p(25) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + modelSelectColumns +
@@ -239,6 +253,8 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 			params.AzureAPIVersion,
 			params.GCPProject,
 			params.GCPLocation,
+			params.Region,
+			params.BedrockModelID,
 			params.Source,
 			params.CreatedBy,
 			params.Aliases,
@@ -424,6 +440,16 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 	if params.GCPLocation != nil {
 		setClauses = append(setClauses, "gcp_location = "+p(argN))
 		args = append(args, *params.GCPLocation)
+		argN++
+	}
+	if params.Region != nil {
+		setClauses = append(setClauses, "region = "+p(argN))
+		args = append(args, *params.Region)
+		argN++
+	}
+	if params.BedrockModelID != nil {
+		setClauses = append(setClauses, "bedrock_model_id = "+p(argN))
+		args = append(args, *params.BedrockModelID)
 		argN++
 	}
 	if params.Aliases != nil {
@@ -654,6 +680,7 @@ func scanModel(scanner interface{ Scan(...any) error }) (*Model, error) {
 		&m.MaxContextTokens, &m.InputPricePer1M, &m.OutputPricePer1M,
 		&m.CachedInputPricePer1M, &m.CacheWritePricePer1M,
 		&m.AzureDeployment, &m.AzureAPIVersion, &m.GCPProject, &m.GCPLocation,
+		&m.Region, &m.BedrockModelID,
 		&isActiveInt, &m.Source, &m.CreatedBy,
 		&m.CreatedAt, &m.UpdatedAt, &m.DeletedAt, &m.Aliases, &m.Timeout,
 		&m.Strategy, &m.MaxRetries, &m.FallbackModelID,
@@ -735,6 +762,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 				AzureAPIVersion:       m.AzureAPIVersion,
 				GCPProject:            m.GCPProject,
 				GCPLocation:           m.GCPLocation,
+				Region:                m.Region,
+				BedrockModelID:        m.BedrockModelID,
 				Source:                "yaml",
 				Aliases:               aliases,
 				Timeout:               m.Timeout,
@@ -790,6 +819,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 		azureVersion := m.AzureAPIVersion
 		gcpProject := m.GCPProject
 		gcpLocation := m.GCPLocation
+		region := m.Region
+		bedrockModelID := m.BedrockModelID
 		timeout := m.Timeout
 		strategy := m.Strategy
 		maxRetries := m.MaxRetries
@@ -808,6 +839,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 			AzureAPIVersion:       &azureVersion,
 			GCPProject:            &gcpProject,
 			GCPLocation:           &gcpLocation,
+			Region:                &region,
+			BedrockModelID:        &bedrockModelID,
 			Aliases:               &aliases,
 			Timeout:               &timeout,
 			Strategy:              &strategy,
@@ -881,6 +914,8 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 				AzureAPIVersion: cd.AzureAPIVersion,
 				GCPProject:      cd.GCPProject,
 				GCPLocation:     cd.GCPLocation,
+				Region:          cd.Region,
+				BedrockModelID:  cd.BedrockModelID,
 				Weight:          weight,
 				Priority:        cd.Priority,
 				PIIFilter:       cd.PIIFilter,
@@ -909,6 +944,8 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 		azureVersion := cd.AzureAPIVersion
 		gcpProject := cd.GCPProject
 		gcpLocation := cd.GCPLocation
+		region := cd.Region
+		bedrockModelID := cd.BedrockModelID
 		weight := cd.Weight
 		if weight < 1 {
 			weight = 1
@@ -922,6 +959,8 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 			AzureAPIVersion: &azureVersion,
 			GCPProject:      &gcpProject,
 			GCPLocation:     &gcpLocation,
+			Region:          &region,
+			BedrockModelID:  &bedrockModelID,
 			Weight:          &weight,
 			Priority:        &priority,
 			// Sync the YAML pii_filter value. Clear to NULL when not set in YAML

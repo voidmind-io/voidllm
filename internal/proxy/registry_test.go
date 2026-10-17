@@ -524,3 +524,143 @@ func TestRegistry_StripAllFallbacks_Concurrent(t *testing.T) {
 	wg.Wait()
 	// Reaching here without the race detector firing is the success criterion.
 }
+
+// ---- Bedrock base URL resolution -------------------------------------------
+
+func TestNewRegistry_BedrockBaseURLResolution(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		cfg          config.ModelConfig
+		wantBaseURL  string
+		wantDestPriv bool
+	}{
+		{
+			name:        "empty base_url derives regional endpoint",
+			cfg:         config.ModelConfig{Name: "m", Provider: "bedrock", Region: "eu-central-1", BedrockModelID: "x-v1:0"},
+			wantBaseURL: "https://bedrock-runtime.eu-central-1.amazonaws.com",
+		},
+		{
+			name:        "gov region derives",
+			cfg:         config.ModelConfig{Name: "m", Provider: "bedrock", Region: "us-gov-west-1", BedrockModelID: "x-v1:0"},
+			wantBaseURL: "https://bedrock-runtime.us-gov-west-1.amazonaws.com",
+		},
+		{
+			name:        "override kept verbatim",
+			cfg:         config.ModelConfig{Name: "m", Provider: "bedrock", BaseURL: "https://bedrock-runtime-fips.us-east-1.amazonaws.com/", Region: "us-east-1", BedrockModelID: "x-v1:0"},
+			wantBaseURL: "https://bedrock-runtime-fips.us-east-1.amazonaws.com/",
+		},
+		{
+			name:         "loopback override is private",
+			cfg:          config.ModelConfig{Name: "m", Provider: "bedrock", BaseURL: "http://127.0.0.1:9", Region: "us-east-1", BedrockModelID: "x-v1:0"},
+			wantBaseURL:  "http://127.0.0.1:9",
+			wantDestPriv: true,
+		},
+		{
+			name:        "other provider with empty base_url is not derived",
+			cfg:         config.ModelConfig{Name: "m", Provider: "openai", Region: "eu-central-1"},
+			wantBaseURL: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			reg, err := NewRegistry([]config.ModelConfig{tc.cfg})
+			if err != nil {
+				t.Fatalf("NewRegistry: %v", err)
+			}
+			m, err := reg.Resolve("m")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.BaseURL != tc.wantBaseURL {
+				t.Errorf("BaseURL = %q, want %q", m.BaseURL, tc.wantBaseURL)
+			}
+			if m.destPrivate != tc.wantDestPriv {
+				t.Errorf("destPrivate = %v, want %v", m.destPrivate, tc.wantDestPriv)
+			}
+			if m.Region != tc.cfg.Region || m.BedrockModelID != tc.cfg.BedrockModelID {
+				t.Errorf("bedrock fields not carried: %+v", m)
+			}
+		})
+	}
+}
+
+func TestNewRegistry_BedrockDeploymentsResolved(t *testing.T) {
+	t.Parallel()
+
+	reg, err := NewRegistry([]config.ModelConfig{{
+		Name: "m", Provider: "bedrock", Strategy: "priority",
+		Deployments: []config.DeploymentConfig{
+			{Name: "derived", Provider: "bedrock", Region: "eu-central-1", BedrockModelID: "eu.a-v1:0", Priority: 1},
+			{Name: "override", Provider: "bedrock", BaseURL: "http://localhost:1", Region: "us-east-1", BedrockModelID: "us.b-v1:0", Priority: 2},
+			{Name: "plain", Provider: "openai", BaseURL: "https://api.openai.com/v1", Priority: 3},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	m, err := reg.Resolve("m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := m.Deployments
+	if d[0].BaseURL != "https://bedrock-runtime.eu-central-1.amazonaws.com" || d[0].destPrivate {
+		t.Errorf("derived deployment = %+v", d[0])
+	}
+	if d[0].Region != "eu-central-1" || d[0].BedrockModelID != "eu.a-v1:0" {
+		t.Errorf("derived deployment fields = %+v", d[0])
+	}
+	if d[1].BaseURL != "http://localhost:1" || !d[1].destPrivate || d[1].BedrockModelID != "us.b-v1:0" {
+		t.Errorf("override deployment = %+v", d[1])
+	}
+	if d[2].BaseURL != "https://api.openai.com/v1" || d[2].destPrivate {
+		t.Errorf("plain deployment = %+v", d[2])
+	}
+}
+
+func TestRegistry_AddModel_BedrockBaseURLResolution(t *testing.T) {
+	t.Parallel()
+
+	reg, err := NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.AddModel(Model{
+		Name: "single", Provider: "bedrock", Type: "chat", Region: "ap-southeast-2", BedrockModelID: "apac.m-v1:0",
+	})
+	reg.AddModel(Model{
+		Name: "multi", Provider: "bedrock", Type: "chat", Strategy: "priority",
+		Deployments: []Deployment{
+			{Name: "d1", Provider: "bedrock", Region: "eu-west-1", BedrockModelID: "eu.m-v1:0"},
+			{Name: "d2", Provider: "bedrock", BaseURL: "https://gw.internal.example", Region: "eu-west-1", BedrockModelID: "eu.m-v1:0"},
+		},
+	})
+	reg.AddModel(Model{Name: "invalid-region", Provider: "bedrock", Type: "chat", Region: "eu-central-1.evil.com", BedrockModelID: "m"})
+
+	single, err := reg.Resolve("single")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if single.BaseURL != "https://bedrock-runtime.ap-southeast-2.amazonaws.com" || single.destPrivate {
+		t.Errorf("single = %+v", single)
+	}
+	multi, err := reg.Resolve("multi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if multi.Deployments[0].BaseURL != "https://bedrock-runtime.eu-west-1.amazonaws.com" || multi.Deployments[0].destPrivate {
+		t.Errorf("d1 = %+v", multi.Deployments[0])
+	}
+	if multi.Deployments[1].BaseURL != "https://gw.internal.example" {
+		t.Errorf("d2 = %+v", multi.Deployments[1])
+	}
+	bad, err := reg.Resolve("invalid-region")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bad.BaseURL != "" {
+		t.Errorf("invalid region must not produce a derived URL, got %q", bad.BaseURL)
+	}
+}

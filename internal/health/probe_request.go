@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/voidmind-io/voidllm/internal/jsonx"
+	"github.com/voidmind-io/voidllm/internal/provider"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 )
 
@@ -66,6 +67,11 @@ type ProbeTarget struct {
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required
 	// when Provider is "vertex".
 	GCPLocation string
+	// Region is the AWS region. Required when Provider is "bedrock".
+	Region string
+	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
+	// Required when Provider is "bedrock".
+	BedrockModelID string
 }
 
 // intentApplicable reports whether a probe of the given intent has a
@@ -78,7 +84,7 @@ func intentApplicable(intent ProbeIntent, provider string) bool {
 		// unconditionally builds a generateContent URL — neither has a
 		// generic model-listing endpoint reachable this way.
 		switch provider {
-		case "azure", "vertex", "gemini":
+		case "azure", "vertex", "gemini", "bedrock":
 			return false
 		}
 		return true
@@ -86,7 +92,7 @@ func intentApplicable(intent ProbeIntent, provider string) bool {
 		// Anthropic and Gemini/Vertex have no OpenAI-compatible embeddings
 		// endpoint. Azure does (it is OpenAI-compatible per deployment).
 		switch provider {
-		case "anthropic", "gemini", "vertex":
+		case "anthropic", "gemini", "vertex", "bedrock":
 			return false
 		}
 		return true
@@ -124,6 +130,8 @@ func probeModel(target ProbeTarget) proxy.Model {
 		AzureAPIVersion: target.AzureAPIVersion,
 		GCPProject:      target.GCPProject,
 		GCPLocation:     target.GCPLocation,
+		Region:          target.Region,
+		BedrockModelID:  target.BedrockModelID,
 	}
 }
 
@@ -197,6 +205,10 @@ func BuildProbeRequest(ctx context.Context, intent ProbeIntent, target ProbeTarg
 		return nil, ErrProbeNotApplicable
 	}
 
+	if target.Provider == provider.Bedrock {
+		return buildBedrockChatProbe(ctx, target)
+	}
+
 	adapter := proxy.GetAdapter(target.Provider)
 	model := probeModel(target)
 	upstreamPath := upstreamPathForIntent(intent)
@@ -249,5 +261,27 @@ func BuildProbeRequest(ctx context.Context, intent ProbeIntent, target ProbeTarg
 		adapter.SetHeaders(req, model)
 	}
 
+	return req, nil
+}
+
+// bedrockProbeBody is the fixed Converse payload used for chat probes. The
+// single output token keeps the probe cost minimal.
+const bedrockProbeBody = `{"messages":[{"role":"user","content":[{"text":"ping"}]}],` +
+	`"inferenceConfig":{"maxTokens":1}}`
+
+// buildBedrockChatProbe builds the Converse request used to probe a Bedrock
+// model: POST {base}/model/{escaped id}/converse with Bearer authentication.
+func buildBedrockChatProbe(ctx context.Context, target ProbeTarget) (*http.Request, error) {
+	rawURL := strings.TrimRight(target.BaseURL, "/") + "/model/" +
+		provider.EscapeBedrockModelID(target.BedrockModelID) + "/converse"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, strings.NewReader(bedrockProbeBody))
+	if err != nil {
+		return nil, fmt.Errorf("build probe request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if target.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+target.APIKey)
+	}
 	return req, nil
 }

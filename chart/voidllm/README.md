@@ -20,7 +20,7 @@ kubectl logs deploy/voidllm | grep "BOOTSTRAP"
 
 ## Features
 
-- **OpenAI-compatible proxy** - route to OpenAI, Anthropic, Azure, Ollama, vLLM
+- **OpenAI-compatible proxy** - route to OpenAI, Anthropic, Azure, AWS Bedrock, Ollama, vLLM
 - **Sub-500us overhead** - Go + Fiber, in-memory auth and model resolution
 - **Built-in admin UI** - embedded in the binary, no separate deployment
 - **RBAC** - org/team/user/key hierarchy with rate limits and token budgets

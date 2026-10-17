@@ -15,6 +15,7 @@ var ValidProviders = map[string]bool{
 	"vllm":      true,
 	"ollama":    true,
 	"custom":    true,
+	"bedrock":   true,
 }
 
 // Names returns the supported provider names as a sorted slice,

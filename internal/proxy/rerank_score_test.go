@@ -262,7 +262,7 @@ func TestRerankScore_PIIShapes(t *testing.T) {
 func TestRerankScore_NonPassthroughAdapter(t *testing.T) {
 	t.Parallel()
 
-	providers := []string{"anthropic", "gemini", "vertex"}
+	providers := []string{"anthropic", "gemini", "vertex", "bedrock"}
 	paths := []struct{ path, body string }{
 		{"/v1/rerank", `{"model":"ad-model","query":"q","documents":["a","b"]}`},
 		{"/v1/score", `{"model":"ad-model","text_1":"a","text_2":"b"}`},
@@ -274,7 +274,8 @@ func TestRerankScore_NonPassthroughAdapter(t *testing.T) {
 
 				upstream, _, calls := captureUpstream(t, http.StatusOK, `{}`,
 					map[string]string{"Content-Type": "application/json"})
-				model := &Model{Name: "ad-model", Provider: provider, Type: "chat", BaseURL: upstream.URL, APIKey: "k"}
+				model := &Model{Name: "ad-model", Provider: provider, Type: "chat", BaseURL: upstream.URL, APIKey: "k",
+					Region: "eu-central-1", BedrockModelID: "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"}
 				reg := &Registry{models: map[string]*Model{model.Name: model}, aliases: make(map[string]string)}
 				reg.rebuildSorted()
 				app := testApp(t, NewProxyHandler(reg, slog.New(slog.NewTextHandler(io.Discard, nil))))

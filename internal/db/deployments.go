@@ -12,7 +12,7 @@ import (
 // deploymentSelectColumns is the ordered column list used in all model_deployments
 // SELECT queries. It must match the scan order in scanDeployment exactly.
 const deploymentSelectColumns = "id, model_id, name, provider, base_url, api_key_encrypted, " +
-	"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
+	"azure_deployment, azure_api_version, gcp_project, gcp_location, region, bedrock_model_id, " +
 	"weight, priority, is_active, " +
 	"created_at, updated_at, deleted_at, pii_filter"
 
@@ -32,12 +32,17 @@ type Deployment struct {
 	GCPProject string
 	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
 	GCPLocation string
-	Weight      int
-	Priority    int
-	IsActive    bool
-	CreatedAt   string
-	UpdatedAt   string
-	DeletedAt   *string
+	// Region is the AWS region. Non-empty only for provider "bedrock".
+	Region string
+	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
+	// Non-empty only for provider "bedrock".
+	BedrockModelID string
+	Weight         int
+	Priority       int
+	IsActive       bool
+	CreatedAt      string
+	UpdatedAt      string
+	DeletedAt      *string
 	// PIIFilter explicitly enables or disables PII anonymization for requests
 	// routed to this deployment. Nil means not set — inherit the model-level or
 	// network-level default. true enables anonymization; false disables it.
@@ -57,6 +62,11 @@ type CreateDeploymentParams struct {
 	GCPProject string
 	// GCPLocation is the Google Cloud region. Required when Provider is "vertex".
 	GCPLocation string
+	// Region is the AWS region. Required when Provider is "bedrock".
+	Region string
+	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
+	// Required when Provider is "bedrock".
+	BedrockModelID string
 	// Weight is the relative probability used for weighted routing. Must be >= 1.
 	Weight int
 	// Priority is the routing preference for the priority strategy; lower value
@@ -81,6 +91,10 @@ type UpdateDeploymentParams struct {
 	GCPProject *string
 	// GCPLocation, when non-nil, replaces the stored Google Cloud region.
 	GCPLocation *string
+	// Region, when non-nil, replaces the stored AWS region.
+	Region *string
+	// BedrockModelID, when non-nil, replaces the stored Bedrock model ID.
+	BedrockModelID *string
 	// Weight, when non-nil, replaces the stored routing weight.
 	Weight *int
 	// Priority, when non-nil, replaces the stored routing priority.
@@ -115,13 +129,14 @@ func (d *DB) CreateDeployment(ctx context.Context, params CreateDeploymentParams
 	p := d.dialect.Placeholder
 	insertQuery := "INSERT INTO model_deployments " +
 		"(id, model_id, name, provider, base_url, api_key_encrypted, " +
-		"azure_deployment, azure_api_version, gcp_project, gcp_location, " +
+		"azure_deployment, azure_api_version, gcp_project, gcp_location, region, bedrock_model_id, " +
 		"weight, priority, is_active, pii_filter, " +
 		"created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
 		p(7) + ", " + p(8) + ", " + p(9) + ", " + p(10) + ", " + p(11) + ", " + p(12) + ", " +
-		"1, " + p(13) + ", CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+		p(13) + ", " + p(14) + ", " +
+		"1, " + p(15) + ", CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + deploymentSelectColumns +
 		" FROM model_deployments WHERE id = " + p(1) + " AND deleted_at IS NULL"
@@ -139,6 +154,8 @@ func (d *DB) CreateDeployment(ctx context.Context, params CreateDeploymentParams
 			params.AzureAPIVersion,
 			params.GCPProject,
 			params.GCPLocation,
+			params.Region,
+			params.BedrockModelID,
 			weight,
 			params.Priority,
 			boolPtrToNullableInt(params.PIIFilter),
@@ -290,6 +307,16 @@ func (d *DB) UpdateDeployment(ctx context.Context, id string, params UpdateDeplo
 		args = append(args, *params.GCPLocation)
 		argN++
 	}
+	if params.Region != nil {
+		setClauses = append(setClauses, "region = "+p(argN))
+		args = append(args, *params.Region)
+		argN++
+	}
+	if params.BedrockModelID != nil {
+		setClauses = append(setClauses, "bedrock_model_id = "+p(argN))
+		args = append(args, *params.BedrockModelID)
+		argN++
+	}
 	if params.Weight != nil {
 		setClauses = append(setClauses, "weight = "+p(argN))
 		args = append(args, *params.Weight)
@@ -426,6 +453,7 @@ func scanDeployment(scanner interface{ Scan(...any) error }) (*Deployment, error
 	err := scanner.Scan(
 		&dep.ID, &dep.ModelID, &dep.Name, &dep.Provider, &dep.BaseURL, &dep.APIKeyEncrypted,
 		&dep.AzureDeployment, &dep.AzureAPIVersion, &dep.GCPProject, &dep.GCPLocation,
+		&dep.Region, &dep.BedrockModelID,
 		&dep.Weight, &dep.Priority,
 		&isActiveInt, &dep.CreatedAt, &dep.UpdatedAt, &dep.DeletedAt,
 		&piiFilterInt,

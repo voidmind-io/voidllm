@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/voidmind-io/voidllm/internal/config"
+	"github.com/voidmind-io/voidllm/internal/provider"
 )
 
 // ErrModelNotFound is returned when a model name or alias cannot be resolved.
@@ -31,8 +32,13 @@ type Deployment struct {
 	GCPProject string
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when Provider is "vertex".
 	GCPLocation string
-	Weight      int
-	Priority    int
+	// Region is the AWS region. Required when Provider is "bedrock".
+	Region string
+	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
+	// Required when Provider is "bedrock".
+	BedrockModelID string
+	Weight         int
+	Priority       int
 	// destPrivate is computed once at registry/config load time from the
 	// deployment's BaseURL host. It is true when the host is a loopback address
 	// (127.0.0.0/8, ::1), a private RFC-1918/ULA address (10/8, 172.16/12,
@@ -79,6 +85,11 @@ type Model struct {
 	GCPProject string
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when Provider is "vertex".
 	GCPLocation string
+	// Region is the AWS region. Required when Provider is "bedrock".
+	Region string
+	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
+	// Required when Provider is "bedrock".
+	BedrockModelID string
 	// Timeout is the per-model upstream timeout. When non-zero it overrides the
 	// global MaxStreamDuration and the context deadline used for non-streaming
 	// requests. Zero means use the global default.
@@ -220,27 +231,31 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 
 		deployments := make([]Deployment, len(mc.Deployments))
 		for i, d := range mc.Deployments {
+			depBaseURL := provider.EffectiveBaseURL(d.Provider, d.BaseURL, d.Region)
 			deployments[i] = Deployment{
 				Name:            d.Name,
 				Provider:        d.Provider,
-				BaseURL:         d.BaseURL,
+				BaseURL:         depBaseURL,
 				APIKey:          d.APIKey,
 				AzureDeployment: d.AzureDeployment,
 				AzureAPIVersion: d.AzureAPIVersion,
 				GCPProject:      d.GCPProject,
 				GCPLocation:     d.GCPLocation,
+				Region:          d.Region,
+				BedrockModelID:  d.BedrockModelID,
 				Weight:          d.Weight,
 				Priority:        d.Priority,
-				destPrivate:     classifyDestPrivate(d.BaseURL),
+				destPrivate:     classifyDestPrivate(depBaseURL),
 				PIIFilter:       d.PIIFilter,
 			}
 		}
 
+		baseURL := provider.EffectiveBaseURL(mc.Provider, mc.BaseURL, mc.Region)
 		m := &Model{
 			Name:              mc.Name,
 			Provider:          mc.Provider,
 			Type:              modelType,
-			BaseURL:           mc.BaseURL,
+			BaseURL:           baseURL,
 			APIKey:            mc.APIKey,
 			Aliases:           aliases,
 			MaxContextTokens:  mc.MaxContextTokens,
@@ -249,12 +264,14 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 			AzureAPIVersion:   mc.AzureAPIVersion,
 			GCPProject:        mc.GCPProject,
 			GCPLocation:       mc.GCPLocation,
+			Region:            mc.Region,
+			BedrockModelID:    mc.BedrockModelID,
 			Timeout:           timeout,
 			Strategy:          mc.Strategy,
 			MaxRetries:        mc.MaxRetries,
 			Deployments:       deployments,
 			FallbackModelName: mc.Fallback,
-			destPrivate:       classifyDestPrivate(mc.BaseURL),
+			destPrivate:       classifyDestPrivate(baseURL),
 			PIIFilter:         mc.PIIFilter,
 		}
 		r.models[mc.Name] = m
@@ -374,15 +391,17 @@ func (r *Registry) AddModel(m Model) {
 	// shallow copying the pointer is safe.
 	deployments := make([]Deployment, len(m.Deployments))
 	for i, d := range m.Deployments {
+		d.BaseURL = provider.EffectiveBaseURL(d.Provider, d.BaseURL, d.Region)
 		d.destPrivate = classifyDestPrivate(d.BaseURL)
 		deployments[i] = d
 	}
 
+	baseURL := provider.EffectiveBaseURL(m.Provider, m.BaseURL, m.Region)
 	entry := &Model{
 		Name:              m.Name,
 		Provider:          m.Provider,
 		Type:              m.Type,
-		BaseURL:           m.BaseURL,
+		BaseURL:           baseURL,
 		APIKey:            m.APIKey,
 		Aliases:           aliases,
 		MaxContextTokens:  m.MaxContextTokens,
@@ -391,12 +410,14 @@ func (r *Registry) AddModel(m Model) {
 		AzureAPIVersion:   m.AzureAPIVersion,
 		GCPProject:        m.GCPProject,
 		GCPLocation:       m.GCPLocation,
+		Region:            m.Region,
+		BedrockModelID:    m.BedrockModelID,
 		Timeout:           m.Timeout,
 		Strategy:          m.Strategy,
 		MaxRetries:        m.MaxRetries,
 		Deployments:       deployments,
 		FallbackModelName: m.FallbackModelName,
-		destPrivate:       classifyDestPrivate(m.BaseURL),
+		destPrivate:       classifyDestPrivate(baseURL),
 		PIIFilter:         m.PIIFilter,
 	}
 	r.models[m.Name] = entry

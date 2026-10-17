@@ -96,7 +96,7 @@ For config-less startup (no YAML file), these environment variables override the
 ```yaml
 models:
   - name: dolphin-mistral         # Unique model name
-    provider: ollama              # openai, anthropic, azure, vllm, ollama, custom
+    provider: ollama              # openai, anthropic, azure, bedrock, vllm, ollama, custom
     base_url: http://localhost:11434/v1
     api_key: ${OLLAMA_KEY}        # Optional, depends on provider
     # timeout: 10m                # Optional. Replaces server.proxy.max_stream_duration

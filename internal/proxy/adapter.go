@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -91,6 +92,9 @@ func isForwardedPseudonym(s string) bool {
 //     PromptTokens carries the same all-inclusive meaning as every other
 //     provider; CachedReadTokens and CacheWriteTokens still report the
 //     individual buckets for pricing.
+//   - Bedrock: Converse inputTokens counts only the non-cached input;
+//     cacheReadInputTokens and cacheWriteInputTokens are reported in addition.
+//     The Bedrock adapter sums all three into PromptTokens, like Anthropic.
 type UsageInfo struct {
 	// PromptTokens is the number of input tokens consumed, inclusive of any
 	// cached-read or cache-write tokens. See the type-level doc for the
@@ -165,6 +169,28 @@ type Adapter interface {
 	StreamUsage() UsageInfo
 }
 
+// binaryStreamAdapter is implemented by adapters whose upstream streams in a
+// non-SSE wire format. The handler recognises the stream by content type and
+// wraps the response body so the line scanner sees "data: ...\n\n" SSE lines.
+type binaryStreamAdapter interface {
+	// StreamContentType returns the lower-case media type of the upstream
+	// stream, matched as a prefix of the response Content-Type.
+	StreamContentType() string
+	// WrapStreamBody returns a reader that decodes the upstream wire format
+	// into SSE lines. Closing the returned reader closes body.
+	WrapStreamBody(body io.ReadCloser) io.ReadCloser
+}
+
+// upstreamErrorMapper is implemented by adapters whose upstream non-2xx
+// bodies are not OpenAI or apierror shaped. The handler replaces such a body
+// with the proxy's error envelope but keeps the upstream status code.
+type upstreamErrorMapper interface {
+	// MapUpstreamError returns the client-facing error code and message for an
+	// upstream error response. The message is client-facing only and must
+	// never be logged.
+	MapUpstreamError(statusCode int, header http.Header, body []byte) (code, message string)
+}
+
 // GetAdapter returns the Adapter for the named provider, or nil for providers
 // that speak the OpenAI wire format natively (passthrough). A fresh instance
 // is returned on every call so that stateful streaming adapters (e.g.
@@ -177,6 +203,8 @@ func GetAdapter(provider string) Adapter {
 		return &AzureAdapter{}
 	case "gemini", "vertex":
 		return &GeminiAdapter{}
+	case "bedrock":
+		return &BedrockAdapter{}
 	default:
 		return nil
 	}
