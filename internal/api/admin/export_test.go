@@ -81,3 +81,7 @@ func SetMCPListenWriteDeadlineForTest(d time.Duration) (restore func()) {
 	mcpListenWriteDeadline = d
 	return func() { mcpListenWriteDeadline = prev }
 }
+
+// CacheSavings exposes the internal cacheSavings function for white-box
+// testing from the admin_test package.
+var CacheSavings = cacheSavings

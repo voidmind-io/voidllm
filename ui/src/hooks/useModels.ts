@@ -26,6 +26,8 @@ export interface ModelResponse {
   max_context_tokens: number
   input_price_per_1m: number
   output_price_per_1m: number
+  cached_input_price_per_1m?: number
+  cache_write_price_per_1m?: number
   azure_deployment?: string
   azure_api_version?: string
   timeout?: string
@@ -56,6 +58,8 @@ export interface CreateModelParams {
   max_context_tokens?: number
   input_price_per_1m?: number
   output_price_per_1m?: number
+  cached_input_price_per_1m?: number
+  cache_write_price_per_1m?: number
   azure_deployment?: string
   azure_api_version?: string
   timeout?: string
@@ -97,6 +101,8 @@ export interface UpdateModelParams {
   max_context_tokens?: number
   input_price_per_1m?: number
   output_price_per_1m?: number
+  cached_input_price_per_1m?: number
+  cache_write_price_per_1m?: number
   azure_deployment?: string
   azure_api_version?: string
   timeout?: string

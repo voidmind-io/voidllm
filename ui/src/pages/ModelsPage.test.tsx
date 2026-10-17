@@ -19,6 +19,8 @@ interface MockModelResponse {
   max_context_tokens: number
   input_price_per_1m: number
   output_price_per_1m: number
+  cached_input_price_per_1m?: number
+  cache_write_price_per_1m?: number
   is_active: boolean
   source: string
   aliases: string[]
@@ -630,5 +632,120 @@ describe('EditModelDialog — Fallback Model field', () => {
     expect(body).not.toHaveProperty('fallback_model_name')
     // The changed field must be present
     expect(body.timeout).toBe('60s')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tests: cache price fields
+// ---------------------------------------------------------------------------
+
+describe('Cache price fields', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  async function openEditDialogForModel(modelName: string) {
+    const modelNameEl = await screen.findByText(modelName)
+    const row = modelNameEl.closest('tr')
+    if (!row) throw new Error(`Could not find table row for model "${modelName}"`)
+    await userEvent.click(within(row).getByTitle('Edit model'))
+    await waitFor(() => expect(screen.getByRole('heading', { name: /edit model/i })).toBeInTheDocument())
+    return getDialog(/edit model/i)
+  }
+
+  function editSetup(model: MockModelResponse, capturedBodies: Map<string, string>) {
+    setupFetchMock(
+      [
+        ...defaultEntries(MOCK_LICENSE_NO_FALLBACK, {
+          data: [model, ...MOCK_MODELS_LIST.slice(1)],
+          has_more: false,
+        }),
+        {
+          matcher: (u) => u.includes('/api/v1/models/model-1'),
+          method: 'PATCH',
+          response: model,
+        },
+      ],
+      capturedBodies,
+    )
+  }
+
+  async function createAndCapture(fill: (dialog: HTMLElement) => Promise<void>) {
+    const capturedBodies = new Map<string, string>()
+    setupFetchMock(
+      [
+        {
+          matcher: (u) => u.includes('/api/v1/models') && !u.includes('/health'),
+          method: 'POST',
+          response: makeChatModel({ id: 'new-model', name: 'cache-model' }),
+        },
+        ...defaultEntries(),
+      ],
+      capturedBodies,
+    )
+    renderModelsPage()
+    await screen.findByText('gpt-4o')
+    await openCreateDialog()
+    const dialog = getDialog(/add model/i)
+    const nameInput = within(dialog).getByRole('textbox', { name: /^name$/i })
+    await userEvent.type(nameInput, 'cache-model')
+    await waitFor(() => expect(nameInput).toHaveValue('cache-model'))
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /base url/i }), 'https://api.openai.com/v1')
+    await fill(dialog)
+    await submitDialog(dialog, /add model/i)
+    await waitFor(() => expect(capturedBodies.has('POST:/api/v1/models')).toBe(true), { timeout: 3000 })
+    return JSON.parse(capturedBodies.get('POST:/api/v1/models')!) as Record<string, unknown>
+  }
+
+  it('create sends both cache prices when filled', async () => {
+    const body = await createAndCapture(async (dialog) => {
+      await userEvent.type(within(dialog).getByLabelText(/cached input price/i), '0.3')
+      await userEvent.type(within(dialog).getByLabelText(/cache write price/i), '3.75')
+    })
+    expect(body.cached_input_price_per_1m).toBe(0.3)
+    expect(body.cache_write_price_per_1m).toBe(3.75)
+  })
+
+  it('create omits cache prices when empty', async () => {
+    const body = await createAndCapture(async () => {})
+    expect(body).not.toHaveProperty('cached_input_price_per_1m')
+    expect(body).not.toHaveProperty('cache_write_price_per_1m')
+  })
+
+  it('edit preloads existing cache prices', async () => {
+    const model = makeChatModel({ cached_input_price_per_1m: 0.3, cache_write_price_per_1m: 3.75 })
+    editSetup(model, new Map())
+    renderModelsPage()
+    const dialog = await openEditDialogForModel('gpt-4o')
+    expect(within(dialog).getByLabelText(/cached input price/i)).toHaveValue(0.3)
+    expect(within(dialog).getByLabelText(/cache write price/i)).toHaveValue(3.75)
+  })
+
+  it('edit sends 0 when a cache price is cleared', async () => {
+    const captured = new Map<string, string>()
+    editSetup(makeChatModel({ cached_input_price_per_1m: 0.3, cache_write_price_per_1m: 3.75 }), captured)
+    renderModelsPage()
+    const dialog = await openEditDialogForModel('gpt-4o')
+    await userEvent.clear(within(dialog).getByLabelText(/cached input price/i))
+    await submitDialog(dialog, /save changes/i)
+    await waitFor(() => expect(captured.has('PATCH:/api/v1/models/model-1')).toBe(true))
+    const body = JSON.parse(captured.get('PATCH:/api/v1/models/model-1')!)
+    expect(body.cached_input_price_per_1m).toBe(0)
+    expect(body).not.toHaveProperty('cache_write_price_per_1m')
+  })
+
+  it('edit omits cache prices when unchanged', async () => {
+    const captured = new Map<string, string>()
+    editSetup(makeChatModel({ cached_input_price_per_1m: 0.3, timeout: '30s' }), captured)
+    renderModelsPage()
+    const dialog = await openEditDialogForModel('gpt-4o')
+    const timeoutInput = within(dialog).getByRole('textbox', { name: /timeout/i })
+    await userEvent.clear(timeoutInput)
+    await userEvent.type(timeoutInput, '60s')
+    await submitDialog(dialog, /save changes/i)
+    await waitFor(() => expect(captured.has('PATCH:/api/v1/models/model-1')).toBe(true))
+    const body = JSON.parse(captured.get('PATCH:/api/v1/models/model-1')!)
+    expect(body).not.toHaveProperty('cached_input_price_per_1m')
+    expect(body).not.toHaveProperty('cache_write_price_per_1m')
   })
 })

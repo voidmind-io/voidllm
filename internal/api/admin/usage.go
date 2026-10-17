@@ -8,6 +8,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
+	"github.com/voidmind-io/voidllm/internal/config"
 	"github.com/voidmind-io/voidllm/internal/db"
 )
 
@@ -36,6 +37,11 @@ type usageDataPoint struct {
 	CacheWriteTokens int64   `json:"cache_write_tokens"`
 	CostEstimate     float64 `json:"cost_estimate"`
 	AvgDurationMS    float64 `json:"avg_duration_ms"`
+	// CacheSavings is the estimated amount saved by prompt caching, computed
+	// from the model's current registry prices. Only present for group_by=model
+	// rows whose model resolves and has an input price configured. May be
+	// negative when cache-write premiums exceed read discounts.
+	CacheSavings *float64 `json:"cache_savings,omitempty"`
 }
 
 // validGroupBy is the set of accepted group_by values for usage endpoints.
@@ -167,6 +173,45 @@ func aggregatesToDataPoints(aggs []db.UsageAggregate) []usageDataPoint {
 	return data
 }
 
+// cacheSavings returns the estimated savings from prompt caching for the given
+// pricing and cached token counts: the cost without caching (all prompt tokens
+// at the input price) minus the actual cost. Fresh and completion tokens cancel
+// out; the cache-write premium is subtracted. A zero cached-input or
+// cache-write price falls back to the input price. It returns nil when no
+// input price is configured. The result may be negative.
+func cacheSavings(p config.PricingConfig, read, write int64) *float64 {
+	if p.InputPer1M <= 0 {
+		return nil
+	}
+	rr := p.CachedInputPer1M
+	if rr == 0 {
+		rr = p.InputPer1M
+	}
+	wr := p.CacheWritePer1M
+	if wr == 0 {
+		wr = p.InputPer1M
+	}
+	s := float64(read)*(p.InputPer1M-rr)/1e6 - float64(write)*(wr-p.InputPer1M)/1e6
+	return &s
+}
+
+// attachCacheSavings fills CacheSavings on group_by=model rows using the
+// current prices from the model registry. Rows whose model does not resolve
+// are left without savings. It is a no-op for other groupings or when no
+// registry is configured.
+func (h *Handler) attachCacheSavings(groupBy string, data []usageDataPoint) {
+	if groupBy != "model" || h.Registry == nil {
+		return
+	}
+	for i := range data {
+		m, err := h.Registry.Resolve(data[i].GroupKey)
+		if err != nil {
+			continue
+		}
+		data[i].CacheSavings = cacheSavings(m.Pricing, data[i].CachedReadTokens, data[i].CacheWriteTokens)
+	}
+}
+
 // enrichGroupLabels resolves entity IDs in the aggregates to human-readable
 // labels for key/user/team/org groupings, mutating each aggregate's GroupLabel
 // in place. Resolution failure is non-fatal: it logs a warning and leaves
@@ -207,7 +252,7 @@ func (h *Handler) enrichGroupLabels(ctx context.Context, groupBy string, aggs []
 //   - group_by (optional): aggregation dimension — "", "model", "team", "key", "user", "day", or "hour".
 //
 // @Summary      Get org usage
-// @Description  Returns aggregated usage metrics for the organization over a time range (max 90 days). Requires org admin.
+// @Description  Returns aggregated usage metrics for the organization over a time range (max 90 days). Requires org admin. With group_by=model, rows include cache_savings estimated from current model prices when the model has an input price.
 // @Tags         usage
 // @Produce      json
 // @Param        org_id    path      string  true   "Organization ID"
@@ -244,12 +289,15 @@ func (h *Handler) GetOrgUsage(c fiber.Ctx) error {
 
 	h.enrichGroupLabels(c.Context(), groupBy, aggregates)
 
+	data := aggregatesToDataPoints(aggregates)
+	h.attachCacheSavings(groupBy, data)
+
 	return c.JSON(usageResponse{
 		OrgID:   orgID,
 		From:    from.UTC().Format(time.RFC3339),
 		To:      to.UTC().Format(time.RFC3339),
 		GroupBy: groupBy,
-		Data:    aggregatesToDataPoints(aggregates),
+		Data:    data,
 	})
 }
 
@@ -263,7 +311,7 @@ func (h *Handler) GetOrgUsage(c fiber.Ctx) error {
 //   - group_by (optional): aggregation dimension — "", "org", "model", "team", "key", "user", "day", or "hour".
 //
 // @Summary      Get system-wide usage
-// @Description  Returns aggregated usage metrics across all organizations over a time range (max 90 days). Requires system_admin.
+// @Description  Returns aggregated usage metrics across all organizations over a time range (max 90 days). Requires system_admin. With group_by=model, rows include cache_savings estimated from current model prices when the model has an input price.
 // @Tags         usage
 // @Produce      json
 // @Param        from      query     string  true   "Start of range (RFC3339)"
@@ -297,11 +345,14 @@ func (h *Handler) SystemAdminUsage(c fiber.Ctx) error {
 
 	h.enrichGroupLabels(c.Context(), groupBy, aggregates)
 
+	data := aggregatesToDataPoints(aggregates)
+	h.attachCacheSavings(groupBy, data)
+
 	return c.JSON(usageResponse{
 		From:    from.UTC().Format(time.RFC3339),
 		To:      to.UTC().Format(time.RFC3339),
 		GroupBy: groupBy,
-		Data:    aggregatesToDataPoints(aggregates),
+		Data:    data,
 	})
 }
 
@@ -314,7 +365,7 @@ func (h *Handler) SystemAdminUsage(c fiber.Ctx) error {
 //   - group_by (optional): aggregation dimension — "", "model", "team", "key", "user", "day", or "hour".
 //
 // @Summary      Get own usage
-// @Description  Returns aggregated usage metrics scoped to the current key or user. Any authenticated key may call this endpoint.
+// @Description  Returns aggregated usage metrics scoped to the current key or user. Any authenticated key may call this endpoint. With group_by=model, rows include cache_savings estimated from current model prices when the model has an input price.
 // @Tags         usage
 // @Produce      json
 // @Param        from      query     string  true   "Start of range (RFC3339)"
@@ -358,11 +409,14 @@ func (h *Handler) MyUsage(c fiber.Ctx) error {
 
 	h.enrichGroupLabels(c.Context(), groupBy, aggregates)
 
+	data := aggregatesToDataPoints(aggregates)
+	h.attachCacheSavings(groupBy, data)
+
 	return c.JSON(usageResponse{
 		OrgID:   keyInfo.OrgID,
 		From:    from.UTC().Format(time.RFC3339),
 		To:      to.UTC().Format(time.RFC3339),
 		GroupBy: groupBy,
-		Data:    aggregatesToDataPoints(aggregates),
+		Data:    data,
 	})
 }

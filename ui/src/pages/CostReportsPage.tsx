@@ -11,6 +11,7 @@ import { useUsage } from '../hooks/useUsage'
 import type { UsageDataPoint } from '../hooks/useUsage'
 import { formatNumber, formatCost } from '../lib/utils'
 import { exportData } from '../lib/export'
+import { cacheHitRate, formatHitRate, sumSavings } from '../lib/cache'
 
 const COST_MODEL_HEADERS = [
   { key: 'group_key', label: 'Model' },
@@ -18,6 +19,9 @@ const COST_MODEL_HEADERS = [
   { key: 'pct', label: '% of Total' },
   { key: 'total_requests', label: 'Requests' },
   { key: 'avg_cost_per_request', label: 'Avg Cost / Request' },
+  { key: 'cache_savings', label: 'Cache Savings' },
+  { key: 'cached_read_tokens', label: 'Cached Read Tokens' },
+  { key: 'cache_write_tokens', label: 'Cache Write Tokens' },
 ]
 
 const TIME_RANGES = ['7d', '30d', '90d'] as const
@@ -145,6 +149,28 @@ function buildModelColumns(totalCost: number): Column<ModelCostRow>[] {
         </span>
       ),
     },
+    {
+      key: 'cache_savings',
+      header: 'Cache Savings',
+      align: 'right',
+      render: (row) => (
+        <span className="text-text-secondary">
+          {row.cache_savings === null || row.cache_savings === undefined
+            ? '-'
+            : formatCost(row.cache_savings)}
+        </span>
+      ),
+    },
+    {
+      key: 'cache_hit_rate',
+      header: 'Cache Hit Rate',
+      align: 'right',
+      render: (row) => (
+        <span className="text-text-secondary">
+          {formatHitRate(cacheHitRate(row.cached_read_tokens ?? 0, row.prompt_tokens))}
+        </span>
+      ),
+    },
   ]
 }
 
@@ -234,7 +260,7 @@ export default function CostReportsPage() {
   const { data: dayUsage, isLoading: dayLoading } = useUsage(orgId, from, to, 'day')
 
   // Compute totals and model rows
-  const { totalCost, modelRows, avgCostPerDay, topModel } = useMemo(() => {
+  const { totalCost, modelRows, avgCostPerDay, topModel, cacheSavings } = useMemo(() => {
     const data = modelUsage?.data ?? []
     const total = data.reduce((acc, d) => acc + d.cost_estimate, 0)
     const days = RANGE_DAYS[range]
@@ -242,12 +268,19 @@ export default function CostReportsPage() {
     const sorted = [...data].sort((a, b) => b.cost_estimate - a.cost_estimate)
     const rows: ModelCostRow[] = sorted.map((d) => ({
       ...d,
+      cache_savings: d.cache_savings ?? null,
       pct: total > 0 ? (d.cost_estimate / total) * 100 : 0,
       avg_cost_per_request:
         d.total_requests > 0 ? d.cost_estimate / d.total_requests : 0,
     }))
     const top = sorted[0]?.group_key ?? '—'
-    return { totalCost: total, modelRows: rows, avgCostPerDay: avg, topModel: top }
+    return {
+      totalCost: total,
+      modelRows: rows,
+      avgCostPerDay: avg,
+      topModel: top,
+      cacheSavings: sumSavings(rows),
+    }
   }, [modelUsage, range])
 
   // Compute day rows with change vs prior day
@@ -334,7 +367,7 @@ export default function CostReportsPage() {
       </div>
 
       {/* Stat cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-8">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <StatCard
           label="Total Cost"
           value={isModelLoading ? '—' : formatCost(totalCost)}
@@ -353,11 +386,20 @@ export default function CostReportsPage() {
           icon={<IconCpu />}
           iconColor="yellow"
         />
+        <StatCard
+          label="Est. Cache Savings"
+          value={isModelLoading || cacheSavings === null ? '-' : formatCost(cacheSavings)}
+          icon={<IconTrendingDown />}
+          iconColor="green"
+        />
       </div>
 
       {/* Cost by Model */}
       <div className="mb-8">
         <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wider mb-4">Cost by Model</h2>
+        <p className="text-xs text-text-tertiary mb-4">
+          Cache savings use current model prices. Models without an input price show -.
+        </p>
         <Table<ModelCostRow>
           columns={modelColumns}
           data={modelRows}

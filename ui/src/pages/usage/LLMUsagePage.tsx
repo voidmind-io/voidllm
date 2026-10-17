@@ -10,6 +10,7 @@ import { useUsage, useCrossOrgUsage } from '../../hooks/useUsage'
 import type { UsageDataPoint } from '../../hooks/useUsage'
 import { formatNumber, formatTokens, formatCost, shortenId } from '../../lib/utils'
 import { exportData } from '../../lib/export'
+import { cacheHitRate, formatHitRate } from '../../lib/cache'
 
 const TIME_RANGES = ['24h', '7d', '30d', '90d'] as const
 type TimeRange = (typeof TIME_RANGES)[number]
@@ -85,6 +86,22 @@ function buildColumns(groupBy: string): Column<UsageDataPoint>[] {
       ),
     },
     {
+      key: 'cached_read_tokens',
+      header: 'Cached Read Tokens',
+      align: 'right',
+      render: (row) => (
+        <span className="text-text-secondary">{formatTokens(row.cached_read_tokens ?? 0)}</span>
+      ),
+    },
+    {
+      key: 'cache_write_tokens',
+      header: 'Cache Write Tokens',
+      align: 'right',
+      render: (row) => (
+        <span className="text-text-secondary">{formatTokens(row.cache_write_tokens ?? 0)}</span>
+      ),
+    },
+    {
       key: 'completion_tokens',
       header: 'Completion Tokens',
       align: 'right',
@@ -124,6 +141,8 @@ const USAGE_EXPORT_HEADERS = [
   { key: 'group_label', label: 'Name' },
   { key: 'total_requests', label: 'Requests' },
   { key: 'prompt_tokens', label: 'Prompt Tokens' },
+  { key: 'cached_read_tokens', label: 'Cached Read Tokens' },
+  { key: 'cache_write_tokens', label: 'Cache Write Tokens' },
   { key: 'completion_tokens', label: 'Completion Tokens' },
   { key: 'total_tokens', label: 'Total Tokens' },
   { key: 'cost_estimate', label: 'Cost' },
@@ -212,14 +231,27 @@ export default function LLMUsagePage() {
     : BASE_GROUP_BY_OPTIONS
 
   const totals = useMemo(() => {
-    if (!usage?.data) return { requests: 0, tokens: 0, cost: 0 }
+    const empty = {
+      requests: 0,
+      tokens: 0,
+      cost: 0,
+      prompt: 0,
+      completion: 0,
+      cachedRead: 0,
+      cacheWrite: 0,
+    }
+    if (!usage?.data) return empty
     return usage.data.reduce(
       (acc, d) => ({
         requests: acc.requests + d.total_requests,
         tokens: acc.tokens + d.total_tokens,
         cost: acc.cost + d.cost_estimate,
+        prompt: acc.prompt + d.prompt_tokens,
+        completion: acc.completion + d.completion_tokens,
+        cachedRead: acc.cachedRead + (d.cached_read_tokens ?? 0),
+        cacheWrite: acc.cacheWrite + (d.cache_write_tokens ?? 0),
       }),
-      { requests: 0, tokens: 0, cost: 0 },
+      empty,
     )
   }, [usage])
 
@@ -232,8 +264,9 @@ export default function LLMUsagePage() {
 
   const isDataLoading = isLoading && (crossOrg ? isSystemAdmin : !!orgId)
 
-  const totalPrompt = usage?.data?.reduce((s, d) => s + d.prompt_tokens, 0) ?? 0
-  const totalCompletion = usage?.data?.reduce((s, d) => s + d.completion_tokens, 0) ?? 0
+  const totalPrompt = totals.prompt
+  const totalCompletion = totals.completion
+  const hitRate = cacheHitRate(totals.cachedRead, totals.prompt)
 
   const top5 = sortedData.slice(0, 5)
 
@@ -287,7 +320,7 @@ export default function LLMUsagePage() {
       </div>
 
       {/* Stat cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <StatCard
           label="Total Requests"
           value={isDataLoading ? '...' : formatTokens(totals.requests)}
@@ -305,6 +338,13 @@ export default function LLMUsagePage() {
           value={isDataLoading ? '...' : formatCost(totals.cost)}
           icon={<DollarIcon />}
           iconColor="green"
+        />
+        <StatCard
+          label="Cache Hit Rate"
+          value={isDataLoading ? '...' : formatHitRate(hitRate)}
+          title={`cached reads / prompt tokens: ${formatNumber(totals.cachedRead)} / ${formatNumber(totals.prompt)}`}
+          icon={<ActivityIcon />}
+          iconColor="yellow"
         />
       </div>
 

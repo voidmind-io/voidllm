@@ -1,7 +1,7 @@
 /** Sanitize a CSV cell to prevent formula injection and handle special characters. */
 function sanitizeCSVCell(value: unknown): string {
   let s = String(value ?? '')
-  if (['=', '+', '-', '@', '\t', '\r'].some((c) => s.startsWith(c))) {
+  if (typeof value === 'string' && ['=', '+', '-', '@', '\t', '\r'].some((c) => s.startsWith(c))) {
     s = "'" + s
   }
   if (s.includes(',') || s.includes('"') || s.includes('\n')) {

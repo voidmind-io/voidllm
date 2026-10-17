@@ -5,14 +5,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
+	"math"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/voidmind-io/voidllm/internal/api/admin"
 	"github.com/voidmind-io/voidllm/internal/auth"
+	"github.com/voidmind-io/voidllm/internal/cache"
+	"github.com/voidmind-io/voidllm/internal/config"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/license"
+	"github.com/voidmind-io/voidllm/internal/proxy"
 )
 
 // insertUsageEventHTTP inserts a single usage_events row into the given DB.
@@ -1074,5 +1081,207 @@ func TestGetOrgUsage_GroupByKey_UnknownKeyID_NoGroupLabel(t *testing.T) {
 	}
 	if _, hasLabel := row["group_label"]; hasLabel {
 		t.Errorf("group_label must be absent when key is unknown, but present: %v", row["group_label"])
+	}
+}
+
+// ---- cache savings -----------------------------------------------------------
+
+func TestCacheSavings(t *testing.T) {
+	t.Parallel()
+
+	f := func(v float64) *float64 { return &v }
+
+	tests := []struct {
+		name        string
+		pricing     config.PricingConfig
+		read, write int64
+		want        *float64
+	}{
+		{"cached price unset falls back to input", config.PricingConfig{InputPer1M: 3}, 1000, 0, f(0)},
+		{"write price unset has no premium", config.PricingConfig{InputPer1M: 3, CachedInputPer1M: 0.3}, 1000, 500, f(0.0027)},
+		{"write premium makes savings negative", config.PricingConfig{InputPer1M: 3, CacheWritePer1M: 3.75}, 0, 1000, f(-0.00075)},
+		{"read and write combined", config.PricingConfig{InputPer1M: 3, CachedInputPer1M: 0.3, CacheWritePer1M: 3.75}, 1000, 200, f(0.00255)},
+		{"no input price", config.PricingConfig{CachedInputPer1M: 0.3}, 1000, 200, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := admin.CacheSavings(tt.pricing, tt.read, tt.write)
+			if tt.want == nil {
+				if got != nil {
+					t.Fatalf("got %v, want nil", *got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("got nil, want %v", *tt.want)
+			}
+			if math.Abs(*got-*tt.want) > 1e-12 {
+				t.Errorf("got %v, want %v", *got, *tt.want)
+			}
+		})
+	}
+}
+
+// TestCacheSavings_ConsistentWithHandlerCost verifies that savings equal the
+// no-cache cost of the prompt minus the cost computed with the proxy handler's
+// formula (fresh*in + read*rr + write*wr + completion*out).
+func TestCacheSavings_ConsistentWithHandlerCost(t *testing.T) {
+	t.Parallel()
+
+	p := config.PricingConfig{InputPer1M: 3, OutputPer1M: 15, CachedInputPer1M: 0.3, CacheWritePer1M: 3.75}
+	const prompt, completion, read, write = int64(5000), int64(700), int64(1000), int64(200)
+
+	fresh := prompt - read - write
+	cost := (float64(fresh)*p.InputPer1M + float64(read)*p.CachedInputPer1M +
+		float64(write)*p.CacheWritePer1M + float64(completion)*p.OutputPer1M) / 1e6
+	noCache := (float64(prompt)*p.InputPer1M + float64(completion)*p.OutputPer1M) / 1e6
+
+	got := admin.CacheSavings(p, read, write)
+	if got == nil {
+		t.Fatal("got nil savings")
+	}
+	if want := noCache - cost; math.Abs(*got-want) > 1e-12 {
+		t.Errorf("savings = %v, want %v", *got, want)
+	}
+}
+
+// setupUsageAppWithRegistry builds an app whose handler uses the given model
+// registry (which may be nil).
+func setupUsageAppWithRegistry(t *testing.T, dsn string, registry *proxy.Registry) (*fiber.App, *db.DB, *cache.Cache[string, auth.KeyInfo]) {
+	t.Helper()
+
+	ctx := context.Background()
+	database, err := db.Open(ctx, config.DatabaseConfig{
+		Driver:          "sqlite",
+		DSN:             dsn,
+		MaxOpenConns:    1,
+		MaxIdleConns:    1,
+		ConnMaxLifetime: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("open test DB: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	if err := db.RunMigrations(ctx, database.SQL(), db.SQLiteDialect{}, slog.Default()); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	keyCache := cache.New[string, auth.KeyInfo]()
+	handler := &admin.Handler{
+		DB:         database,
+		HMACSecret: testHMACSecret,
+		KeyCache:   keyCache,
+		Registry:   registry,
+		License:    license.NewHolder(license.Verify("", true)),
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	app := fiber.New()
+	admin.RegisterRoutes(app, handler, keyCache, testHMACSecret, nil)
+	return app, database, keyCache
+}
+
+// fetchCacheSavings seeds one cached usage event per model, queries the org
+// usage endpoint with groupBy and returns cache_savings keyed by group_key (or
+// "" for ungrouped rows). A nil value means the field was absent.
+func fetchCacheSavings(t *testing.T, registry *proxy.Registry, dsn, groupBy string, models ...string) map[string]*float64 {
+	t.Helper()
+
+	app, database, keyCache := setupUsageAppWithRegistry(t, dsn, registry)
+	org := mustCreateOrg(t, database, "Savings Org", "savings-"+strings.ToLower(t.Name()))
+	testKey := addTestKey(t, keyCache, auth.RoleOrgAdmin, org.ID)
+
+	now := time.Now().UTC()
+	for i, m := range models {
+		insertUsageEventWithCacheHTTP(t, database, fmt.Sprintf("sav-%d", i), "key-sav", "", org.ID, m,
+			5000, 100, 5100, 1000, 200, now.Add(-30*time.Minute))
+	}
+
+	req := httptest.NewRequest("GET", usageURL(org.ID, now.Add(-time.Hour).Format(time.RFC3339), now.Add(time.Minute).Format(time.RFC3339), groupBy), nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+
+	var envelope struct {
+		Data []struct {
+			GroupKey     string   `json:"group_key"`
+			CacheSavings *float64 `json:"cache_savings"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(envelope.Data) == 0 {
+		t.Fatal("data is empty")
+	}
+	out := make(map[string]*float64, len(envelope.Data))
+	for _, d := range envelope.Data {
+		out[d.GroupKey] = d.CacheSavings
+	}
+	return out
+}
+
+func newSavingsRegistry(t *testing.T) *proxy.Registry {
+	t.Helper()
+	reg, err := proxy.NewRegistry([]config.ModelConfig{
+		{
+			Name: "priced", Provider: "anthropic", BaseURL: "https://api.anthropic.com",
+			Pricing: config.PricingConfig{InputPer1M: 3, OutputPer1M: 15, CachedInputPer1M: 0.3, CacheWritePer1M: 3.75},
+		},
+		{Name: "unpriced", Provider: "openai", BaseURL: "https://api.openai.com/v1"},
+	})
+	if err != nil {
+		t.Fatalf("proxy.NewRegistry: %v", err)
+	}
+	return reg
+}
+
+func TestGetOrgUsage_CacheSavings_GroupByModel(t *testing.T) {
+	t.Parallel()
+
+	got := fetchCacheSavings(t, newSavingsRegistry(t), "file:TestUsageSavingsModel?mode=memory&cache=private",
+		"model", "priced", "unpriced", "unknown-model")
+
+	if v := got["priced"]; v == nil {
+		t.Error("priced: cache_savings absent, want 0.00255")
+	} else if math.Abs(*v-0.00255) > 1e-9 {
+		t.Errorf("priced: cache_savings = %v, want 0.00255", *v)
+	}
+	for _, m := range []string{"unpriced", "unknown-model"} {
+		if got[m] != nil {
+			t.Errorf("%s: cache_savings = %v, want absent", m, *got[m])
+		}
+	}
+}
+
+func TestGetOrgUsage_CacheSavings_AbsentForDayGrouping(t *testing.T) {
+	t.Parallel()
+
+	got := fetchCacheSavings(t, newSavingsRegistry(t), "file:TestUsageSavingsDay?mode=memory&cache=private",
+		"day", "priced")
+	for k, v := range got {
+		if v != nil {
+			t.Errorf("group %q: cache_savings = %v, want absent", k, *v)
+		}
+	}
+}
+
+func TestGetOrgUsage_CacheSavings_AbsentWithNilRegistry(t *testing.T) {
+	t.Parallel()
+
+	got := fetchCacheSavings(t, nil, "file:TestUsageSavingsNilReg?mode=memory&cache=private",
+		"model", "priced")
+	if got["priced"] != nil {
+		t.Errorf("cache_savings = %v, want absent", *got["priced"])
 	}
 }

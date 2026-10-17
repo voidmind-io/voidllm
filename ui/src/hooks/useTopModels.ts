@@ -1,23 +1,8 @@
 import { useQuery } from '@tanstack/react-query'
 import apiClient from '../api/client'
+import type { UsageDataPoint, UsageResponse } from './useUsage'
 
-export interface UsageDataPoint {
-  group_key: string
-  total_requests: number
-  prompt_tokens: number
-  completion_tokens: number
-  total_tokens: number
-  cost_estimate: number
-  avg_duration_ms: number
-}
-
-interface UsageResponse {
-  org_id: string
-  from: string
-  to: string
-  group_by: string
-  data: UsageDataPoint[]
-}
+export type { UsageDataPoint, UsageResponse }
 
 export function useTopModels(orgId: string, enabled = true) {
   return useQuery({
