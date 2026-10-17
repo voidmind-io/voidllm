@@ -744,6 +744,10 @@ func TestIsAllowedPath(t *testing.T) {
 		{name: "rerank allowed", path: "rerank", want: true},
 		{name: "score allowed", path: "score", want: true},
 		{name: "unknown path rejected", path: "bogus", want: false},
+		{name: "reranking rejected", path: "reranking", want: false},
+		{name: "scores rejected", path: "scores", want: false},
+		{name: "rerank subpath rejected", path: "rerank/foo", want: false},
+		{name: "capitalised Rerank rejected", path: "Rerank", want: false},
 	}
 
 	for _, tc := range tests {

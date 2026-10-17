@@ -183,17 +183,18 @@ func (s *streamUsageExtractor) observe(line []byte) {
 	data := line[len("data: "):]
 	var chunk struct {
 		Usage *struct {
-			PromptTokens        int               `json:"prompt_tokens"`
-			CompletionTokens    int               `json:"completion_tokens"`
+			PromptTokens        *int              `json:"prompt_tokens"`
+			CompletionTokens    *int              `json:"completion_tokens"`
 			TotalTokens         int               `json:"total_tokens"`
 			PromptTokensDetails *wireUsageDetails `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if jsonx.Unmarshal(data, &chunk) == nil && chunk.Usage != nil {
 		ui := UsageInfo{
-			PromptTokens:     chunk.Usage.PromptTokens,
-			CompletionTokens: chunk.Usage.CompletionTokens,
+			PromptTokens:     derefInt(chunk.Usage.PromptTokens),
+			CompletionTokens: derefInt(chunk.Usage.CompletionTokens),
 			TotalTokens:      chunk.Usage.TotalTokens,
+			TotalOnly:        chunk.Usage.PromptTokens == nil && chunk.Usage.CompletionTokens == nil && chunk.Usage.TotalTokens > 0,
 		}
 		if chunk.Usage.PromptTokensDetails != nil {
 			ui.CachedReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
@@ -1054,7 +1055,7 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 	// forwarding a malformed chat request upstream.
 	if adapter != nil && !isAzureAdapter(adapter) && (upstreamPath == "rerank" || upstreamPath == "score") {
 		if err := apierror.Send(c, fiber.StatusBadRequest,
-			"bad_request", "endpoint not supported for this provider"); err != nil {
+			"bad_request", "endpoint not supported for this model"); err != nil {
 			return nil, nil, nil, err
 		}
 		return nil, nil, nil, errResponseSent
@@ -1228,6 +1229,10 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 	// context is recycled by fasthttp after the handler exits and must not be
 	// accessed inside the SendStreamWriter closure.
 	respStatusCode := resp.StatusCode
+
+	// upstreamPath is captured for the same reason: c.Path() must not be read
+	// inside the closure.
+	upstreamPath := path.Clean(strings.TrimPrefix(c.Path(), "/v1/"))
 
 	// upstreamCancel, resp.Body.Close, and the drain tracking call are all
 	// handled inside the closure. SendStreamWriter's goroutine outlives
@@ -1809,6 +1814,7 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			if streamUI.PromptTokens == 0 && streamUI.CompletionTokens == 0 {
 				streamUI = extractor.lastUsage
 			}
+			streamUI = normalizeRerankScoreUsage(upstreamPath, streamUI)
 			durationMS := int(time.Since(startTime).Milliseconds())
 			// Use the upstream HTTP status for successful, complete streams. For
 			// aborted or truncated streams (no clean [DONE]) log StatusBadGateway
@@ -2193,8 +2199,8 @@ type wireUsageDetails struct {
 func extractUsage(body []byte) UsageInfo {
 	var resp struct {
 		Usage *struct {
-			PromptTokens        int               `json:"prompt_tokens"`
-			CompletionTokens    int               `json:"completion_tokens"`
+			PromptTokens        *int              `json:"prompt_tokens"`
+			CompletionTokens    *int              `json:"completion_tokens"`
 			TotalTokens         int               `json:"total_tokens"`
 			PromptTokensDetails *wireUsageDetails `json:"prompt_tokens_details"`
 		} `json:"usage"`
@@ -2203,9 +2209,10 @@ func extractUsage(body []byte) UsageInfo {
 		return UsageInfo{}
 	}
 	ui := UsageInfo{
-		PromptTokens:     resp.Usage.PromptTokens,
-		CompletionTokens: resp.Usage.CompletionTokens,
+		PromptTokens:     derefInt(resp.Usage.PromptTokens),
+		CompletionTokens: derefInt(resp.Usage.CompletionTokens),
 		TotalTokens:      resp.Usage.TotalTokens,
+		TotalOnly:        resp.Usage.PromptTokens == nil && resp.Usage.CompletionTokens == nil && resp.Usage.TotalTokens > 0,
 	}
 	if resp.Usage.PromptTokensDetails != nil {
 		ui.CachedReadTokens = resp.Usage.PromptTokensDetails.CachedTokens
@@ -2214,17 +2221,25 @@ func extractUsage(body []byte) UsageInfo {
 	return ui
 }
 
+// derefInt returns *v, or 0 when v is nil.
+func derefInt(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
 // normalizeRerankScoreUsage maps a total_tokens-only usage object to prompt
 // tokens for the rerank and score endpoints. vLLM's /rerank reports just
 // usage.total_tokens; without this mapping the event would carry zero prompt
-// tokens and a zero cost although the client was billed. Responses that
-// already carry prompt or completion tokens, and all other paths, are
-// returned unchanged.
+// tokens and a zero cost although the client was billed. Only usage objects
+// that omit prompt_tokens and completion_tokens entirely (UsageInfo.TotalOnly)
+// are remapped; explicit zeros and all other paths are returned unchanged.
 func normalizeRerankScoreUsage(upstreamPath string, ui UsageInfo) UsageInfo {
 	if upstreamPath != "rerank" && upstreamPath != "score" {
 		return ui
 	}
-	if ui.PromptTokens == 0 && ui.CompletionTokens == 0 && ui.TotalTokens > 0 {
+	if ui.TotalOnly {
 		ui.PromptTokens = ui.TotalTokens
 	}
 	return ui

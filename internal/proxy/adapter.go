@@ -110,6 +110,12 @@ type UsageInfo struct {
 	// above the normal input rate. Always zero for providers without a
 	// cache-write concept (OpenAI, Gemini).
 	CacheWriteTokens int
+	// TotalOnly is true when the upstream usage object carried a positive
+	// total_tokens but omitted both prompt_tokens and completion_tokens (as
+	// opposed to reporting them as explicit zeros). Set by the OpenAI-format
+	// usage parsers only; it does not affect cost or token accounting except
+	// through normalizeRerankScoreUsage.
+	TotalOnly bool
 }
 
 // Adapter transforms requests and responses between the client's OpenAI-compatible

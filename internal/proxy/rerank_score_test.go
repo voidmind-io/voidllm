@@ -127,6 +127,16 @@ func TestRerankScore_UsageExtraction(t *testing.T) {
 		}
 	})
 
+	t.Run("rerank with explicit zero prompt and completion is not remapped", func(t *testing.T) {
+		t.Parallel()
+		u := runUsageRequest(t, "/v1/rerank",
+			`{"model":"rr-model","query":"q","documents":["a"]}`,
+			`{"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":9}}`, pricing)
+		if u.prompt != 0 || u.total != 9 {
+			t.Errorf("prompt/total = %d/%d, want 0/9", u.prompt, u.total)
+		}
+	})
+
 	t.Run("chat response with total_tokens only is not remapped", func(t *testing.T) {
 		t.Parallel()
 		u := runUsageRequest(t, "/v1/chat/completions",
@@ -147,11 +157,12 @@ func TestNormalizeRerankScoreUsage(t *testing.T) {
 		in   UsageInfo
 		want UsageInfo
 	}{
-		{"rerank total only", "rerank", UsageInfo{TotalTokens: 5}, UsageInfo{PromptTokens: 5, TotalTokens: 5}},
-		{"score total only", "score", UsageInfo{TotalTokens: 5}, UsageInfo{PromptTokens: 5, TotalTokens: 5}},
+		{"rerank total only", "rerank", UsageInfo{TotalTokens: 5, TotalOnly: true}, UsageInfo{PromptTokens: 5, TotalTokens: 5, TotalOnly: true}},
+		{"score total only", "score", UsageInfo{TotalTokens: 5, TotalOnly: true}, UsageInfo{PromptTokens: 5, TotalTokens: 5, TotalOnly: true}},
+		{"explicit zeros", "rerank", UsageInfo{TotalTokens: 5}, UsageInfo{TotalTokens: 5}},
 		{"prompt already set", "rerank", UsageInfo{PromptTokens: 3, TotalTokens: 5}, UsageInfo{PromptTokens: 3, TotalTokens: 5}},
 		{"completion set", "score", UsageInfo{CompletionTokens: 2, TotalTokens: 5}, UsageInfo{CompletionTokens: 2, TotalTokens: 5}},
-		{"other path", "embeddings", UsageInfo{TotalTokens: 5}, UsageInfo{TotalTokens: 5}},
+		{"other path", "embeddings", UsageInfo{TotalTokens: 5, TotalOnly: true}, UsageInfo{TotalTokens: 5, TotalOnly: true}},
 		{"no usage", "rerank", UsageInfo{}, UsageInfo{}},
 	}
 	for _, tc := range tests {
@@ -285,5 +296,103 @@ func TestRerankScore_NonPassthroughAdapter(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRerankScore_StreamingUsage verifies that a total_tokens-only usage chunk
+// on an SSE response from /v1/rerank is recorded as prompt tokens.
+func TestRerankScore_StreamingUsage(t *testing.T) {
+	t.Parallel()
+
+	sse := "data: {\"id\":\"r\",\"usage\":{\"total_tokens\":17}}\n\ndata: [DONE]\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, sse)
+	}))
+	t.Cleanup(upstream.Close)
+
+	model := &Model{Name: "rr-model", Provider: "vllm", Type: "reranking", BaseURL: upstream.URL, APIKey: "k",
+		Pricing: config.PricingConfig{InputPer1M: 1_000_000}}
+	reg := &Registry{models: map[string]*Model{model.Name: model}, aliases: make(map[string]string)}
+	reg.rebuildSorted()
+
+	d := openCostFormulaDB(t)
+	ul := usage.NewLogger(d, config.UsageConfig{BufferSize: 8, FlushInterval: time.Hour},
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	ul.Start()
+	h := NewProxyHandler(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.UsageLogger = ul
+	app, rawKey := testAppWithAuth(t, h, auth.KeyInfo{ID: "rr-key", KeyType: "user_key", OrgID: "rr-org", Role: "member"})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/rerank",
+		strings.NewReader(`{"model":"rr-model","query":"q","documents":["a"],"stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rawKey)
+	resp, err := app.Test(req, testTimeout)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	resp.Body.Close()
+	ul.Stop()
+
+	var prompt, total int
+	var cost sql.NullFloat64
+	row := d.SQL().QueryRowContext(context.Background(),
+		"SELECT prompt_tokens, total_tokens, cost_estimate FROM usage_events LIMIT 1")
+	if err := row.Scan(&prompt, &total, &cost); err != nil {
+		t.Fatalf("scan usage_events: %v", err)
+	}
+	if prompt != 17 || total != 17 || !cost.Valid || cost.Float64 != 17 {
+		t.Errorf("prompt/total/cost = %d/%d/%+v, want 17/17/17", prompt, total, cost)
+	}
+}
+
+// TestRerankScore_FallbackToTranslatingAdapter verifies that when a vllm
+// primary fails with 503 on /v1/rerank and its fallback is an anthropic model,
+// the client gets the clean 400 and the anthropic upstream is never called.
+func TestRerankScore_FallbackToTranslatingAdapter(t *testing.T) {
+	t.Parallel()
+
+	primary, _, primaryCalls := captureUpstream(t, http.StatusServiceUnavailable, `{"error":"down"}`,
+		map[string]string{"Content-Type": "application/json"})
+	fallback, _, fallbackCalls := captureUpstream(t, http.StatusOK, `{}`,
+		map[string]string{"Content-Type": "application/json"})
+
+	reg, err := NewRegistry([]config.ModelConfig{
+		{Name: "rr-primary", Provider: "vllm", BaseURL: primary.URL, APIKey: "k", Fallback: "rr-fallback"},
+		{Name: "rr-fallback", Provider: "anthropic", BaseURL: fallback.URL, APIKey: "k"},
+	})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	h := NewProxyHandler(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.FallbackMaxDepth = 1
+	app := testApp(t, h)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/rerank",
+		strings.NewReader(`{"model":"rr-primary","query":"q","documents":["a"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, testTimeout)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400; body: %s", resp.StatusCode, b)
+	}
+	if !strings.Contains(string(b), "endpoint not supported for this model") {
+		t.Errorf("unexpected body: %s", b)
+	}
+	if n := atomic.LoadInt32(primaryCalls); n != 1 {
+		t.Errorf("primary calls = %d, want 1", n)
+	}
+	if n := atomic.LoadInt32(fallbackCalls); n != 0 {
+		t.Errorf("anthropic fallback calls = %d, want 0", n)
 	}
 }
