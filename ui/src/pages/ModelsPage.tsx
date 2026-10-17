@@ -490,6 +490,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const [maxContextTokens, setMaxContextTokens] = useState('')
   const [inputPricePer1m, setInputPricePer1m] = useState('')
   const [outputPricePer1m, setOutputPricePer1m] = useState('')
+  const [cachedInputPricePer1m, setCachedInputPricePer1m] = useState('')
+  const [cacheWritePricePer1m, setCacheWritePricePer1m] = useState('')
   const [azureDeployment, setAzureDeployment] = useState('')
   const [azureApiVersion, setAzureApiVersion] = useState('')
   const [timeout, setTimeout] = useState('')
@@ -527,6 +529,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     setMaxContextTokens('')
     setInputPricePer1m('')
     setOutputPricePer1m('')
+    setCachedInputPricePer1m('')
+    setCacheWritePricePer1m('')
     setAzureDeployment('')
     setAzureApiVersion('')
     setTimeout('')
@@ -675,6 +679,14 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
         const parsed = parseFloat(outputPricePer1m)
         if (!isNaN(parsed)) params.output_price_per_1m = parsed
       }
+      if (cachedInputPricePer1m.trim()) {
+        const parsed = parseFloat(cachedInputPricePer1m)
+        if (!isNaN(parsed)) params.cached_input_price_per_1m = parsed
+      }
+      if (cacheWritePricePer1m.trim()) {
+        const parsed = parseFloat(cacheWritePricePer1m)
+        if (!isNaN(parsed)) params.cache_write_price_per_1m = parsed
+      }
       if (provider === 'azure') {
         if (azureDeployment.trim()) params.azure_deployment = azureDeployment.trim()
         if (azureApiVersion.trim()) params.azure_api_version = azureApiVersion.trim()
@@ -719,6 +731,14 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       if (outputPricePer1m.trim()) {
         const parsed = parseFloat(outputPricePer1m)
         if (!isNaN(parsed)) params.output_price_per_1m = parsed
+      }
+      if (cachedInputPricePer1m.trim()) {
+        const parsed = parseFloat(cachedInputPricePer1m)
+        if (!isNaN(parsed)) params.cached_input_price_per_1m = parsed
+      }
+      if (cacheWritePricePer1m.trim()) {
+        const parsed = parseFloat(cacheWritePricePer1m)
+        if (!isNaN(parsed)) params.cache_write_price_per_1m = parsed
       }
       if (timeout.trim()) params.timeout = timeout.trim()
       if (parsedAliases.length > 0) params.aliases = parsedAliases
@@ -1179,6 +1199,26 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                 disabled={isPending}
               />
             </div>
+            <div className="grid grid-cols-2 gap-4">
+              <Input
+                label="Cached Input Price per 1M tokens"
+                description="Leave empty to bill cached reads at the input price"
+                type="number"
+                value={cachedInputPricePer1m}
+                onChange={(e) => setCachedInputPricePer1m(e.target.value)}
+                placeholder="e.g. 0.25"
+                disabled={isPending}
+              />
+              <Input
+                label="Cache Write Price per 1M tokens"
+                description="Leave empty to use the input price"
+                type="number"
+                value={cacheWritePricePer1m}
+                onChange={(e) => setCacheWritePricePer1m(e.target.value)}
+                placeholder="e.g. 3.75"
+                disabled={isPending}
+              />
+            </div>
             <Input
               label="Timeout"
               value={timeout}
@@ -1244,6 +1284,12 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
   const [outputPrice, setOutputPrice] = useState(
     model.output_price_per_1m > 0 ? String(model.output_price_per_1m) : '',
   )
+  const [cachedInputPrice, setCachedInputPrice] = useState(
+    (model.cached_input_price_per_1m ?? 0) > 0 ? String(model.cached_input_price_per_1m) : '',
+  )
+  const [cacheWritePrice, setCacheWritePrice] = useState(
+    (model.cache_write_price_per_1m ?? 0) > 0 ? String(model.cache_write_price_per_1m) : '',
+  )
   const [azureDeployment, setAzureDeployment] = useState(model.azure_deployment ?? '')
   const [azureApiVersion, setAzureApiVersion] = useState(model.azure_api_version ?? '')
   const [timeout, setTimeout] = useState(model.timeout ?? '')
@@ -1304,6 +1350,24 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
       }
     } else if (model.output_price_per_1m > 0) {
       params.output_price_per_1m = 0
+    }
+
+    if (cachedInputPrice.trim()) {
+      const parsed = parseFloat(cachedInputPrice)
+      if (!isNaN(parsed) && parsed !== (model.cached_input_price_per_1m ?? 0)) {
+        params.cached_input_price_per_1m = parsed
+      }
+    } else if ((model.cached_input_price_per_1m ?? 0) > 0) {
+      params.cached_input_price_per_1m = 0
+    }
+
+    if (cacheWritePrice.trim()) {
+      const parsed = parseFloat(cacheWritePrice)
+      if (!isNaN(parsed) && parsed !== (model.cache_write_price_per_1m ?? 0)) {
+        params.cache_write_price_per_1m = parsed
+      }
+    } else if ((model.cache_write_price_per_1m ?? 0) > 0) {
+      params.cache_write_price_per_1m = 0
     }
 
     if (isAzure) {
@@ -1430,6 +1494,26 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
             value={outputPrice}
             onChange={(e) => setOutputPrice(e.target.value)}
             placeholder="e.g. 10.00"
+            disabled={updateModel.isPending}
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          <Input
+            label="Cached Input Price per 1M tokens"
+            description="Leave empty to bill cached reads at the input price"
+            type="number"
+            value={cachedInputPrice}
+            onChange={(e) => setCachedInputPrice(e.target.value)}
+            placeholder="e.g. 0.25"
+            disabled={updateModel.isPending}
+          />
+          <Input
+            label="Cache Write Price per 1M tokens"
+            description="Leave empty to use the input price"
+            type="number"
+            value={cacheWritePrice}
+            onChange={(e) => setCacheWritePrice(e.target.value)}
+            placeholder="e.g. 3.75"
             disabled={updateModel.isPending}
           />
         </div>
