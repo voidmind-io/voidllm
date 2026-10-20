@@ -37,7 +37,7 @@
     "jsdom": "^29.0.0",
     "tailwindcss": "^4.2.4",
     "typescript": "~5.9.3",
-    "typescript-eslint": "^8.65.0",
+    "typescript-eslint": "^8.71.2",
     "vite": "^8.1.5",
     "vitest": "^4.1.11"
   }
