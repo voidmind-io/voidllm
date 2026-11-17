@@ -60,6 +60,8 @@ func (r *Router) Pick(model proxy.Model) []proxy.Deployment {
 			AzureAPIVersion: model.AzureAPIVersion,
 			GCPProject:      model.GCPProject,
 			GCPLocation:     model.GCPLocation,
+			Region:          model.Region,
+			BedrockModelID:  model.BedrockModelID,
 			Weight:          1,
 			Priority:        0,
 		}}

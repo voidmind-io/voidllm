@@ -39,6 +39,7 @@ const providerLabels: Record<ProviderKey, string> = {
   openai: 'OpenAI',
   anthropic: 'Anthropic',
   azure: 'Azure',
+  bedrock: 'AWS Bedrock',
   vllm: 'vLLM',
   ollama: 'Ollama',
   custom: 'Custom',
@@ -48,6 +49,7 @@ const PROVIDER_OPTIONS = [
   { value: 'openai', label: 'OpenAI' },
   { value: 'anthropic', label: 'Anthropic' },
   { value: 'azure', label: 'Azure' },
+  { value: 'bedrock', label: 'AWS Bedrock' },
   { value: 'vllm', label: 'vLLM' },
   { value: 'ollama', label: 'Ollama' },
   { value: 'custom', label: 'Custom' },
@@ -127,6 +129,7 @@ const BASE_URL_PLACEHOLDERS: Record<string, string> = {
   openai: 'https://api.openai.com/v1',
   anthropic: 'https://api.anthropic.com',
   azure: 'https://<resource>.openai.azure.com',
+  bedrock: 'Optional - defaults to https://bedrock-runtime.<region>.amazonaws.com',
   vllm: 'http://localhost:8000/v1',
   ollama: 'http://localhost:11434/v1',
   custom: 'https://your-endpoint/v1',
@@ -228,6 +231,49 @@ function HealthBadge({ info }: HealthBadgeProps) {
   )
 }
 
+interface BedrockFieldsProps {
+  region: string
+  bedrockModelId: string
+  onRegionChange: (value: string) => void
+  onBedrockModelIdChange: (value: string) => void
+  regionError?: string
+  bedrockModelIdError?: string
+  disabled?: boolean
+}
+
+function BedrockFields({
+  region,
+  bedrockModelId,
+  onRegionChange,
+  onBedrockModelIdChange,
+  regionError,
+  bedrockModelIdError,
+  disabled,
+}: BedrockFieldsProps) {
+  return (
+    <>
+      <Input
+        label="AWS Region"
+        value={region}
+        onChange={(e) => onRegionChange(e.target.value)}
+        placeholder="eu-central-1"
+        error={regionError}
+        disabled={disabled}
+      />
+      <Input
+        label="Bedrock Model ID"
+        value={bedrockModelId}
+        onChange={(e) => onBedrockModelIdChange(e.target.value)}
+        placeholder="eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        error={bedrockModelIdError}
+        disabled={disabled}
+      />
+    </>
+  )
+}
+
+const BEDROCK_CHAT_ONLY_ERROR = 'Bedrock supports chat models only'
+
 // ---------------------------------------------------------------------------
 // DeploymentDialog
 // ---------------------------------------------------------------------------
@@ -242,6 +288,8 @@ interface DeploymentFormErrors {
   name?: string
   provider?: string
   base_url?: string
+  region?: string
+  bedrock_model_id?: string
 }
 
 function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProps) {
@@ -253,6 +301,8 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
   const [apiKey, setApiKey] = useState('')
   const [azureDeployment, setAzureDeployment] = useState(deployment?.azure_deployment ?? '')
   const [azureApiVersion, setAzureApiVersion] = useState(deployment?.azure_api_version ?? '')
+  const [region, setRegion] = useState(deployment?.region ?? '')
+  const [bedrockModelId, setBedrockModelId] = useState(deployment?.bedrock_model_id ?? '')
   const [weight, setWeight] = useState(String(deployment?.weight ?? 1))
   const [priority, setPriority] = useState(String(deployment?.priority ?? 0))
   const [errors, setErrors] = useState<DeploymentFormErrors>({})
@@ -263,6 +313,7 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
 
   const isPending = createDeployment.isPending || updateDeployment.isPending
   const isAzure = provider === 'azure'
+  const isBedrock = provider === 'bedrock'
 
   function handleClose() {
     setName('')
@@ -271,6 +322,8 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
     setApiKey('')
     setAzureDeployment('')
     setAzureApiVersion('')
+    setRegion('')
+    setBedrockModelId('')
     setWeight('1')
     setPriority('0')
     setErrors({})
@@ -281,7 +334,9 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
     const next: DeploymentFormErrors = {}
     if (!name.trim()) next.name = 'Name is required'
     if (!provider) next.provider = 'Provider is required'
-    if (!isEdit && !baseUrl.trim()) next.base_url = 'Base URL is required'
+    if (!isEdit && !isBedrock && !baseUrl.trim()) next.base_url = 'Base URL is required'
+    if (isBedrock && !region.trim()) next.region = 'AWS region is required'
+    if (isBedrock && !bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
     setErrors(next)
     return Object.keys(next).length === 0
   }
@@ -297,8 +352,16 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
       const params: Record<string, unknown> = {}
       if (name.trim() !== deployment.name) params.name = name.trim()
       if (provider !== deployment.provider) params.provider = provider
-      if (baseUrl.trim() && baseUrl.trim() !== deployment.base_url) params.base_url = baseUrl.trim()
+      if (isBedrock) {
+        if (baseUrl.trim() !== deployment.base_url) params.base_url = baseUrl.trim()
+      } else if (baseUrl.trim() && baseUrl.trim() !== deployment.base_url) {
+        params.base_url = baseUrl.trim()
+      }
       if (apiKey.trim()) params.api_key = apiKey.trim()
+      if (isBedrock && region.trim() !== (deployment.region ?? '')) params.region = region.trim()
+      if (isBedrock && bedrockModelId.trim() !== (deployment.bedrock_model_id ?? '')) {
+        params.bedrock_model_id = bedrockModelId.trim()
+      }
       if (isAzure && azureDeployment.trim() !== (deployment.azure_deployment ?? '')) {
         params.azure_deployment = azureDeployment.trim() || undefined
       }
@@ -327,10 +390,12 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
           params: {
             name: name.trim(),
             provider,
-            base_url: baseUrl.trim(),
+            base_url: baseUrl.trim() || undefined,
             api_key: apiKey.trim() || undefined,
             azure_deployment: isAzure && azureDeployment.trim() ? azureDeployment.trim() : undefined,
             azure_api_version: isAzure && azureApiVersion.trim() ? azureApiVersion.trim() : undefined,
+            region: isBedrock ? region.trim() : undefined,
+            bedrock_model_id: isBedrock ? bedrockModelId.trim() : undefined,
             weight: !isNaN(parsedWeight) ? parsedWeight : 1,
             priority: !isNaN(parsedPriority) ? parsedPriority : 0,
           },
@@ -372,9 +437,16 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
           onChange={(e) => setBaseUrl(e.target.value)}
           placeholder={BASE_URL_PLACEHOLDERS[provider] ?? 'https://'}
           error={errors.base_url}
-          description={isEdit ? 'Leave empty to keep current' : undefined}
+          description={isEdit && !isBedrock ? 'Leave empty to keep current' : undefined}
           disabled={isPending}
         />
+        {isBedrock && isEdit && (
+          <div>
+            <Button type="button" variant="secondary" size="sm" onClick={() => setBaseUrl('')} disabled={isPending}>
+              Use regional endpoint
+            </Button>
+          </div>
+        )}
         <Input
           label="API Key"
           type="password"
@@ -384,6 +456,17 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
           description={isEdit ? 'Leave empty to keep current key' : 'Encrypted at rest, never shown again'}
           disabled={isPending}
         />
+        {isBedrock && (
+          <BedrockFields
+            region={region}
+            bedrockModelId={bedrockModelId}
+            onRegionChange={setRegion}
+            onBedrockModelIdChange={setBedrockModelId}
+            regionError={errors.region}
+            bedrockModelIdError={errors.bedrock_model_id}
+            disabled={isPending}
+          />
+        )}
         {isAzure && (
           <>
             <Input
@@ -444,8 +527,11 @@ interface CreateModelDialogProps {
 
 interface FormErrors {
   name?: string
+  type?: string
   provider?: string
   base_url?: string
+  region?: string
+  bedrock_model_id?: string
   deployments?: string
 }
 
@@ -456,6 +542,8 @@ interface DeploymentFormEntry {
   apiKey: string
   azureDeployment: string
   azureApiVersion: string
+  region: string
+  bedrockModelId: string
   weight: number
   priority: number
 }
@@ -467,6 +555,8 @@ const emptyDeploymentEntry = (): DeploymentFormEntry => ({
   apiKey: '',
   azureDeployment: '',
   azureApiVersion: '',
+  region: '',
+  bedrockModelId: '',
   weight: 1,
   priority: 0,
 })
@@ -475,6 +565,8 @@ interface InlineDeploymentFormErrors {
   name?: string
   provider?: string
   base_url?: string
+  region?: string
+  bedrock_model_id?: string
 }
 
 function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
@@ -494,6 +586,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const [cacheWritePricePer1m, setCacheWritePricePer1m] = useState('')
   const [azureDeployment, setAzureDeployment] = useState('')
   const [azureApiVersion, setAzureApiVersion] = useState('')
+  const [region, setRegion] = useState('')
+  const [bedrockModelId, setBedrockModelId] = useState('')
   const [timeout, setTimeout] = useState('')
   const [piiFilter, setPiiFilter] = useState('default')
 
@@ -533,6 +627,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     setCacheWritePricePer1m('')
     setAzureDeployment('')
     setAzureApiVersion('')
+    setRegion('')
+    setBedrockModelId('')
     setTimeout('')
     setStrategy('round-robin')
     setMaxRetries('')
@@ -568,6 +664,10 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
         if (azureDeployment.trim()) body.azure_deployment = azureDeployment.trim()
         if (azureApiVersion.trim()) body.azure_api_version = azureApiVersion.trim()
       }
+      if (isBedrock) {
+        body.region = region.trim()
+        body.bedrock_model_id = bedrockModelId.trim()
+      }
       const res = await apiClient<{ success: boolean; message: string }>('/models/test-connection', {
         method: 'POST',
         body: JSON.stringify(body),
@@ -584,7 +684,10 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     const next: InlineDeploymentFormErrors = {}
     if (!depFormEntry.name.trim()) next.name = 'Name is required'
     if (!depFormEntry.provider) next.provider = 'Provider is required'
-    if (!depFormEntry.baseUrl.trim()) next.base_url = 'Base URL is required'
+    const depIsBedrock = depFormEntry.provider === 'bedrock'
+    if (!depIsBedrock && !depFormEntry.baseUrl.trim()) next.base_url = 'Base URL is required'
+    if (depIsBedrock && !depFormEntry.region.trim()) next.region = 'AWS region is required'
+    if (depIsBedrock && !depFormEntry.bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
     setDepFormErrors(next)
     return Object.keys(next).length === 0
   }
@@ -643,9 +746,17 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
 
     if (mode === 'single') {
       if (!provider) next.provider = 'Provider is required'
-      if (!baseUrl.trim()) next.base_url = 'Base URL is required'
+      if (!isBedrock && !baseUrl.trim()) next.base_url = 'Base URL is required'
+      if (isBedrock) {
+        if (type !== 'chat') next.type = BEDROCK_CHAT_ONLY_ERROR
+        if (!region.trim()) next.region = 'AWS region is required'
+        if (!bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
+      }
     } else {
       if (deployments.length === 0) next.deployments = 'At least one deployment is required'
+      if (type !== 'chat' && deployments.some((d) => d.provider === 'bedrock')) {
+        next.type = BEDROCK_CHAT_ONLY_ERROR
+      }
     }
 
     setErrors(next)
@@ -663,9 +774,9 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
         name: name.trim(),
         type,
         provider,
-        base_url: baseUrl.trim(),
       }
 
+      if (baseUrl.trim()) params.base_url = baseUrl.trim()
       if (apiKey.trim()) params.api_key = apiKey.trim()
       if (maxContextTokens.trim()) {
         const parsed = parseInt(maxContextTokens, 10)
@@ -690,6 +801,10 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       if (provider === 'azure') {
         if (azureDeployment.trim()) params.azure_deployment = azureDeployment.trim()
         if (azureApiVersion.trim()) params.azure_api_version = azureApiVersion.trim()
+      }
+      if (isBedrock) {
+        params.region = region.trim()
+        params.bedrock_model_id = bedrockModelId.trim()
       }
       if (timeout.trim()) params.timeout = timeout.trim()
       if (parsedAliases.length > 0) params.aliases = parsedAliases
@@ -753,10 +868,12 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
             params: {
               name: dep.name,
               provider: dep.provider,
-              base_url: dep.baseUrl,
+              base_url: dep.baseUrl || undefined,
               api_key: dep.apiKey || undefined,
               azure_deployment: dep.azureDeployment || undefined,
               azure_api_version: dep.azureApiVersion || undefined,
+              region: dep.provider === 'bedrock' ? dep.region.trim() : undefined,
+              bedrock_model_id: dep.provider === 'bedrock' ? dep.bedrockModelId.trim() : undefined,
               weight: dep.weight,
               priority: dep.priority,
             },
@@ -774,8 +891,10 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   }
 
   const isAzure = provider === 'azure'
+  const isBedrock = provider === 'bedrock'
   const isPending = createModel.isPending || createDeployment.isPending
   const depFormIsAzure = depFormEntry.provider === 'azure'
+  const depFormIsBedrock = depFormEntry.provider === 'bedrock'
   const depFormIsOpen = showDeploymentForm || editingDeployment !== null
 
   const fallbackOptions: SelectOption[] = useMemo(() => {
@@ -813,6 +932,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
           options={MODEL_TYPE_OPTIONS}
           value={type}
           onChange={setType}
+          error={errors.type}
           disabled={isPending}
         />
 
@@ -848,7 +968,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                 variant="secondary"
                 size="sm"
                 loading={testing}
-                disabled={!baseUrl.trim()}
+                disabled={isBedrock ? !region.trim() || !bedrockModelId.trim() : !baseUrl.trim()}
                 onClick={handleTestConnection}
               >
                 Test Connection
@@ -859,6 +979,17 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                 </span>
               )}
             </div>
+            {isBedrock && (
+              <BedrockFields
+                region={region}
+                bedrockModelId={bedrockModelId}
+                onRegionChange={(v) => { setRegion(v); setTestResult(null) }}
+                onBedrockModelIdChange={(v) => { setBedrockModelId(v); setTestResult(null) }}
+                regionError={errors.region}
+                bedrockModelIdError={errors.bedrock_model_id}
+                disabled={isPending}
+              />
+            )}
             {isAzure && (
               <>
                 <Input
@@ -968,6 +1099,17 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                             placeholder="sk-..."
                             disabled={isPending}
                           />
+                          {depFormIsBedrock && (
+                            <BedrockFields
+                              region={depFormEntry.region}
+                              bedrockModelId={depFormEntry.bedrockModelId}
+                              onRegionChange={(v) => setDepFormEntry((prev) => ({ ...prev, region: v }))}
+                              onBedrockModelIdChange={(v) => setDepFormEntry((prev) => ({ ...prev, bedrockModelId: v }))}
+                              regionError={depFormErrors.region}
+                              bedrockModelIdError={depFormErrors.bedrock_model_id}
+                              disabled={isPending}
+                            />
+                          )}
                           {depFormIsAzure && (
                             <>
                               <Input
@@ -1087,6 +1229,17 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                     placeholder="sk-..."
                     disabled={isPending}
                   />
+                  {depFormIsBedrock && (
+                    <BedrockFields
+                      region={depFormEntry.region}
+                      bedrockModelId={depFormEntry.bedrockModelId}
+                      onRegionChange={(v) => setDepFormEntry((prev) => ({ ...prev, region: v }))}
+                      onBedrockModelIdChange={(v) => setDepFormEntry((prev) => ({ ...prev, bedrockModelId: v }))}
+                      regionError={depFormErrors.region}
+                      bedrockModelIdError={depFormErrors.bedrock_model_id}
+                      disabled={isPending}
+                    />
+                  )}
                   {depFormIsAzure && (
                     <>
                       <Input
@@ -1292,6 +1445,9 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
   )
   const [azureDeployment, setAzureDeployment] = useState(model.azure_deployment ?? '')
   const [azureApiVersion, setAzureApiVersion] = useState(model.azure_api_version ?? '')
+  const [region, setRegion] = useState(model.region ?? '')
+  const [bedrockModelId, setBedrockModelId] = useState(model.bedrock_model_id ?? '')
+  const [errors, setErrors] = useState<FormErrors>({})
   const [timeout, setTimeout] = useState(model.timeout ?? '')
   const [fallbackModelName, setFallbackModelName] = useState(model.fallback_model_name ?? '')
   const [piiFilter, setPiiFilter] = useState(() => piiFilterFromResponse(model.pii_filter))
@@ -1303,6 +1459,7 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
   const hasFallbackFeature = license?.features.includes('fallback_chains') ?? false
 
   const isAzure = provider === 'azure'
+  const isBedrock = provider === 'bedrock'
 
   const fallbackOptions: SelectOption[] = useMemo(() => {
     const allModels = modelsData?.data ?? []
@@ -1316,6 +1473,17 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
 
   function handleSubmit(e: React.FormEvent | React.MouseEvent) {
     e.preventDefault()
+
+    if (isBedrock) {
+      const next: FormErrors = {}
+      if (type !== 'chat') next.type = BEDROCK_CHAT_ONLY_ERROR
+      if (!region.trim()) next.region = 'AWS region is required'
+      if (!bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
+      setErrors(next)
+      if (Object.keys(next).length > 0) return
+    } else {
+      setErrors({})
+    }
 
     const params: UpdateModelParams = {}
 
@@ -1368,6 +1536,13 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
       }
     } else if ((model.cache_write_price_per_1m ?? 0) > 0) {
       params.cache_write_price_per_1m = 0
+    }
+
+    if (isBedrock) {
+      if (region.trim() !== (model.region ?? '')) params.region = region.trim()
+      if (bedrockModelId.trim() !== (model.bedrock_model_id ?? '')) {
+        params.bedrock_model_id = bedrockModelId.trim()
+      }
     }
 
     if (isAzure) {
@@ -1453,6 +1628,7 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
           options={MODEL_TYPE_OPTIONS}
           value={type}
           onChange={setType}
+          error={errors.type}
           disabled={updateModel.isPending}
         />
         <Input
@@ -1462,6 +1638,19 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
           placeholder={BASE_URL_PLACEHOLDERS[provider] ?? 'https://'}
           disabled={updateModel.isPending}
         />
+        {isBedrock && (
+          <div>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => setBaseUrl('')}
+              disabled={updateModel.isPending}
+            >
+              Use regional endpoint
+            </Button>
+          </div>
+        )}
         <Input
           label="API Key"
           type="password"
@@ -1517,6 +1706,17 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
             disabled={updateModel.isPending}
           />
         </div>
+        {isBedrock && (
+          <BedrockFields
+            region={region}
+            bedrockModelId={bedrockModelId}
+            onRegionChange={setRegion}
+            onBedrockModelIdChange={setBedrockModelId}
+            regionError={errors.region}
+            bedrockModelIdError={errors.bedrock_model_id}
+            disabled={updateModel.isPending}
+          />
+        )}
         {isAzure && (
           <>
             <Input

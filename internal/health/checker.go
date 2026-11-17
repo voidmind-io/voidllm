@@ -53,6 +53,10 @@ type probeTarget struct {
 	gcpProject string
 	// gcpLocation is the Google Cloud region. Non-empty only for provider "vertex".
 	gcpLocation string
+	// region is the AWS region. Non-empty only for provider "bedrock".
+	region string
+	// bedrockModelID is the Bedrock model ID. Non-empty only for provider "bedrock".
+	bedrockModelID string
 }
 
 // asProbeTarget converts t to the exported ProbeTarget shape that
@@ -69,6 +73,8 @@ func (t probeTarget) asProbeTarget() ProbeTarget {
 		AzureAPIVersion: t.azureAPIVersion,
 		GCPProject:      t.gcpProject,
 		GCPLocation:     t.gcpLocation,
+		Region:          t.region,
+		BedrockModelID:  t.bedrockModelID,
 	}
 }
 
@@ -258,6 +264,8 @@ func (c *Checker) runAll(level probeLevel) {
 				azureAPIVersion: m.AzureAPIVersion,
 				gcpProject:      m.GCPProject,
 				gcpLocation:     m.GCPLocation,
+				region:          m.Region,
+				bedrockModelID:  m.BedrockModelID,
 			}
 			c.runOne(t, level)
 			continue
@@ -275,6 +283,8 @@ func (c *Checker) runAll(level probeLevel) {
 				azureAPIVersion: d.AzureAPIVersion,
 				gcpProject:      d.GCPProject,
 				gcpLocation:     d.GCPLocation,
+				region:          d.Region,
+				bedrockModelID:  d.BedrockModelID,
 			}
 			c.runOne(t, level)
 		}

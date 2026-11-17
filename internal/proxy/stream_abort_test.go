@@ -241,7 +241,7 @@ func TestAnthropicTransformStreamLine_DropCases(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			a := &AnthropicAdapter{}
+			a := &AnthropicAdapter{startSeen: true}
 			outLines, err := a.TransformStreamLine([]byte(tc.line))
 
 			if err != nil {

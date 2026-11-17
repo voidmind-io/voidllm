@@ -998,7 +998,7 @@ func TestIsStreamingResponse(t *testing.T) {
 			if tc.contentType != "" {
 				resp.Header.Set("Content-Type", tc.contentType)
 			}
-			got := isStreamingResponse(resp)
+			got := isStreamingResponse(resp, nil)
 			if got != tc.want {
 				t.Errorf("isStreamingResponse(%q) = %v, want %v", tc.contentType, got, tc.want)
 			}
