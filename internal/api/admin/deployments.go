@@ -26,8 +26,12 @@ type createDeploymentRequest struct {
 	GCPProject string `json:"gcp_project"`
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when provider is "vertex".
 	GCPLocation string `json:"gcp_location"`
-	Weight      int    `json:"weight"`
-	Priority    int    `json:"priority"`
+	// Region is the AWS region (e.g. "eu-central-1"). Required when provider is "bedrock".
+	Region string `json:"region"`
+	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN. Required when provider is "bedrock".
+	BedrockModelID string `json:"bedrock_model_id"`
+	Weight         int    `json:"weight"`
+	Priority       int    `json:"priority"`
 	// PIIFilter explicitly enables or disables PII anonymization for requests
 	// routed to this deployment. Omit to inherit from the model or network default.
 	PIIFilter *bool `json:"pii_filter,omitempty"`
@@ -46,8 +50,12 @@ type updateDeploymentRequest struct {
 	GCPProject *string `json:"gcp_project"`
 	// GCPLocation, when non-nil, replaces the stored Google Cloud region.
 	GCPLocation *string `json:"gcp_location"`
-	Weight      *int    `json:"weight"`
-	Priority    *int    `json:"priority"`
+	// Region, when non-nil, replaces the stored AWS region.
+	Region *string `json:"region"`
+	// BedrockModelID, when non-nil, replaces the stored Bedrock model ID.
+	BedrockModelID *string `json:"bedrock_model_id"`
+	Weight         *int    `json:"weight"`
+	Priority       *int    `json:"priority"`
 	// PIIFilter, when non-nil, replaces the PII anonymization override for
 	// this deployment. Pass true to force anonymization on, false to force it off.
 	// Omit the field entirely to leave the existing setting unchanged.
@@ -68,9 +76,13 @@ type deploymentResponse struct {
 	GCPProject string `json:"gcp_project,omitempty"`
 	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
 	GCPLocation string `json:"gcp_location,omitempty"`
-	Weight      int    `json:"weight"`
-	Priority    int    `json:"priority"`
-	IsActive    bool   `json:"is_active"`
+	// Region is the AWS region. Non-empty only for provider "bedrock".
+	Region string `json:"region,omitempty"`
+	// BedrockModelID is the Bedrock model ID. Non-empty only for provider "bedrock".
+	BedrockModelID string `json:"bedrock_model_id,omitempty"`
+	Weight         int    `json:"weight"`
+	Priority       int    `json:"priority"`
+	IsActive       bool   `json:"is_active"`
 	// PIIFilter is the per-deployment PII anonymization override. Nil means
 	// inherit from the model-level or network-level default; true forces
 	// anonymization on; false forces it off.
@@ -98,6 +110,8 @@ func deploymentToResponse(d *db.Deployment) deploymentResponse {
 		AzureAPIVersion: d.AzureAPIVersion,
 		GCPProject:      d.GCPProject,
 		GCPLocation:     d.GCPLocation,
+		Region:          d.Region,
+		BedrockModelID:  d.BedrockModelID,
 		Weight:          d.Weight,
 		Priority:        d.Priority,
 		IsActive:        d.IsActive,
@@ -107,10 +121,14 @@ func deploymentToResponse(d *db.Deployment) deploymentResponse {
 	}
 }
 
-// validateDeploymentBaseURL returns a non-empty error message if baseURL is
-// empty or does not start with http:// or https://.
-func validateDeploymentBaseURL(baseURL string) string {
+// validateDeploymentBaseURL returns a non-empty error message if baseURL does
+// not start with http:// or https://. An empty baseURL is rejected except for
+// the bedrock provider, where it selects the regional endpoint.
+func validateDeploymentBaseURL(baseURL, providerName string) string {
 	if baseURL == "" {
+		if providerName == provider.Bedrock {
+			return ""
+		}
 		return "base_url is required"
 	}
 	u, err := url.Parse(baseURL)
@@ -146,7 +164,8 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 	ctx := c.Context()
 	modelID := c.Params("model_id")
 
-	if _, err := h.DB.GetModel(ctx, modelID); err != nil {
+	parent, err := h.DB.GetModel(ctx, modelID)
+	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "model not found")
 		}
@@ -171,8 +190,13 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 	if !provider.ValidProviders[req.Provider] {
 		return apierror.BadRequest(c, "provider must be one of: "+strings.Join(provider.Names(), ", "))
 	}
-	if msg := validateDeploymentBaseURL(req.BaseURL); msg != "" {
+	if msg := validateDeploymentBaseURL(req.BaseURL, req.Provider); msg != "" {
 		return apierror.BadRequest(c, msg)
+	}
+	if req.Provider == provider.Bedrock {
+		if msg := validateBedrockFields(req.Region, req.BedrockModelID, parent.ModelType); msg != "" {
+			return apierror.BadRequest(c, msg)
+		}
 	}
 
 	// Insert without API key to obtain the stable deployment ID used as AAD.
@@ -186,6 +210,8 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 		AzureAPIVersion: req.AzureAPIVersion,
 		GCPProject:      req.GCPProject,
 		GCPLocation:     req.GCPLocation,
+		Region:          req.Region,
+		BedrockModelID:  req.BedrockModelID,
 		Weight:          req.Weight,
 		Priority:        req.Priority,
 		PIIFilter:       req.PIIFilter,
@@ -298,7 +324,8 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 	modelID := c.Params("model_id")
 	deploymentID := c.Params("deployment_id")
 
-	if _, err := h.DB.GetModel(ctx, modelID); err != nil {
+	parent, err := h.DB.GetModel(ctx, modelID)
+	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "model not found")
 		}
@@ -321,11 +348,6 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 	if req.Provider != nil && !provider.ValidProviders[*req.Provider] {
 		return apierror.BadRequest(c, "provider must be one of: "+strings.Join(provider.Names(), ", "))
 	}
-	if req.BaseURL != nil {
-		if msg := validateDeploymentBaseURL(*req.BaseURL); msg != "" {
-			return apierror.BadRequest(c, msg)
-		}
-	}
 
 	dep, err := h.DB.GetDeployment(ctx, deploymentID)
 	if err != nil {
@@ -337,6 +359,33 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 	}
 	if dep.ModelID != modelID {
 		return apierror.Send(c, fiber.StatusNotFound, "not_found", "deployment not found")
+	}
+
+	// Validate the merged (existing + request) values so a partial update
+	// cannot leave the deployment in an invalid state.
+	mergedProvider := dep.Provider
+	if req.Provider != nil {
+		mergedProvider = *req.Provider
+	}
+	mergedBaseURL := dep.BaseURL
+	if req.BaseURL != nil {
+		mergedBaseURL = *req.BaseURL
+	}
+	if msg := validateDeploymentBaseURL(mergedBaseURL, mergedProvider); msg != "" {
+		return apierror.BadRequest(c, msg)
+	}
+	if mergedProvider == provider.Bedrock {
+		mergedRegion := dep.Region
+		if req.Region != nil {
+			mergedRegion = *req.Region
+		}
+		mergedModelID := dep.BedrockModelID
+		if req.BedrockModelID != nil {
+			mergedModelID = *req.BedrockModelID
+		}
+		if msg := validateBedrockFields(mergedRegion, mergedModelID, parent.ModelType); msg != "" {
+			return apierror.BadRequest(c, msg)
+		}
 	}
 
 	// Resolve the tri-state pii_filter semantics:
@@ -361,6 +410,8 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 		AzureAPIVersion: req.AzureAPIVersion,
 		GCPProject:      req.GCPProject,
 		GCPLocation:     req.GCPLocation,
+		Region:          req.Region,
+		BedrockModelID:  req.BedrockModelID,
 		Weight:          req.Weight,
 		Priority:        req.Priority,
 		PIIFilter:       piiFilter,

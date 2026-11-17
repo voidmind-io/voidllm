@@ -525,7 +525,7 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			"circuit_open", "upstream temporarily unavailable")
 	}
 
-	if isStreamingResponse(resp) {
+	if isStreamingResponse(resp, adapter) {
 		var breaker *circuitbreaker.Breaker
 		// A 429 can carry Content-Type: text/event-stream and still be
 		// dispatched into handleStreamingResponse below. Its neutral outcome
@@ -538,11 +538,11 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			breaker = p.CircuitBreakers.Get(deploymentKey(currentModel.Name, usedDep.Name))
 		}
 		return p.handleStreamingResponse(c, resp, cancelUpstream, currentModel,
-			keyInfo, adapter, startTime, requestID, requestedModelName, effectiveStreamDur, maxRespBody, trackDone, breaker, piiFilter)
+			keyInfo, adapter, usedDep, startTime, requestID, requestedModelName, effectiveStreamDur, maxRespBody, trackDone, breaker, piiFilter)
 	}
 
 	defer cancelUpstream()
-	return p.handleBufferedResponse(c, resp, currentModel, keyInfo, adapter,
+	return p.handleBufferedResponse(c, resp, currentModel, keyInfo, adapter, usedDep,
 		startTime, requestID, requestedModelName, maxRespBody, piiFilter)
 }
 
@@ -603,6 +603,8 @@ func (p *ProxyHandler) tryModel(
 			AzureAPIVersion: model.AzureAPIVersion,
 			GCPProject:      model.GCPProject,
 			GCPLocation:     model.GCPLocation,
+			Region:          model.Region,
+			BedrockModelID:  model.BedrockModelID,
 			Weight:          1,
 			destPrivate:     model.destPrivate,
 			PIIFilter:       model.PIIFilter,
@@ -805,7 +807,7 @@ func (p *ProxyHandler) tryModel(
 				resolved = true
 			}
 			p.Cooldowns.Mark(depKey, retryAfterOrDefault(currentResp))
-		} else if breaker != nil && !isStreamingResponse(currentResp) {
+		} else if breaker != nil && !isStreamingResponse(currentResp, currentAdapter) {
 			if currentResp.StatusCode >= 500 {
 				breaker.RecordFailure()
 			} else {
@@ -1218,7 +1220,7 @@ func writeStreamAbortEvent(w *bufio.Writer, code string) bool {
 // maxRespBody is the aggregate byte cap for the PII-buffered streaming path;
 // it is the same limit used for non-streaming responses.
 // filter may be nil when PII anonymization is disabled.
-func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response, cancelUpstream context.CancelFunc, model Model, keyInfo *auth.KeyInfo, adapter Adapter, startTime time.Time, requestID string, requestedModelName string, maxStreamDuration time.Duration, maxRespBody int, trackDone func(), breaker *circuitbreaker.Breaker, filter *pii.Filter) error {
+func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response, cancelUpstream context.CancelFunc, model Model, keyInfo *auth.KeyInfo, adapter Adapter, usedDep Deployment, startTime time.Time, requestID string, requestedModelName string, maxStreamDuration time.Duration, maxRespBody int, trackDone func(), breaker *circuitbreaker.Breaker, filter *pii.Filter) error {
 	copyResponseHeaders(c, resp)
 	c.Set("Content-Type", "text/event-stream")
 	c.Set("Cache-Control", "no-cache")
@@ -1245,7 +1247,15 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 		defer metrics.ActiveStreams.Dec()
 		defer trackDone()
 		defer cancelUpstream()
-		defer resp.Body.Close()
+
+		// Adapters whose upstream is not SSE decode the wire format here so the
+		// scanner below always reads "data: ...\n\n" lines. The deferred Close
+		// targets the wrapper, which closes the underlying response body.
+		body := resp.Body
+		if bs, ok := adapter.(binaryStreamAdapter); ok {
+			body = bs.WrapStreamBody(body)
+		}
+		defer body.Close()
 
 		// Stream timeout: after maxStreamDuration, cancel the upstream
 		// request context. This causes the transport to tear down the
@@ -1261,7 +1271,7 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 		defer streamTimer.Stop()
 
 		extractor := &streamUsageExtractor{}
-		scanner := bufio.NewScanner(resp.Body)
+		scanner := bufio.NewScanner(body)
 		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024) // up to 4MB per SSE line
 
 		// needsContentRestore is true when PII was detected in the request: the
@@ -1814,6 +1824,19 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			if streamUI.PromptTokens == 0 && streamUI.CompletionTokens == 0 {
 				streamUI = extractor.lastUsage
 			}
+			if rep, ok := adapter.(usageAnomalyReporter); ok {
+				if zero, present := rep.ZeroInputUsageReported(); zero {
+					p.Log.LogAttrs(context.Background(), slog.LevelWarn, "upstream reported zero input tokens",
+						slog.String("model", model.Name),
+						slog.String("provider", usedDep.Provider),
+						slog.String("deployment", usedDep.Name),
+						slog.Bool("usage_present", present),
+						slog.String("request_id", requestID),
+						slog.Int("completion_tokens", streamUI.CompletionTokens),
+						slog.Bool("stream", true),
+					)
+				}
+			}
 			streamUI = normalizeRerankScoreUsage(upstreamPath, streamUI)
 			durationMS := int(time.Since(startTime).Milliseconds())
 			// Use the upstream HTTP status for successful, complete streams. For
@@ -1838,7 +1861,7 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 // requestedModelName is the canonical name the client originally asked for;
 // it may differ from model.Name when a fallback was activated.
 // filter may be nil when PII anonymization is disabled.
-func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, model Model, keyInfo *auth.KeyInfo, adapter Adapter, startTime time.Time, requestID string, requestedModelName string, maxResponseBody int, filter *pii.Filter) error {
+func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, model Model, keyInfo *auth.KeyInfo, adapter Adapter, usedDep Deployment, startTime time.Time, requestID string, requestedModelName string, maxResponseBody int, filter *pii.Filter) error {
 	// Content-Length pre-check: fast-reject optimization to avoid allocating
 	// memory for obviously oversized responses. Not the security boundary —
 	// io.LimitReader on the next line handles chunked/unknown-length responses.
@@ -1872,8 +1895,10 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 	copyResponseHeaders(c, resp)
 
 	// Transform the body if an adapter is present and the response is
-	// successful. Error responses (4xx/5xx) are forwarded as-is so that
-	// provider-specific error details reach the client unchanged.
+	// successful. Error responses (4xx/5xx) are forwarded unchanged so that
+	// provider-specific error details reach the client, unless the adapter
+	// implements upstreamErrorMapper: then the body is replaced by the mapped
+	// apierror envelope and the status code stays unchanged.
 	//
 	// usageBody tracks which body to pass to extractUsage. Anthropic (and
 	// other non-OpenAI adapters) use provider-specific field names
@@ -1884,7 +1909,23 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 	// so usageBody stays as responseBody.
 	var finalBody []byte
 	var usageBody []byte
-	if adapter != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if mapper, ok := adapter.(upstreamErrorMapper); ok && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+		// The upstream error body is not apierror-shaped. Map it to the
+		// proxy's error envelope; the status code is left unchanged so
+		// retry, cooldown and breaker decisions keep using the raw status.
+		code, message := mapper.MapUpstreamError(resp.StatusCode, resp.Header, responseBody)
+		mapped, mapErr := jsonx.Marshal(apierror.Response{Error: apierror.Detail{
+			Code:      code,
+			Message:   message,
+			RequestID: apierror.RequestIDFromCtx(c),
+		}})
+		if mapErr != nil {
+			return apierror.Send(c, fiber.StatusBadGateway, "upstream_error", "failed to map upstream error")
+		}
+		c.Set("Content-Type", "application/json")
+		finalBody = mapped
+		usageBody = mapped
+	} else if adapter != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		var transformErr error
 		finalBody, transformErr = adapter.TransformResponse(responseBody)
 		if transformErr != nil {
@@ -1921,6 +1962,19 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 		// For non-streaming responses TTFT equals total duration: the entire
 		// response body is the first (and only) "token delivery".
 		ttftMS := durationMS
+		if rep, ok := adapter.(usageAnomalyReporter); ok {
+			if zero, present := rep.ZeroInputUsageReported(); zero {
+				p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream reported zero input tokens",
+					slog.String("model", model.Name),
+					slog.String("provider", usedDep.Provider),
+					slog.String("deployment", usedDep.Name),
+					slog.Bool("usage_present", present),
+					slog.String("request_id", requestID),
+					slog.Int("completion_tokens", ui.CompletionTokens),
+					slog.Bool("stream", false),
+				)
+			}
+		}
 		p.logUsageEvent(keyInfo, model, ui, durationMS, &ttftMS, resp.StatusCode, requestID, requestedModelName)
 	}
 
@@ -2029,6 +2083,8 @@ func applyDeployment(model *Model, dep Deployment) {
 	model.AzureAPIVersion = dep.AzureAPIVersion
 	model.GCPProject = dep.GCPProject
 	model.GCPLocation = dep.GCPLocation
+	model.Region = dep.Region
+	model.BedrockModelID = dep.BedrockModelID
 }
 
 // isRetryable reports whether an HTTP status code from an upstream response
@@ -2323,9 +2379,17 @@ func isAllowedPath(p string) bool {
 		strings.HasPrefix(p, "models/")
 }
 
-// isStreamingResponse reports whether the upstream response is a server-sent
-// event stream by inspecting the Content-Type header.
-func isStreamingResponse(resp *http.Response) bool {
+// isStreamingResponse reports whether the upstream response is a stream by
+// inspecting the Content-Type header. A server-sent event stream always
+// qualifies; a binary stream qualifies only when the adapter declares that
+// wire format via binaryStreamAdapter.
+func isStreamingResponse(resp *http.Response, adapter Adapter) bool {
 	ct := resp.Header.Get("Content-Type")
-	return strings.Contains(ct, "text/event-stream")
+	if strings.Contains(ct, "text/event-stream") {
+		return true
+	}
+	if bs, ok := adapter.(binaryStreamAdapter); ok {
+		return strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), bs.StreamContentType())
+	}
+	return false
 }

@@ -23,7 +23,7 @@ Privacy-first LLM proxy and AI gateway. Self-hosted, single binary, sub-500us ov
 
 ## Models
 
-- [Provider Setup](models/providers.md) - OpenAI, Anthropic, Azure, Ollama, vLLM, custom
+- [Provider Setup](models/providers.md) - OpenAI, Anthropic, Azure, AWS Bedrock, Ollama, vLLM, custom
 - [Load Balancing](models/load-balancing.md) - strategies, failover, circuit breakers
 - [Aliases](models/aliases.md) - logical names for models (per org/team)
 
