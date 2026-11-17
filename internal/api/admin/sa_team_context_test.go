@@ -39,10 +39,10 @@ func TestCanRotateAPIKey(t *testing.T) {
 		want   bool
 	}{
 		{
-			name:   "org_admin rotates any key",
+			name:   "org_admin static check does not cover another user's key (owner standing is checked by the handler)",
 			caller: auth.KeyInfo{Role: auth.RoleOrgAdmin, UserID: caller},
 			key:    &db.APIKey{KeyType: keygen.KeyTypeUser, UserID: strp(other)},
-			want:   true,
+			want:   false,
 		},
 		{
 			name:   "org_admin rotates sa_key",

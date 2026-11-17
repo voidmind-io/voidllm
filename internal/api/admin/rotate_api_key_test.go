@@ -617,7 +617,7 @@ func TestRotateAPIKey_NewKeyHasSameMetadata(t *testing.T) {
 	}
 }
 
-func TestRotateAPIKey_OrgAdminCanRotateAnyKeyInOrg(t *testing.T) {
+func TestRotateAPIKey_OrgAdminCanRotateLowerRankedMembersKey(t *testing.T) {
 	t.Parallel()
 
 	app, database, keyCache := setupTestApp(t, "file:TestRotateAPIKey_OrgAdmin?mode=memory&cache=private")
@@ -626,7 +626,17 @@ func TestRotateAPIKey_OrgAdminCanRotateAnyKeyInOrg(t *testing.T) {
 	owner := mustCreateUser(t, database, "rotate-owner2@example.com", "Owner2")
 	admin := mustCreateUser(t, database, "rotate-admin@example.com", "Admin")
 	team := mustCreateTeam(t, database, org.ID, "Dev", "rotate-orgadmin-team")
-	mustCreateUserMemberships(t, database, org.ID, team.ID, owner.ID)
+	// The key owner is a plain org member so the org_admin outranks it.
+	if _, err := database.CreateOrgMembership(context.Background(), db.CreateOrgMembershipParams{
+		OrgID: org.ID, UserID: owner.ID, Role: auth.RoleMember,
+	}); err != nil {
+		t.Fatalf("CreateOrgMembership: %v", err)
+	}
+	if _, err := database.CreateTeamMembership(context.Background(), db.CreateTeamMembershipParams{
+		TeamID: team.ID, UserID: owner.ID, Role: auth.RoleMember,
+	}); err != nil {
+		t.Fatalf("CreateTeamMembership: %v", err)
+	}
 	mustCreateUserMemberships(t, database, org.ID, team.ID, admin.ID)
 
 	// Use org_admin key to create a key owned by 'owner'.

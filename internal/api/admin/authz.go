@@ -3,6 +3,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 
@@ -93,4 +94,62 @@ func (h *Handler) requireTeamAccess(c fiber.Ctx) (*auth.KeyInfo, *db.Team, bool)
 	}
 
 	return keyInfo, team, true
+}
+
+// canActOnUser decides whether caller may act on another user's credentials in
+// orgID. A system admin caller, or a caller acting on itself, is always
+// allowed. Otherwise the target must:
+//  1. hold a membership in orgID (failing this yields 404 "user not found" so
+//     existence is not revealed),
+//  2. not be a system admin,
+//  3. hold a strictly lower org role than the caller, and
+//  4. when crossOrgSensitive is true (password or email changes, and issuing
+//     or rotating a key for the user), hold no membership in any other
+//     non-deleted organization.
+//
+// Rules 2-4 yield 403 "insufficient permissions". It returns status 0 when the
+// action is allowed. A non-nil err reports a storage failure.
+func (h *Handler) canActOnUser(ctx context.Context, caller *auth.KeyInfo, orgID, targetUserID string, crossOrgSensitive bool) (int, string, error) {
+	if auth.HasRole(caller.Role, auth.RoleSystemAdmin) {
+		return 0, "", nil
+	}
+	if caller.UserID != "" && caller.UserID == targetUserID {
+		return 0, "", nil
+	}
+
+	targetRole, err := h.DB.GetOrgMembershipRole(ctx, targetUserID, orgID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return fiber.StatusNotFound, "user not found", nil
+		}
+		return 0, "", err
+	}
+
+	target, err := h.DB.GetUser(ctx, targetUserID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return fiber.StatusNotFound, "user not found", nil
+		}
+		return 0, "", err
+	}
+	if target.IsSystemAdmin {
+		return fiber.StatusForbidden, "insufficient permissions", nil
+	}
+
+	// Strictly lower: the caller outranks the target and the target does not
+	// reach the caller's rank. Unknown roles never satisfy HasRole.
+	if !auth.HasRole(caller.Role, targetRole) || auth.HasRole(targetRole, caller.Role) {
+		return fiber.StatusForbidden, "insufficient permissions", nil
+	}
+
+	if crossOrgSensitive {
+		n, err := h.DB.CountOtherOrgMemberships(ctx, targetUserID, orgID)
+		if err != nil {
+			return 0, "", err
+		}
+		if n > 0 {
+			return fiber.StatusForbidden, "insufficient permissions", nil
+		}
+	}
+	return 0, "", nil
 }

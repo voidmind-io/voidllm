@@ -536,6 +536,39 @@ func (d *DB) GetUserOrgRole(ctx context.Context, userID string, orgID string) (s
 	return role, nil
 }
 
+// GetOrgMembershipRole returns the role recorded in org_memberships for a user
+// in an organization. Unlike GetUserOrgRole it does not consult
+// users.is_system_admin, so it answers only whether a membership row exists.
+// Returns ErrNotFound when the user has no membership in the org.
+func (d *DB) GetOrgMembershipRole(ctx context.Context, userID string, orgID string) (string, error) {
+	p := d.dialect.Placeholder
+	var role string
+	err := d.sql.QueryRowContext(ctx,
+		"SELECT role FROM org_memberships WHERE user_id = "+p(1)+" AND org_id = "+p(2),
+		userID, orgID).Scan(&role)
+	if err != nil {
+		return "", fmt.Errorf("get org membership role user %s org %s: %w", userID, orgID, translateError(err))
+	}
+	return role, nil
+}
+
+// CountOtherOrgMemberships returns the number of organizations other than
+// orgID in which the user holds a membership. Memberships in soft-deleted
+// organizations are ignored.
+func (d *DB) CountOtherOrgMemberships(ctx context.Context, userID string, orgID string) (int, error) {
+	p := d.dialect.Placeholder
+	var n int
+	err := d.sql.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM org_memberships om"+
+			" JOIN organizations o ON o.id = om.org_id AND o.deleted_at IS NULL"+
+			" WHERE om.user_id = "+p(1)+" AND om.org_id <> "+p(2),
+		userID, orgID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count other org memberships user %s org %s: %w", userID, orgID, translateError(err))
+	}
+	return n, nil
+}
+
 // IsTeamMember reports whether a user is a member of the given team.
 // It returns false (not an error) if the user has no membership row.
 func (d *DB) IsTeamMember(ctx context.Context, userID string, teamID string) (bool, error) {

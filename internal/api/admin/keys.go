@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
@@ -212,30 +213,97 @@ func apiKeyVisibleToCallerKey(key *db.APIKey, caller *auth.KeyInfo) bool {
 	return key.UserID != nil && *key.UserID == caller.UserID
 }
 
-// canRotateAPIKey reports whether the caller may rotate the given key. Rotation
-// returns the new plaintext, so it is narrower than visibility: org_admin and
-// above may rotate any key in the org; everyone else may rotate only keys they
-// own, plus team keys of their own team when the caller is at least team_admin
-// and has a team context (a team_key, a team-bound sa_key, or a user_key
-// carrying team_id). A team_key resolves to team_admin, so rotating it never
-// raises a team_admin caller's privilege; a member never qualifies. Other
-// users' keys and service-account keys are never rotatable below org_admin,
-// even when they carry the caller's team_id.
+// canRotateAPIKey reports whether the caller may rotate the given key based on
+// the key and caller alone. Rotation returns the new plaintext, so it is
+// narrower than visibility. org_admin and above may rotate keys that carry no
+// user owner (team keys, service-account keys) and their own keys; a key owned
+// by another user is decided by Handler.canRotateKey, which also checks the
+// owner's standing in the org. Everyone else may rotate only keys they own,
+// plus team keys of their own team when the caller is at least team_admin and
+// has a team context (a team_key, a team-bound sa_key, or a user_key carrying
+// team_id). A team_key resolves to team_admin, so rotating it never raises a
+// team_admin caller's privilege; a member never qualifies. Other users' keys
+// and service-account keys are never rotatable below org_admin, even when
+// they carry the caller's team_id.
 func canRotateAPIKey(caller *auth.KeyInfo, key *db.APIKey) bool {
-	if auth.HasRole(caller.Role, auth.RoleOrgAdmin) {
-		return true
-	}
 	if caller.UserID != "" && key.UserID != nil && *key.UserID == caller.UserID {
 		return true
+	}
+	if auth.HasRole(caller.Role, auth.RoleOrgAdmin) {
+		return key.UserID == nil
 	}
 	return auth.HasRole(caller.Role, auth.RoleTeamAdmin) &&
 		key.KeyType == keygen.KeyTypeTeam &&
 		caller.TeamID != "" && key.TeamID != nil && *key.TeamID == caller.TeamID
 }
 
+// canRotateKey reports whether the caller may rotate the given key. System
+// admins may rotate any key. Otherwise canRotateAPIKey decides, and an
+// org_admin caller may additionally rotate a key owned by another user only
+// when that user holds a membership in the key's org, is not a system admin,
+// and holds a strictly lower org role than the caller, and, because rotation
+// issues a new credential for that user, has no membership in any other
+// non-deleted org. A non-nil error reports a storage failure.
+//
+// Unlike authorizeKeyOwner there is no fallback for an owner who has left the
+// org: rotation hands out a fresh working credential for that user, and an
+// owner without a membership here must not receive one from this org's admins.
+func (h *Handler) canRotateKey(ctx context.Context, caller *auth.KeyInfo, key *db.APIKey) (bool, error) {
+	if auth.HasRole(caller.Role, auth.RoleSystemAdmin) || canRotateAPIKey(caller, key) {
+		return true, nil
+	}
+	if !auth.HasRole(caller.Role, auth.RoleOrgAdmin) || key.UserID == nil {
+		return false, nil
+	}
+	status, _, err := h.canActOnUser(ctx, caller, key.OrgID, *key.UserID, true)
+	if err != nil {
+		return false, err
+	}
+	return status == 0, nil
+}
+
+// authorizeKeyOwner applies the owner-standing rule to org_admin callers that
+// are not system admins and act on a key owned by another user: the owner must
+// hold a membership in the key's org, must not be a system admin, and must hold
+// a strictly lower org role than the caller. Keys without a user owner, the
+// caller's own keys, keys whose owner no longer has a membership in the org
+// (unless the owner is a system admin), system admin callers and callers below
+// org_admin (whose scope is checked separately) return status 0. A non-nil err reports a
+// storage failure.
+func (h *Handler) authorizeKeyOwner(ctx context.Context, caller *auth.KeyInfo, key *db.APIKey) (int, string, error) {
+	if !auth.HasRole(caller.Role, auth.RoleOrgAdmin) || auth.HasRole(caller.Role, auth.RoleSystemAdmin) {
+		return 0, "", nil
+	}
+	if key.UserID == nil || (caller.UserID != "" && *key.UserID == caller.UserID) {
+		return 0, "", nil
+	}
+	status, msg, err := h.canActOnUser(ctx, caller, key.OrgID, *key.UserID, false)
+	if err != nil || status != fiber.StatusNotFound {
+		return status, msg, err
+	}
+	// The owner no longer holds a membership in the org, so they carry no org
+	// role to protect and the key may still be updated or removed. A system
+	// admin's keys stay protected regardless of membership.
+	owner, err := h.DB.GetUser(ctx, *key.UserID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return 0, "", nil
+		}
+		return 0, "", err
+	}
+	if owner.IsSystemAdmin {
+		return fiber.StatusForbidden, "insufficient permissions", nil
+	}
+	return 0, "", nil
+}
+
 // CreateAPIKey handles POST /api/v1/orgs/:org_id/keys.
 // Org admins and system admins may create any key type.
 // Members may only create user_key for themselves (user_id is forced to their own ID).
+// A user_key for another user requires that user to hold a membership in the
+// org; for non-system-admin callers the target must also not be a system admin,
+// must hold a strictly lower org role than the caller, and must hold no
+// membership in any other non-deleted org.
 // The plaintext key is returned exactly once in the response body.
 //
 // @Summary      Create an API key
@@ -347,17 +415,42 @@ func (h *Handler) CreateAPIKey(c fiber.Ctx) error {
 	if req.UserID != nil && *req.UserID != "" {
 		if _, err := h.DB.GetUser(ctx, *req.UserID); err != nil {
 			if errors.Is(err, db.ErrNotFound) {
+				if !auth.HasRole(keyInfo.Role, auth.RoleSystemAdmin) {
+					// Same response as a missing membership so callers cannot
+					// probe which user IDs exist in other orgs.
+					return apierror.BadRequest(c, "user is not a member of this organization")
+				}
 				return apierror.BadRequest(c, "user not found")
 			}
 			h.Log.ErrorContext(ctx, "create api key: get user", slog.String("error", err.Error()))
 			return apierror.InternalError(c, "failed to validate user")
 		}
-		if _, err := h.DB.GetUserOrgRole(ctx, *req.UserID, orgID); err != nil {
+		// System admin callers keep the broad check: GetUserOrgRole also accepts
+		// a target that is a system admin without a membership row, so they can
+		// issue keys for themselves in any org. Other callers need a real
+		// membership row for the target, and the rank rules below.
+		var memberErr error
+		if auth.HasRole(keyInfo.Role, auth.RoleSystemAdmin) {
+			_, memberErr = h.DB.GetUserOrgRole(ctx, *req.UserID, orgID)
+		} else {
+			_, memberErr = h.DB.GetOrgMembershipRole(ctx, *req.UserID, orgID)
+		}
+		if err := memberErr; err != nil {
 			if errors.Is(err, db.ErrNotFound) {
 				return apierror.BadRequest(c, "user is not a member of this organization")
 			}
 			h.Log.ErrorContext(ctx, "create api key: verify user org membership", slog.String("error", err.Error()))
 			return apierror.InternalError(c, "failed to validate user")
+		}
+		if req.KeyType == keygen.KeyTypeUser && (keyInfo.UserID == "" || *req.UserID != keyInfo.UserID) {
+			status, msg, err := h.canActOnUser(ctx, keyInfo, orgID, *req.UserID, true)
+			if err != nil {
+				h.Log.ErrorContext(ctx, "create api key: authorize target user", slog.String("error", err.Error()))
+				return apierror.InternalError(c, "failed to validate user")
+			}
+			if status != 0 {
+				return apierror.Send(c, status, "forbidden", msg)
+			}
 		}
 	}
 
@@ -610,7 +703,9 @@ func (h *Handler) ListAPIKeys(c fiber.Ctx) error {
 }
 
 // UpdateAPIKey handles PATCH /api/v1/orgs/:org_id/keys/:key_id.
-// Org admins may update any key in the org. Team admins may update keys scoped
+// Org admins may update any org-level key and any key owned by themselves or by
+// a lower-ranked non-system-admin member; keys of system admins and peer org
+// admins are refused (403). Team admins may update keys scoped
 // to their team or owned by themselves. Members may only update their own keys.
 // Only name, limits, and expires_at are updatable. Rate and token limit fields
 // may only be changed by org admins and system admins — see canSetKeyLimits
@@ -660,6 +755,13 @@ func (h *Handler) UpdateAPIKey(c fiber.Ctx) error {
 		if !apiKeyVisibleToCallerKey(existing, keyInfo) {
 			return apierror.NotFound(c, "api key not found")
 		}
+	}
+
+	if status, msg, err := h.authorizeKeyOwner(c.Context(), keyInfo, existing); err != nil {
+		h.Log.ErrorContext(c.Context(), "update api key: authorize owner", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to verify key owner")
+	} else if status != 0 {
+		return apierror.Send(c, status, "forbidden", msg)
 	}
 
 	var req updateAPIKeyRequest
@@ -802,8 +904,11 @@ type rotatedKeyInfo struct {
 
 // RotateAPIKey handles POST /api/v1/orgs/:org_id/keys/:key_id/rotate.
 // It generates a new API key with the same metadata as the existing key and
-// sets the old key to expire after a 24-hour grace period. Org admins and
-// system admins may rotate any key; members may only rotate their own keys.
+// sets the old key to expire after a 24-hour grace period. System admins may
+// rotate any key. Org admins may rotate org-level keys (team and service-account
+// keys), their own keys, and user keys of members whose org role is strictly
+// lower than their own, who are not system admins and who belong to no other
+// non-deleted org. Members may only rotate their own keys.
 //
 // @Summary      Rotate an API key
 // @Description  Generates a new key with the same metadata as the existing one and shortens the old key's lifetime to a 24-hour grace period. Members may only rotate their own keys.
@@ -871,8 +976,14 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 		}
 	}
 
-	// Members and team admins may only rotate keys within their scope; org_admin+ may rotate any key.
-	if !canRotateAPIKey(keyInfo, existing) {
+	// Members and team admins may only rotate keys within their scope; org_admin may rotate
+	// org-level keys and keys of strictly lower-ranked org members; system_admin may rotate any key.
+	canRotate, err := h.canRotateKey(ctx, keyInfo, existing)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "rotate api key: authorize owner", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to rotate key")
+	}
+	if !canRotate {
 		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "you can only rotate keys within your scope")
 	}
 
@@ -1019,7 +1130,9 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 }
 
 // DeleteAPIKey handles DELETE /api/v1/orgs/:org_id/keys/:key_id.
-// Org admins may delete any key in the org. Members may only delete their own keys.
+// Org admins may delete any org-level key and any key owned by themselves or by
+// a lower-ranked non-system-admin member; keys of system admins and peer org
+// admins are refused (403). Members may only delete their own keys.
 // Deletion is a soft-delete. The key is also removed from the in-memory cache so it
 // is immediately rejected by the proxy.
 // Returns 404 if the key belongs to a different org or the caller lacks access.
@@ -1062,6 +1175,13 @@ func (h *Handler) DeleteAPIKey(c fiber.Ctx) error {
 		if apiKey.UserID == nil || *apiKey.UserID != keyInfo.UserID {
 			return apierror.Send(c, fiber.StatusForbidden, "forbidden", "you can only delete your own keys")
 		}
+	}
+
+	if status, msg, err := h.authorizeKeyOwner(c.Context(), keyInfo, apiKey); err != nil {
+		h.Log.ErrorContext(c.Context(), "delete api key: authorize owner", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to verify key owner")
+	} else if status != 0 {
+		return apierror.Send(c, status, "forbidden", msg)
 	}
 
 	if err := h.DB.DeleteAPIKey(c.Context(), apiKey.ID); err != nil {

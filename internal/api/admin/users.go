@@ -221,8 +221,9 @@ func (h *Handler) CreateUser(c fiber.Ctx) error {
 }
 
 // GetUser handles GET /api/v1/users/:user_id.
-// Requires org_admin or higher. org_admin callers may only fetch users who are
-// members of their own organization; system_admin may fetch any user.
+// Requires org_admin or higher. system_admin may fetch any user. Other callers
+// may fetch only users that hold a membership row in their own organization;
+// no privilege comparison applies to reads.
 //
 // @Summary      Get a user
 // @Description  Returns a single user. Org admins may only fetch users within their org; system admins may fetch any user.
@@ -257,7 +258,7 @@ func (h *Handler) GetUser(c fiber.Ctx) error {
 	}
 
 	if !auth.HasRole(keyInfo.Role, auth.RoleSystemAdmin) {
-		if _, err := h.DB.GetUserOrgRole(c.Context(), id, keyInfo.OrgID); err != nil {
+		if _, err := h.DB.GetOrgMembershipRole(c.Context(), id, keyInfo.OrgID); err != nil {
 			if errors.Is(err, db.ErrNotFound) {
 				return apierror.NotFound(c, "user not found")
 			}
@@ -326,8 +327,12 @@ func (h *Handler) ListUsers(c fiber.Ctx) error {
 }
 
 // UpdateUser handles PATCH /api/v1/users/:user_id.
-// Requires org_admin or higher. org_admin callers may only update users who are
-// members of their own organization; system_admin may update any user.
+// Requires org_admin or higher. system_admin may update any user. Any other
+// caller may update itself; for another user the target must hold a membership
+// in the caller's organization, must not be a system admin, and must hold a
+// strictly lower org role than the caller. Changing a password or email
+// additionally requires that the target has no membership in any other
+// organization. Display-name changes need only the first three conditions.
 // Only system admins may change is_system_admin.
 //
 // @Summary      Update a user
@@ -357,19 +362,21 @@ func (h *Handler) UpdateUser(c fiber.Ctx) error {
 
 	id := c.Params("user_id")
 
-	if !auth.HasRole(keyInfo.Role, auth.RoleSystemAdmin) {
-		if _, err := h.DB.GetUserOrgRole(c.Context(), id, keyInfo.OrgID); err != nil {
-			if errors.Is(err, db.ErrNotFound) {
-				return apierror.NotFound(c, "user not found")
-			}
-			h.Log.ErrorContext(c.Context(), "update user: verify org membership", slog.String("error", err.Error()))
-			return apierror.InternalError(c, "failed to verify user access")
-		}
-	}
-
 	var req updateUserRequest
 	if err := c.Bind().JSON(&req); err != nil {
 		return apierror.BadRequest(c, "invalid request body")
+	}
+
+	status, msg, err := h.canActOnUser(c.Context(), keyInfo, keyInfo.OrgID, id, req.Password != nil || req.Email != nil)
+	if err != nil {
+		h.Log.ErrorContext(c.Context(), "update user: authorize target", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to verify user access")
+	}
+	if status == fiber.StatusNotFound {
+		return apierror.NotFound(c, msg)
+	}
+	if status != 0 {
+		return apierror.Send(c, status, "forbidden", msg)
 	}
 
 	if req.IsSystemAdmin != nil && !auth.HasRole(keyInfo.Role, auth.RoleSystemAdmin) {

@@ -71,7 +71,8 @@ func orgMembershipToResponse(m *db.OrgMembership) orgMembershipResponse {
 }
 
 // CreateOrgMembership handles POST /api/v1/orgs/:org_id/members.
-// System admins may assign any role. Org admins may only assign the "member" role.
+// System admins may assign any role. Org admins may only assign the "member" role
+// and may not add a user who is a system admin.
 // On success the key cache is fully reloaded from the DB, mirroring
 // UpdateOrgMembership, so that a user_key or session_key belonging to this
 // user that was previously uncacheable for lack of a membership row (see
@@ -117,6 +118,20 @@ func (h *Handler) CreateOrgMembership(c fiber.Ctx) error {
 	}
 	if !isSystemAdmin && req.Role == auth.RoleOrgAdmin {
 		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "only system admins may assign the org_admin role")
+	}
+
+	if !isSystemAdmin {
+		target, err := h.DB.GetUser(c.Context(), req.UserID)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return apierror.BadRequest(c, "user not found")
+			}
+			h.Log.ErrorContext(c.Context(), "create org membership: get user", slog.String("error", err.Error()))
+			return apierror.InternalError(c, "failed to create org membership")
+		}
+		if target.IsSystemAdmin {
+			return apierror.Send(c, fiber.StatusForbidden, "forbidden", "insufficient permissions")
+		}
 	}
 
 	m, err := h.DB.CreateOrgMembership(c.Context(), db.CreateOrgMembershipParams{
@@ -201,7 +216,10 @@ func (h *Handler) ListOrgMemberships(c fiber.Ctx) error {
 // UpdateOrgMembership handles PATCH /api/v1/orgs/:org_id/members/:membership_id.
 // System admins may change a membership role to any valid value. Org admins may
 // only change a role to "member". Both may also set the per-user token and rate
-// limits, which apply across every API key the user owns in this org. On
+// limits, which apply across every API key the user owns in this org. A caller
+// that is not a system admin may change its own membership as before, but may
+// change another user's membership (role or limits) only when that user is not
+// a system admin and holds a strictly lower org role than the caller. On
 // success the key cache is fully reloaded from the DB so the new role and
 // limits take effect immediately instead of waiting for the next periodic
 // key cache reload.
@@ -242,6 +260,13 @@ func (h *Handler) UpdateOrgMembership(c fiber.Ctx) error {
 	}
 	if existing.OrgID != orgID {
 		return apierror.NotFound(c, "org membership not found")
+	}
+
+	if status, msg, err := h.canActOnUser(c.Context(), keyInfo, orgID, existing.UserID, false); err != nil {
+		h.Log.ErrorContext(c.Context(), "update org membership: authorize target", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to verify user access")
+	} else if status != 0 {
+		return apierror.Send(c, status, "forbidden", msg)
 	}
 
 	var req updateOrgMembershipRequest
@@ -303,9 +328,10 @@ func (h *Handler) UpdateOrgMembership(c fiber.Ctx) error {
 }
 
 // DeleteOrgMembership handles DELETE /api/v1/orgs/:org_id/members/:membership_id.
-// System admins may delete any membership; org admins may only delete memberships
-// within their own organization. Every API key the removed user owns in this
-// org is immediately evicted from the in-memory key cache (and, when Redis is
+// System admins may delete any membership. Other callers may delete their own
+// membership, and the membership of another user in their own organization only
+// when that user is not a system admin and holds a strictly lower org role.
+// Every API key the removed user owns in this org is immediately evicted from the in-memory key cache (and, when Redis is
 // configured, invalidated on other instances) so those keys stop
 // authenticating without waiting for the next periodic cache reload. Keys the
 // user owns in other organizations are unaffected.
@@ -327,7 +353,8 @@ func (h *Handler) DeleteOrgMembership(c fiber.Ctx) error {
 	orgID := c.Params("org_id")
 	membershipID := c.Params("membership_id")
 
-	if _, ok := requireOrgAccess(c, orgID); !ok {
+	keyInfo, ok := requireOrgAccess(c, orgID)
+	if !ok {
 		return nil
 	}
 
@@ -341,6 +368,13 @@ func (h *Handler) DeleteOrgMembership(c fiber.Ctx) error {
 	}
 	if existing.OrgID != orgID {
 		return apierror.NotFound(c, "org membership not found")
+	}
+
+	if status, msg, err := h.canActOnUser(c.Context(), keyInfo, orgID, existing.UserID, false); err != nil {
+		h.Log.ErrorContext(c.Context(), "delete org membership: authorize target", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to verify user access")
+	} else if status != 0 {
+		return apierror.Send(c, status, "forbidden", msg)
 	}
 
 	if err := h.DB.DeleteOrgMembership(c.Context(), membershipID); err != nil {
