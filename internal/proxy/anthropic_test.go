@@ -2483,6 +2483,9 @@ func TestAnthropicTransformStreamLine(t *testing.T) {
 			t.Parallel()
 
 			a := &AnthropicAdapter{}
+			// Lifecycle events other than message_start require a prior
+			// message_start; these single-line cases isolate per-event behavior.
+			a.startSeen = !strings.Contains(tc.line, `"type":"message_start"`)
 			outLines, err := a.TransformStreamLine([]byte(tc.line))
 
 			if tc.wantAbort {

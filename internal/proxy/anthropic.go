@@ -64,6 +64,11 @@ type AnthropicAdapter struct {
 	// emits a trailing usage-only chunk before [DONE], mirroring OpenAI's
 	// include_usage behavior.
 	includeUsage bool
+
+	// startSeen is set once a valid message_start event has been processed in
+	// the current stream. Events that depend on message_start (content blocks,
+	// message_delta, message_stop) abort the stream when it is still false.
+	startSeen bool
 }
 
 // anthropicIncomingMessage is the parsed form of a single message in the
@@ -1159,6 +1164,14 @@ func (a *AnthropicAdapter) TransformResponse(body []byte) ([]byte, error) {
 // overwriting or dropping the mapping. A duplicate indicates a malformed
 // upstream stream and the fail-closed signal lets the handler emit a
 // content-free error event instead of continuing with inconsistent state.
+//
+// Stream lifecycle: exactly one message_start must precede any
+// content_block_start, content_block_delta, message_delta or message_stop.
+// A second message_start, an unparseable message_start, or any of those events
+// arriving before message_start aborts the stream (errStreamTransformAborted),
+// so a stream without input-token usage is recorded as incomplete rather than
+// as a normal response with zero prompt tokens. ping, content_block_stop and
+// unknown event types are unaffected.
 func (a *AnthropicAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 	s := string(line)
 
@@ -1205,14 +1218,20 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 				} `json:"usage"`
 			} `json:"message"`
 		}
-		if err := jsonx.Unmarshal(payload, &ms); err == nil {
-			if ms.Message.ID != "" {
-				a.msgID = ms.Message.ID
-			}
-			a.inputTokens = ms.Message.Usage.InputTokens
-			a.cacheReadTokens = ms.Message.Usage.CacheReadInputTokens
-			a.cacheWriteTokens = ms.Message.Usage.CacheCreationInputTokens
+		if a.startSeen {
+			// Second message_start in one stream — protocol violation.
+			return nil, errStreamTransformAborted
 		}
+		if err := jsonx.Unmarshal(payload, &ms); err != nil {
+			return nil, errStreamTransformAborted
+		}
+		a.startSeen = true
+		if ms.Message.ID != "" {
+			a.msgID = ms.Message.ID
+		}
+		a.inputTokens = ms.Message.Usage.InputTokens
+		a.cacheReadTokens = ms.Message.Usage.CacheReadInputTokens
+		a.cacheWriteTokens = ms.Message.Usage.CacheCreationInputTokens
 		if a.msgID == "" {
 			a.msgID = "chatcmpl-proxy"
 		}
@@ -1220,6 +1239,9 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 		return [][]byte{appendDataPrefix(chunk)}, nil
 
 	case "content_block_start":
+		if !a.startSeen {
+			return nil, errStreamTransformAborted
+		}
 		// Only tool_use blocks produce output at this stage; text content_block_start
 		// is dropped (text content arrives via text_delta events).
 		var cbs struct {
@@ -1287,6 +1309,9 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 		return [][]byte{appendDataPrefix(chunk)}, nil
 
 	case "content_block_delta":
+		if !a.startSeen {
+			return nil, errStreamTransformAborted
+		}
 		var cbd struct {
 			Index int `json:"index"`
 			Delta struct {
@@ -1330,6 +1355,9 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 		}
 
 	case "message_delta":
+		if !a.startSeen {
+			return nil, errStreamTransformAborted
+		}
 		var md struct {
 			Delta struct {
 				StopReason *string `json:"stop_reason"`
@@ -1348,6 +1376,9 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 		return [][]byte{appendDataPrefix(chunk)}, nil
 
 	case "message_stop":
+		if !a.startSeen {
+			return nil, errStreamTransformAborted
+		}
 		// When the client requested stream_options.include_usage, emit a
 		// trailing usage-only chunk before [DONE], mirroring OpenAI's final
 		// streaming chunk. This is the last event of a clean stream — an
