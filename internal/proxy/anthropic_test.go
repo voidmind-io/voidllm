@@ -2295,6 +2295,9 @@ func TestAnthropicTransformStreamLine(t *testing.T) {
 		wantNil bool
 		// wantAbort means the adapter should return errStreamTransformAborted.
 		wantAbort bool
+		// freshStream, when true, runs the line on an adapter that has not seen
+		// message_start; otherwise message_start is treated as already seen.
+		freshStream bool
 		// wantExact, if non-empty, is the exact byte slice expected (for simple cases).
 		wantExact string
 		// checkFn performs structured assertions on the returned line.
@@ -2353,8 +2356,9 @@ func TestAnthropicTransformStreamLine(t *testing.T) {
 			},
 		},
 		{
-			name: "message_start produces OpenAI chunk with role assistant",
-			line: `data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet-20240620","stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}`,
+			name:        "message_start produces OpenAI chunk with role assistant",
+			line:        `data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet-20240620","stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}`,
+			freshStream: true,
 			checkFn: func(t *testing.T, out []byte) {
 				t.Helper()
 				chunk := parseChunk(t, out)
@@ -2371,8 +2375,9 @@ func TestAnthropicTransformStreamLine(t *testing.T) {
 			},
 		},
 		{
-			name: "message_start without message id uses fallback id",
-			line: `data: {"type":"message_start","message":{}}`,
+			name:        "message_start without message id uses fallback id",
+			line:        `data: {"type":"message_start","message":{}}`,
+			freshStream: true,
 			checkFn: func(t *testing.T, out []byte) {
 				t.Helper()
 				chunk := parseChunk(t, out)
@@ -2485,7 +2490,7 @@ func TestAnthropicTransformStreamLine(t *testing.T) {
 			a := &AnthropicAdapter{}
 			// Lifecycle events other than message_start require a prior
 			// message_start; these single-line cases isolate per-event behavior.
-			a.startSeen = !strings.Contains(tc.line, `"type":"message_start"`)
+			a.startSeen = !tc.freshStream
 			outLines, err := a.TransformStreamLine([]byte(tc.line))
 
 			if tc.wantAbort {

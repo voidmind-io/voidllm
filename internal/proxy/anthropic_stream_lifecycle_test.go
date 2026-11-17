@@ -66,35 +66,49 @@ func TestAnthropicStreamLifecycle_FirstEvent(t *testing.T) {
 func TestAnthropicStreamLifecycle_MessageStartViolations(t *testing.T) {
 	t.Parallel()
 
+	const badStart = `data: {"type":"message_start","message":{"usage":{"input_tokens":"many"}}}`
+
 	tests := []struct {
 		name  string
 		lines []string
+		// abortAt lists the indices of lines that must each return
+		// errStreamTransformAborted when fed to the same adapter in order.
+		abortAt []int
 	}{
-		{"duplicate message_start aborts", []string{lcMessageStart, lcMessageStart}},
-		{"message_start with non-object message aborts", []string{`data: {"type":"message_start","message":"oops"}`}},
-		{"non-JSON message_start passes through then next lifecycle event aborts", []string{`data: {"type":"message_start","message":`, lcBlockDelta}},
-		{"message_start with wrong field types aborts", []string{`data: {"type":"message_start","message":{"usage":{"input_tokens":"many"}}}`}},
-		{"events after malformed message_start still abort", []string{`data: {"type":"message_start","message":{"usage":{"input_tokens":"many"}}}`, lcBlockDelta}},
+		{"duplicate message_start aborts", []string{lcMessageStart, lcMessageStart}, []int{1}},
+		{"message_start with non-object message aborts", []string{`data: {"type":"message_start","message":"oops"}`}, []int{0}},
+		{"truncated JSON message_start aborts", []string{`data: {"type":"message_start","message":`}, []int{0}},
+		{"message_start with wrong field types aborts", []string{badStart}, []int{0}},
+		{"events after malformed message_start still abort", []string{badStart, lcBlockDelta, lcMessageDelta}, []int{0, 1, 2}},
+		{"[DONE] before message_start aborts", []string{`data: [DONE]`}, []int{0}},
+		{"non-JSON data line after message_start aborts", []string{lcMessageStart, `data: not json`}, []int{1}},
+		{"error event before message_start aborts", []string{`data: {"type":"error","error":{"type":"overloaded_error","message":"x"}}`}, []int{0}},
+		{"error event after message_start aborts", []string{lcMessageStart, lcBlockDelta, `data: {"type":"error","error":{"type":"overloaded_error","message":"x"}}`}, []int{2}},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
+			want := make(map[int]bool, len(tc.abortAt))
+			for _, i := range tc.abortAt {
+				want[i] = true
+			}
 			a := &AnthropicAdapter{}
-			var lastErr error
-			var lastOut [][]byte
-			for _, l := range tc.lines {
-				lastOut, lastErr = a.TransformStreamLine([]byte(l))
-				if lastErr != nil {
-					break
+			for i, l := range tc.lines {
+				out, err := a.TransformStreamLine([]byte(l))
+				if want[i] {
+					if !errors.Is(err, errStreamTransformAborted) {
+						t.Fatalf("line %d: err = %v, want errStreamTransformAborted", i, err)
+					}
+					if len(out) != 0 {
+						t.Errorf("line %d: output = %q, want none on abort", i, out)
+					}
+					continue
 				}
-			}
-			if !errors.Is(lastErr, errStreamTransformAborted) {
-				t.Fatalf("err = %v, want errStreamTransformAborted", lastErr)
-			}
-			if len(lastOut) != 0 {
-				t.Errorf("output = %q, want none on abort", lastOut)
+				if err != nil {
+					t.Fatalf("line %d: unexpected error: %v", i, err)
+				}
 			}
 		})
 	}
@@ -204,6 +218,12 @@ func TestHandle_AnthropicStreamLifecycle(t *testing.T) {
 		{
 			name:       "missing message_start is recorded as 502",
 			lines:      []string{lcBlockStart, lcBlockDelta, lcBlockStop, lcMessageDelta, lcMessageStop},
+			wantStatus: http.StatusBadGateway,
+			wantAbort:  true,
+		},
+		{
+			name:       "[DONE] without message_start is recorded as 502",
+			lines:      []string{`data: [DONE]`},
 			wantStatus: http.StatusBadGateway,
 			wantAbort:  true,
 		},

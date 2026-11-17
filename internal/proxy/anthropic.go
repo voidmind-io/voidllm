@@ -1172,6 +1172,11 @@ func (a *AnthropicAdapter) TransformResponse(body []byte) ([]byte, error) {
 // so a stream without input-token usage is recorded as incomplete rather than
 // as a normal response with zero prompt tokens. ping, content_block_stop and
 // unknown event types are unaffected.
+//
+// A "data: " line whose payload is not valid JSON (including "data: [DONE]")
+// and an Anthropic "error" event also abort the stream. Blank lines and lines
+// that do not start with "data: " are handled as before (blank lines pass
+// through, "event:" lines are dropped, other lines pass through).
 func (a *AnthropicAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 	s := string(line)
 
@@ -1194,8 +1199,9 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 
 	var event map[string]jsonx.RawMessage
 	if err := jsonx.Unmarshal(payload, &event); err != nil {
-		// Not valid JSON — pass through unchanged so the client can observe it.
-		return [][]byte{line}, nil
+		// Anthropic only sends JSON data payloads; anything else (including a
+		// literal [DONE]) is a protocol violation — abort fail-closed.
+		return nil, errStreamTransformAborted
 	}
 
 	var eventType string
@@ -1204,6 +1210,11 @@ func (a *AnthropicAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 	}
 
 	switch eventType {
+	case "error":
+		// Upstream error event mid-stream — abort fail-closed without
+		// forwarding or logging its content.
+		return nil, errStreamTransformAborted
+
 	case "message_start":
 		// Extract the message ID and input token counts for this stream.
 		// cache_read_input_tokens and cache_creation_input_tokens are only
