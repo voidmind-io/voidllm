@@ -397,5 +397,28 @@ func (h *Handler) DeleteTeam(c fiber.Ctx) error {
 		h.Log.ErrorContext(c.Context(), "delete team", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to delete team")
 	}
+
+	// Evict every cached key acting for this team (team keys and keys of
+	// team-bound service accounts) so they stop authenticating
+	// immediately instead of waiting for the next periodic cache refresh. The
+	// hashes come from the DB rather than the in-memory cache so keys created on
+	// other instances are found too. A lookup failure is logged and not fatal:
+	// auth.Cacheable refuses these keys on the next reload.
+	hashes, err := h.DB.ListActiveKeyHashesByTeam(c.Context(), team.ID)
+	if err != nil {
+		h.Log.ErrorContext(c.Context(), "delete team: list key hashes for cache eviction", slog.String("error", err.Error()))
+	}
+	for _, keyHash := range hashes {
+		h.KeyCache.Delete(keyHash)
+
+		if h.Redis != nil {
+			if err := h.Redis.PublishInvalidation(c.Context(), voidredis.ChannelKeys, keyHash); err != nil {
+				h.Log.LogAttrs(c.Context(), slog.LevelWarn, "redis: publish key invalidation failed",
+					slog.String("error", err.Error()),
+				)
+			}
+		}
+	}
+
 	return c.SendStatus(fiber.StatusNoContent)
 }

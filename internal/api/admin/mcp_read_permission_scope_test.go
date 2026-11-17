@@ -175,9 +175,8 @@ func TestCheckMCPServerReadPermission_GlobalScoped_Regression(t *testing.T) {
 }
 
 // TestCheckMCPServerReadPermission_TeamBoundServiceAccount verifies the
-// effective-team fallback: a service-account key whose owning service
-// account is bound to a team (KeyInfo.ServiceAccountTeamID, not
-// KeyInfo.TeamID — see auth.KeyInfoFromRecord) may read its own team's
+// team scoping: a service-account key whose owning service account is bound
+// to a team (auth.KeyInfoFromRecord copies that team into KeyInfo.TeamID) may read its own team's
 // server, exactly as a team_admin user key scoped to that team can. Each
 // KeyInfo is produced via the real auth.KeyInfoFromRecord path from a
 // db.KeyRecord shaped like the sa_key rows LoadActiveKey actually returns,

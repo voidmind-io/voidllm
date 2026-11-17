@@ -305,18 +305,11 @@ func TestKeyInfoFromRecord_NilIDsMapToEmptyString(t *testing.T) {
 	if ki.ServiceAccountID != "" {
 		t.Errorf("ServiceAccountID = %q, want empty", ki.ServiceAccountID)
 	}
-	if ki.ServiceAccountTeamID != "" {
-		t.Errorf("ServiceAccountTeamID = %q, want empty", ki.ServiceAccountTeamID)
-	}
 }
 
 // TestKeyInfoFromRecord_ServiceAccountTeamIDMapping verifies that
-// KeyInfo.ServiceAccountTeamID is copied from KeyRecord.ServiceAccountTeamID
-// for a team-bound sa_key, independently of KeyInfo.TeamID — which stays
-// empty, since api_keys.team_id is never populated on sa_key rows. Callers
-// that need to authorize a team-bound service-account key against its own
-// team (e.g. checkMCPServerReadPermission) must read ServiceAccountTeamID,
-// not TeamID.
+// KeyInfo.TeamID is set from KeyRecord.ServiceAccountTeamID for a team-bound
+// sa_key, since api_keys.team_id is never populated on sa_key rows.
 func TestKeyInfoFromRecord_ServiceAccountTeamIDMapping(t *testing.T) {
 	t.Parallel()
 
@@ -332,11 +325,8 @@ func TestKeyInfoFromRecord_ServiceAccountTeamIDMapping(t *testing.T) {
 	if !ok {
 		t.Fatal("KeyInfoFromRecord() ok = false, want true")
 	}
-	if ki.ServiceAccountTeamID != teamID {
-		t.Errorf("ServiceAccountTeamID = %q, want %q", ki.ServiceAccountTeamID, teamID)
-	}
-	if ki.TeamID != "" {
-		t.Errorf("TeamID = %q, want empty (sa_key never sets TeamID from the service account)", ki.TeamID)
+	if ki.TeamID != teamID {
+		t.Errorf("TeamID = %q, want %q (sa_key takes TeamID from the service account)", ki.TeamID, teamID)
 	}
 }
 
@@ -348,9 +338,9 @@ func ptrEmptyString() *string {
 	return &s
 }
 
-// TestCacheable is the table for Cacheable: team keys are always cacheable
-// regardless of ServiceAccountActive, UserActive, or MembershipExists (all
-// meaningless for that key type); a user_key or session_key is cacheable
+// TestCacheable is the table for Cacheable: team keys are cacheable only while
+// their team is active, regardless of ServiceAccountActive, UserActive, or
+// MembershipExists (all meaningless for that key type); a user_key or session_key is cacheable
 // only while its owning user is active and either has a surviving org
 // membership row or is a system admin; a sa_key is cacheable only while its
 // owning service account is active, i.e. not missing and not soft-deleted.
@@ -408,9 +398,14 @@ func TestCacheable(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "team_key is always cacheable regardless of user/membership/service account state",
-			rec:  db.KeyRecord{KeyType: keygen.KeyTypeTeam, ServiceAccountActive: false, UserActive: false, MembershipExists: false, IsSystemAdmin: 0},
+			name: "team_key with active team is cacheable regardless of user/membership/service account state",
+			rec:  db.KeyRecord{KeyType: keygen.KeyTypeTeam, TeamActive: true, ServiceAccountActive: false, UserActive: false, MembershipExists: false, IsSystemAdmin: 0},
 			want: true,
+		},
+		{
+			name: "team_key of a deleted team is not cacheable",
+			rec:  db.KeyRecord{KeyType: keygen.KeyTypeTeam, TeamActive: false},
+			want: false,
 		},
 		{
 			name: "sa_key with active service account is cacheable",

@@ -269,20 +269,31 @@ func parsePagination(c fiber.Ctx) (paginationParams, error) {
 	return paginationParams{Limit: limit, Cursor: cursor}, nil
 }
 
-// refreshAccessCache reloads all model access allowlists from the database into
-// the in-memory access cache. It is called after any Set*ModelAccess mutation
-// so that the hot path immediately reflects the updated configuration.
-// If AccessCache is nil the call is a no-op.
-func (h *Handler) refreshAccessCache(ctx context.Context) {
+// reloadAccessCache reloads all model access allowlists from the database into
+// the in-memory access cache and returns any load error without logging it.
+// If AccessCache is nil the call is a no-op and returns nil. Callers that must
+// fail closed on a failed reload (key rotation) use this directly.
+func (h *Handler) reloadAccessCache(ctx context.Context) error {
 	if h.AccessCache == nil {
-		return
+		return nil
 	}
 	orgA, teamA, keyA, err := h.DB.LoadAllModelAccess(ctx)
 	if err != nil {
-		h.Log.ErrorContext(ctx, "refresh model access cache", slog.String("error", err.Error()))
-		return
+		return fmt.Errorf("reload model access cache: %w", err)
 	}
 	h.AccessCache.Load(orgA, teamA, keyA)
+	return nil
+}
+
+// refreshAccessCache reloads all model access allowlists from the database into
+// the in-memory access cache. It is called after any Set*ModelAccess mutation
+// so that the hot path immediately reflects the updated configuration.
+// If AccessCache is nil the call is a no-op. A load failure is logged and
+// otherwise ignored.
+func (h *Handler) refreshAccessCache(ctx context.Context) {
+	if err := h.reloadAccessCache(ctx); err != nil {
+		h.Log.ErrorContext(ctx, "refresh model access cache", slog.String("error", err.Error()))
+	}
 }
 
 // refreshMCPCaches performs a single LoadAllActiveMCPServers query and feeds
@@ -335,6 +346,28 @@ type MCPAccessRefreshScope struct {
 	KeyID  string
 }
 
+// reloadMCPAccessCache reloads all MCP access allowlists from the database
+// into the in-memory MCP access cache and returns any load error without
+// logging it. scope is forwarded to AfterMCPAccessRefresh, if set, once the
+// reload completes. If MCPAccessCache is nil the call is a no-op returning nil
+// and AfterMCPAccessRefresh is not invoked, since nothing in the hot path
+// changed. Callers that must fail closed on a failed reload (key rotation) use
+// this directly.
+func (h *Handler) reloadMCPAccessCache(ctx context.Context, scope MCPAccessRefreshScope) error {
+	if h.MCPAccessCache == nil {
+		return nil
+	}
+	orgA, teamA, keyA, err := h.DB.LoadAllMCPAccess(ctx)
+	if err != nil {
+		return fmt.Errorf("reload mcp access cache: %w", err)
+	}
+	h.MCPAccessCache.Load(orgA, teamA, keyA)
+	if h.AfterMCPAccessRefresh != nil {
+		h.AfterMCPAccessRefresh(scope)
+	}
+	return nil
+}
+
 // refreshMCPAccessCache reloads all MCP access allowlists from the database
 // into the in-memory MCP access cache. It is called after any Set*MCPAccess
 // mutation so that the hot path immediately reflects the updated
@@ -342,18 +375,10 @@ type MCPAccessRefreshScope struct {
 // known to affect — forwarded to AfterMCPAccessRefresh, if set, once the
 // cache reload completes. If MCPAccessCache is nil the call is a no-op —
 // AfterMCPAccessRefresh is not invoked in that case either, since nothing in
-// the hot path actually changed.
+// the hot path actually changed. A load failure is logged and otherwise
+// ignored.
 func (h *Handler) refreshMCPAccessCache(ctx context.Context, scope MCPAccessRefreshScope) {
-	if h.MCPAccessCache == nil {
-		return
-	}
-	orgA, teamA, keyA, err := h.DB.LoadAllMCPAccess(ctx)
-	if err != nil {
+	if err := h.reloadMCPAccessCache(ctx, scope); err != nil {
 		h.Log.ErrorContext(ctx, "refresh mcp access cache", slog.String("error", err.Error()))
-		return
-	}
-	h.MCPAccessCache.Load(orgA, teamA, keyA)
-	if h.AfterMCPAccessRefresh != nil {
-		h.AfterMCPAccessRefresh(scope)
 	}
 }

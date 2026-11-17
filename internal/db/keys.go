@@ -56,6 +56,11 @@ type KeyRecord struct {
 	// trusted to authenticate as the least-privilege RoleMember default —
 	// see auth.Cacheable.
 	MembershipExists bool
+	// TeamActive is true when the key's effective team exists and has not been
+	// soft-deleted. The effective team is k.team_id, or for a sa_key with no
+	// team_id of its own, the owning (non-deleted) service account's team_id.
+	// False when the key has no effective team or the team is soft-deleted.
+	TeamActive bool
 
 	// Key-level rate and token limits.
 	DailyTokenLimit   int64
@@ -97,11 +102,18 @@ type KeyRecord struct {
 // by both LoadAllActiveKeys and LoadActiveKey. It resolves org, team,
 // per-user (org membership), and owning-service-account metadata alongside
 // the key row itself so that a single query populates a complete cache entry.
-// The service_accounts JOIN is intentionally unconditional on sa.deleted_at
-// (soft-delete is not filtered in the ON clause) so callers can distinguish
-// "no service account row" from "soft-deleted service account row" via
+// The service_accounts JOIN applies only to sa_key rows and only to a service
+// account of the key's own org (fail closed: a cross-org or non-sa_key link
+// resolves as "no service account", so KeyRecord.ServiceAccountActive is
+// false). It is intentionally unconditional on sa.deleted_at (soft-delete is
+// not filtered in the ON clause) so callers can distinguish "no service
+// account row" from "soft-deleted service account row" via
 // KeyRecord.ServiceAccountActive rather than have both cases collapse into
-// NULL. The users and org_memberships JOINs are similarly unconditional on
+// NULL. The teams JOIN resolves the effective team per key type, matching
+// auth.KeyInfoFromRecord: for a sa_key it is the non-deleted service
+// account's team_id (k.team_id is ignored), for every other key type it is
+// k.team_id; in both cases the team must belong to the key's org and not be
+// soft-deleted. The users and org_memberships JOINs are similarly unconditional on
 // existence so callers can distinguish "user soft-deleted" (KeyRecord.UserActive)
 // from "user has no membership in this key's org" (KeyRecord.MembershipExists)
 // rather than have both collapse into the same NULL-derived defaults. Callers
@@ -125,13 +137,14 @@ SELECT
     sa.team_id,
     CASE WHEN sa.id IS NOT NULL AND sa.deleted_at IS NULL THEN 1 ELSE 0 END,
     CASE WHEN u.id IS NOT NULL THEN 1 ELSE 0 END,
-    CASE WHEN m.id IS NOT NULL THEN 1 ELSE 0 END
+    CASE WHEN m.id IS NOT NULL THEN 1 ELSE 0 END,
+    CASE WHEN t.id IS NOT NULL THEN 1 ELSE 0 END
 FROM api_keys k
 JOIN organizations o ON o.id = k.org_id AND o.deleted_at IS NULL
-LEFT JOIN teams t ON t.id = k.team_id AND t.deleted_at IS NULL
+LEFT JOIN service_accounts sa ON sa.id = k.service_account_id AND k.key_type = 'sa_key' AND sa.org_id = k.org_id
+LEFT JOIN teams t ON t.id = CASE WHEN k.key_type = 'sa_key' THEN CASE WHEN sa.deleted_at IS NULL THEN sa.team_id END ELSE k.team_id END AND t.org_id = k.org_id AND t.deleted_at IS NULL
 LEFT JOIN users u ON u.id = k.user_id AND u.deleted_at IS NULL
 LEFT JOIN org_memberships m ON m.user_id = k.user_id AND m.org_id = k.org_id
-LEFT JOIN service_accounts sa ON sa.id = k.service_account_id
 `
 
 // scanKeyRecord scans a single row produced by keySelectFromJoin into a
@@ -147,6 +160,7 @@ func scanKeyRecord(row interface {
 		serviceAccountActive int
 		userActive           int
 		membershipExists     int
+		teamActive           int
 	)
 
 	if err := row.Scan(
@@ -163,10 +177,11 @@ func scanKeyRecord(row interface {
 		&r.UserRequestsPerMinute, &r.UserRequestsPerDay,
 		&r.IsSystemAdmin, &r.MembershipRole,
 		&r.ServiceAccountTeamID, &serviceAccountActive,
-		&userActive, &membershipExists,
+		&userActive, &membershipExists, &teamActive,
 	); err != nil {
 		return KeyRecord{}, fmt.Errorf("scan row: %w", err)
 	}
+	r.TeamActive = teamActive == 1
 	r.ServiceAccountActive = serviceAccountActive == 1
 	r.UserActive = userActive == 1
 	r.MembershipExists = membershipExists == 1
@@ -310,6 +325,32 @@ func (d *DB) ListActiveKeyHashesByUserInOrg(ctx context.Context, userID, orgID s
 	hashes, err := scanKeyHashes(rows)
 	if err != nil {
 		return nil, fmt.Errorf("list active key hashes by user %s in org %s: %w", userID, orgID, err)
+	}
+	return hashes, nil
+}
+
+// ListActiveKeyHashesByTeam returns the key_hash of every non-deleted API key
+// that stops authenticating when teamID is soft-deleted: team keys of teamID
+// and sa_keys owned by a service account bound to teamID. Team-scoped user
+// keys are deliberately excluded because auth.Cacheable keeps them, so
+// evicting them would only bounce until the next reload. It is used to evict
+// the returned keys from the cache immediately after the team is soft-deleted
+// (see DeleteTeam). DeleteTeam only sets teams.deleted_at, so this query
+// returns the same keys whether it runs before or after the soft-delete.
+func (d *DB) ListActiveKeyHashesByTeam(ctx context.Context, teamID string) ([]string, error) {
+	p := d.dialect.Placeholder
+	query := "SELECT key_hash FROM api_keys WHERE deleted_at IS NULL AND ((key_type = 'team_key' AND team_id = " + p(1) + ")" +
+		" OR service_account_id IN (SELECT id FROM service_accounts WHERE team_id = " + p(2) + " AND deleted_at IS NULL))"
+
+	rows, err := d.sql.QueryContext(ctx, query, teamID, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list active key hashes by team %s: query: %w", teamID, err)
+	}
+	defer rows.Close()
+
+	hashes, err := scanKeyHashes(rows)
+	if err != nil {
+		return nil, fmt.Errorf("list active key hashes by team %s: %w", teamID, err)
 	}
 	return hashes, nil
 }

@@ -168,9 +168,8 @@ func normalizeExpiresAt(raw *string) (*string, error) {
 // Machine callers (caller.UserID == "") can only ever be an org-level
 // service-account key. The role check above already excludes team-scoped
 // sa_keys and team_keys, since auth.KeyInfoFromRecord resolves those to
-// team_admin (derived from the owning service account's own team_id, not
-// from caller.TeamID — the api_keys.team_id column is never populated on
-// sa_key rows). So once the org_admin check has passed, a machine caller can
+// team_admin (a team-bound sa_key's role is derived from the owning service
+// account's team_id). So once the org_admin check has passed, a machine caller can
 // only be an org-scoped sa_key, and no further role/team check is needed
 // here. Such a caller may set limits on any other key in the org, but never
 // on a key belonging to its own service account and never on itself, so a
@@ -211,6 +210,27 @@ func apiKeyVisibleToCallerKey(key *db.APIKey, caller *auth.KeyInfo) bool {
 	}
 	// Member sees only own keys.
 	return key.UserID != nil && *key.UserID == caller.UserID
+}
+
+// canRotateAPIKey reports whether the caller may rotate the given key. Rotation
+// returns the new plaintext, so it is narrower than visibility: org_admin and
+// above may rotate any key in the org; everyone else may rotate only keys they
+// own, plus team keys of their own team when the caller is at least team_admin
+// and has a team context (a team_key, a team-bound sa_key, or a user_key
+// carrying team_id). A team_key resolves to team_admin, so rotating it never
+// raises a team_admin caller's privilege; a member never qualifies. Other
+// users' keys and service-account keys are never rotatable below org_admin,
+// even when they carry the caller's team_id.
+func canRotateAPIKey(caller *auth.KeyInfo, key *db.APIKey) bool {
+	if auth.HasRole(caller.Role, auth.RoleOrgAdmin) {
+		return true
+	}
+	if caller.UserID != "" && key.UserID != nil && *key.UserID == caller.UserID {
+		return true
+	}
+	return auth.HasRole(caller.Role, auth.RoleTeamAdmin) &&
+		key.KeyType == keygen.KeyTypeTeam &&
+		caller.TeamID != "" && key.TeamID != nil && *key.TeamID == caller.TeamID
 }
 
 // CreateAPIKey handles POST /api/v1/orgs/:org_id/keys.
@@ -557,10 +577,10 @@ func (h *Handler) ListAPIKeys(c fiber.Ctx) error {
 
 	// Fail closed: below org_admin, the caller must always end up scoped by
 	// some identifier of their own. A caller with neither filter — e.g. a
-	// team-bound sa_key, whose KeyInfo.TeamID is never populated (see
-	// auth.KeyInfoFromRecord) and which has no UserID either — would
-	// otherwise hit ListAPIKeys with both filters empty, and an empty filter
-	// means "no filter" at the DB layer, returning every key in the org.
+	// session key with no team context and no UserID, or any key whose identity
+	// could not be resolved — would otherwise hit ListAPIKeys with both filters
+	// empty, and an empty filter means "no filter" at the DB layer, returning
+	// every key in the org.
 	if !auth.HasRole(keyInfo.Role, auth.RoleOrgAdmin) && filterUserID == "" && filterTeamID == "" {
 		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "insufficient scope to list keys")
 	}
@@ -852,10 +872,8 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 	}
 
 	// Members and team admins may only rotate keys within their scope; org_admin+ may rotate any key.
-	if !auth.HasRole(keyInfo.Role, auth.RoleOrgAdmin) {
-		if !apiKeyVisibleToCallerKey(existing, keyInfo) {
-			return apierror.Send(c, fiber.StatusForbidden, "forbidden", "you can only rotate keys within your scope")
-		}
+	if !canRotateAPIKey(keyInfo, existing) {
+		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "you can only rotate keys within your scope")
 	}
 
 	plaintextKey, err := keygen.Generate(existing.KeyType)
@@ -886,6 +904,13 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 		}
 	}
 
+	// Machine callers (team_key, sa_key) have no user ID, and created_by is a
+	// NOT NULL foreign key to users, so the rotated key keeps its original creator.
+	rotatedCreatedBy := keyInfo.UserID
+	if rotatedCreatedBy == "" {
+		rotatedCreatedBy = existing.CreatedBy
+	}
+
 	// INSERT the new key and UPDATE the old key's expiry atomically so that a
 	// crash between the two writes cannot leave both keys permanently valid.
 	rotated, err := h.DB.RotateKeyTx(ctx, existing.ID, oldExpiresAt, db.CreateAPIKeyParams{
@@ -902,7 +927,7 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 		RequestsPerMinute: existing.RequestsPerMinute,
 		RequestsPerDay:    existing.RequestsPerDay,
 		ExpiresAt:         existing.ExpiresAt,
-		CreatedBy:         keyInfo.UserID,
+		CreatedBy:         rotatedCreatedBy,
 	})
 	if err != nil {
 		h.Log.ErrorContext(ctx, "rotate api key: rotate tx", slog.String("error", err.Error()))
@@ -911,14 +936,31 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 	newKey := rotated.NewKey
 	updatedOld := rotated.OldKey
 
+	// RotateKeyTx copied the old key's key-level model and MCP allowlists to the
+	// new key. Reload the access caches before the new key becomes cacheable so
+	// it is never admitted without its allowlist (a missing key-level allowlist
+	// means unrestricted). If either reload fails the new key is not written to
+	// the key cache at all (fail closed); the next periodic reload caches it.
+	// The Redis ChannelAccess message only makes peers reload model access; MCP
+	// access on peers converges on their periodic refresh.
+	accessErr := errors.Join(
+		h.reloadAccessCache(ctx),
+		h.reloadMCPAccessCache(ctx, MCPAccessRefreshScope{KeyID: newKey.ID}),
+	)
+	h.publishAccessInvalidation(ctx)
+
 	// Populate the cache from a fresh read of the new key with its full org,
 	// team, and per-user membership limits resolved via JOIN — the same
 	// approach used by CreateAPIKey — so the rotated key is subject to its
 	// complete limit hierarchy immediately. A lookup or mapping failure is
 	// logged and the cache write is skipped rather than failing the request;
 	// the next periodic reload (at most 30s later) will pick it up.
-	newRec, err := h.DB.LoadActiveKey(ctx, newKey.ID)
-	if err != nil {
+	if accessErr != nil {
+		h.Log.LogAttrs(ctx, slog.LevelWarn, "rotate api key: access cache reload failed, not caching new key",
+			slog.String("key_id", newKey.ID),
+			slog.String("error", accessErr.Error()),
+		)
+	} else if newRec, err := h.DB.LoadActiveKey(ctx, newKey.ID); err != nil {
 		h.Log.ErrorContext(ctx, "rotate api key: load for cache", slog.String("error", err.Error()))
 	} else if !auth.Cacheable(*newRec) {
 		h.Log.LogAttrs(ctx, slog.LevelWarn, "rotate api key: skipping non-cacheable key",

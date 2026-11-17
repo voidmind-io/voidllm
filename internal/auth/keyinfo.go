@@ -13,19 +13,16 @@ import (
 //   - user_key and session_key: system_admin if the owning user has the
 //     is_system_admin flag set, otherwise the org membership role.
 //   - team_key: always team_admin.
-//   - sa_key: the role is derived from the owning service account, not from
-//     k.team_id — api_keys.team_id is never populated on sa_key rows, so the
-//     service account's own team_id (resolved via r.ServiceAccountTeamID and
-//     r.ServiceAccountActive) is the only source of truth for whether the key
-//     is team-bound or org-level. team_admin if the service account is
-//     team-bound, org_admin if it is org-scoped. Note that KeyInfo.TeamID is
-//     NOT set from the service account's team here — it stays derived from
-//     k.team_id as for every other key type, so model access and team limits
-//     for sa_key are unaffected by this change. The service account's own
-//     team, when it has one, is instead copied into the separate
-//     KeyInfo.ServiceAccountTeamID field, for callers (e.g. MCP server read
-//     permission checks) that need to authorize a team-bound sa_key against
-//     its own team without conflating it with TeamID's key-scoping meaning.
+//   - sa_key: the role and team are derived from the owning service account,
+//     not from k.team_id — api_keys.team_id is never populated on sa_key rows,
+//     so the service account's own team_id (resolved via
+//     r.ServiceAccountTeamID and r.ServiceAccountActive) is the only source of
+//     truth for whether the key is team-bound or org-level. team_admin if the
+//     service account is team-bound, org_admin if it is org-scoped. For a
+//     team-bound, active service account KeyInfo.TeamID is set to the service
+//     account's team, so model access, team limits, aliases and MCP access
+//     treat the key as acting for that team. An org-scoped or inactive
+//     service account leaves TeamID empty.
 //
 // The returned bool is false when the role could not be resolved with
 // confidence — a user/session key with no org membership row, a sa_key whose
@@ -77,8 +74,9 @@ func KeyInfoFromRecord(r db.KeyRecord) (KeyInfo, bool) {
 	if r.ServiceAccountID != nil {
 		ki.ServiceAccountID = *r.ServiceAccountID
 	}
-	if r.ServiceAccountTeamID != nil {
-		ki.ServiceAccountTeamID = *r.ServiceAccountTeamID
+	if r.KeyType == keygen.KeyTypeSA && r.ServiceAccountActive &&
+		r.ServiceAccountTeamID != nil && *r.ServiceAccountTeamID != "" {
+		ki.TeamID = *r.ServiceAccountTeamID
 	}
 
 	ok := true
@@ -151,8 +149,11 @@ func KeyInfoFromRecord(r db.KeyRecord) (KeyInfo, bool) {
 // r.UserActive check above, never let back in via the IsSystemAdmin
 // exception.
 //
-// team_key records are always cacheable — a team_key has no owning user or
-// service account for this function to invalidate against.
+// team_key records are cacheable only while their team exists and is not
+// soft-deleted (r.TeamActive). A sa_key bound to a team is likewise refused
+// once that team is soft-deleted; an org-scoped sa_key has no team to check.
+// user_key and session_key records are not affected by a team's deletion: a
+// user's own key is not the team's identity.
 //
 // Every call site that writes a KeyInfo derived from a db.KeyRecord into the
 // key cache — LoadKeysIntoCache and every key-creation, rotation, or update
@@ -164,7 +165,10 @@ func KeyInfoFromRecord(r db.KeyRecord) (KeyInfo, bool) {
 func Cacheable(r db.KeyRecord) bool {
 	switch r.KeyType {
 	case keygen.KeyTypeSA:
-		return r.ServiceAccountActive
+		teamBound := r.ServiceAccountTeamID != nil && *r.ServiceAccountTeamID != ""
+		return r.ServiceAccountActive && (!teamBound || r.TeamActive)
+	case keygen.KeyTypeTeam:
+		return r.TeamActive
 	case keygen.KeyTypeUser, keygen.KeyTypeSession:
 		return r.UserActive && (r.MembershipExists || r.IsSystemAdmin == 1)
 	default:

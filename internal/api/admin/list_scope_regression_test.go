@@ -15,17 +15,18 @@ import (
 
 // ---- Regression: below-org_admin callers with no scope filter must be ------
 // ---- rejected with 403, not silently see every key/service-account in the -
-// ---- org. A team-bound sa_key is the case that used to fail open: its ------
-// ---- resolved role is team_admin, but auth.KeyInfoFromRecord deliberately --
-// ---- never populates KeyInfo.TeamID for sa_key callers (it stays derived --
-// ---- from the sa_key's own, always-nil, api_keys.team_id — see keyinfo.go)-
-// ---- and it has no UserID either, so both scope filters end up empty, ------
-// ---- which meant "no filter" at the DB layer before the fix. ---------------
+// ---- org. A team-bound sa_key used to fail open: its resolved role is ------
+// ---- team_admin, but it had neither TeamID nor UserID, so both scope --------
+// ---- filters ended up empty, which meant "no filter" at the DB layer. -------
+// ---- KeyInfo.TeamID now carries the service account's team, so key listing --
+// ---- is team-scoped; service-account listing still fails closed with 403. ---
 
 // TestListAPIKeys_TeamBoundSAKey_ScopeRegression verifies that a team-bound
-// service-account key calling GET /api/v1/orgs/{org_id}/keys gets 403
-// (insufficient scope), rather than falling through to an unfiltered
-// ListAPIKeys call that would return every key in the org.
+// service-account key calling GET /api/v1/orgs/{org_id}/keys gets 200 scoped
+// to its own team (KeyInfo.TeamID carries the service account's team), rather
+// than falling through to an unfiltered ListAPIKeys call that would return
+// every key in the org. Keys of other teams and team-less keys of other users
+// must not appear.
 func TestListAPIKeys_TeamBoundSAKey_ScopeRegression(t *testing.T) {
 	t.Parallel()
 
@@ -33,12 +34,16 @@ func TestListAPIKeys_TeamBoundSAKey_ScopeRegression(t *testing.T) {
 
 	org := mustCreateOrg(t, database, "O", "list-keys-sa-scope-org")
 	team := mustCreateTeam(t, database, org.ID, "T", "list-keys-sa-scope-team")
+	otherTeam := mustCreateTeam(t, database, org.ID, "T2", "list-keys-sa-scope-team2")
 	creator := mustCreateUser(t, database, "list-keys-sa-scope-creator@example.com", "Creator")
 	other := mustCreateUser(t, database, "list-keys-sa-scope-other@example.com", "Other")
 	mustCreateMembership(t, database, org.ID, creator.ID, auth.RoleOrgAdmin)
 
-	// Another key in the org that must never leak into the sa_key's response.
-	mustCreateAPIKeyDirect(t, database, org.ID, &team.ID, &other.ID, other.ID, 0)
+	// A key of the SA's own team: visible.
+	ownTeamKey := mustCreateAPIKeyDirect(t, database, org.ID, &team.ID, &other.ID, other.ID, 0)
+	// Keys that must never leak into the sa_key's response.
+	otherTeamKey := mustCreateAPIKeyDirect(t, database, org.ID, &otherTeam.ID, &other.ID, other.ID, 0)
+	teamlessKey := mustCreateAPIKeyDirect(t, database, org.ID, nil, &other.ID, other.ID, 0)
 
 	callerKey, _ := mustCreateSAKeyCallerViaDB(t, database, keyCache, org.ID, &team.ID, creator.ID)
 
@@ -50,9 +55,29 @@ func TestListAPIKeys_TeamBoundSAKey_ScopeRegression(t *testing.T) {
 		t.Fatalf("app.Test: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != fiber.StatusForbidden {
+	if resp.StatusCode != fiber.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		t.Errorf("status = %d, want 403; body: %s", resp.StatusCode, b)
+		t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, b)
+	}
+
+	var got struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	decodeBody(t, resp.Body, &got)
+	ids := make(map[string]bool, len(got.Data))
+	for _, k := range got.Data {
+		ids[k.ID] = true
+	}
+	if !ids[ownTeamKey.ID] {
+		t.Errorf("response does not include own team's key %s", ownTeamKey.ID)
+	}
+	if ids[otherTeamKey.ID] {
+		t.Errorf("response leaks key %s of another team", otherTeamKey.ID)
+	}
+	if ids[teamlessKey.ID] {
+		t.Errorf("response leaks team-less key %s of another user", teamlessKey.ID)
 	}
 }
 

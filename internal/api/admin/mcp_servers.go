@@ -453,19 +453,10 @@ func checkMCPServerReadPermission(c fiber.Ctx, server *db.MCPServer, ki *auth.Ke
 	if server.TeamID != nil {
 		// Team-scoped: readable by org_admin (or higher) of the server's org,
 		// or by a caller whose key is scoped to the same team. This mirrors
-		// the team check in checkMCPServerScopePermission.
-		//
-		// effectiveTeamID falls back to the caller's service-account team
-		// when the key itself is not team-scoped: a team-bound
-		// service-account key never has KeyInfo.TeamID set (api_keys.team_id
-		// is never populated on sa_key rows — see auth.KeyInfoFromRecord),
-		// so without this fallback such a key could never read its own
-		// team's server.
-		effectiveTeamID := ki.TeamID
-		if effectiveTeamID == "" {
-			effectiveTeamID = ki.ServiceAccountTeamID
-		}
-		if ki.Role != auth.RoleOrgAdmin && effectiveTeamID != *server.TeamID {
+		// the team check in checkMCPServerScopePermission. A team-bound
+		// service-account key carries its service account's team in
+		// KeyInfo.TeamID (see auth.KeyInfoFromRecord).
+		if ki.Role != auth.RoleOrgAdmin && ki.TeamID != *server.TeamID {
 			return apierror.Forbidden(c, "access denied: server belongs to a different team")
 		}
 	}

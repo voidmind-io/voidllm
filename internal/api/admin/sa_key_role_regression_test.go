@@ -97,22 +97,13 @@ func TestSAKeyRoleRegression_TeamBound(t *testing.T) {
 
 	// (a) Cannot change limits on another key in the org.
 	//
-	// Observed status is 404, not 403: UpdateAPIKey gates non-org_admin
-	// callers through apiKeyVisibleToCallerKey, which for a team_admin
-	// caller only matches when caller.TeamID equals the target key's
-	// TeamID. auth.KeyInfoFromRecord deliberately never populates
-	// KeyInfo.TeamID for sa_key callers (it stays derived from the sa_key's
-	// own, always-nil, api_keys.team_id — see keyinfo.go) even when the
-	// underlying service account is team-bound, so caller.TeamID is always
-	// "" for every sa_key. That never equals a real team ID, so the request
-	// is treated as if the key were simply not visible (404) rather than
-	// visible-but-forbidden (403). The DB write is still correctly
-	// prevented either way. ListAPIKeys and ListServiceAccounts hit this
-	// same empty-TeamID gap from the list side — a team-bound sa_key caller
-	// has neither TeamID nor UserID to scope by — and are guarded
-	// separately: both return 403 when a below-org_admin caller resolves to
-	// no scope filter at all, rather than falling through to an unfiltered,
-	// org-wide list.
+	// Observed status is 403: auth.KeyInfoFromRecord now sets KeyInfo.TeamID
+	// for a team-bound sa_key, so the target key (same team) is visible to
+	// the caller via apiKeyVisibleToCallerKey, and the request is then
+	// rejected by the limits check, which only allows org_admin and above to
+	// change limits. The DB write is prevented. ListServiceAccounts still
+	// returns 403 when a below-org_admin caller resolves to no scope filter
+	// at all, rather than falling through to an unfiltered, org-wide list.
 	t.Run("cannot change limits on another key", func(t *testing.T) {
 		req := httptest.NewRequest("PATCH", keyItemURL(org.ID, target.ID),
 			bodyJSON(t, map[string]any{"requests_per_minute": float64(1)}))
@@ -124,9 +115,9 @@ func TestSAKeyRoleRegression_TeamBound(t *testing.T) {
 			t.Fatalf("app.Test: %v", err)
 		}
 		defer resp.Body.Close()
-		if resp.StatusCode != fiber.StatusNotFound {
+		if resp.StatusCode != fiber.StatusForbidden {
 			b, _ := io.ReadAll(resp.Body)
-			t.Errorf("status = %d, want 404; body: %s", resp.StatusCode, b)
+			t.Errorf("status = %d, want 403; body: %s", resp.StatusCode, b)
 		}
 
 		reloaded, err := database.GetAPIKey(context.Background(), target.ID)

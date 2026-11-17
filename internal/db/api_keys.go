@@ -438,6 +438,13 @@ func (d *DB) RotateKeyTx(ctx context.Context, oldID string, oldExpiresAt string,
 			return fmt.Errorf("update old key expiry: %w", ErrNotFound)
 		}
 
+		if copyErr := copyKeyAccessRows(ctx, q, d.dialect, "key_model_access", "model_name", oldID, newID.String()); copyErr != nil {
+			return copyErr
+		}
+		if copyErr := copyKeyAccessRows(ctx, q, d.dialect, "key_mcp_access", "server_id", oldID, newID.String()); copyErr != nil {
+			return copyErr
+		}
+
 		newRow := q.QueryRowContext(ctx, selectQuery, newID.String())
 		var scanErr error
 		result.NewKey, scanErr = scanAPIKey(newRow)
@@ -457,6 +464,48 @@ func (d *DB) RotateKeyTx(ctx context.Context, oldID string, oldExpiresAt string,
 		return nil, fmt.Errorf("rotate key tx: %w", txErr)
 	}
 	return &result, nil
+}
+
+// copyKeyAccessRows copies every row of a key-level access table (table is
+// key_model_access or key_mcp_access, valueCol its allowlist column) from
+// oldKeyID to newKeyID, minting a fresh UUIDv7 per row. table and valueCol are
+// compile-time constants supplied by RotateKeyTx, never user input. It runs on
+// the caller's transaction so a rotated key never exists without the old key's
+// allowlist: a missing key-level allowlist means unrestricted.
+func copyKeyAccessRows(ctx context.Context, q Querier, dialect Dialect, table, valueCol, oldKeyID, newKeyID string) error {
+	p := dialect.Placeholder
+	rows, err := q.QueryContext(ctx, "SELECT "+valueCol+" FROM "+table+" WHERE key_id = "+p(1), oldKeyID)
+	if err != nil {
+		return fmt.Errorf("select %s: %w", table, err)
+	}
+	defer rows.Close()
+
+	var values []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return fmt.Errorf("scan %s: %w", table, err)
+		}
+		values = append(values, v)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate %s: %w", table, err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close %s rows: %w", table, err)
+	}
+
+	insert := "INSERT INTO " + table + " (id, key_id, " + valueCol + ") VALUES (" + p(1) + ", " + p(2) + ", " + p(3) + ")"
+	for _, v := range values {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("copy %s: generate id: %w", table, err)
+		}
+		if _, err := q.ExecContext(ctx, insert, id.String(), newKeyID, v); err != nil {
+			return fmt.Errorf("copy %s %q: %w", table, v, translateError(err))
+		}
+	}
+	return nil
 }
 
 // GetUserOrgRole resolves the effective RBAC role for a user in an organization.
