@@ -453,9 +453,16 @@ func (r *subscriberRegistry) unregister(sub *Subscriber) {
 
 // wait blocks until every currently registered Subscriber has itself been
 // unregistered, or timeout elapses first, whichever comes first. Reports
-// whether every stream finished before the timeout. See
+// whether every stream finished before the timeout. An empty registry reports
+// true immediately, regardless of timeout (including zero or negative). See
 // Server.WaitForSubscriptionsDrain's own doc for its production caller.
 func (r *subscriberRegistry) wait(timeout time.Duration) bool {
+	r.mu.Lock()
+	empty := len(r.all) == 0
+	r.mu.Unlock()
+	if empty {
+		return true
+	}
 	done := make(chan struct{})
 	go func() {
 		r.wg.Wait()
@@ -640,7 +647,8 @@ func (s *Server) CloseSubscriptions() {
 // has itself finished — its own handler observed Done(), wrote the
 // graceful-end response, and called Subscriber.Unregister — or timeout
 // elapses first, whichever comes first. Reports whether every stream
-// finished before the timeout.
+// finished before the timeout. If no stream is registered, it returns true
+// immediately, regardless of timeout.
 //
 // Intended to be called immediately after CloseSubscriptions, before
 // stopping the HTTP server(s) hosting this Server's routes (see
