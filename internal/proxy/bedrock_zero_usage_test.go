@@ -24,24 +24,39 @@ func TestBedrockAdapter_StreamZeroInputUsageReported(t *testing.T) {
 		name       string
 		meta       string
 		want       bool
+		wantPres   bool
 		wantPrompt float64
 		wantCompl  float64
 	}{
 		{
 			name: "all zero usage",
 			meta: `{"metadata":{"usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0}}}`,
-			want: true,
+			want: true, wantPres: true,
+		},
+		{
+			name:     "metadata without usage",
+			meta:     `{"metadata":{}}`,
+			want:     true,
+			wantPres: false,
+		},
+		{
+			name:     "metadata with null usage",
+			meta:     `{"metadata":{"usage":null}}`,
+			want:     true,
+			wantPres: false,
 		},
 		{
 			name:      "zero input with output tokens",
 			meta:      `{"metadata":{"usage":{"inputTokens":0,"outputTokens":7,"totalTokens":7}}}`,
 			want:      true,
+			wantPres:  true,
 			wantCompl: 7,
 		},
 		{
 			name:       "normal usage",
 			meta:       bsMeta,
 			want:       false,
+			wantPres:   true,
 			wantPrompt: 10,
 			wantCompl:  5,
 		},
@@ -49,6 +64,7 @@ func TestBedrockAdapter_StreamZeroInputUsageReported(t *testing.T) {
 			name:       "zero input but cache read",
 			meta:       `{"metadata":{"usage":{"inputTokens":0,"outputTokens":5,"cacheReadInputTokens":40}}}`,
 			want:       false,
+			wantPres:   true,
 			wantPrompt: 40,
 			wantCompl:  5,
 		},
@@ -56,6 +72,7 @@ func TestBedrockAdapter_StreamZeroInputUsageReported(t *testing.T) {
 			name:       "zero input but cache write",
 			meta:       `{"metadata":{"usage":{"inputTokens":0,"outputTokens":5,"cacheWriteInputTokens":9}}}`,
 			want:       false,
+			wantPres:   true,
 			wantPrompt: 9,
 			wantCompl:  5,
 		},
@@ -64,15 +81,15 @@ func TestBedrockAdapter_StreamZeroInputUsageReported(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			a := &BedrockAdapter{includeUsage: true, responseID: "chatcmpl-1", modelName: "mm"}
-			if a.ZeroInputUsageReported() {
+			if zero, present := a.ZeroInputUsageReported(); zero || present {
 				t.Fatal("flag set before any metadata")
 			}
 			lines, err := bsFeed(a, bsStart, bsText(0, "x"), bsStop, tc.meta)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := a.ZeroInputUsageReported(); got != tc.want {
-				t.Errorf("ZeroInputUsageReported() = %v, want %v", got, tc.want)
+			if zero, present := a.ZeroInputUsageReported(); zero != tc.want || present != tc.wantPres {
+				t.Errorf("ZeroInputUsageReported() = (%v, %v), want (%v, %v)", zero, present, tc.want, tc.wantPres)
 			}
 			chunks := bsChunks(t, lines)
 			last := chunks[len(chunks)-1]
@@ -98,8 +115,8 @@ func TestBedrockAdapter_StreamZeroInputUsageMetadataBeforeStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !a.ZeroInputUsageReported() {
-		t.Error("ZeroInputUsageReported() = false, want true")
+	if zero, present := a.ZeroInputUsageReported(); !zero || !present {
+		t.Errorf("ZeroInputUsageReported() = (%v, %v), want (true, true)", zero, present)
 	}
 	if lines[len(lines)-2] != "data: [DONE]" {
 		t.Errorf("[DONE] missing, tail %q", lines[len(lines)-2:])
@@ -113,31 +130,43 @@ func TestBedrockAdapter_TransformResponseZeroInputUsageReported(t *testing.T) {
 		name string
 		in   string
 		want bool
+		pres bool
 	}{
 		{
 			name: "zero input no cache",
 			in:   `{"output":{"message":{"role":"assistant","content":[{"text":"hi"}]}},"stopReason":"end_turn","usage":{"inputTokens":0,"outputTokens":2,"totalTokens":2}}`,
 			want: true,
+			pres: true,
 		},
 		{
 			name: "usage block absent",
 			in:   `{"output":{"message":{"role":"assistant","content":[{"text":"hi"}]}},"stopReason":"end_turn"}`,
 			want: true,
+			pres: false,
+		},
+		{
+			name: "usage null",
+			in:   `{"output":{"message":{"role":"assistant","content":[{"text":"hi"}]}},"stopReason":"end_turn","usage":null}`,
+			want: true,
+			pres: false,
 		},
 		{
 			name: "normal usage",
 			in:   `{"output":{"message":{"role":"assistant","content":[{"text":"hi"}]}},"stopReason":"end_turn","usage":{"inputTokens":4,"outputTokens":2,"totalTokens":6}}`,
 			want: false,
+			pres: true,
 		},
 		{
 			name: "zero input with cache read",
 			in:   `{"output":{"message":{"role":"assistant","content":[{"text":"hi"}]}},"stopReason":"end_turn","usage":{"inputTokens":0,"outputTokens":2,"cacheReadInputTokens":12}}`,
 			want: false,
+			pres: true,
 		},
 		{
 			name: "zero input with cache write",
 			in:   `{"output":{"message":{"role":"assistant","content":[{"text":"hi"}]}},"stopReason":"end_turn","usage":{"inputTokens":0,"outputTokens":2,"cacheWriteInputTokens":3}}`,
 			want: false,
+			pres: true,
 		},
 	}
 	for _, tc := range tests {
@@ -147,8 +176,8 @@ func TestBedrockAdapter_TransformResponseZeroInputUsageReported(t *testing.T) {
 			if _, err := a.TransformResponse([]byte(tc.in)); err != nil {
 				t.Fatal(err)
 			}
-			if got := a.ZeroInputUsageReported(); got != tc.want {
-				t.Errorf("ZeroInputUsageReported() = %v, want %v", got, tc.want)
+			if zero, present := a.ZeroInputUsageReported(); zero != tc.want || present != tc.pres {
+				t.Errorf("ZeroInputUsageReported() = (%v, %v), want (%v, %v)", zero, present, tc.want, tc.pres)
 			}
 		})
 	}
@@ -159,7 +188,7 @@ func TestGetAdapter_UsageAnomalyReporter(t *testing.T) {
 	if _, ok := GetAdapter("bedrock").(usageAnomalyReporter); !ok {
 		t.Error("bedrock adapter does not implement usageAnomalyReporter")
 	}
-	for _, p := range []string{"openai", "anthropic", "vllm", "azure"} {
+	for _, p := range []string{"openai", "anthropic", "vllm", "azure", "gemini", "vertex"} {
 		if _, ok := GetAdapter(p).(usageAnomalyReporter); ok {
 			t.Errorf("%s adapter unexpectedly implements usageAnomalyReporter", p)
 		}
@@ -195,6 +224,7 @@ func TestBedrockHandler_ZeroInputUsageWarn(t *testing.T) {
 		stream     bool
 		upstream   func(w http.ResponseWriter, r *http.Request, _ []byte)
 		wantWarn   bool
+		wantPres   bool
 		wantCompl  int
 		wantPrompt int
 		wantBody   []string
@@ -206,6 +236,7 @@ func TestBedrockHandler_ZeroInputUsageWarn(t *testing.T) {
 				bhWriteFrames(w, bhFrameStart(), bhFrameText("ok"), bhFrameStop("end_turn"), bhFrameMeta(0, 3, 0, 0))
 			},
 			wantWarn:  true,
+			wantPres:  true,
 			wantCompl: 3,
 			wantBody:  []string{`"prompt_tokens":0`, `"completion_tokens":3`, `"finish_reason":"stop"`, "data: [DONE]"},
 		},
@@ -238,8 +269,29 @@ func TestBedrockHandler_ZeroInputUsageWarn(t *testing.T) {
 				_, _ = io.WriteString(w, `{"output":{"message":{"role":"assistant","content":[{"text":"pong"}]}},"stopReason":"end_turn","usage":{"inputTokens":0,"outputTokens":3,"totalTokens":3}}`)
 			},
 			wantWarn:  true,
+			wantPres:  true,
 			wantCompl: 3,
 			wantBody:  []string{`"prompt_tokens":0`, `"completion_tokens":3`, `"content":"pong"`},
+		},
+		{
+			name: "buffered usage block absent",
+			upstream: func(w http.ResponseWriter, r *http.Request, _ []byte) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"output":{"message":{"role":"assistant","content":[{"text":"pong"}]}},"stopReason":"end_turn"}`)
+			},
+			wantWarn: true,
+			wantPres: false,
+			wantBody: []string{`"prompt_tokens":0`, `"content":"pong"`},
+		},
+		{
+			name:   "stream metadata without usage",
+			stream: true,
+			upstream: func(w http.ResponseWriter, r *http.Request, _ []byte) {
+				bhWriteFrames(w, bhFrameStart(), bhFrameText("ok"), bhFrameStop("end_turn"), esEventFrame("metadata", `{"metrics":{"latencyMs":5}}`))
+			},
+			wantWarn: true,
+			wantPres: false,
+			wantBody: []string{`"prompt_tokens":0`, "data: [DONE]"},
 		},
 		{
 			name: "buffered normal",
@@ -298,6 +350,12 @@ func TestBedrockHandler_ZeroInputUsageWarn(t *testing.T) {
 			}
 			if rec["model"] != "claude" || rec["provider"] != "bedrock" {
 				t.Errorf("model/provider = %v/%v", rec["model"], rec["provider"])
+			}
+			if d, ok := rec["deployment"]; !ok || d == "" {
+				t.Errorf("deployment attr missing or empty: %v", rec)
+			}
+			if rec["usage_present"] != tc.wantPres {
+				t.Errorf("usage_present = %v, want %v", rec["usage_present"], tc.wantPres)
 			}
 			// The request-ID middleware is not installed by the test server, so
 			// only the presence of the attribute can be asserted here.

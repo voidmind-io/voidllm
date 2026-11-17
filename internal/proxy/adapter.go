@@ -182,11 +182,12 @@ type binaryStreamAdapter interface {
 }
 
 // usageAnomalyReporter is implemented by adapters that can tell when the
-// upstream reported a usage block with zero input tokens for a completed call.
+// upstream reported zero input tokens for a completed call.
 type usageAnomalyReporter interface {
-	// ZeroInputUsageReported reports whether the upstream sent a usage block
-	// whose input token count (including cache buckets) was zero.
-	ZeroInputUsageReported() bool
+	// ZeroInputUsageReported reports whether a completed upstream call reported
+	// zero input tokens (including cache buckets). present is false when the
+	// upstream sent no usage block at all.
+	ZeroInputUsageReported() (zero bool, present bool)
 }
 
 // upstreamErrorMapper is implemented by adapters whose upstream non-2xx

@@ -538,11 +538,11 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			breaker = p.CircuitBreakers.Get(deploymentKey(currentModel.Name, usedDep.Name))
 		}
 		return p.handleStreamingResponse(c, resp, cancelUpstream, currentModel,
-			keyInfo, adapter, startTime, requestID, requestedModelName, effectiveStreamDur, maxRespBody, trackDone, breaker, piiFilter)
+			keyInfo, adapter, usedDep, startTime, requestID, requestedModelName, effectiveStreamDur, maxRespBody, trackDone, breaker, piiFilter)
 	}
 
 	defer cancelUpstream()
-	return p.handleBufferedResponse(c, resp, currentModel, keyInfo, adapter,
+	return p.handleBufferedResponse(c, resp, currentModel, keyInfo, adapter, usedDep,
 		startTime, requestID, requestedModelName, maxRespBody, piiFilter)
 }
 
@@ -1220,7 +1220,7 @@ func writeStreamAbortEvent(w *bufio.Writer, code string) bool {
 // maxRespBody is the aggregate byte cap for the PII-buffered streaming path;
 // it is the same limit used for non-streaming responses.
 // filter may be nil when PII anonymization is disabled.
-func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response, cancelUpstream context.CancelFunc, model Model, keyInfo *auth.KeyInfo, adapter Adapter, startTime time.Time, requestID string, requestedModelName string, maxStreamDuration time.Duration, maxRespBody int, trackDone func(), breaker *circuitbreaker.Breaker, filter *pii.Filter) error {
+func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response, cancelUpstream context.CancelFunc, model Model, keyInfo *auth.KeyInfo, adapter Adapter, usedDep Deployment, startTime time.Time, requestID string, requestedModelName string, maxStreamDuration time.Duration, maxRespBody int, trackDone func(), breaker *circuitbreaker.Breaker, filter *pii.Filter) error {
 	copyResponseHeaders(c, resp)
 	c.Set("Content-Type", "text/event-stream")
 	c.Set("Cache-Control", "no-cache")
@@ -1824,14 +1824,18 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			if streamUI.PromptTokens == 0 && streamUI.CompletionTokens == 0 {
 				streamUI = extractor.lastUsage
 			}
-			if rep, ok := adapter.(usageAnomalyReporter); ok && rep.ZeroInputUsageReported() {
-				p.Log.LogAttrs(context.Background(), slog.LevelWarn, "upstream reported zero input tokens",
-					slog.String("model", model.Name),
-					slog.String("provider", model.Provider),
-					slog.String("request_id", requestID),
-					slog.Int("completion_tokens", streamUI.CompletionTokens),
-					slog.Bool("stream", true),
-				)
+			if rep, ok := adapter.(usageAnomalyReporter); ok {
+				if zero, present := rep.ZeroInputUsageReported(); zero {
+					p.Log.LogAttrs(context.Background(), slog.LevelWarn, "upstream reported zero input tokens",
+						slog.String("model", model.Name),
+						slog.String("provider", usedDep.Provider),
+						slog.String("deployment", usedDep.Name),
+						slog.Bool("usage_present", present),
+						slog.String("request_id", requestID),
+						slog.Int("completion_tokens", streamUI.CompletionTokens),
+						slog.Bool("stream", true),
+					)
+				}
 			}
 			streamUI = normalizeRerankScoreUsage(upstreamPath, streamUI)
 			durationMS := int(time.Since(startTime).Milliseconds())
@@ -1857,7 +1861,7 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 // requestedModelName is the canonical name the client originally asked for;
 // it may differ from model.Name when a fallback was activated.
 // filter may be nil when PII anonymization is disabled.
-func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, model Model, keyInfo *auth.KeyInfo, adapter Adapter, startTime time.Time, requestID string, requestedModelName string, maxResponseBody int, filter *pii.Filter) error {
+func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, model Model, keyInfo *auth.KeyInfo, adapter Adapter, usedDep Deployment, startTime time.Time, requestID string, requestedModelName string, maxResponseBody int, filter *pii.Filter) error {
 	// Content-Length pre-check: fast-reject optimization to avoid allocating
 	// memory for obviously oversized responses. Not the security boundary —
 	// io.LimitReader on the next line handles chunked/unknown-length responses.
@@ -1958,14 +1962,18 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 		// For non-streaming responses TTFT equals total duration: the entire
 		// response body is the first (and only) "token delivery".
 		ttftMS := durationMS
-		if rep, ok := adapter.(usageAnomalyReporter); ok && rep.ZeroInputUsageReported() {
-			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream reported zero input tokens",
-				slog.String("model", model.Name),
-				slog.String("provider", model.Provider),
-				slog.String("request_id", requestID),
-				slog.Int("completion_tokens", ui.CompletionTokens),
-				slog.Bool("stream", false),
-			)
+		if rep, ok := adapter.(usageAnomalyReporter); ok {
+			if zero, present := rep.ZeroInputUsageReported(); zero {
+				p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream reported zero input tokens",
+					slog.String("model", model.Name),
+					slog.String("provider", usedDep.Provider),
+					slog.String("deployment", usedDep.Name),
+					slog.Bool("usage_present", present),
+					slog.String("request_id", requestID),
+					slog.Int("completion_tokens", ui.CompletionTokens),
+					slog.Bool("stream", false),
+				)
+			}
 		}
 		p.logUsageEvent(keyInfo, model, ui, durationMS, &ttftMS, resp.StatusCode, requestID, requestedModelName)
 	}

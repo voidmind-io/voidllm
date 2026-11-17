@@ -66,7 +66,7 @@ type bedrockMessageStopEvent struct {
 
 // bedrockMetadataEvent is the metadata event payload carrying token usage.
 type bedrockMetadataEvent struct {
-	Usage bedrockUsage `json:"usage"`
+	Usage *bedrockUsage `json:"usage"`
 }
 
 // TransformStreamLine converts one SSE line produced by the event-stream
@@ -148,15 +148,20 @@ func (a *BedrockAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 		if a.metadataSeen {
 			return nil, errStreamTransformAborted
 		}
-		if !ev.Metadata.Usage.valid() {
+		var usage bedrockUsage
+		if ev.Metadata.Usage != nil {
+			usage = *ev.Metadata.Usage
+		}
+		if !usage.valid() {
 			return nil, errStreamTransformAborted
 		}
 		a.metadataSeen = true
-		a.inputTokens = ev.Metadata.Usage.InputTokens
-		a.outputTokens = ev.Metadata.Usage.OutputTokens
-		a.cacheReadTokens = ev.Metadata.Usage.CacheReadInputTokens
-		a.cacheWriteTokens = ev.Metadata.Usage.CacheWriteInputTokens
+		a.inputTokens = usage.InputTokens
+		a.outputTokens = usage.OutputTokens
+		a.cacheReadTokens = usage.CacheReadInputTokens
+		a.cacheWriteTokens = usage.CacheWriteInputTokens
 		a.zeroInputUsage = a.inputTokens+a.cacheReadTokens+a.cacheWriteTokens == 0
+		a.usagePresent = ev.Metadata.Usage != nil
 		if a.stopSeen {
 			return a.finishLines(), nil
 		}

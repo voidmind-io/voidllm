@@ -53,12 +53,15 @@ type BedrockAdapter struct {
 	// zeroInputUsage is set when the upstream reported a usage block whose
 	// input token count, including cache buckets, was zero.
 	zeroInputUsage bool
+	// usagePresent is set when the upstream sent a non-null usage block.
+	usagePresent bool
 }
 
-// ZeroInputUsageReported reports whether the upstream sent a usage block whose
-// input token count (including cache buckets) was zero.
-func (a *BedrockAdapter) ZeroInputUsageReported() bool {
-	return a.zeroInputUsage
+// ZeroInputUsageReported reports whether a completed upstream call reported
+// zero input tokens (including cache buckets). present is false when the
+// upstream sent no usage block at all, in which case zero is true as well.
+func (a *BedrockAdapter) ZeroInputUsageReported() (zero bool, present bool) {
+	return a.zeroInputUsage, a.usagePresent
 }
 
 // bedrockConverseRequest is the Converse request body. It is the upstream
@@ -190,8 +193,8 @@ type bedrockConverseResponse struct {
 			Content []bedrockResponseBlock `json:"content"`
 		} `json:"message"`
 	} `json:"output"`
-	StopReason string       `json:"stopReason"`
-	Usage      bedrockUsage `json:"usage"`
+	StopReason string        `json:"stopReason"`
+	Usage      *bedrockUsage `json:"usage"`
 }
 
 // bedrockResponseBlock is one content block of a Converse response. Blocks of
@@ -641,7 +644,11 @@ func (a *BedrockAdapter) TransformResponse(body []byte) ([]byte, error) {
 		return nil, errors.New("bedrock transform response: malformed body")
 	}
 
-	if !br.Usage.valid() {
+	var usage bedrockUsage
+	if br.Usage != nil {
+		usage = *br.Usage
+	}
+	if !usage.valid() {
 		return nil, errors.New("bedrock transform response: malformed body")
 	}
 
@@ -694,8 +701,9 @@ func (a *BedrockAdapter) TransformResponse(body []byte) ([]byte, error) {
 
 	// inputTokens counts only the non-cached input; the cache buckets are
 	// reported in addition, so the total prompt is the sum of all three.
-	prompt := br.Usage.InputTokens + br.Usage.CacheReadInputTokens + br.Usage.CacheWriteInputTokens
+	prompt := usage.InputTokens + usage.CacheReadInputTokens + usage.CacheWriteInputTokens
 	a.zeroInputUsage = prompt == 0
+	a.usagePresent = br.Usage != nil
 	resp := openAIResponse{
 		ID:     respID,
 		Object: "chat.completion",
@@ -711,9 +719,9 @@ func (a *BedrockAdapter) TransformResponse(body []byte) ([]byte, error) {
 		}},
 		Usage: openAIUsage{
 			PromptTokens:        prompt,
-			CompletionTokens:    br.Usage.OutputTokens,
-			TotalTokens:         prompt + br.Usage.OutputTokens,
-			PromptTokensDetails: cacheUsageDetails(br.Usage.CacheReadInputTokens, br.Usage.CacheWriteInputTokens),
+			CompletionTokens:    usage.OutputTokens,
+			TotalTokens:         prompt + usage.OutputTokens,
+			PromptTokensDetails: cacheUsageDetails(usage.CacheReadInputTokens, usage.CacheWriteInputTokens),
 		},
 	}
 	out, err := jsonx.Marshal(resp)
