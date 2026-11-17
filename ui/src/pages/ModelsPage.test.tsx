@@ -28,6 +28,8 @@ interface MockModelResponse {
   updated_at: string
   timeout?: string
   fallback_model_name?: string
+  region?: string
+  bedrock_model_id?: string
   deployments?: unknown[]
 }
 
@@ -632,6 +634,248 @@ describe('EditModelDialog — Fallback Model field', () => {
     expect(body).not.toHaveProperty('fallback_model_name')
     // The changed field must be present
     expect(body.timeout).toBe('60s')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tests: AWS Bedrock provider
+// ---------------------------------------------------------------------------
+
+function getComboboxByLabel(container: HTMLElement, label: string): HTMLElement {
+  const match = within(container).getAllByRole('combobox').find((el) => {
+    const labelledBy = el.getAttribute('aria-labelledby')
+    if (!labelledBy) return false
+    return document.getElementById(labelledBy)?.textContent?.toLowerCase().includes(label.toLowerCase())
+  })
+  if (!match) throw new Error(`Could not find combobox "${label}"`)
+  return match
+}
+
+async function pickBedrockProvider(dialog: HTMLElement) {
+  await userEvent.click(getComboboxByLabel(dialog, 'provider'))
+  await userEvent.click(screen.getByRole('option', { name: 'AWS Bedrock' }))
+}
+
+describe('AWS Bedrock provider', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  async function openEditDialogForModel(modelName: string) {
+    const modelNameEl = await screen.findByText(modelName)
+    const row = modelNameEl.closest('tr')
+    if (!row) throw new Error(`Could not find table row for model "${modelName}"`)
+    await userEvent.click(within(row).getByTitle('Edit model'))
+  }
+
+  it('shows region and model ID fields only for bedrock and marks base URL optional', async () => {
+    setupFetchMock(defaultEntries())
+    renderModelsPage()
+
+    await openCreateDialog()
+    const dialog = getDialog(/add model/i)
+    expect(within(dialog).queryByRole('textbox', { name: /aws region/i })).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('textbox', { name: /bedrock model id/i })).not.toBeInTheDocument()
+
+    await pickBedrockProvider(dialog)
+
+    expect(within(dialog).getByRole('textbox', { name: /aws region/i })).toHaveAttribute('placeholder', 'eu-central-1')
+    expect(within(dialog).getByRole('textbox', { name: /bedrock model id/i })).toHaveAttribute(
+      'placeholder',
+      'eu.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    )
+    expect(within(dialog).getByRole('textbox', { name: /base url/i })).toHaveAttribute(
+      'placeholder',
+      'Optional - defaults to https://bedrock-runtime.<region>.amazonaws.com',
+    )
+  })
+
+  it('creates a bedrock model without base_url and with region and bedrock_model_id', async () => {
+    const capturedBodies = new Map<string, string>()
+    setupFetchMock(
+      [
+        {
+          matcher: (u) => u.includes('/api/v1/models') && !u.includes('/health'),
+          method: 'POST',
+          response: makeChatModel({ id: 'new-br', name: 'claude-br', provider: 'bedrock' }),
+        },
+        ...defaultEntries(),
+      ],
+      capturedBodies,
+    )
+    renderModelsPage()
+
+    await openCreateDialog()
+    const dialog = getDialog(/add model/i)
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'claude-br')
+    await pickBedrockProvider(dialog)
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /aws region/i }), 'eu-central-1')
+    await userEvent.type(
+      within(dialog).getByRole('textbox', { name: /bedrock model id/i }),
+      'eu.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    )
+    await submitDialog(dialog, /add model/i)
+
+    await waitFor(() => expect(capturedBodies.has('POST:/api/v1/models')).toBe(true))
+    const body = JSON.parse(capturedBodies.get('POST:/api/v1/models')!)
+    expect(body.provider).toBe('bedrock')
+    expect(body.region).toBe('eu-central-1')
+    expect(body.bedrock_model_id).toBe('eu.anthropic.claude-sonnet-4-5-20250929-v1:0')
+    expect(body).not.toHaveProperty('base_url')
+  })
+
+  it('requires region and model ID for bedrock and does not submit', async () => {
+    const capturedBodies = new Map<string, string>()
+    setupFetchMock(
+      [
+        {
+          matcher: (u) => u.includes('/api/v1/models') && !u.includes('/health'),
+          method: 'POST',
+          response: makeChatModel(),
+        },
+        ...defaultEntries(),
+      ],
+      capturedBodies,
+    )
+    renderModelsPage()
+
+    await openCreateDialog()
+    const dialog = getDialog(/add model/i)
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'claude-br')
+    await pickBedrockProvider(dialog)
+    await submitDialog(dialog, /add model/i)
+
+    expect(await within(dialog).findByText('AWS region is required')).toBeInTheDocument()
+    expect(within(dialog).getByText('Bedrock model ID is required')).toBeInTheDocument()
+    expect(within(dialog).queryByText('Base URL is required')).not.toBeInTheDocument()
+    expect(capturedBodies.has('POST:/api/v1/models')).toBe(false)
+  })
+
+  it('rejects non-chat model types for bedrock', async () => {
+    const capturedBodies = new Map<string, string>()
+    setupFetchMock(
+      [
+        {
+          matcher: (u) => u.includes('/api/v1/models') && !u.includes('/health'),
+          method: 'POST',
+          response: makeChatModel(),
+        },
+        ...defaultEntries(),
+      ],
+      capturedBodies,
+    )
+    renderModelsPage()
+
+    await openCreateDialog()
+    const dialog = getDialog(/add model/i)
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'embed-br')
+    await userEvent.click(getComboboxByLabel(dialog, 'type'))
+    await userEvent.click(screen.getByRole('option', { name: /embedding/i }))
+    await pickBedrockProvider(dialog)
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /aws region/i }), 'eu-central-1')
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /bedrock model id/i }), 'amazon.titan')
+    await submitDialog(dialog, /add model/i)
+
+    expect(await within(dialog).findByText('Bedrock supports chat models only')).toBeInTheDocument()
+    expect(capturedBodies.has('POST:/api/v1/models')).toBe(false)
+  })
+
+  it('sends region and bedrock_model_id in the test-connection request', async () => {
+    const capturedBodies = new Map<string, string>()
+    setupFetchMock(
+      [
+        {
+          matcher: (u) => u.includes('/api/v1/models/test-connection'),
+          method: 'POST',
+          response: { success: true, message: 'ok' },
+        },
+        ...defaultEntries(),
+      ],
+      capturedBodies,
+    )
+    renderModelsPage()
+
+    await openCreateDialog()
+    const dialog = getDialog(/add model/i)
+    await pickBedrockProvider(dialog)
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /aws region/i }), 'us-east-1')
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /bedrock model id/i }), 'amazon.nova-lite-v1:0')
+    await userEvent.click(within(dialog).getByRole('button', { name: /test connection/i }))
+
+    await waitFor(() => expect(capturedBodies.has('POST:/api/v1/models/test-connection')).toBe(true))
+    const body = JSON.parse(capturedBodies.get('POST:/api/v1/models/test-connection')!)
+    expect(body.provider).toBe('bedrock')
+    expect(body.region).toBe('us-east-1')
+    expect(body.bedrock_model_id).toBe('amazon.nova-lite-v1:0')
+  })
+
+  it('edit dialog prefills bedrock fields and sends changed values', async () => {
+    const capturedBodies = new Map<string, string>()
+    const bedrockModel = makeChatModel({
+      id: 'model-br',
+      name: 'claude-br',
+      provider: 'bedrock',
+      base_url: '',
+      region: 'eu-central-1',
+      bedrock_model_id: 'eu.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    })
+    setupFetchMock(
+      [
+        ...defaultEntries(MOCK_LICENSE_NO_FALLBACK, { data: [bedrockModel], has_more: false }),
+        { matcher: (u) => u.includes('/api/v1/models/model-br'), method: 'PATCH', response: bedrockModel },
+      ],
+      capturedBodies,
+    )
+    renderModelsPage()
+
+    await openEditDialogForModel('claude-br')
+    const dialog = getDialog(/edit model/i)
+    const regionInput = within(dialog).getByRole('textbox', { name: /aws region/i })
+    expect(regionInput).toHaveValue('eu-central-1')
+    expect(within(dialog).getByRole('textbox', { name: /bedrock model id/i })).toHaveValue(
+      'eu.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    )
+
+    await userEvent.clear(regionInput)
+    await userEvent.type(regionInput, 'us-east-1')
+    await submitDialog(dialog, /save changes/i)
+
+    await waitFor(() => expect(capturedBodies.has('PATCH:/api/v1/models/model-br')).toBe(true))
+    const body = JSON.parse(capturedBodies.get('PATCH:/api/v1/models/model-br')!)
+    expect(body).toEqual({ region: 'us-east-1' })
+  })
+
+  it('"Use regional endpoint" clears the base URL and sends base_url as empty string', async () => {
+    const capturedBodies = new Map<string, string>()
+    const bedrockModel = makeChatModel({
+      id: 'model-br',
+      name: 'claude-br',
+      provider: 'bedrock',
+      base_url: 'https://vpce-1.bedrock-runtime.eu-central-1.vpce.amazonaws.com',
+      region: 'eu-central-1',
+      bedrock_model_id: 'eu.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    })
+    setupFetchMock(
+      [
+        ...defaultEntries(MOCK_LICENSE_NO_FALLBACK, { data: [bedrockModel], has_more: false }),
+        { matcher: (u) => u.includes('/api/v1/models/model-br'), method: 'PATCH', response: bedrockModel },
+      ],
+      capturedBodies,
+    )
+    renderModelsPage()
+
+    await openEditDialogForModel('claude-br')
+    const dialog = getDialog(/edit model/i)
+    const baseUrlInput = within(dialog).getByRole('textbox', { name: /base url/i })
+    expect(baseUrlInput).toHaveValue('https://vpce-1.bedrock-runtime.eu-central-1.vpce.amazonaws.com')
+
+    await userEvent.click(within(dialog).getByRole('button', { name: /use regional endpoint/i }))
+    expect(baseUrlInput).toHaveValue('')
+    await submitDialog(dialog, /save changes/i)
+
+    await waitFor(() => expect(capturedBodies.has('PATCH:/api/v1/models/model-br')).toBe(true))
+    const body = JSON.parse(capturedBodies.get('PATCH:/api/v1/models/model-br')!)
+    expect(body.base_url).toBe('')
   })
 })
 

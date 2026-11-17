@@ -98,6 +98,7 @@ redis:
 #   openai     — OpenAI API, direct passthrough
 #   anthropic  — Anthropic API, request/response translation applied
 #   azure      — Azure OpenAI, URL mapping applied
+#   bedrock    - AWS Bedrock, Converse API translation (region + bedrock_model_id, Bedrock API key)
 #   custom     — Any OpenAI-compatible endpoint, direct passthrough
 
 models:
@@ -156,6 +157,14 @@ models:
     azure_deployment: gpt-4o
     azure_api_version: "2024-02-01"
     max_context_tokens: 128000
+
+  # AWS Bedrock (Converse API). base_url is optional and defaults to
+  # https://bedrock-runtime.<region>.amazonaws.com. Bedrock API keys only.
+  # - name: claude-sonnet-bedrock
+  #   provider: bedrock
+  #   region: eu-central-1
+  #   bedrock_model_id: eu.anthropic.claude-sonnet-4-5-20250929-v1:0
+  #   api_key: ${BEDROCK_API_KEY}
 
   - name: text-embedding-3-small
     provider: openai
@@ -306,7 +315,7 @@ settings:
 
   # PII anonymization - replace PII in outbound prompts with pseudonyms.
   # Pseudonyms are restored in the response; no PII is ever persisted or logged.
-  # Applies only to external providers (openai, anthropic, azure, gemini, vertex).
+  # Applies only to external providers (openai, anthropic, azure, bedrock, gemini, vertex).
   # Disabled by default. Only "pseudonymize" is supported as action.
   # pii:
   #   enabled: false

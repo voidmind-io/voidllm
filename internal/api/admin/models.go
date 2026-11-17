@@ -48,6 +48,10 @@ type createModelRequest struct {
 	GCPProject string `json:"gcp_project,omitempty"`
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when provider is "vertex".
 	GCPLocation string `json:"gcp_location,omitempty"`
+	// Region is the AWS region (e.g. "eu-central-1"). Required when provider is "bedrock".
+	Region string `json:"region,omitempty"`
+	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN. Required when provider is "bedrock".
+	BedrockModelID string `json:"bedrock_model_id,omitempty"`
 	// Aliases are optional short names that resolve to this model in proxy requests.
 	Aliases []string `json:"aliases"`
 	// Timeout is the per-model upstream timeout as a Go duration string (e.g. "30s",
@@ -96,6 +100,10 @@ type updateModelRequest struct {
 	GCPProject *string `json:"gcp_project"`
 	// GCPLocation, when non-nil, replaces the Google Cloud region.
 	GCPLocation *string `json:"gcp_location"`
+	// Region, when non-nil, replaces the AWS region.
+	Region *string `json:"region"`
+	// BedrockModelID, when non-nil, replaces the Bedrock model ID.
+	BedrockModelID *string `json:"bedrock_model_id"`
 	// Aliases, when non-nil, replaces the full set of aliases for the model.
 	// Pass an empty slice to remove all aliases.
 	Aliases *[]string `json:"aliases"`
@@ -162,10 +170,14 @@ type modelResponse struct {
 	// GCPProject is the Google Cloud project ID. Non-empty only for provider "vertex".
 	GCPProject string `json:"gcp_project,omitempty"`
 	// GCPLocation is the Google Cloud region. Non-empty only for provider "vertex".
-	GCPLocation string   `json:"gcp_location,omitempty"`
-	IsActive    bool     `json:"is_active"`
-	Source      string   `json:"source"`
-	Aliases     []string `json:"aliases"`
+	GCPLocation string `json:"gcp_location,omitempty"`
+	// Region is the AWS region. Non-empty only for provider "bedrock".
+	Region string `json:"region,omitempty"`
+	// BedrockModelID is the Bedrock model ID. Non-empty only for provider "bedrock".
+	BedrockModelID string   `json:"bedrock_model_id,omitempty"`
+	IsActive       bool     `json:"is_active"`
+	Source         string   `json:"source"`
+	Aliases        []string `json:"aliases"`
 	// Timeout is the per-model upstream timeout (e.g. "30s", "2m").
 	// An empty string means the global default is used.
 	Timeout string `json:"timeout,omitempty"`
@@ -243,6 +255,8 @@ func modelToResponse(m *db.Model, fallbackName string) modelResponse {
 		AzureAPIVersion:       m.AzureAPIVersion,
 		GCPProject:            m.GCPProject,
 		GCPLocation:           m.GCPLocation,
+		Region:                m.Region,
+		BedrockModelID:        m.BedrockModelID,
 		IsActive:              m.IsActive,
 		Source:                m.Source,
 		Aliases:               aliases,
@@ -293,6 +307,8 @@ func dbModelToProxy(m *db.Model, apiKeyPlaintext string, fallbackName string) pr
 		AzureAPIVersion:   m.AzureAPIVersion,
 		GCPProject:        m.GCPProject,
 		GCPLocation:       m.GCPLocation,
+		Region:            m.Region,
+		BedrockModelID:    m.BedrockModelID,
 		Timeout:           timeout,
 		FallbackModelName: fallbackName,
 		PIIFilter:         m.PIIFilter,
@@ -498,12 +514,20 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		if req.Provider == "" {
 			return apierror.BadRequest(c, "provider is required")
 		}
-		if req.BaseURL == "" {
+		if req.BaseURL == "" && req.Provider != provider.Bedrock {
 			return apierror.BadRequest(c, "base_url is required")
 		}
 	}
 	if req.Provider != "" && !provider.ValidProviders[req.Provider] {
 		return apierror.BadRequest(c, "provider must be one of: "+strings.Join(provider.Names(), ", "))
+	}
+	if req.Strategy == "" && req.Provider == provider.Bedrock {
+		if msg := validateBedrockFields(req.Region, req.BedrockModelID, req.Type); msg != "" {
+			return apierror.BadRequest(c, msg)
+		}
+		if req.BaseURL != "" && !hasHTTPScheme(req.BaseURL) {
+			return apierror.BadRequest(c, "base_url must begin with http:// or https://")
+		}
 	}
 	if req.Timeout != "" {
 		if _, err := time.ParseDuration(req.Timeout); err != nil {
@@ -591,6 +615,8 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		AzureAPIVersion:       req.AzureAPIVersion,
 		GCPProject:            req.GCPProject,
 		GCPLocation:           req.GCPLocation,
+		Region:                req.Region,
+		BedrockModelID:        req.BedrockModelID,
 		Source:                "api",
 		CreatedBy:             createdBy,
 		Aliases:               aliasStr,
@@ -829,8 +855,59 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		if req.Provider != nil && *req.Provider == "" {
 			return apierror.BadRequest(c, "provider must not be empty in single-endpoint mode")
 		}
-		if req.BaseURL != nil && *req.BaseURL == "" {
-			return apierror.BadRequest(c, "base_url must not be empty in single-endpoint mode")
+		mergedProvider := existing.Provider
+		if req.Provider != nil {
+			mergedProvider = *req.Provider
+		}
+		mergedBaseURL := existing.BaseURL
+		if req.BaseURL != nil {
+			mergedBaseURL = *req.BaseURL
+		}
+		if mergedBaseURL == "" && mergedProvider != provider.Bedrock {
+			if req.BaseURL != nil {
+				return apierror.BadRequest(c, "base_url must not be empty in single-endpoint mode")
+			}
+			return apierror.BadRequest(c, "base_url is required")
+		}
+		if mergedProvider == provider.Bedrock {
+			mergedRegion := existing.Region
+			if req.Region != nil {
+				mergedRegion = *req.Region
+			}
+			mergedModelID := existing.BedrockModelID
+			if req.BedrockModelID != nil {
+				mergedModelID = *req.BedrockModelID
+			}
+			mergedType := existing.ModelType
+			if req.Type != nil {
+				mergedType = *req.Type
+			}
+			if msg := validateBedrockFields(mergedRegion, mergedModelID, mergedType); msg != "" {
+				return apierror.BadRequest(c, msg)
+			}
+			if mergedBaseURL != "" && !hasHTTPScheme(mergedBaseURL) {
+				return apierror.BadRequest(c, "base_url must begin with http:// or https://")
+			}
+		}
+	}
+	// A load-balanced model keeps its endpoints on deployments; a bedrock
+	// deployment only supports chat, so a non-chat effective type is rejected.
+	if effectiveStrategy != "" {
+		effectiveType := existing.ModelType
+		if req.Type != nil {
+			effectiveType = *req.Type
+		}
+		if effectiveType != "" && effectiveType != "chat" {
+			deps, depsErr := h.DB.ListDeployments(ctx, modelID)
+			if depsErr != nil {
+				h.Log.ErrorContext(ctx, "update model: list deployments", slog.String("error", depsErr.Error()))
+				return apierror.InternalError(c, "failed to get model deployments")
+			}
+			for i := range deps {
+				if deps[i].Provider == provider.Bedrock {
+					return apierror.BadRequest(c, "bedrock supports only chat models")
+				}
+			}
 		}
 	}
 	if req.Timeout != nil && *req.Timeout != "" {
@@ -880,6 +957,8 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		AzureAPIVersion:       req.AzureAPIVersion,
 		GCPProject:            req.GCPProject,
 		GCPLocation:           req.GCPLocation,
+		Region:                req.Region,
+		BedrockModelID:        req.BedrockModelID,
 		Timeout:               req.Timeout,
 		Strategy:              req.Strategy,
 		MaxRetries:            req.MaxRetries,
@@ -1209,6 +1288,11 @@ type testConnectionRequest struct {
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required
 	// to build a working probe URL when Provider is "vertex".
 	GCPLocation string `json:"gcp_location,omitempty"`
+	// Region is the AWS region. Required when Provider is "bedrock".
+	Region string `json:"region,omitempty"`
+	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
+	// Required when Provider is "bedrock".
+	BedrockModelID string `json:"bedrock_model_id,omitempty"`
 }
 
 // testConnectionResponse is the JSON response returned by TestModelConnection.
@@ -1247,8 +1331,43 @@ func validateProviderIdentity(req testConnectionRequest) (message string, ok boo
 		if req.AzureDeployment == "" {
 			return "azure_deployment is required for azure", false
 		}
+	case "bedrock":
+		switch {
+		case req.Region == "":
+			return "region is required for bedrock", false
+		case !provider.ValidBedrockRegion(req.Region):
+			return "region is not a valid AWS region", false
+		case req.BedrockModelID == "":
+			return "bedrock_model_id is required for bedrock", false
+		case !provider.ValidBedrockModelID(req.BedrockModelID):
+			return "bedrock_model_id is invalid", false
+		}
 	}
 	return "", true
+}
+
+// hasHTTPScheme reports whether rawURL begins with http:// or https://.
+func hasHTTPScheme(rawURL string) bool {
+	return strings.HasPrefix(rawURL, "http://") || strings.HasPrefix(rawURL, "https://")
+}
+
+// validateBedrockFields returns a non-empty error message when the bedrock
+// specific fields of a model or deployment are missing or invalid. modelType
+// is the type of the owning model; an empty value is treated as chat.
+func validateBedrockFields(region, modelID, modelType string) string {
+	switch {
+	case region == "":
+		return "region is required for bedrock"
+	case !provider.ValidBedrockRegion(region):
+		return "region is not a valid AWS region"
+	case modelID == "":
+		return "bedrock_model_id is required for bedrock"
+	case !provider.ValidBedrockModelID(modelID):
+		return "bedrock_model_id is invalid"
+	case modelType != "" && modelType != "chat":
+		return "bedrock supports only chat models"
+	}
+	return ""
 }
 
 // TestModelConnection handles POST /api/v1/models/test-connection.
@@ -1282,6 +1401,14 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&req); err != nil {
 		return apierror.BadRequest(c, "invalid request body")
 	}
+	if req.BaseURL == "" && req.Provider == provider.Bedrock {
+		// Surface missing or invalid region/model ID with a specific message
+		// before falling back to the generic base_url error.
+		if msg, ok := validateProviderIdentity(req); !ok {
+			return c.JSON(testConnectionResponse{Success: false, Message: msg})
+		}
+	}
+	req.BaseURL = provider.EffectiveBaseURL(req.Provider, req.BaseURL, req.Region)
 	if req.BaseURL == "" {
 		return apierror.BadRequest(c, "base_url is required")
 	}
@@ -1319,6 +1446,8 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 		AzureAPIVersion: req.AzureAPIVersion,
 		GCPProject:      req.GCPProject,
 		GCPLocation:     req.GCPLocation,
+		Region:          req.Region,
+		BedrockModelID:  req.BedrockModelID,
 	}
 
 	// Probe the provider the same way the proxy hot path would actually talk

@@ -109,6 +109,10 @@ type DeploymentConfig struct {
 	GCPProject string `yaml:"gcp_project" json:"gcp_project,omitempty"`
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when provider is "vertex".
 	GCPLocation string `yaml:"gcp_location" json:"gcp_location,omitempty"`
+	// Region is the AWS region (e.g. "eu-central-1"). Required when provider is "bedrock".
+	Region string `yaml:"region" json:"region,omitempty"`
+	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN. Required when provider is "bedrock".
+	BedrockModelID string `yaml:"bedrock_model_id" json:"bedrock_model_id,omitempty"`
 	// Weight is the relative routing weight for the "weighted" strategy.
 	// A value of 0 means this deployment is only used as a fallback when all
 	// weighted deployments are unavailable.
@@ -152,6 +156,10 @@ type ModelConfig struct {
 	GCPProject string `yaml:"gcp_project" json:"gcp_project,omitempty"`
 	// GCPLocation is the Google Cloud region (e.g. "us-central1"). Required when provider is "vertex".
 	GCPLocation string `yaml:"gcp_location" json:"gcp_location,omitempty"`
+	// Region is the AWS region (e.g. "eu-central-1"). Required when provider is "bedrock".
+	Region string `yaml:"region" json:"region,omitempty"`
+	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN. Required when provider is "bedrock".
+	BedrockModelID string `yaml:"bedrock_model_id" json:"bedrock_model_id,omitempty"`
 	// Timeout is the per-model upstream timeout as a duration string (e.g. "30s",
 	// "2m"). When non-empty it overrides the global stream/response timeout for
 	// this model. Zero or empty means use the global default.
