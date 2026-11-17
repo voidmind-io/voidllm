@@ -969,6 +969,7 @@ func TestAnthropicStream_UsageChunk(t *testing.T) {
 		t.Parallel()
 		a := &AnthropicAdapter{}
 		a.includeUsage = true
+		a.startSeen = true
 
 		// Register content-block index 0 as a tool_use block.
 		if _, err := a.TransformStreamLine([]byte(
