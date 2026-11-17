@@ -181,6 +181,14 @@ type binaryStreamAdapter interface {
 	WrapStreamBody(body io.ReadCloser) io.ReadCloser
 }
 
+// usageAnomalyReporter is implemented by adapters that can tell when the
+// upstream reported a usage block with zero input tokens for a completed call.
+type usageAnomalyReporter interface {
+	// ZeroInputUsageReported reports whether the upstream sent a usage block
+	// whose input token count (including cache buckets) was zero.
+	ZeroInputUsageReported() bool
+}
+
 // upstreamErrorMapper is implemented by adapters whose upstream non-2xx
 // bodies are not OpenAI or apierror shaped. The handler replaces such a body
 // with the proxy's error envelope but keeps the upstream status code.

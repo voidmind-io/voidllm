@@ -1824,6 +1824,15 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			if streamUI.PromptTokens == 0 && streamUI.CompletionTokens == 0 {
 				streamUI = extractor.lastUsage
 			}
+			if rep, ok := adapter.(usageAnomalyReporter); ok && rep.ZeroInputUsageReported() {
+				p.Log.LogAttrs(context.Background(), slog.LevelWarn, "upstream reported zero input tokens",
+					slog.String("model", model.Name),
+					slog.String("provider", model.Provider),
+					slog.String("request_id", requestID),
+					slog.Int("completion_tokens", streamUI.CompletionTokens),
+					slog.Bool("stream", true),
+				)
+			}
 			streamUI = normalizeRerankScoreUsage(upstreamPath, streamUI)
 			durationMS := int(time.Since(startTime).Milliseconds())
 			// Use the upstream HTTP status for successful, complete streams. For
@@ -1949,6 +1958,15 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 		// For non-streaming responses TTFT equals total duration: the entire
 		// response body is the first (and only) "token delivery".
 		ttftMS := durationMS
+		if rep, ok := adapter.(usageAnomalyReporter); ok && rep.ZeroInputUsageReported() {
+			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "upstream reported zero input tokens",
+				slog.String("model", model.Name),
+				slog.String("provider", model.Provider),
+				slog.String("request_id", requestID),
+				slog.Int("completion_tokens", ui.CompletionTokens),
+				slog.Bool("stream", false),
+			)
+		}
 		p.logUsageEvent(keyInfo, model, ui, durationMS, &ttftMS, resp.StatusCode, requestID, requestedModelName)
 	}
 

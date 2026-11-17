@@ -49,6 +49,16 @@ type BedrockAdapter struct {
 	outputTokens     int
 	cacheReadTokens  int
 	cacheWriteTokens int
+
+	// zeroInputUsage is set when the upstream reported a usage block whose
+	// input token count, including cache buckets, was zero.
+	zeroInputUsage bool
+}
+
+// ZeroInputUsageReported reports whether the upstream sent a usage block whose
+// input token count (including cache buckets) was zero.
+func (a *BedrockAdapter) ZeroInputUsageReported() bool {
+	return a.zeroInputUsage
 }
 
 // bedrockConverseRequest is the Converse request body. It is the upstream
@@ -685,6 +695,7 @@ func (a *BedrockAdapter) TransformResponse(body []byte) ([]byte, error) {
 	// inputTokens counts only the non-cached input; the cache buckets are
 	// reported in addition, so the total prompt is the sum of all three.
 	prompt := br.Usage.InputTokens + br.Usage.CacheReadInputTokens + br.Usage.CacheWriteInputTokens
+	a.zeroInputUsage = prompt == 0
 	resp := openAIResponse{
 		ID:     respID,
 		Object: "chat.completion",

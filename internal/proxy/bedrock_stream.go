@@ -156,6 +156,7 @@ func (a *BedrockAdapter) TransformStreamLine(line []byte) ([][]byte, error) {
 		a.outputTokens = ev.Metadata.Usage.OutputTokens
 		a.cacheReadTokens = ev.Metadata.Usage.CacheReadInputTokens
 		a.cacheWriteTokens = ev.Metadata.Usage.CacheWriteInputTokens
+		a.zeroInputUsage = a.inputTokens+a.cacheReadTokens+a.cacheWriteTokens == 0
 		if a.stopSeen {
 			return a.finishLines(), nil
 		}
