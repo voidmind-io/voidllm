@@ -61,10 +61,12 @@ type OAuthTokenManager struct {
 }
 
 // NewOAuthTokenManager creates a token manager with the given HTTP client.
-// When client is nil a default client with a 30-second timeout is used.
+// When client is nil a default client with a 30-second timeout is used whose
+// transport refuses connections to internal addresses (NewSSRFSafeTransport
+// with allowPrivate false).
 func NewOAuthTokenManager(client *http.Client) *OAuthTokenManager {
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = &http.Client{Transport: NewSSRFSafeTransport(false), Timeout: 30 * time.Second}
 	}
 	return &OAuthTokenManager{
 		tokens: make(map[string]*cachedToken),

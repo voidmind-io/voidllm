@@ -48,7 +48,7 @@ func TestOAuthTokenManager_FetchToken_BodyOverLimit_Rejected(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	mgr := mcp.NewOAuthTokenManager(nil)
+	mgr := mcp.NewOAuthTokenManager(&http.Client{})
 	_, err := mgr.GetToken(context.Background(), "over-limit-server", oauthTestConfig(srv.URL))
 	if err == nil {
 		t.Fatal("GetToken() error = nil, want an error for a token response exceeding oauthResponseMaxBytes " +
@@ -87,7 +87,7 @@ func TestOAuthTokenManager_FetchToken_BodyExactlyAtLimit_Accepted(t *testing.T) 
 	}))
 	t.Cleanup(srv.Close)
 
-	mgr := mcp.NewOAuthTokenManager(nil)
+	mgr := mcp.NewOAuthTokenManager(&http.Client{})
 	token, err := mgr.GetToken(context.Background(), "exact-limit-server", oauthTestConfig(srv.URL))
 	if err != nil {
 		t.Fatalf("GetToken() error = %v, want nil for a token response of exactly OAuthResponseMaxBytes", err)
@@ -112,7 +112,7 @@ func TestOAuthTokenManager_FetchToken_BodyOverLimit_NotAConnectionError(t *testi
 	}))
 	t.Cleanup(srv.Close)
 
-	mgr := mcp.NewOAuthTokenManager(nil)
+	mgr := mcp.NewOAuthTokenManager(&http.Client{})
 	_, err := mgr.GetToken(context.Background(), "over-limit-server-2", oauthTestConfig(srv.URL))
 	if err == nil {
 		t.Fatal("GetToken() error = nil, want an error")

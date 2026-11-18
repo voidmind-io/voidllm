@@ -310,7 +310,12 @@ func (h *Handler) buildAdHocTransport(server *db.MCPServer, timeout time.Duratio
 		if h.MCPTransportCache != nil {
 			oauthMgr = h.MCPTransportCache.OAuthManager()
 		} else {
-			oauthMgr = mcp.NewOAuthTokenManager(nil)
+			oauthTransport := mcp.NewSSRFSafeTransport(h.MCPAllowPrivateURLs)
+			oauthTransport.IdleConnTimeout = 30 * time.Second
+			oauthMgr = mcp.NewOAuthTokenManager(&http.Client{
+				Transport: oauthTransport,
+				Timeout:   30 * time.Second,
+			})
 		}
 		oauthCfg = &mcp.OAuthConfig{
 			TokenURL:     server.OAuthTokenURL,
@@ -1275,7 +1280,7 @@ func (h *Handler) CallMCPTool(ctx context.Context, ki *auth.KeyInfo, serverAlias
 	}
 
 	if callErr != nil {
-		return nil, fmt.Errorf("CallMCPTool %s/%s: transport: %w", serverAlias, toolName, callErr)
+		return nil, fmt.Errorf("CallMCPTool %s/%s: transport: %w", serverAlias, toolName, mcp.SanitizeDialError(callErr))
 	}
 
 	return callResult.Body, nil
@@ -1345,7 +1350,7 @@ func (h *Handler) MakeToolFetcher() mcp.ToolFetcher {
 
 		listing, err := transport.ListTools(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("tool fetcher %s: list tools: %w", serverID, err)
+			return nil, fmt.Errorf("tool fetcher %s: list tools: %w", serverID, mcp.SanitizeDialError(err))
 		}
 		return listing, nil
 	}

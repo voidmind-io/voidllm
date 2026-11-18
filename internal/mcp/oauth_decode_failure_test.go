@@ -37,7 +37,7 @@ func TestOAuthTokenManager_FetchToken_DecodeFailure_NeverLeaksUpstreamBytes(t *t
 	}))
 	t.Cleanup(srv.Close)
 
-	mgr := mcp.NewOAuthTokenManager(nil)
+	mgr := mcp.NewOAuthTokenManager(&http.Client{})
 	_, err := mgr.GetToken(context.Background(), "decode-failure-server", oauthTestConfig(srv.URL))
 	if err == nil {
 		t.Fatal("GetToken() error = nil, want a decode error for malformed JSON")
@@ -67,7 +67,7 @@ func TestOAuthTokenManager_DiscoverTokenURL_DecodeFailure_NeverLeaksUpstreamByte
 	}))
 	t.Cleanup(srv.Close)
 
-	mgr := mcp.NewOAuthTokenManager(nil)
+	mgr := mcp.NewOAuthTokenManager(&http.Client{})
 	cfg := mcp.OAuthConfig{ServerURL: srv.URL, ClientID: "test-client", ClientSecret: "test-secret"}
 	_, err := mgr.GetToken(context.Background(), "discovery-decode-failure-server", cfg)
 	if err == nil {

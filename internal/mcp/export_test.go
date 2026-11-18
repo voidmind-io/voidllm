@@ -617,3 +617,6 @@ func (t *HTTPTransport) ScopedStateCount() int {
 	defer res.binding.scopesMu.Unlock()
 	return len(res.binding.scopes)
 }
+
+// CheckDialAddress exposes checkDialAddress (the dial guard) for black-box tests.
+var CheckDialAddress = checkDialAddress

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
-	"net"
+	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/gofiber/fiber/v3"
@@ -15,8 +17,98 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
+	"github.com/voidmind-io/voidllm/internal/mcp"
 	"github.com/voidmind-io/voidllm/pkg/crypto"
 )
+
+// ssoDiscoveryTimeout bounds the OIDC discovery request made by
+// TestSSOConnection.
+const ssoDiscoveryTimeout = 10 * time.Second
+
+// ssoDiscoveryMaxBody caps the size of an OIDC discovery response read by
+// TestSSOConnection.
+const ssoDiscoveryMaxBody = 1 << 20
+
+// ssoDiscoveryIdleConnTimeout bounds how long an idle discovery connection is
+// kept open.
+const ssoDiscoveryIdleConnTimeout = 5 * time.Second
+
+// errSSODiscoveryTooLarge is returned from the discovery response body once
+// it exceeds ssoDiscoveryMaxBody.
+var errSSODiscoveryTooLarge = errors.New("discovery response too large")
+
+// newSSODiscoveryClient returns the HTTP client used for OIDC issuer
+// discovery: internal destinations are refused at dial time, redirects are not
+// followed, and the response body is size-limited.
+func newSSODiscoveryClient() *http.Client {
+	return newSSODiscoveryClientWithGuard(false)
+}
+
+// newSSODiscoveryClientWithGuard builds the discovery client. allowPrivate
+// disables the dial guard and exists only so tests can reach local servers;
+// production code must go through newSSODiscoveryClient.
+func newSSODiscoveryClientWithGuard(allowPrivate bool) *http.Client {
+	transport := mcp.NewSSRFSafeTransport(allowPrivate)
+	transport.DisableKeepAlives = true
+	transport.IdleConnTimeout = ssoDiscoveryIdleConnTimeout
+	return &http.Client{
+		Transport: &limitedBodyTransport{base: transport, limit: ssoDiscoveryMaxBody},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: ssoDiscoveryTimeout,
+	}
+}
+
+// limitedBodyTransport wraps an http.Transport and replaces each response
+// body with a reader that fails, rather than truncates, past limit bytes.
+type limitedBodyTransport struct {
+	base  *http.Transport
+	limit int64
+}
+
+// RoundTrip performs the request on the base transport and limits the body.
+func (t *limitedBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = &limitedBody{rc: resp.Body, remaining: t.limit}
+	return resp, nil
+}
+
+// CloseIdleConnections closes idle connections on the base transport.
+func (t *limitedBodyTransport) CloseIdleConnections() {
+	t.base.CloseIdleConnections()
+}
+
+// limitedBody is a response body that returns errSSODiscoveryTooLarge once more
+// than the allowed number of bytes would be read.
+type limitedBody struct {
+	rc        io.ReadCloser
+	remaining int64
+}
+
+// Read reads from the underlying body, failing once the limit is exceeded.
+func (b *limitedBody) Read(p []byte) (int, error) {
+	if b.remaining < 0 {
+		return 0, errSSODiscoveryTooLarge
+	}
+	if int64(len(p)) > b.remaining+1 {
+		p = p[:b.remaining+1]
+	}
+	n, err := b.rc.Read(p)
+	b.remaining -= int64(n)
+	if b.remaining < 0 {
+		return 0, errSSODiscoveryTooLarge
+	}
+	return n, err
+}
+
+// Close closes the underlying body.
+func (b *limitedBody) Close() error {
+	return b.rc.Close()
+}
 
 // ssoConfigRequest is the JSON body accepted by UpsertOrgSSOConfig.
 // If ClientSecret is empty, the stored encrypted secret is preserved unchanged.
@@ -235,6 +327,8 @@ func (h *Handler) DeleteOrgSSOConfig(c fiber.Ctx) error {
 // TestSSOConnection handles POST /api/v1/orgs/:org_id/sso/test.
 // Callers must be org admins or system admins. It validates that the provided
 // issuer URL is reachable and returns a valid OIDC discovery document.
+// The issuer must use https and must not be, or resolve to, an internal
+// address; redirects are not followed. Failure details are not returned.
 //
 // @Summary      Test SSO connection
 // @Description  Validates an OIDC issuer URL by fetching its discovery document. Returns status "ok" on success or "error" with a message on failure.
@@ -268,18 +362,28 @@ func (h *Handler) TestSSOConnection(c fiber.Ctx) error {
 	if parseErr != nil || (u.Scheme != "https" && u.Scheme != "http") {
 		return apierror.BadRequest(c, "issuer must be a valid https URL")
 	}
-	if u.Scheme == "http" && u.Hostname() != "localhost" && u.Hostname() != "127.0.0.1" {
-		return apierror.BadRequest(c, "issuer must use https (http is only allowed for localhost)")
+	if u.Scheme != "https" {
+		return apierror.BadRequest(c, "issuer must use https")
 	}
 	if isPrivateHost(u.Hostname()) {
 		return apierror.BadRequest(c, "issuer URL must not point to a private address")
 	}
 
-	_, err := oidc.NewProvider(c.Context(), req.Issuer)
-	if err != nil {
+	// Discovery runs through a dial-time guarded transport so that hostnames
+	// resolving to internal addresses are refused, and redirects are not
+	// followed. This is independent of MCPAllowPrivateURLs.
+	client := newSSODiscoveryClient()
+	defer client.CloseIdleConnections()
+	if _, err := oidc.NewProvider(oidc.ClientContext(c.Context(), client), req.Issuer); err != nil {
+		// The error text may embed the upstream response body, so it is
+		// neither logged nor returned.
+		h.Log.WarnContext(c.Context(), "sso issuer discovery failed",
+			slog.String("org_id", orgID),
+			slog.String("category", "discovery"),
+		)
 		return c.JSON(testSSOResponse{
 			Status:  "error",
-			Message: err.Error(),
+			Message: "issuer discovery failed",
 		})
 	}
 
@@ -363,15 +467,15 @@ func marshalStringSlice(s []string) (string, error) {
 	return string(b), nil
 }
 
-// isPrivateHost reports whether host resolves to a loopback, private, or
-// link-local address. When host is not a valid IP literal it is compared
-// against well-known localhost aliases; arbitrary hostnames are allowed
-// (DNS rebinding is a separate concern outside this layer).
+// isPrivateHost reports whether host is an IP literal rejected by
+// mcp.IsBlockedAddr, ignoring any IPv6 zone; a host with a zone separator whose
+// address part does not parse is rejected. The name "localhost" is also
+// rejected. Other hostnames are allowed here and are checked at dial time by
+// the guarded transport used for discovery.
 func isPrivateHost(host string) bool {
-	ip := net.ParseIP(host)
-	if ip == nil {
-		lower := strings.ToLower(host)
-		return lower == "localhost" || lower == "127.0.0.1" || lower == "::1"
+	if strings.EqualFold(host, "localhost") {
+		return true
 	}
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+	_, blocked := blockedHostLiteral(host)
+	return blocked
 }

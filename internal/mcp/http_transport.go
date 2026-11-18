@@ -12,6 +12,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -172,9 +173,147 @@ var errToolsListDuplicateTool = errors.New("mcp: tools/list returned the same to
 // this file, and this guard is no exception.
 var errToolsListPreScanFailed = errors.New("mcp: tools/list pre-decode tool-count scan failed")
 
-// cloudMetadataIP is the well-known link-local address used by cloud provider
+// cloudMetadataAddr is the well-known link-local address used by cloud provider
 // instance metadata services (AWS, GCP, Azure, DigitalOcean, etc.).
-var cloudMetadataIP = net.ParseIP("169.254.169.254")
+var cloudMetadataAddr = netip.MustParseAddr("169.254.169.254")
+
+// Address ranges that are not covered by the netip classification helpers.
+var (
+	// sharedAddressSpace is the carrier-grade NAT range 100.64.0.0/10 (RFC 6598).
+	sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+	// teredoPrefix is the Teredo tunneling range 2001:0000::/32 (RFC 4380).
+	teredoPrefix = netip.MustParsePrefix("2001::/32")
+	// nat64WellKnown is the NAT64 well-known prefix 64:ff9b::/96 (RFC 6052).
+	nat64WellKnown = netip.MustParsePrefix("64:ff9b::/96")
+	// nat64LocalUse is the NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215). It is
+	// blocked entirely: it is never a legitimate public destination, and its
+	// embedded IPv4 position depends on the prefix length chosen by the operator.
+	nat64LocalUse = netip.MustParsePrefix("64:ff9b:1::/48")
+)
+
+// IsBlockedIP reports whether ip is an address that outbound requests to
+// user-supplied URLs must not reach. See IsBlockedAddr for the full list. A
+// nil or malformed ip is reported as blocked.
+func IsBlockedIP(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	return IsBlockedAddr(addr)
+}
+
+// IsBlockedAddr reports whether addr is an address that outbound requests to
+// user-supplied URLs must not reach: loopback, private, link-local unicast
+// and multicast, unspecified (0.0.0.0 and ::), the shared address space
+// 100.64.0.0/10, and the cloud metadata service address. IPv6 forms that
+// embed an IPv4 address (IPv4-mapped, IPv4-compatible, 6to4, NAT64) are
+// judged by the embedded IPv4 address, and Teredo and NAT64 local-use
+// (64:ff9b:1::/48) addresses are blocked
+// entirely. Any IPv6 zone is ignored. An invalid addr is reported as blocked.
+func IsBlockedAddr(addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return true
+	}
+	addr = addr.WithZone("").Unmap()
+	if addr.Is4() {
+		return isBlockedV4(addr)
+	}
+	if addr.IsLoopback() ||
+		addr.IsPrivate() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() ||
+		addr.IsInterfaceLocalMulticast() ||
+		addr.IsUnspecified() ||
+		teredoPrefix.Contains(addr) ||
+		nat64LocalUse.Contains(addr) {
+		return true
+	}
+	b := addr.As16()
+	switch {
+	case b[0] == 0x20 && b[1] == 0x02:
+		// 6to4: the IPv4 address sits in bytes 2..5.
+		return isBlockedV4(netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}))
+	case nat64WellKnown.Contains(addr):
+		return isBlockedV4(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}))
+	case isIPv4Compatible(b):
+		return isBlockedV4(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}))
+	}
+	return false
+}
+
+// isIPv4Compatible reports whether b has the deprecated IPv4-compatible form
+// ::a.b.c.d (the first 96 bits are zero).
+func isIPv4Compatible(b [16]byte) bool {
+	for _, v := range b[:12] {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// isBlockedV4 applies the IPv4 rules of IsBlockedAddr to a plain IPv4 address.
+func isBlockedV4(addr netip.Addr) bool {
+	return addr.IsLoopback() ||
+		addr.IsPrivate() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() ||
+		addr.IsUnspecified() ||
+		sharedAddressSpace.Contains(addr) ||
+		addr == cloudMetadataAddr
+}
+
+// Dial guard errors. Their messages are fixed strings that never include the
+// address, because callers may return them to API users. net/http wraps them
+// in errors whose text does add the remote address, so API-facing code must
+// pass dial errors through SanitizeDialError before returning them.
+var (
+	// ErrDialInternalBlocked is returned by the dial guard for loopback,
+	// private, link-local, and other internal destinations.
+	ErrDialInternalBlocked = errors.New("connection to internal address blocked")
+	// ErrDialMetadataBlocked is returned by the dial guard for the cloud
+	// metadata service address.
+	ErrDialMetadataBlocked = errors.New("connection to cloud metadata service blocked")
+)
+
+// SanitizeDialError returns ErrDialMetadataBlocked or ErrDialInternalBlocked
+// when err wraps one of them, discarding the wrapping text that carries the
+// remote address. Any other error is returned unchanged.
+func SanitizeDialError(err error) error {
+	switch {
+	case errors.Is(err, ErrDialMetadataBlocked):
+		return ErrDialMetadataBlocked
+	case errors.Is(err, ErrDialInternalBlocked):
+		return ErrDialInternalBlocked
+	}
+	return err
+}
+
+// checkDialAddress is the dial-time guard: it returns an error unless address
+// ("host:port" or a bare host) is a parseable IP that IsBlockedAddr accepts.
+// Zones are stripped before the check, and anything that is not an IP literal
+// is refused (fail closed) since the dialer always passes resolved addresses.
+func checkDialAddress(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		// address is already a bare host when no port is present; use as-is.
+		host = address
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return ErrDialInternalBlocked
+	}
+	addr = addr.WithZone("").Unmap()
+	// The metadata address is link-local and would be refused by IsBlockedAddr
+	// anyway; it is checked separately only so it gets its own message.
+	if addr == cloudMetadataAddr {
+		return ErrDialMetadataBlocked
+	}
+	if IsBlockedAddr(addr) {
+		return ErrDialInternalBlocked
+	}
+	return nil
+}
 
 // ssrfDialTimeout, ssrfTLSHandshakeTimeout, and ssrfResponseHeaderTimeout
 // bound only the connection-establishment phase of a request made through
@@ -199,8 +338,11 @@ const (
 )
 
 // NewSSRFSafeTransport returns an http.Transport that, when allowPrivate is
-// false, refuses TCP connections to loopback, private, link-local, and cloud
-// metadata addresses at dial time. This defends against DNS rebinding attacks:
+// false, refuses TCP connections to addresses matched by IsBlockedAddr
+// (loopback, private, link-local, unspecified, shared address space, cloud
+// metadata, and tunneling forms embedding such addresses) at dial time. The
+// guard fails closed: a dial target that is not a parseable IP is refused.
+// This defends against DNS rebinding attacks:
 // even if a hostname resolved to a public IP at registration time, a malicious
 // DNS update cannot redirect traffic to an internal address at call time.
 // When allowPrivate is true the transport is unrestricted (for self-hosted
@@ -214,24 +356,7 @@ func NewSSRFSafeTransport(allowPrivate bool) *http.Transport {
 	dialer := &net.Dialer{Timeout: ssrfDialTimeout}
 	if !allowPrivate {
 		dialer.Control = func(_, address string, _ syscall.RawConn) error {
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				// address is already a bare host when no port is present; use as-is.
-				host = address
-			}
-			ip := net.ParseIP(host)
-			if ip == nil {
-				// Not an IP address — DNS was already resolved by the dialer;
-				// if we reach here with a hostname it is safe to pass through.
-				return nil
-			}
-			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-				return fmt.Errorf("connection to internal address blocked: %s", host)
-			}
-			if ip.Equal(cloudMetadataIP) {
-				return fmt.Errorf("connection to cloud metadata service blocked: %s", host)
-			}
-			return nil
+			return checkDialAddress(address)
 		}
 	}
 	return &http.Transport{

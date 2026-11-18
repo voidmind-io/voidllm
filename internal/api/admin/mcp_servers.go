@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
@@ -198,12 +199,9 @@ func invalidMCPProtocolVersionMsg() string {
 	return "protocol_version must be one of: " + strings.Join(mcpProtocolVersionChoices(), ", ")
 }
 
-// cloudMetadataIP is the well-known link-local address used by cloud provider
-// instance metadata services (AWS, GCP, Azure, DigitalOcean, etc.).
-var cloudMetadataIP = net.ParseIP("169.254.169.254")
-
 // validateMCPServerURL checks that rawURL is an http/https URL that does not
-// resolve to a loopback, private, or link-local network address. It is called
+// point to or resolve to an address rejected by mcp.IsBlockedIP (loopback,
+// private, link-local, unspecified, shared address space, cloud metadata). It is called
 // on both creation and update to prevent SSRF attacks via registered MCP servers.
 // DNS resolution failures are tolerated at registration time — they are checked
 // again at call time by the transport layer.
@@ -220,8 +218,15 @@ func validateMCPServerURL(rawURL string, allowPrivate bool) error {
 	}
 	host := u.Hostname()
 
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" {
+	if strings.EqualFold(host, "localhost") {
 		return fmt.Errorf("URL must not point to localhost")
+	}
+
+	if isLiteral, blocked := blockedHostLiteral(host); isLiteral {
+		if blocked {
+			return fmt.Errorf("URL must not point to a private or internal network address")
+		}
+		return nil
 	}
 
 	ips, err := net.LookupHost(host)
@@ -230,18 +235,26 @@ func validateMCPServerURL(rawURL string, allowPrivate bool) error {
 		return nil
 	}
 	for _, ipStr := range ips {
-		ip := net.ParseIP(ipStr)
-		if ip == nil {
-			continue
-		}
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		if _, blocked := blockedHostLiteral(ipStr); blocked {
 			return fmt.Errorf("URL must not point to a private or internal network address")
-		}
-		if ip.Equal(cloudMetadataIP) {
-			return fmt.Errorf("URL must not point to cloud metadata service")
 		}
 	}
 	return nil
+}
+
+// blockedHostLiteral classifies host, as returned by url.URL.Hostname, as an
+// IP literal. isLiteral is true when host is an IP literal, optionally carrying
+// an IPv6 zone ("%eth0" or "%25eth0"); the zone is ignored and the address part
+// is checked with mcp.IsBlockedAddr. A host containing a zone separator whose
+// address part does not parse is reported as a blocked literal. For any other
+// host both results are false.
+func blockedHostLiteral(host string) (isLiteral, blocked bool) {
+	addrPart, _, zoned := strings.Cut(host, "%")
+	addr, err := netip.ParseAddr(addrPart)
+	if err != nil {
+		return zoned, zoned
+	}
+	return true, mcp.IsBlockedAddr(addr)
 }
 
 // mcpTestTimeout is the per-request deadline used by TestMCPServerConnection.
@@ -1740,7 +1753,7 @@ func (h *Handler) TestMCPServerConnection(c fiber.Ctx) error {
 		}
 		return c.JSON(testMCPServerResponse{
 			Success: false,
-			Error:   probeErr.Error(),
+			Error:   mcp.SanitizeDialError(probeErr).Error(),
 		})
 	}
 	return c.JSON(testMCPServerResponse{
