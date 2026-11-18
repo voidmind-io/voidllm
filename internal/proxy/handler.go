@@ -24,11 +24,13 @@ import (
 
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
+	"github.com/voidmind-io/voidllm/internal/awsauth"
 	"github.com/voidmind-io/voidllm/internal/circuitbreaker"
 	"github.com/voidmind-io/voidllm/internal/cooldown"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	"github.com/voidmind-io/voidllm/internal/pii"
+	"github.com/voidmind-io/voidllm/internal/provider"
 	"github.com/voidmind-io/voidllm/internal/ratelimit"
 	"github.com/voidmind-io/voidllm/internal/shutdown"
 	"github.com/voidmind-io/voidllm/internal/usage"
@@ -57,6 +59,7 @@ type ProxyHandler struct {
 	TokenCounter      *ratelimit.TokenCounter // nil disables token budget enforcement
 	ShutdownState     *shutdown.State         // nil disables in-flight tracking and graceful drain
 	Tracer            trace.Tracer            // nil disables distributed tracing
+	AWSSigner         BedrockSigner           // signs bedrock models with bedrock_auth "iam"; nil makes them fail with 502
 	Log               *slog.Logger
 	MaxRequestBody    int           // maximum allowed request body size in bytes
 	MaxResponseBody   int           // maximum allowed non-streaming response body size in bytes
@@ -112,6 +115,23 @@ type requestEnvelope struct {
 // maps this sentinel to nil before returning so that Fiber treats the response
 // as already sent. No other package ever sees this value.
 var errResponseSent = errors.New("response sent")
+
+// errBedrockCredentials is returned by buildUpstreamRequest when a Bedrock IAM
+// request could not be signed. No response has been written; tryModel treats it
+// as an availability failure of the deployment. It carries no detail on purpose.
+var errBedrockCredentials = errors.New("bedrock iam credentials unavailable")
+
+// bedrockCredentialsMessage is the fixed client-facing message used when
+// every candidate failed with errBedrockCredentials.
+const bedrockCredentialsMessage = "Bedrock IAM credentials unavailable"
+
+// BedrockSigner signs outbound Bedrock requests with AWS SigV4. body must be
+// the exact bytes sent as the request body. roleARN may be empty.
+// Implementations must not include credentials or SDK error text in returned
+// errors.
+type BedrockSigner interface {
+	Sign(ctx context.Context, req *http.Request, body []byte, region, roleARN string) error
+}
 
 // defaultMaxRequestBody, defaultMaxResponseBody, and defaultMaxStreamDuration
 // are the fallback limits used when ProxyHandler fields are zero (e.g. in
@@ -517,6 +537,9 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 	// All candidates (and fallback chain) exhausted without a usable response.
 	if resp == nil {
 		if lastErr != nil {
+			if errors.Is(lastErr, errBedrockCredentials) {
+				return apierror.Send(c, fiber.StatusBadGateway, "upstream_unavailable", bedrockCredentialsMessage)
+			}
 			return apierror.Send(c, fiber.StatusBadGateway, "upstream_unavailable", "upstream provider is unavailable")
 		}
 		// Every candidate was blocked by its circuit breaker.
@@ -605,6 +628,8 @@ func (p *ProxyHandler) tryModel(
 			GCPLocation:     model.GCPLocation,
 			Region:          model.Region,
 			BedrockModelID:  model.BedrockModelID,
+			BedrockAuth:     model.BedrockAuth,
+			BedrockRoleARN:  model.BedrockRoleARN,
 			Weight:          1,
 			destPrivate:     model.destPrivate,
 			PIIFilter:       model.PIIFilter,
@@ -683,6 +708,23 @@ func (p *ProxyHandler) tryModel(
 		var buildErr error
 		req, cancelUpstream, currentAdapter, buildErr = p.buildUpstreamRequest(c, m, effectiveBody, envelope)
 		if buildErr != nil {
+			if errors.Is(buildErr, errBedrockCredentials) {
+				// Credential failure is an availability failure of this
+				// deployment: count it against the breaker and try the next
+				// candidate. buildUpstreamRequest already cancelled the
+				// upstream context and logged the category.
+				if breaker != nil {
+					breaker.RecordFailure()
+					resolved = true
+				}
+				metrics.UpstreamErrorsTotal.WithLabelValues(m.Name, m.Provider).Inc()
+				lastErr = buildErr
+				req = nil
+				cancelUpstream = nil
+				currentAdapter = nil
+				metrics.RoutingRetriesTotal.WithLabelValues(model.Name, model.Strategy).Inc()
+				continue
+			}
 			return nil, nil, nil, Deployment{}, nil, 0, buildErr
 		}
 
@@ -1063,6 +1105,17 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 		return nil, nil, nil, errResponseSent
 	}
 
+	bedrockIAM := model.Provider == provider.Bedrock && model.BedrockAuth == provider.BedrockAuthIAM
+	if bedrockIAM && model.APIKey != "" {
+		p.Log.LogAttrs(c.Context(), slog.LevelError, "invalid bedrock configuration",
+			slog.String("model", model.Name),
+		)
+		if err := apierror.Send(c, fiber.StatusInternalServerError, "internal_error", "invalid bedrock configuration"); err != nil {
+			return nil, nil, nil, err
+		}
+		return nil, nil, nil, errResponseSent
+	}
+
 	// Determine if body needs mutation.
 	needsModelReplace := envelope.Model != model.Name
 	needsStreamOpts := envelope.Stream && (adapter == nil || isAzureAdapter(adapter))
@@ -1172,7 +1225,45 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 		adapter.SetHeaders(req, model)
 	}
 
+	if bedrockIAM {
+		// IAM requests are authenticated by the signature alone; make sure no
+		// bearer token can accompany them.
+		req.Header.Del("Authorization")
+		if signErr := p.signBedrock(upstreamCtx, req, modifiedBody, model); signErr != nil {
+			upstreamCancel()
+			category := "sign_failed"
+			var credErr *awsauth.CredentialsError
+			if errors.As(signErr, &credErr) {
+				category = credErr.Category
+			} else if errors.Is(signErr, errNoBedrockSigner) {
+				category = "signer_not_configured"
+			} else if errors.Is(signErr, provider.ErrBedrockIAMEndpoint) {
+				category = "endpoint_not_allowed"
+			}
+			p.Log.LogAttrs(c.Context(), slog.LevelError, "bedrock iam signing failed",
+				slog.String("model", model.Name),
+				slog.String("category", category),
+			)
+			return nil, nil, nil, errBedrockCredentials
+		}
+	}
+
 	return req, upstreamCancel, adapter, nil
+}
+
+// errNoBedrockSigner is returned by signBedrock when no signer is configured.
+var errNoBedrockSigner = errors.New("no bedrock signer configured")
+
+// signBedrock signs req for model using the configured AWSSigner.
+func (p *ProxyHandler) signBedrock(ctx context.Context, req *http.Request, body []byte, model Model) error {
+	if p.AWSSigner == nil {
+		return errNoBedrockSigner
+	}
+	// Defense in depth: never sign a request that is not going to an AWS host.
+	if err := provider.ValidBedrockIAMEndpoint(req.URL.String(), model.Region); err != nil {
+		return err
+	}
+	return p.AWSSigner.Sign(ctx, req, body, model.Region, model.BedrockRoleARN)
 }
 
 // doneLine is the exact SSE data line OpenAI-compatible upstreams (and our
@@ -2085,6 +2176,8 @@ func applyDeployment(model *Model, dep Deployment) {
 	model.GCPLocation = dep.GCPLocation
 	model.Region = dep.Region
 	model.BedrockModelID = dep.BedrockModelID
+	model.BedrockAuth = dep.BedrockAuth
+	model.BedrockRoleARN = dep.BedrockRoleARN
 }
 
 // isRetryable reports whether an HTTP status code from an upstream response

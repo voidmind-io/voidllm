@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/voidmind-io/voidllm/internal/provider"
 	"gopkg.in/yaml.v3"
 )
 
@@ -113,6 +114,10 @@ type DeploymentConfig struct {
 	Region string `yaml:"region" json:"region,omitempty"`
 	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN. Required when provider is "bedrock".
 	BedrockModelID string `yaml:"bedrock_model_id" json:"bedrock_model_id,omitempty"`
+	// BedrockAuth selects the Bedrock authentication mode: "api_key" (default) or "iam".
+	BedrockAuth string `yaml:"bedrock_auth" json:"bedrock_auth,omitempty"`
+	// BedrockRoleARN is an optional IAM role to assume. Only valid with bedrock_auth "iam".
+	BedrockRoleARN string `yaml:"bedrock_role_arn" json:"bedrock_role_arn,omitempty"`
 	// Weight is the relative routing weight for the "weighted" strategy.
 	// A value of 0 means this deployment is only used as a fallback when all
 	// weighted deployments are unavailable.
@@ -160,6 +165,10 @@ type ModelConfig struct {
 	Region string `yaml:"region" json:"region,omitempty"`
 	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN. Required when provider is "bedrock".
 	BedrockModelID string `yaml:"bedrock_model_id" json:"bedrock_model_id,omitempty"`
+	// BedrockAuth selects the Bedrock authentication mode: "api_key" (default) or "iam".
+	BedrockAuth string `yaml:"bedrock_auth" json:"bedrock_auth,omitempty"`
+	// BedrockRoleARN is an optional IAM role to assume. Only valid with bedrock_auth "iam".
+	BedrockRoleARN string `yaml:"bedrock_role_arn" json:"bedrock_role_arn,omitempty"`
 	// Timeout is the per-model upstream timeout as a duration string (e.g. "30s",
 	// "2m"). When non-empty it overrides the global stream/response timeout for
 	// this model. Zero or empty means use the global default.
@@ -877,6 +886,20 @@ func loadDefaults() (*Config, error) {
 
 // setDefaults populates zero-value fields with their documented defaults.
 func (c *Config) setDefaults() {
+	// Bedrock auth mode
+	for i := range c.Models {
+		m := &c.Models[i]
+		if m.Provider == provider.Bedrock && m.BedrockAuth == "" {
+			m.BedrockAuth = provider.BedrockAuthAPIKey
+		}
+		for j := range m.Deployments {
+			d := &m.Deployments[j]
+			if d.Provider == provider.Bedrock && d.BedrockAuth == "" {
+				d.BedrockAuth = provider.BedrockAuthAPIKey
+			}
+		}
+	}
+
 	// Server proxy
 	if c.Server.Proxy.Port == 0 {
 		c.Server.Proxy.Port = 8080

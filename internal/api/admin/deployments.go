@@ -30,6 +30,10 @@ type createDeploymentRequest struct {
 	Region string `json:"region"`
 	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN. Required when provider is "bedrock".
 	BedrockModelID string `json:"bedrock_model_id"`
+	// BedrockAuth selects the Bedrock auth mode: "api_key" (default) or "iam".
+	BedrockAuth string `json:"bedrock_auth"`
+	// BedrockRoleARN is an optional IAM role to assume. Only valid with bedrock_auth "iam".
+	BedrockRoleARN string `json:"bedrock_role_arn"`
 	Weight         int    `json:"weight"`
 	Priority       int    `json:"priority"`
 	// PIIFilter explicitly enables or disables PII anonymization for requests
@@ -54,6 +58,11 @@ type updateDeploymentRequest struct {
 	Region *string `json:"region"`
 	// BedrockModelID, when non-nil, replaces the stored Bedrock model ID.
 	BedrockModelID *string `json:"bedrock_model_id"`
+	// BedrockAuth, when non-nil, replaces the Bedrock auth mode.
+	BedrockAuth *string `json:"bedrock_auth"`
+	// BedrockRoleARN, when non-nil, replaces the Bedrock role ARN. An empty
+	// string unsets it.
+	BedrockRoleARN *string `json:"bedrock_role_arn"`
 	Weight         *int    `json:"weight"`
 	Priority       *int    `json:"priority"`
 	// PIIFilter, when non-nil, replaces the PII anonymization override for
@@ -80,6 +89,10 @@ type deploymentResponse struct {
 	Region string `json:"region,omitempty"`
 	// BedrockModelID is the Bedrock model ID. Non-empty only for provider "bedrock".
 	BedrockModelID string `json:"bedrock_model_id,omitempty"`
+	// BedrockAuth is the Bedrock auth mode. Non-empty only for provider "bedrock".
+	BedrockAuth string `json:"bedrock_auth,omitempty"`
+	// BedrockRoleARN is the optional IAM role. Non-empty only for provider "bedrock" with iam auth.
+	BedrockRoleARN string `json:"bedrock_role_arn,omitempty"`
 	Weight         int    `json:"weight"`
 	Priority       int    `json:"priority"`
 	IsActive       bool   `json:"is_active"`
@@ -112,6 +125,8 @@ func deploymentToResponse(d *db.Deployment) deploymentResponse {
 		GCPLocation:     d.GCPLocation,
 		Region:          d.Region,
 		BedrockModelID:  d.BedrockModelID,
+		BedrockAuth:     bedrockAuthForProvider(d.Provider, d.BedrockAuth),
+		BedrockRoleARN:  d.BedrockRoleARN,
 		Weight:          d.Weight,
 		Priority:        d.Priority,
 		IsActive:        d.IsActive,
@@ -197,6 +212,17 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 		if msg := validateBedrockFields(req.Region, req.BedrockModelID, parent.ModelType); msg != "" {
 			return apierror.BadRequest(c, msg)
 		}
+		if msg := provider.ValidateBedrockAuth(req.BedrockAuth, req.BedrockRoleARN, req.APIKey != ""); msg != "" {
+			return apierror.BadRequest(c, msg)
+		}
+		if !provider.ValidBedrockBaseURLShape(req.BaseURL) {
+			return apierror.BadRequest(c, "base_url must not contain a query string or fragment")
+		}
+		if msg := bedrockIAMEndpointMessage(req.BedrockAuth, req.BaseURL, req.Region); msg != "" {
+			return apierror.BadRequest(c, msg)
+		}
+	} else if req.BedrockAuth != "" || req.BedrockRoleARN != "" {
+		return apierror.BadRequest(c, "bedrock_auth and bedrock_role_arn are only valid for the bedrock provider")
 	}
 
 	// Insert without API key to obtain the stable deployment ID used as AAD.
@@ -212,6 +238,8 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 		GCPLocation:     req.GCPLocation,
 		Region:          req.Region,
 		BedrockModelID:  req.BedrockModelID,
+		BedrockAuth:     req.BedrockAuth,
+		BedrockRoleARN:  req.BedrockRoleARN,
 		Weight:          req.Weight,
 		Priority:        req.Priority,
 		PIIFilter:       req.PIIFilter,
@@ -386,6 +414,25 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 		if msg := validateBedrockFields(mergedRegion, mergedModelID, parent.ModelType); msg != "" {
 			return apierror.BadRequest(c, msg)
 		}
+		if msg := validateBedrockAuthUpdate(
+			dep.BedrockAuth, dep.BedrockRoleARN, dep.APIKeyEncrypted != nil,
+			req.Provider != nil && dep.Provider != provider.Bedrock,
+			req.BedrockAuth, req.BedrockRoleARN, req.APIKey,
+		); msg != "" {
+			return apierror.BadRequest(c, msg)
+		}
+		if !provider.ValidBedrockBaseURLShape(mergedBaseURL) {
+			return apierror.BadRequest(c, "base_url must not contain a query string or fragment")
+		}
+		mergedAuth := dep.BedrockAuth
+		if req.BedrockAuth != nil {
+			mergedAuth = *req.BedrockAuth
+		}
+		if msg := bedrockIAMEndpointMessage(mergedAuth, mergedBaseURL, mergedRegion); msg != "" {
+			return apierror.BadRequest(c, msg)
+		}
+	} else if (req.BedrockAuth != nil && *req.BedrockAuth != "") || (req.BedrockRoleARN != nil && *req.BedrockRoleARN != "") {
+		return apierror.BadRequest(c, "bedrock_auth and bedrock_role_arn are only valid for the bedrock provider")
 	}
 
 	// Resolve the tri-state pii_filter semantics:
@@ -412,13 +459,29 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 		GCPLocation:     req.GCPLocation,
 		Region:          req.Region,
 		BedrockModelID:  req.BedrockModelID,
+		BedrockAuth:     req.BedrockAuth,
+		BedrockRoleARN:  req.BedrockRoleARN,
 		Weight:          req.Weight,
 		Priority:        req.Priority,
 		PIIFilter:       piiFilter,
 		ClearPIIFilter:  clearPIIFilter,
 	}
 
-	if req.APIKey != nil {
+	if params.BedrockAuth != nil && *params.BedrockAuth == "" {
+		apiKeyMode := provider.BedrockAuthAPIKey
+		params.BedrockAuth = &apiKeyMode
+	}
+	if req.Provider != nil && *req.Provider != provider.Bedrock && dep.Provider == provider.Bedrock {
+		// Leaving bedrock: reset the bedrock-only auth settings.
+		apiKeyMode, noRole := provider.BedrockAuthAPIKey, ""
+		params.BedrockAuth = &apiKeyMode
+		params.BedrockRoleARN = &noRole
+	}
+
+	if req.APIKey != nil && *req.APIKey == "" {
+		// An explicitly empty api_key clears the stored key.
+		params.ClearAPIKey = true
+	} else if req.APIKey != nil {
 		enc, encErr := crypto.EncryptString(*req.APIKey, h.EncryptionKey, deploymentAAD(deploymentID))
 		if encErr != nil {
 			h.Log.ErrorContext(ctx, "update deployment: encrypt api key", slog.String("error", encErr.Error()))

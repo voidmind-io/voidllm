@@ -167,7 +167,9 @@ func (c *Config) validate() error {
 			}
 
 			if m.Provider == provider.Bedrock {
-				errs = append(errs, validateBedrock(prefix, prefix, m.BaseURL, m.Region, m.BedrockModelID, m.Type)...)
+				errs = append(errs, validateBedrock(prefix, prefix, m.BaseURL, m.Region, m.BedrockModelID, m.BedrockAuth, m.BedrockRoleARN, m.APIKey != "", m.Type)...)
+			} else if m.BedrockAuth != "" || m.BedrockRoleARN != "" {
+				errs = append(errs, fmt.Errorf("%s.bedrock_auth/bedrock_role_arn: only valid for bedrock provider", prefix))
 			} else if m.BaseURL == "" {
 				errs = append(errs, fmt.Errorf("%s.base_url: must not be empty", prefix))
 			} else if !strings.HasPrefix(m.BaseURL, "http://") && !strings.HasPrefix(m.BaseURL, "https://") {
@@ -217,7 +219,9 @@ func (c *Config) validate() error {
 				}
 
 				if d.Provider == provider.Bedrock {
-					errs = append(errs, validateBedrock(dprefix, prefix, d.BaseURL, d.Region, d.BedrockModelID, m.Type)...)
+					errs = append(errs, validateBedrock(dprefix, prefix, d.BaseURL, d.Region, d.BedrockModelID, d.BedrockAuth, d.BedrockRoleARN, d.APIKey != "", m.Type)...)
+				} else if d.BedrockAuth != "" || d.BedrockRoleARN != "" {
+					errs = append(errs, fmt.Errorf("%s.bedrock_auth/bedrock_role_arn: only valid for bedrock provider", dprefix))
 				} else if d.BaseURL == "" {
 					errs = append(errs, fmt.Errorf("%s.base_url: must not be empty", dprefix))
 				} else if !strings.HasPrefix(d.BaseURL, "http://") && !strings.HasPrefix(d.BaseURL, "https://") {
@@ -565,7 +569,7 @@ func (c *Config) validate() error {
 // validateBedrock validates the fields of a bedrock model or deployment.
 // prefix addresses the entry itself, modelPrefix addresses the owning model
 // (the type field lives on the model).
-func validateBedrock(prefix, modelPrefix, baseURL, region, modelID, modelType string) []error {
+func validateBedrock(prefix, modelPrefix, baseURL, region, modelID, auth, roleARN string, hasAPIKey bool, modelType string) []error {
 	var errs []error
 	if region == "" {
 		errs = append(errs, fmt.Errorf("%s.region: must not be empty for bedrock provider", prefix))
@@ -577,8 +581,24 @@ func validateBedrock(prefix, modelPrefix, baseURL, region, modelID, modelType st
 	} else if !provider.ValidBedrockModelID(modelID) {
 		errs = append(errs, fmt.Errorf("%s.bedrock_model_id: invalid Bedrock model ID", prefix))
 	}
+	// In api_key mode the key may legitimately be stored only in the database
+	// (Admin API), so YAML does not require it; treat it as present.
+	if provider.NormalizeBedrockAuth(auth) == provider.BedrockAuthAPIKey {
+		hasAPIKey = true
+	}
+	if msg := provider.ValidateBedrockAuth(auth, roleARN, hasAPIKey); msg != "" {
+		errs = append(errs, fmt.Errorf("%s: %s", prefix, msg))
+	}
+	if auth == provider.BedrockAuthIAM && provider.ValidBedrockRegion(region) {
+		if endpointErr := provider.ValidBedrockIAMEndpoint(provider.EffectiveBaseURL(provider.Bedrock, baseURL, region), region); endpointErr != nil {
+			errs = append(errs, fmt.Errorf("%s.base_url: %w", prefix, endpointErr))
+		}
+	}
 	if baseURL != "" && !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
 		errs = append(errs, fmt.Errorf("%s.base_url: must start with http:// or https://", prefix))
+	}
+	if !provider.ValidBedrockBaseURLShape(baseURL) {
+		errs = append(errs, fmt.Errorf("%s.base_url: must not contain a query string or fragment", prefix))
 	}
 	if modelType != "" && modelType != "chat" {
 		errs = append(errs, fmt.Errorf("%s.type: bedrock supports only chat models", modelPrefix))

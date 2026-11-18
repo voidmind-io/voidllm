@@ -72,6 +72,44 @@ type ProbeTarget struct {
 	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
 	// Required when Provider is "bedrock".
 	BedrockModelID string
+	// BedrockAuth is the Bedrock auth mode: "api_key" (or empty) or "iam".
+	// In "iam" mode BuildProbeRequest sets no Authorization header; the caller
+	// signs the request with SignProbeRequest before sending it.
+	BedrockAuth string
+	// BedrockRoleARN is the optional IAM role assumed in "iam" mode.
+	BedrockRoleARN string
+}
+
+// ErrBedrockCredentials is returned by SignProbeRequest when a Bedrock IAM
+// probe request could not be signed. It carries no credential or SDK detail.
+var ErrBedrockCredentials = errors.New("bedrock iam credentials unavailable")
+
+// IsBedrockIAM reports whether target is a Bedrock target using IAM auth.
+func (t ProbeTarget) IsBedrockIAM() bool {
+	return t.Provider == provider.Bedrock && t.BedrockAuth == provider.BedrockAuthIAM
+}
+
+// SignProbeRequest signs req with signer when target is a Bedrock IAM target
+// and is a no-op otherwise. req must have been built by BuildProbeRequest for
+// the same target (its body is the fixed Bedrock probe payload). A nil signer
+// or a signing failure yields ErrBedrockCredentials; the underlying cause is
+// deliberately dropped because it may contain upstream response text.
+func SignProbeRequest(ctx context.Context, signer proxy.BedrockSigner, req *http.Request, target ProbeTarget) error {
+	if !target.IsBedrockIAM() {
+		return nil
+	}
+	if signer == nil {
+		return ErrBedrockCredentials
+	}
+	req.Header.Del("Authorization")
+	// Defense in depth: never sign a request that is not going to an AWS host.
+	if provider.ValidBedrockIAMEndpoint(req.URL.String(), target.Region) != nil {
+		return ErrBedrockCredentials
+	}
+	if err := signer.Sign(ctx, req, []byte(bedrockProbeBody), target.Region, target.BedrockRoleARN); err != nil {
+		return ErrBedrockCredentials
+	}
+	return nil
 }
 
 // intentApplicable reports whether a probe of the given intent has a
@@ -132,6 +170,8 @@ func probeModel(target ProbeTarget) proxy.Model {
 		GCPLocation:     target.GCPLocation,
 		Region:          target.Region,
 		BedrockModelID:  target.BedrockModelID,
+		BedrockAuth:     target.BedrockAuth,
+		BedrockRoleARN:  target.BedrockRoleARN,
 	}
 }
 
@@ -270,7 +310,9 @@ const bedrockProbeBody = `{"messages":[{"role":"user","content":[{"text":"ping"}
 	`"inferenceConfig":{"maxTokens":1}}`
 
 // buildBedrockChatProbe builds the Converse request used to probe a Bedrock
-// model: POST {base}/model/{escaped id}/converse with Bearer authentication.
+// model: POST {base}/model/{escaped id}/converse. Bearer authentication is set
+// in api_key mode; in iam mode no Authorization header is set (see
+// SignProbeRequest).
 func buildBedrockChatProbe(ctx context.Context, target ProbeTarget) (*http.Request, error) {
 	rawURL := strings.TrimRight(target.BaseURL, "/") + "/model/" +
 		provider.EscapeBedrockModelID(target.BedrockModelID) + "/converse"
@@ -280,7 +322,7 @@ func buildBedrockChatProbe(ctx context.Context, target ProbeTarget) (*http.Reque
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if target.APIKey != "" {
+	if target.APIKey != "" && !target.IsBedrockIAM() {
 		req.Header.Set("Authorization", "Bearer "+target.APIKey)
 	}
 	return req, nil

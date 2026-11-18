@@ -37,6 +37,10 @@ type Deployment struct {
 	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
 	// Required when Provider is "bedrock".
 	BedrockModelID string
+	// BedrockAuth is the Bedrock auth mode: "api_key" (or empty) or "iam".
+	BedrockAuth string
+	// BedrockRoleARN is the optional IAM role assumed in "iam" mode.
+	BedrockRoleARN string
 	Weight         int
 	Priority       int
 	// destPrivate is computed once at registry/config load time from the
@@ -90,6 +94,10 @@ type Model struct {
 	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
 	// Required when Provider is "bedrock".
 	BedrockModelID string
+	// BedrockAuth is the Bedrock auth mode: "api_key" (or empty) or "iam".
+	BedrockAuth string
+	// BedrockRoleARN is the optional IAM role assumed in "iam" mode.
+	BedrockRoleARN string
 	// Timeout is the per-model upstream timeout. When non-zero it overrides the
 	// global MaxStreamDuration and the context deadline used for non-streaming
 	// requests. Zero means use the global default.
@@ -243,6 +251,8 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 				GCPLocation:     d.GCPLocation,
 				Region:          d.Region,
 				BedrockModelID:  d.BedrockModelID,
+				BedrockAuth:     d.BedrockAuth,
+				BedrockRoleARN:  d.BedrockRoleARN,
 				Weight:          d.Weight,
 				Priority:        d.Priority,
 				destPrivate:     classifyDestPrivate(depBaseURL),
@@ -266,6 +276,8 @@ func NewRegistry(models []config.ModelConfig) (*Registry, error) {
 			GCPLocation:       mc.GCPLocation,
 			Region:            mc.Region,
 			BedrockModelID:    mc.BedrockModelID,
+			BedrockAuth:       mc.BedrockAuth,
+			BedrockRoleARN:    mc.BedrockRoleARN,
 			Timeout:           timeout,
 			Strategy:          mc.Strategy,
 			MaxRetries:        mc.MaxRetries,
@@ -412,6 +424,8 @@ func (r *Registry) AddModel(m Model) {
 		GCPLocation:       m.GCPLocation,
 		Region:            m.Region,
 		BedrockModelID:    m.BedrockModelID,
+		BedrockAuth:       m.BedrockAuth,
+		BedrockRoleARN:    m.BedrockRoleARN,
 		Timeout:           m.Timeout,
 		Strategy:          m.Strategy,
 		MaxRetries:        m.MaxRetries,

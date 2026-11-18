@@ -27,6 +27,7 @@ func TestValidate_Bedrock(t *testing.T) {
   - name: claude
     provider: bedrock
     region: eu-central-1
+    api_key: test-key
     bedrock_model_id: ` + goodID + `
 `,
 		},
@@ -48,6 +49,7 @@ func TestValidate_Bedrock(t *testing.T) {
     provider: bedrock
     base_url: https://vpce-123.bedrock-runtime.eu-central-1.vpce.amazonaws.com
     region: eu-central-1
+    api_key: test-key
     bedrock_model_id: ` + goodID + `
 `,
 		},
@@ -58,6 +60,7 @@ func TestValidate_Bedrock(t *testing.T) {
     provider: bedrock
     base_url: http://localhost:9999
     region: eu-central-1
+    api_key: test-key
     bedrock_model_id: ` + goodID + `
 `,
 		},
@@ -67,6 +70,7 @@ func TestValidate_Bedrock(t *testing.T) {
   - name: claude
     provider: bedrock
     region: us-gov-west-1
+    api_key: test-key
     bedrock_model_id: arn:aws:bedrock:us-gov-west-1:123456789012:inference-profile/us-gov.anthropic.claude-v1:0
 `,
 		},
@@ -95,6 +99,7 @@ func TestValidate_Bedrock(t *testing.T) {
   - name: claude
     provider: bedrock
     region: eu-central-1.evil.com
+    api_key: test-key
     bedrock_model_id: ` + goodID + `
 `,
 			wantErr: []string{"models[0].region: invalid AWS region"},
@@ -105,6 +110,7 @@ func TestValidate_Bedrock(t *testing.T) {
   - name: claude
     provider: bedrock
     region: EU-CENTRAL-1
+    api_key: test-key
     bedrock_model_id: ` + goodID + `
 `,
 			wantErr: []string{"models[0].region: invalid AWS region"},
@@ -115,6 +121,7 @@ func TestValidate_Bedrock(t *testing.T) {
   - name: claude
     provider: bedrock
     region: eu-central-1
+    api_key: test-key
 `,
 			wantErr: []string{"models[0].bedrock_model_id: must not be empty for bedrock provider"},
 		},
@@ -124,6 +131,7 @@ func TestValidate_Bedrock(t *testing.T) {
   - name: claude
     provider: bedrock
     region: eu-central-1
+    api_key: test-key
     bedrock_model_id: "bad id"
 `,
 			wantErr: []string{"models[0].bedrock_model_id: invalid Bedrock model ID"},
@@ -134,6 +142,7 @@ func TestValidate_Bedrock(t *testing.T) {
   - name: claude
     provider: bedrock
     region: eu-central-1
+    api_key: test-key
     bedrock_model_id: "../x?y=1"
 `,
 			wantErr: []string{"models[0].bedrock_model_id: invalid Bedrock model ID"},
@@ -145,6 +154,7 @@ func TestValidate_Bedrock(t *testing.T) {
     provider: bedrock
     base_url: ftp://x
     region: eu-central-1
+    api_key: test-key
     bedrock_model_id: ` + goodID + `
 `,
 			wantErr: []string{"models[0].base_url: must start with http:// or https://"},
@@ -156,6 +166,7 @@ func TestValidate_Bedrock(t *testing.T) {
     provider: bedrock
     type: embedding
     region: eu-central-1
+    api_key: test-key
     bedrock_model_id: ` + goodID + `
 `,
 			wantErr: []string{"models[0].type: bedrock supports only chat models"},
@@ -185,6 +196,7 @@ func TestValidate_Bedrock(t *testing.T) {
     provider: openai
     base_url: https://api.openai.com
     region: not a region!
+    api_key: test-key
     bedrock_model_id: "bad id"
 `,
 		},
@@ -202,6 +214,7 @@ func TestValidate_Bedrock(t *testing.T) {
       - name: bedrock
         provider: bedrock
         region: eu-central-1
+        api_key: test-key
         bedrock_model_id: ` + goodID + `
         priority: 2
 `,
@@ -229,6 +242,7 @@ func TestValidate_Bedrock(t *testing.T) {
       - name: bedrock
         provider: bedrock
         region: eu-central-1
+        api_key: test-key
         bedrock_model_id: "a b"
 `,
 			wantErr: []string{"models[0].deployments[0].bedrock_model_id: invalid Bedrock model ID"},
@@ -243,6 +257,7 @@ func TestValidate_Bedrock(t *testing.T) {
       - name: bedrock
         provider: bedrock
         region: "eu-central-1/../x"
+        api_key: test-key
         bedrock_model_id: ` + goodID + `
 `,
 			wantErr: []string{"models[0].deployments[0].region: invalid AWS region"},
@@ -258,6 +273,7 @@ func TestValidate_Bedrock(t *testing.T) {
         provider: bedrock
         base_url: gopher://x
         region: eu-central-1
+        api_key: test-key
         bedrock_model_id: ` + goodID + `
 `,
 			wantErr: []string{"models[0].deployments[0].base_url: must start with http:// or https://"},
@@ -273,6 +289,7 @@ func TestValidate_Bedrock(t *testing.T) {
       - name: bedrock
         provider: bedrock
         region: eu-central-1
+        api_key: test-key
         bedrock_model_id: ` + goodID + `
 `,
 			wantErr: []string{"models[0].type: bedrock supports only chat models"},
@@ -319,6 +336,7 @@ func TestLoad_BedrockFieldsParsed(t *testing.T) {
   - name: claude
     provider: bedrock
     region: eu-central-1
+    api_key: test-key
     bedrock_model_id: eu.anthropic.claude-sonnet-4-5-20250929-v1:0
   - name: multi
     provider: bedrock
@@ -327,6 +345,7 @@ func TestLoad_BedrockFieldsParsed(t *testing.T) {
       - name: a
         provider: bedrock
         region: us-east-1
+        api_key: test-key
         bedrock_model_id: us.model-v1:0
         priority: 1
 `))
@@ -352,6 +371,7 @@ func TestLoad_BedrockEnvInterpolation(t *testing.T) {
   - name: claude
     provider: bedrock
     region: ${BEDROCK_TEST_REGION}
+    api_key: test-key
     bedrock_model_id: ${BEDROCK_TEST_MODEL}
 `))
 	cfg, _, err := config.Load(path)
@@ -369,6 +389,7 @@ func TestValidate_ProviderBedrockAccepted(t *testing.T) {
   - name: x
     provider: bedrock
     region: eu-west-1
+    api_key: test-key
     bedrock_model_id: m-v1
 `))
 	if _, _, err := config.Load(path); err != nil {

@@ -28,6 +28,7 @@ import (
 	apihealth "github.com/voidmind-io/voidllm/internal/api/health"
 	"github.com/voidmind-io/voidllm/internal/audit"
 	"github.com/voidmind-io/voidllm/internal/auth"
+	"github.com/voidmind-io/voidllm/internal/awsauth"
 	"github.com/voidmind-io/voidllm/internal/cache"
 	"github.com/voidmind-io/voidllm/internal/circuitbreaker"
 	"github.com/voidmind-io/voidllm/internal/config"
@@ -40,6 +41,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	voidotel "github.com/voidmind-io/voidllm/internal/otel"
 	"github.com/voidmind-io/voidllm/internal/pii"
+	"github.com/voidmind-io/voidllm/internal/provider"
 	"github.com/voidmind-io/voidllm/internal/proxy"
 	"github.com/voidmind-io/voidllm/internal/ratelimit"
 	voidredis "github.com/voidmind-io/voidllm/internal/redis"
@@ -322,7 +324,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 
 		for _, m := range dbModels {
 			var apiKey string
-			if m.APIKeyEncrypted != nil {
+			if m.APIKeyEncrypted != nil && !(m.Provider == provider.Bedrock && m.BedrockAuth == provider.BedrockAuthIAM) {
 				var decErr error
 				apiKey, decErr = crypto.DecryptString(*m.APIKeyEncrypted, encKey, []byte("model:"+m.ID))
 				if decErr != nil {
@@ -364,7 +366,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			deployments := make([]proxy.Deployment, 0, len(dbDeps))
 			for _, dep := range dbDeps {
 				var depAPIKey string
-				if dep.APIKeyEncrypted != nil {
+				if dep.APIKeyEncrypted != nil && !(dep.Provider == provider.Bedrock && dep.BedrockAuth == provider.BedrockAuthIAM) {
 					var decErr error
 					depAPIKey, decErr = crypto.DecryptString(*dep.APIKeyEncrypted, encKey, deploymentAAD(dep.ID))
 					if decErr != nil {
@@ -386,6 +388,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 					GCPLocation:     dep.GCPLocation,
 					Region:          dep.Region,
 					BedrockModelID:  dep.BedrockModelID,
+					BedrockAuth:     dep.BedrockAuth,
+					BedrockRoleARN:  dep.BedrockRoleARN,
 					Weight:          dep.Weight,
 					Priority:        dep.Priority,
 					PIIFilter:       dep.PIIFilter,
@@ -417,6 +421,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 				GCPLocation:       m.GCPLocation,
 				Region:            m.Region,
 				BedrockModelID:    m.BedrockModelID,
+				BedrockAuth:       m.BedrockAuth,
+				BedrockRoleARN:    m.BedrockRoleARN,
 				Timeout:           timeout,
 				Strategy:          m.Strategy,
 				MaxRetries:        m.MaxRetries,
@@ -683,11 +689,16 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		}
 	}
 
+	// One SigV4 signer shared by the proxy, health checker and admin API. It
+	// makes no network calls until the first bedrock IAM request.
+	awsSigner := awsauth.NewSigner()
+
 	// Build the health checker when at least one probe level is enabled.
 	var healthChecker *health.Checker
 	hcCfg := cfg.Settings.HealthCheck
 	if hcCfg.Health.Enabled || hcCfg.Models.Enabled || hcCfg.Functional.Enabled {
 		healthChecker = health.NewChecker(registry, hcCfg, log)
+		healthChecker.SetSigner(awsSigner)
 	}
 	if hcCfg.Functional.Enabled {
 		log.LogAttrs(ctx, slog.LevelWarn,
@@ -702,6 +713,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	modelRouter := router.NewRouter(healthChecker, cbRegistry, cdRegistry)
 
 	proxyHandler := proxy.NewProxyHandler(registry, log)
+	proxyHandler.AWSSigner = awsSigner
 	proxyHandler.AccessCache = accessCache
 	proxyHandler.AliasCache = aliasCache
 	proxyHandler.CircuitBreakers = cbRegistry
@@ -729,6 +741,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	loginThrottle := auth.NewLoginThrottle()
 
 	adminHandler := &admin.Handler{
+		AWSSigner:          awsSigner,
 		DB:                 database,
 		HMACSecret:         hmacSecret,
 		EncryptionKey:      encKey,
