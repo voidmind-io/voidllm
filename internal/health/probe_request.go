@@ -102,6 +102,10 @@ func SignProbeRequest(ctx context.Context, signer proxy.BedrockSigner, req *http
 		return ErrBedrockCredentials
 	}
 	req.Header.Del("Authorization")
+	// Defense in depth: never sign a request that is not going to an AWS host.
+	if provider.ValidBedrockIAMEndpoint(req.URL.String()) != nil {
+		return ErrBedrockCredentials
+	}
 	if err := signer.Sign(ctx, req, []byte(bedrockProbeBody), target.Region, target.BedrockRoleARN); err != nil {
 		return ErrBedrockCredentials
 	}

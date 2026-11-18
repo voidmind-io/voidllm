@@ -94,7 +94,7 @@ models:
 | `region` | yes | AWS region, e.g. `eu-central-1`, `us-gov-west-1`. Must look like a region name (`eu-central-1`); anything else, such as a value containing a dot or a slash, is rejected. |
 | `bedrock_model_id` | yes | Base model ID, cross-region inference profile ID, or ARN. Up to 2048 characters from letters, digits, `.`, `_`, `:`, `/`, `-`. |
 | `bedrock_auth` | no | `api_key` (default) or `iam`. See [IAM authentication](#iam-authentication). |
-| `api_key` | yes with `bedrock_auth: api_key` | Bedrock API key, sent as `Authorization: Bearer`. Must be empty with `bedrock_auth: iam`. |
+| `api_key` | api_key mode | Bedrock API key, sent as `Authorization: Bearer`. The Admin API requires it in `api_key` mode when creating a model or deployment. In YAML it may be omitted if the key is already stored in the database. Must be empty with `bedrock_auth: iam`. |
 | `bedrock_role_arn` | no | IAM role to assume through STS. Only valid with `bedrock_auth: iam`. Must match `arn:aws:iam::<12 digit account>:role/<name>`. |
 | `base_url` | no | Endpoint override. Empty means the regional endpoint (see below). Must start with `http://` or `https://`. |
 
@@ -122,7 +122,7 @@ Many newer models can only be called through an inference profile, not by their 
 
 Two modes are available, selected with `bedrock_auth` (per model or per deployment):
 
-- `api_key` (default): a Bedrock API key sent as a bearer token. An `api_key` is required in this mode.
+- `api_key` (default): a Bedrock API key sent as a bearer token. Creating a model or deployment through the Admin API requires an `api_key` in this mode; YAML may omit it when the key is stored in the database.
 - `iam`: requests are signed with AWS SigV4 using credentials from the AWS credential chain. See [IAM authentication](#iam-authentication).
 
 #### API key mode
@@ -180,6 +180,8 @@ models:
 ```
 
 The same two fields work on a deployment inside a multi-deployment model.
+
+Signed requests may only go to AWS. With `bedrock_auth: iam` the effective endpoint (the regional default or your `base_url`) must use `https` and a host name ending in `.amazonaws.com`, `.amazonaws.com.cn` or `.api.aws`, without credentials in the URL and not an IP address. VPC endpoints such as `vpce-....bedrock-runtime.<region>.vpce.amazonaws.com` are fine. Anything else is rejected at config load and in the Admin API, and VoidLLM refuses to sign such a request at runtime.
 
 Credentials are resolved lazily on the first request through the default AWS credential chain (aws-sdk-go-v2), in this order:
 
@@ -296,9 +298,9 @@ Bedrock error responses are mapped to the standard VoidLLM error shape. The HTTP
 | Bedrock exception | Error code | Message |
 |---|---|---|
 | `ValidationException` | `invalid_request` | Bedrock rejected the request as invalid |
-| `UnrecognizedClientException`, `InvalidSignatureException`, other 401 | `invalid_api_key` | upstream rejected the Bedrock API key |
-| `ExpiredTokenException` | `expired_api_key` | Bedrock API key has expired |
-| `AccessDeniedException` with an authentication failure (an invalid or unknown API key returns 403) | `invalid_api_key` | upstream rejected the Bedrock API key |
+| `UnrecognizedClientException`, `InvalidSignatureException`, other 401 | `invalid_api_key` | Bedrock rejected the credentials |
+| `ExpiredTokenException` | `expired_api_key` | Bedrock credentials have expired |
+| `AccessDeniedException` with an authentication failure (an invalid or unknown API key returns 403) | `invalid_api_key` | Bedrock rejected the credentials |
 | `AccessDeniedException`, other 403 | `permission_denied` | Bedrock API key is not authorized for this model |
 | `ValidationException` reporting that the account has no Bedrock model access | `permission_denied` | Bedrock model access is not enabled for this AWS account |
 | `ResourceNotFoundException` | `model_not_found` | Bedrock model or inference profile not found |

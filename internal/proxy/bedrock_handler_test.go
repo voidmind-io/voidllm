@@ -521,9 +521,9 @@ func TestBedrockHandler_ErrorMapping(t *testing.T) {
 		{"validation on stream request", 400, "ValidationException", "bad input", true, "invalid_request", "Bedrock rejected the request as invalid"},
 		{"access denied static", 403, "AccessDeniedException", "User: arn:aws:iam::" + acct + ":user/alice is not authorized", false, "permission_denied", "Bedrock API key is not authorized for this model"},
 		{"access denied on stream request", 403, "AccessDeniedException", "arn:aws:iam::" + acct + ":role/x", true, "permission_denied", "Bedrock API key is not authorized for this model"},
-		{"unrecognized client", 403, "UnrecognizedClientException", "token invalid " + acct, false, "invalid_api_key", "upstream rejected the Bedrock API key"},
-		{"401 without type", 401, "", "nope " + acct, false, "invalid_api_key", "upstream rejected the Bedrock API key"},
-		{"expired", 400, "ExpiredTokenException", "expired " + acct, false, "expired_api_key", "Bedrock API key has expired"},
+		{"unrecognized client", 403, "UnrecognizedClientException", "token invalid " + acct, false, "invalid_api_key", "Bedrock rejected the credentials"},
+		{"401 without type", 401, "", "nope " + acct, false, "invalid_api_key", "Bedrock rejected the credentials"},
+		{"expired", 400, "ExpiredTokenException", "expired " + acct, false, "expired_api_key", "Bedrock credentials have expired"},
 		{"not found", 404, "ResourceNotFoundException", "arn " + acct, false, "model_not_found", "Bedrock model or inference profile not found"},
 		{"throttling", 429, "ThrottlingException", "Too many requests " + acct, false, "rate_limit_exceeded", "Bedrock rate limit exceeded"},
 		{"quota", 400, "ServiceQuotaExceededException", "quota " + acct, false, "quota_exceeded", "Bedrock service quota exceeded"},
@@ -1021,7 +1021,7 @@ func TestBedrockHandler_ErrorMapping_RealAWSShapes(t *testing.T) {
 		wantMessage string
 		leak        string
 	}{
-		{"invalid bearer key", 403, "AccessDeniedException:http://internal.amazon.com/coral/com.amazon.coral.service/", `{"Message":"Authentication failed: Please make sure your API Key is valid."}`, "invalid_api_key", "upstream rejected the Bedrock API key", "Authentication failed"},
+		{"invalid bearer key", 403, "AccessDeniedException:http://internal.amazon.com/coral/com.amazon.coral.service/", `{"Message":"Authentication failed: Please make sure your API Key is valid."}`, "invalid_api_key", "Bedrock rejected the credentials", "Authentication failed"},
 		{"no model access", 400, "ValidationException:http://internal.amazon.com/coral/com.amazon.bedrock/", `{"message":"Error 002: Access to Bedrock models is not allowed for this account"}`, "permission_denied", "Bedrock model access is not enabled for this AWS account", "Error 002"},
 	}
 	for _, tc := range tests {

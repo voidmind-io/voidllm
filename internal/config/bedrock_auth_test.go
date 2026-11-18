@@ -31,10 +31,17 @@ func TestValidate_BedrockAuth(t *testing.T) {
 		// models
 		{name: "model api_key mode with key", models: model("    bedrock_auth: api_key\n    api_key: k\n")},
 		{name: "model empty auth with key", models: model("    api_key: k\n")},
-		{name: "model api_key mode without key", models: model("    bedrock_auth: api_key\n"),
-			wantErr: []string{"models[0]", "api_key is required for bedrock when bedrock_auth is api_key"}},
-		{name: "model empty auth without key", models: model(""),
-			wantErr: []string{"api_key is required for bedrock"}},
+		// The key may be stored only in the DB (Admin API), so YAML does not require it.
+		{name: "model api_key mode without key", models: model("    bedrock_auth: api_key\n")},
+		{name: "model empty auth without key", models: model("")},
+		{name: "model iam http base_url", models: model("    bedrock_auth: iam\n    base_url: http://bedrock-runtime.eu-central-1.amazonaws.com\n"),
+			wantErr: []string{"models[0].base_url", "bedrock iam requires an https base_url"}},
+		{name: "model iam non-aws base_url", models: model("    bedrock_auth: iam\n    base_url: https://evil.example.com\n"),
+			wantErr: []string{"models[0].base_url", "bedrock iam requires an https base_url"}},
+		{name: "model iam ip base_url", models: model("    bedrock_auth: iam\n    base_url: https://127.0.0.1\n"),
+			wantErr: []string{"bedrock iam requires an https base_url"}},
+		{name: "model iam vpce base_url", models: model("    bedrock_auth: iam\n    base_url: https://vpce-0abc.bedrock-runtime.eu-central-1.vpce.amazonaws.com\n")},
+		{name: "model api_key mode custom base_url allowed", models: model("    api_key: k\n    base_url: http://localhost:9999\n")},
 		{name: "model iam without key", models: model("    bedrock_auth: iam\n")},
 		{name: "model iam with role", models: model("    bedrock_auth: iam\n    bedrock_role_arn: " + role + "\n")},
 		{name: "model iam govcloud role", models: model("    bedrock_auth: iam\n    bedrock_role_arn: arn:aws-us-gov:iam::123456789012:role/path/x\n")},
@@ -57,8 +64,9 @@ func TestValidate_BedrockAuth(t *testing.T) {
 
 		// deployments
 		{name: "deployment api_key mode with key", models: dep("        api_key: k\n")},
-		{name: "deployment api_key mode without key", models: dep("        bedrock_auth: api_key\n"),
-			wantErr: []string{"models[0].deployments[0]", "api_key is required for bedrock"}},
+		{name: "deployment api_key mode without key", models: dep("        bedrock_auth: api_key\n")},
+		{name: "deployment iam non-aws base_url", models: dep("        bedrock_auth: iam\n        base_url: https://evil.example.com\n"),
+			wantErr: []string{"models[0].deployments[0].base_url", "bedrock iam requires an https base_url"}},
 		{name: "deployment iam without key", models: dep("        bedrock_auth: iam\n")},
 		{name: "deployment iam with role", models: dep("        bedrock_auth: iam\n        bedrock_role_arn: " + role + "\n")},
 		{name: "deployment iam with key", models: dep("        bedrock_auth: iam\n        api_key: k\n"),

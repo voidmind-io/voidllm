@@ -760,12 +760,12 @@ func (a *BedrockAdapter) MapUpstreamError(statusCode int, header http.Header, bo
 		}
 		return "invalid_request", "Bedrock rejected the request as invalid"
 	case "ExpiredTokenException":
-		return "expired_api_key", "Bedrock API key has expired"
+		return "expired_api_key", "Bedrock credentials have expired"
 	case "UnrecognizedClientException", "InvalidSignatureException":
-		return "invalid_api_key", "upstream rejected the Bedrock API key"
+		return "invalid_api_key", "Bedrock rejected the credentials"
 	case "AccessDeniedException":
 		if strings.Contains(bedrockErrorMessage(body), "authentication failed") {
-			return "invalid_api_key", "upstream rejected the Bedrock API key"
+			return "invalid_api_key", "Bedrock rejected the credentials"
 		}
 		return "permission_denied", "Bedrock API key is not authorized for this model"
 	case "ResourceNotFoundException":
@@ -790,7 +790,7 @@ func (a *BedrockAdapter) MapUpstreamError(statusCode int, header http.Header, bo
 	case http.StatusBadRequest:
 		return "invalid_request", "Bedrock rejected the request"
 	case http.StatusUnauthorized:
-		return "invalid_api_key", "upstream rejected the Bedrock API key"
+		return "invalid_api_key", "Bedrock rejected the credentials"
 	case http.StatusForbidden:
 		return "permission_denied", "Bedrock API key is not authorized for this model"
 	case http.StatusNotFound:

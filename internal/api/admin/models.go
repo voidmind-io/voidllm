@@ -551,6 +551,9 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		if req.BaseURL != "" && !hasHTTPScheme(req.BaseURL) {
 			return apierror.BadRequest(c, "base_url must begin with http:// or https://")
 		}
+		if msg := bedrockIAMEndpointMessage(req.BedrockAuth, req.BaseURL, req.Region); msg != "" {
+			return apierror.BadRequest(c, msg)
+		}
 	}
 	if req.Timeout != "" {
 		if _, err := time.ParseDuration(req.Timeout); err != nil {
@@ -918,6 +921,13 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 				req.Provider != nil && existing.Provider != provider.Bedrock,
 				req.BedrockAuth, req.BedrockRoleARN, req.APIKey,
 			); msg != "" {
+				return apierror.BadRequest(c, msg)
+			}
+			mergedAuth := existing.BedrockAuth
+			if req.BedrockAuth != nil {
+				mergedAuth = *req.BedrockAuth
+			}
+			if msg := bedrockIAMEndpointMessage(mergedAuth, mergedBaseURL, mergedRegion); msg != "" {
 				return apierror.BadRequest(c, msg)
 			}
 		} else if (req.BedrockAuth != nil && *req.BedrockAuth != "") || (req.BedrockRoleARN != nil && *req.BedrockRoleARN != "") {
@@ -1413,6 +1423,24 @@ func bedrockAuthForProvider(providerName, auth string) string {
 	return provider.NormalizeBedrockAuth(auth)
 }
 
+// bedrockIAMEndpointMessage returns an error message when auth is iam and the
+// effective endpoint (baseURL, or the regional default derived from region) is
+// not an AWS https host that signed requests may be sent to. It returns the
+// empty string for other auth modes and when the region is invalid (reported
+// by the region validation instead).
+func bedrockIAMEndpointMessage(auth, baseURL, region string) string {
+	if provider.NormalizeBedrockAuth(auth) != provider.BedrockAuthIAM {
+		return ""
+	}
+	if baseURL == "" && !provider.ValidBedrockRegion(region) {
+		return ""
+	}
+	if err := provider.ValidBedrockIAMEndpoint(provider.EffectiveBaseURL(provider.Bedrock, baseURL, region)); err != nil {
+		return "base_url must be an https amazonaws.com, amazonaws.com.cn or api.aws host when bedrock_auth is iam"
+	}
+	return ""
+}
+
 // validateBedrockAuthUpdate validates the Bedrock auth combination that results
 // from applying a partial update on top of the stored values. It returns an
 // empty string when the update does not touch auth-related fields and the
@@ -1502,6 +1530,18 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 		// before falling back to the generic base_url error.
 		if msg, ok := validateProviderIdentity(req); !ok {
 			return c.JSON(testConnectionResponse{Success: false, Message: msg})
+		}
+	}
+	if req.Provider == provider.Bedrock {
+		// Same auth rules as create, applied before any probe is sent.
+		if msg, ok := validateProviderIdentity(req); !ok {
+			return c.JSON(testConnectionResponse{Success: false, Message: msg})
+		}
+		if msg := provider.ValidateBedrockAuth(req.BedrockAuth, req.BedrockRoleARN, req.APIKey != ""); msg != "" {
+			return apierror.BadRequest(c, msg)
+		}
+		if msg := bedrockIAMEndpointMessage(req.BedrockAuth, req.BaseURL, req.Region); msg != "" {
+			return apierror.BadRequest(c, msg)
 		}
 	}
 	req.BaseURL = provider.EffectiveBaseURL(req.Provider, req.BaseURL, req.Region)

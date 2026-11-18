@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -62,10 +63,51 @@ func (f *fakeBedrockSigner) snapshot() []fakeSignCall {
 	return append([]fakeSignCall(nil), f.calls...)
 }
 
+// bhAWSURL returns an AWS-looking endpoint that bhRouteAWS routes to the local
+// upstream test server, so IAM tests satisfy the AWS-host signing check.
+func bhAWSURL(upstreamURL string) string {
+	u, err := url.Parse(upstreamURL)
+	if err != nil {
+		return upstreamURL
+	}
+	return "https://p" + u.Port() + ".bedrock-runtime.eu-central-1.amazonaws.com"
+}
+
+// awsRouteTransport rewrites requests for bhAWSURL hosts to the local server.
+type awsRouteTransport struct{ base http.RoundTripper }
+
+func (t awsRouteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	host := req.URL.Hostname()
+	if strings.HasPrefix(host, "p") && strings.HasSuffix(host, ".bedrock-runtime.eu-central-1.amazonaws.com") {
+		port := strings.TrimSuffix(strings.TrimPrefix(host, "p"), ".bedrock-runtime.eu-central-1.amazonaws.com")
+		r := req.Clone(req.Context())
+		r.URL.Scheme = "http"
+		r.URL.Host = "127.0.0.1:" + port
+		r.Host = r.URL.Host
+		return t.base.RoundTrip(r)
+	}
+	return t.base.RoundTrip(req)
+}
+
+// bhRouteAWS installs the routing transport on the handler's HTTP client.
+func bhRouteAWS(env *bhEnv) {
+	c := &http.Client{}
+	if env.h.HTTPClient != nil {
+		cc := *env.h.HTTPClient
+		c = &cc
+	}
+	base := c.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	c.Transport = awsRouteTransport{base: base}
+	env.h.HTTPClient = c
+}
+
 func bhIAMRegistry(t *testing.T, upstreamURL, apiKey string) *Registry {
 	t.Helper()
 	reg, err := NewRegistry([]config.ModelConfig{{
-		Name: "claude", Provider: "bedrock", BaseURL: upstreamURL, APIKey: apiKey,
+		Name: "claude", Provider: "bedrock", BaseURL: bhAWSURL(upstreamURL), APIKey: apiKey,
 		Region: "eu-central-1", BedrockModelID: bhModelID, BedrockAuth: "iam", BedrockRoleARN: iamRoleGood,
 	}})
 	if err != nil {
@@ -98,6 +140,7 @@ func TestBedrockHandler_IAM_SignedNoBearer(t *testing.T) {
 				_, _ = io.WriteString(w, bhOKJSON)
 			})
 			env := newBHEnv(t, bhIAMRegistry(t, up.URL, ""))
+			bhRouteAWS(env)
 			signer := &fakeBedrockSigner{}
 			env.h.AWSSigner = signer
 
@@ -152,13 +195,14 @@ func TestBedrockHandler_APIKeyModeUnchanged(t *testing.T) {
 		t.Run("auth="+auth, func(t *testing.T) {
 			t.Parallel()
 			reg, err := NewRegistry([]config.ModelConfig{{
-				Name: "claude", Provider: "bedrock", BaseURL: up.URL, APIKey: bhAPIKey,
+				Name: "claude", Provider: "bedrock", BaseURL: bhAWSURL(up.URL), APIKey: bhAPIKey,
 				Region: "eu-central-1", BedrockModelID: bhModelID, BedrockAuth: auth,
 			}})
 			if err != nil {
 				t.Fatal(err)
 			}
 			env := newBHEnv(t, reg)
+			bhRouteAWS(env)
 			signer := &fakeBedrockSigner{}
 			env.h.AWSSigner = signer
 			resp := env.post(t, `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`)
@@ -183,6 +227,7 @@ func TestBedrockHandler_IAM_NoSignerConfigured(t *testing.T) {
 		_, _ = io.WriteString(w, bhOKJSON)
 	})
 	env := newBHEnv(t, bhIAMRegistry(t, up.URL, ""))
+	bhRouteAWS(env)
 	resp := env.post(t, `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`)
 	if resp.Status != http.StatusBadGateway || !strings.Contains(resp.Body, "Bedrock IAM credentials unavailable") {
 		t.Fatalf("status %d body %s", resp.Status, resp.Body)
@@ -199,6 +244,7 @@ func TestBedrockHandler_IAM_WithAPIKeyIsConfigError(t *testing.T) {
 		_, _ = io.WriteString(w, bhOKJSON)
 	})
 	env := newBHEnv(t, bhIAMRegistry(t, up.URL, bhAPIKey))
+	bhRouteAWS(env)
 	signer := &fakeBedrockSigner{}
 	env.h.AWSSigner = signer
 	resp := env.post(t, `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`)
@@ -231,9 +277,10 @@ func TestBedrockHandler_IAM_SignFailureFailsOverToSecondDeployment(t *testing.T)
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, strings.Replace(bhOKJSON, "pong", "from-two", 1))
 			})
-			dep1 := Deployment{Name: "d1", Provider: "bedrock", BaseURL: up1.URL, Region: "eu-central-1", BedrockModelID: "eu.model-one-v1:0", BedrockAuth: "iam", BedrockRoleARN: iamRoleBad, Priority: 1}
-			dep2 := Deployment{Name: "d2", Provider: "bedrock", BaseURL: up2.URL, Region: "us-east-1", BedrockModelID: "us.model-two-v1:0", BedrockAuth: "iam", BedrockRoleARN: iamRoleGood, Priority: 2}
+			dep1 := Deployment{Name: "d1", Provider: "bedrock", BaseURL: bhAWSURL(up1.URL), Region: "eu-central-1", BedrockModelID: "eu.model-one-v1:0", BedrockAuth: "iam", BedrockRoleARN: iamRoleBad, Priority: 1}
+			dep2 := Deployment{Name: "d2", Provider: "bedrock", BaseURL: bhAWSURL(up2.URL), Region: "us-east-1", BedrockModelID: "us.model-two-v1:0", BedrockAuth: "iam", BedrockRoleARN: iamRoleGood, Priority: 2}
 			env := newBHEnv(t, twoDeploymentRegistry("claude", dep1, dep2))
+			bhRouteAWS(env)
 			env.h.Router = &staticDeploymentPicker{deps: []Deployment{dep1, dep2}}
 			signer := &fakeBedrockSigner{failRoles: map[string]error{
 				iamRoleBad: &awsauth.CredentialsError{Category: awsauth.CategoryAssumeRoleFailed},
@@ -300,9 +347,10 @@ func TestBedrockHandler_IAM_AllSignersFail(t *testing.T) {
 				t.Error("no request may reach upstream")
 				w.WriteHeader(500)
 			})
-			dep1 := Deployment{Name: "d1", Provider: "bedrock", BaseURL: up.URL, Region: "eu-central-1", BedrockModelID: "m1-v1:0", BedrockAuth: "iam", Priority: 1}
-			dep2 := Deployment{Name: "d2", Provider: "bedrock", BaseURL: up.URL, Region: "us-east-1", BedrockModelID: "m2-v1:0", BedrockAuth: "iam", Priority: 2}
+			dep1 := Deployment{Name: "d1", Provider: "bedrock", BaseURL: bhAWSURL(up.URL), Region: "eu-central-1", BedrockModelID: "m1-v1:0", BedrockAuth: "iam", Priority: 1}
+			dep2 := Deployment{Name: "d2", Provider: "bedrock", BaseURL: bhAWSURL(up.URL), Region: "us-east-1", BedrockModelID: "m2-v1:0", BedrockAuth: "iam", Priority: 2}
 			env := newBHEnv(t, twoDeploymentRegistry("claude", dep1, dep2))
+			bhRouteAWS(env)
 			env.h.Router = &staticDeploymentPicker{deps: []Deployment{dep1, dep2}}
 			signer := &fakeBedrockSigner{failAll: tc.err}
 			env.h.AWSSigner = signer
@@ -345,12 +393,13 @@ func TestBedrockHandler_IAM_RealSignerEndToEnd(t *testing.T) {
 		_, _ = io.WriteString(w, bhOKJSON)
 	})
 	reg, err := NewRegistry([]config.ModelConfig{{
-		Name: "claude", Provider: "bedrock", BaseURL: up.URL, Region: "eu-central-1", BedrockModelID: bhModelID, BedrockAuth: "iam",
+		Name: "claude", Provider: "bedrock", BaseURL: bhAWSURL(up.URL), Region: "eu-central-1", BedrockModelID: bhModelID, BedrockAuth: "iam",
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	env := newBHEnv(t, reg)
+	bhRouteAWS(env)
 	env.h.AWSSigner = awsauth.NewSigner()
 
 	resp := env.post(t, `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`)
@@ -382,4 +431,36 @@ func TestBedrockHandler_IAM_RealSignerEndToEnd(t *testing.T) {
 		t.Error("secret appears in Authorization")
 	}
 	assertNoCredsInLogs(t, env.logs.String())
+}
+
+// TestBedrockHandler_IAM_RefusesNonAWSEndpoint verifies that an IAM model whose
+// final URL is not an AWS host is never signed and never reaches the upstream.
+func TestBedrockHandler_IAM_RefusesNonAWSEndpoint(t *testing.T) {
+	t.Parallel()
+	up := newBHUpstream(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		t.Error("request must not reach a non-AWS upstream")
+		w.WriteHeader(500)
+	})
+	// up.URL is plain http on 127.0.0.1: not an AWS endpoint.
+	reg, err := NewRegistry([]config.ModelConfig{{
+		Name: "claude", Provider: "bedrock", BaseURL: up.URL,
+		Region: "eu-central-1", BedrockModelID: bhModelID, BedrockAuth: "iam",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := newBHEnv(t, reg)
+	signer := &fakeBedrockSigner{}
+	env.h.AWSSigner = signer
+
+	resp := env.post(t, `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.Status != http.StatusBadGateway || !strings.Contains(resp.Body, "Bedrock IAM credentials unavailable") {
+		t.Fatalf("status %d body %s", resp.Status, resp.Body)
+	}
+	if n := len(signer.snapshot()); n != 0 {
+		t.Errorf("signer called %d times, want 0", n)
+	}
+	if n := len(up.requests()); n != 0 {
+		t.Errorf("upstream requests = %d, want 0", n)
+	}
 }

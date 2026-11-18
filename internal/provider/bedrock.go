@@ -1,6 +1,9 @@
 package provider
 
 import (
+	"errors"
+	"net/netip"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -25,6 +28,39 @@ const (
 // ValidBedrockRoleARN reports whether arn is a syntactically valid IAM role ARN.
 func ValidBedrockRoleARN(arn string) bool {
 	return bedrockRoleARNRe.MatchString(arn)
+}
+
+// ErrBedrockIAMEndpoint is returned by ValidBedrockIAMEndpoint when an endpoint
+// is not an AWS HTTPS host that SigV4 credentials may be sent to.
+var ErrBedrockIAMEndpoint = errors.New("bedrock iam requires an https base_url on an amazonaws.com, amazonaws.com.cn or api.aws host")
+
+// bedrockIAMHostSuffixes are the DNS suffixes SigV4-signed requests may target.
+var bedrockIAMHostSuffixes = []string{".amazonaws.com", ".amazonaws.com.cn", ".api.aws"}
+
+// ValidBedrockIAMEndpoint reports whether baseURL is an endpoint to which
+// IAM-signed requests may be sent: https, no userinfo, a DNS host name (not an
+// IP literal) ending in .amazonaws.com, .amazonaws.com.cn or .api.aws,
+// compared case-insensitively. It returns ErrBedrockIAMEndpoint otherwise.
+// This prevents a misconfigured or malicious base_url from receiving signed
+// requests and the credential-derived signature headers.
+func ValidBedrockIAMEndpoint(baseURL string) error {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Scheme != "https" || u.User != nil {
+		return ErrBedrockIAMEndpoint
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if host == "" {
+		return ErrBedrockIAMEndpoint
+	}
+	if _, perr := netip.ParseAddr(host); perr == nil {
+		return ErrBedrockIAMEndpoint
+	}
+	for _, suffix := range bedrockIAMHostSuffixes {
+		if strings.HasSuffix(host, suffix) && len(host) > len(suffix) {
+			return nil
+		}
+	}
+	return ErrBedrockIAMEndpoint
 }
 
 // NormalizeBedrockAuth returns the effective Bedrock auth mode, mapping the

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -38,9 +39,35 @@ func (f *fakeSigner) Sign(_ context.Context, req *http.Request, body []byte, reg
 	return nil
 }
 
+// awsURLFor returns an AWS-looking endpoint that awsRouteTransport routes to
+// the local test server at serverURL, so IAM tests pass the AWS-host check.
+func awsURLFor(serverURL string) string {
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		return serverURL
+	}
+	return "https://p" + u.Port() + ".bedrock-runtime.eu-central-1.amazonaws.com"
+}
+
+// awsRouteTransport rewrites awsURLFor hosts to the local server.
+type awsRouteTransport struct{}
+
+func (awsRouteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	const suffix = ".bedrock-runtime.eu-central-1.amazonaws.com"
+	host := req.URL.Hostname()
+	if strings.HasPrefix(host, "p") && strings.HasSuffix(host, suffix) {
+		r := req.Clone(req.Context())
+		r.URL.Scheme = "http"
+		r.URL.Host = "127.0.0.1:" + strings.TrimSuffix(strings.TrimPrefix(host, "p"), suffix)
+		r.Host = r.URL.Host
+		return http.DefaultTransport.RoundTrip(r)
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
 func iamTarget() health.ProbeTarget {
 	return health.ProbeTarget{
-		ModelName: "claude", Provider: "bedrock", BaseURL: "https://h.example", APIKey: "stale-key",
+		ModelName: "claude", Provider: "bedrock", BaseURL: "https://bedrock-runtime.eu-central-1.amazonaws.com", APIKey: "stale-key",
 		Region: "eu-central-1", BedrockModelID: "m-v1:0", BedrockAuth: "iam",
 		BedrockRoleARN: "arn:aws:iam::123456789012:role/r",
 	}
@@ -75,6 +102,16 @@ func TestSignProbeRequest(t *testing.T) {
 	}{
 		{name: "iam signs", target: iamTarget(), signer: &fakeSigner{}, wantSigned: true},
 		{name: "iam signer failure", target: iamTarget(), signer: &fakeSigner{err: errors.New("leaky sdk detail SECRET")}, wantErr: health.ErrBedrockCredentials},
+		{name: "iam non-AWS endpoint refused", target: func() health.ProbeTarget {
+			x := iamTarget()
+			x.BaseURL = "https://evil.example.com"
+			return x
+		}(), signer: &fakeSigner{}, wantErr: health.ErrBedrockCredentials},
+		{name: "iam http endpoint refused", target: func() health.ProbeTarget {
+			x := iamTarget()
+			x.BaseURL = "http://bedrock-runtime.eu-central-1.amazonaws.com"
+			return x
+		}(), signer: &fakeSigner{}, wantErr: health.ErrBedrockCredentials},
 		{name: "iam nil signer", target: iamTarget(), nilSigner: true, wantErr: health.ErrBedrockCredentials},
 		{name: "api_key is a no-op", target: apiKeyTarget, signer: &fakeSigner{}},
 		{name: "empty auth is a no-op", target: emptyAuthTarget, signer: &fakeSigner{}},
@@ -153,10 +190,11 @@ func TestChecker_BedrockIAM(t *testing.T) {
 		t.Cleanup(srv.Close)
 
 		reg := newRegistryWithConfig(t, config.ModelConfig{
-			Provider: "bedrock", BaseURL: srv.URL, Region: "eu-central-1", BedrockModelID: "m-v1",
+			Provider: "bedrock", BaseURL: awsURLFor(srv.URL), Region: "eu-central-1", BedrockModelID: "m-v1",
 			BedrockAuth: "iam", BedrockRoleARN: "arn:aws:iam::123456789012:role/r",
 		})
 		c := health.NewChecker(reg, cfg(true, true, true), newLogger())
+		c.SetHTTPClientForTest(&http.Client{Transport: awsRouteTransport{}})
 		if signer != nil {
 			c.SetSigner(signer)
 		}

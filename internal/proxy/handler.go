@@ -1237,6 +1237,8 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 				category = credErr.Category
 			} else if errors.Is(signErr, errNoBedrockSigner) {
 				category = "signer_not_configured"
+			} else if errors.Is(signErr, provider.ErrBedrockIAMEndpoint) {
+				category = "endpoint_not_allowed"
 			}
 			p.Log.LogAttrs(c.Context(), slog.LevelError, "bedrock iam signing failed",
 				slog.String("model", model.Name),
@@ -1256,6 +1258,10 @@ var errNoBedrockSigner = errors.New("no bedrock signer configured")
 func (p *ProxyHandler) signBedrock(ctx context.Context, req *http.Request, body []byte, model Model) error {
 	if p.AWSSigner == nil {
 		return errNoBedrockSigner
+	}
+	// Defense in depth: never sign a request that is not going to an AWS host.
+	if err := provider.ValidBedrockIAMEndpoint(req.URL.String()); err != nil {
+		return err
 	}
 	return p.AWSSigner.Sign(ctx, req, body, model.Region, model.BedrockRoleARN)
 }

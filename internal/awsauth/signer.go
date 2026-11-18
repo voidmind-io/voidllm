@@ -13,6 +13,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -55,8 +57,41 @@ type CredentialsError struct {
 // Error returns the failure category only.
 func (e *CredentialsError) Error() string { return e.Category }
 
+// LogValue implements slog.LogValuer and exposes only the category.
+func (e *CredentialsError) LogValue() slog.Value {
+	return slog.StringValue(e.Category)
+}
+
+// Format implements fmt.Formatter so every verb (%v, %+v, %s, %q) prints only
+// the category and never the wrapped SDK error.
+func (e *CredentialsError) Format(f fmt.State, verb rune) {
+	if verb == 'q' {
+		_, _ = fmt.Fprintf(f, "%q", e.Category)
+		return
+	}
+	_, _ = io.WriteString(f, e.Category)
+}
+
 // Unwrap returns the underlying SDK error.
 func (e *CredentialsError) Unwrap() error { return e.err }
+
+const (
+	// credentialsExpiryWindow makes cached credentials refresh this long before
+	// they expire, so a request never signs with credentials about to lapse.
+	credentialsExpiryWindow = 5 * time.Minute
+	// credentialsExpiryJitterFrac randomizes the refresh point within the
+	// window so concurrent caches do not refresh in lockstep.
+	credentialsExpiryJitterFrac = 0.5
+)
+
+// newCredentialsCache wraps p in a credentials cache with the package expiry
+// window and jitter.
+func newCredentialsCache(p aws.CredentialsProvider) *aws.CredentialsCache {
+	return aws.NewCredentialsCache(p, func(o *aws.CredentialsCacheOptions) {
+		o.ExpiryWindow = credentialsExpiryWindow
+		o.ExpiryWindowJitterFrac = credentialsExpiryJitterFrac
+	})
+}
 
 // roleProviderFactory builds a credentials provider that assumes roleARN in
 // region on top of the base configuration.
@@ -85,7 +120,7 @@ type signerOption func(*Signer)
 func withBaseProvider(provider aws.CredentialsProvider) signerOption {
 	return func(s *Signer) {
 		s.load = func(context.Context) (aws.Config, error) {
-			return aws.Config{Credentials: aws.NewCredentialsCache(provider)}, nil
+			return aws.Config{Credentials: newCredentialsCache(provider)}, nil
 		}
 	}
 }
@@ -109,7 +144,7 @@ func newSigner(opts ...signerOption) *Signer {
 			if err != nil {
 				return aws.Config{}, err
 			}
-			cfg.Credentials = aws.NewCredentialsCache(cfg.Credentials)
+			cfg.Credentials = newCredentialsCache(cfg.Credentials)
 			return cfg, nil
 		},
 		newRP: func(base aws.Config, roleARN, region string) aws.CredentialsProvider {
@@ -159,7 +194,7 @@ func (s *Signer) provider(ctx context.Context, region, roleARN string) (aws.Cred
 	if p, ok := s.roles[key]; ok {
 		return p, nil
 	}
-	p := aws.NewCredentialsCache(s.newRP(cfg, roleARN, region))
+	p := newCredentialsCache(s.newRP(cfg, roleARN, region))
 	s.roles[key] = p
 	return p, nil
 }

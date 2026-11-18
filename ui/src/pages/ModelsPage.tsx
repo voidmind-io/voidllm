@@ -251,6 +251,8 @@ function validateRoleArn(auth: BedrockAuth, roleArn: string): string | undefined
   return BEDROCK_ROLE_ARN_PATTERN.test(trimmed) ? undefined : BEDROCK_ROLE_ARN_ERROR
 }
 
+const BEDROCK_API_KEY_ERROR = 'API key is required when authentication is set to API key'
+
 interface BedrockFieldsProps {
   region: string
   bedrockModelId: string
@@ -339,6 +341,7 @@ interface DeploymentFormErrors {
   region?: string
   bedrock_model_id?: string
   bedrock_role_arn?: string
+  api_key?: string
 }
 
 function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProps) {
@@ -394,6 +397,9 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
     if (isBedrock) {
       const arnError = validateRoleArn(bedrockAuth, bedrockRoleArn)
       if (arnError) next.bedrock_role_arn = arnError
+      const keyRequired =
+        bedrockAuth === 'api_key' && (!isEdit || toBedrockAuth(deployment.bedrock_auth) === 'iam')
+      if (keyRequired && !apiKey.trim()) next.api_key = BEDROCK_API_KEY_ERROR
     }
     setErrors(next)
     return Object.keys(next).length === 0
@@ -523,6 +529,7 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
             onChange={(e) => setApiKey(e.target.value)}
             placeholder={isEdit ? 'Leave empty to keep current' : 'sk-...'}
             description={isEdit ? 'Leave empty to keep current key' : 'Encrypted at rest, never shown again'}
+            error={errors.api_key}
             disabled={isPending}
           />
         )}
@@ -608,6 +615,7 @@ interface FormErrors {
   region?: string
   bedrock_model_id?: string
   bedrock_role_arn?: string
+  api_key?: string
   deployments?: string
 }
 
@@ -648,6 +656,7 @@ interface InlineDeploymentFormErrors {
   region?: string
   bedrock_model_id?: string
   bedrock_role_arn?: string
+  api_key?: string
 }
 
 function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
@@ -778,6 +787,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     if (depIsBedrock) {
       const arnError = validateRoleArn(depFormEntry.bedrockAuth, depFormEntry.bedrockRoleArn)
       if (arnError) next.bedrock_role_arn = arnError
+      if (depFormEntry.bedrockAuth === 'api_key' && !depFormEntry.apiKey.trim()) next.api_key = BEDROCK_API_KEY_ERROR
     }
     setDepFormErrors(next)
     return Object.keys(next).length === 0
@@ -844,9 +854,13 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
         if (!bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
         const arnError = validateRoleArn(bedrockAuth, bedrockRoleArn)
         if (arnError) next.bedrock_role_arn = arnError
+        if (bedrockAuth === 'api_key' && !apiKey.trim()) next.api_key = BEDROCK_API_KEY_ERROR
       }
     } else {
       if (deployments.length === 0) next.deployments = 'At least one deployment is required'
+      if (deployments.some((d) => d.provider === 'bedrock' && d.bedrockAuth === 'api_key' && !d.apiKey.trim())) {
+        next.deployments = 'Every Bedrock deployment using API key authentication needs an API key'
+      }
       if (type !== 'chat' && deployments.some((d) => d.provider === 'bedrock')) {
         next.type = BEDROCK_CHAT_ONLY_ERROR
       }
@@ -1063,6 +1077,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                 onChange={(e) => { setApiKey(e.target.value); setTestResult(null) }}
                 placeholder="sk-..."
                 description="Encrypted at rest, never shown again"
+                error={errors.api_key}
                 disabled={isPending}
               />
             )}
@@ -1207,6 +1222,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                               value={depFormEntry.apiKey}
                               onChange={(e) => setDepFormEntry((prev) => ({ ...prev, apiKey: e.target.value }))}
                               placeholder="sk-..."
+                              error={depFormErrors.api_key}
                               disabled={isPending}
                             />
                           )}
@@ -1344,6 +1360,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                       value={depFormEntry.apiKey}
                       onChange={(e) => setDepFormEntry((prev) => ({ ...prev, apiKey: e.target.value }))}
                       placeholder="sk-..."
+                      error={depFormErrors.api_key}
                       disabled={isPending}
                     />
                   )}
@@ -1607,6 +1624,9 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
       if (!bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
       const arnError = validateRoleArn(bedrockAuth, bedrockRoleArn)
       if (arnError) next.bedrock_role_arn = arnError
+      if (bedrockAuth === 'api_key' && toBedrockAuth(model.bedrock_auth) === 'iam' && !apiKey.trim()) {
+        next.api_key = BEDROCK_API_KEY_ERROR
+      }
       setErrors(next)
       if (Object.keys(next).length > 0) return
     } else {
@@ -1795,6 +1815,7 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
             onChange={(e) => setApiKey(e.target.value)}
             placeholder="Leave empty to keep current key"
             description="Leave empty to keep current key. Enter a new value to replace."
+            error={errors.api_key}
             disabled={updateModel.isPending}
           />
         )}

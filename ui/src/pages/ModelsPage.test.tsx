@@ -712,6 +712,7 @@ describe('AWS Bedrock provider', () => {
     const dialog = getDialog(/add model/i)
     await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'claude-br')
     await pickBedrockProvider(dialog)
+    await userEvent.type(within(dialog).getByLabelText(/^api key$/i), 'abwk-123')
     await userEvent.type(within(dialog).getByRole('textbox', { name: /aws region/i }), 'eu-central-1')
     await userEvent.type(
       within(dialog).getByRole('textbox', { name: /bedrock model id/i }),
@@ -890,6 +891,7 @@ const VALID_ROLE_ARN = 'arn:aws:iam::123456789012:role/voidllm-bedrock'
 const IAM_LABEL = 'IAM role (AWS credential chain)'
 const ARN_ERROR = 'Role ARN must look like arn:aws:iam::123456789012:role/name'
 const MODELS_POST = 'POST:/api/v1/models'
+const API_KEY_ERROR = 'API key is required when authentication is set to API key'
 
 async function pickAuth(container: HTMLElement, optionName: string) {
   await userEvent.click(getComboboxByLabel(container, 'authentication'))
@@ -1026,12 +1028,34 @@ describe('AWS Bedrock IAM authentication', () => {
       await pickAuth(dialog, IAM_LABEL)
       await userEvent.type(getRoleArnInput(dialog), 'not-an-arn')
       await pickAuth(dialog, 'API key')
+      await userEvent.type(within(dialog).getByLabelText(/^api key$/i), 'abwk-123')
       await submitDialog(dialog, /add model/i)
 
       await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
       const body = JSON.parse(capturedBodies.get(MODELS_POST)!)
       expect(body.bedrock_auth).toBe('api_key')
       expect(body).not.toHaveProperty('bedrock_role_arn')
+    })
+
+    it('blocks a keyless api_key bedrock model with an inline error and sends no request', async () => {
+      const capturedBodies = new Map<string, string>()
+      setupFetchMock(postModelEntries(), capturedBodies)
+      await renderSettled()
+
+      await openCreateDialog()
+      const dialog = getDialog(/add model/i)
+      await dialogFocused()
+      await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'claude-br')
+      await pickBedrockProvider(dialog)
+      await fillBedrockBasics(dialog)
+      await submitDialog(dialog, /add model/i)
+
+      expect(await within(dialog).findByText(API_KEY_ERROR)).toBeInTheDocument()
+      expect(capturedBodies.has(MODELS_POST)).toBe(false)
+
+      await userEvent.type(within(dialog).getByLabelText(/^api key$/i), 'abwk-123')
+      await submitDialog(dialog, /add model/i)
+      await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
     })
 
     it('creates in IAM mode with a trimmed valid role ARN and no api_key', async () => {
@@ -1376,6 +1400,38 @@ describe('AWS Bedrock IAM authentication', () => {
       })
     })
 
+    it('requires a new api key when switching an IAM model back to api_key', async () => {
+      const capturedBodies = new Map<string, string>()
+      patchSetup(makeChatModel({ ...bedrockBase, bedrock_auth: 'iam' }), capturedBodies)
+      await renderSettled('claude-br')
+
+      await openEditDialogForModel('claude-br')
+      const dialog = getDialog(/edit model/i)
+      await dialogFocused()
+      await pickAuth(dialog, 'API key')
+      await submitDialog(dialog, /save changes/i)
+
+      expect(await within(dialog).findByText(API_KEY_ERROR)).toBeInTheDocument()
+      expect(capturedBodies.has('PATCH:/api/v1/models/model-br')).toBe(false)
+    })
+
+    it('does not require an api key when editing an existing api_key model', async () => {
+      const capturedBodies = new Map<string, string>()
+      patchSetup(makeChatModel({ ...bedrockBase, bedrock_auth: 'api_key' }), capturedBodies)
+      await renderSettled('claude-br')
+
+      await openEditDialogForModel('claude-br')
+      const dialog = getDialog(/edit model/i)
+      await dialogFocused()
+      const region = within(dialog).getByRole('textbox', { name: /aws region/i })
+      await userEvent.clear(region)
+      await userEvent.type(region, 'us-east-1')
+      await submitDialog(dialog, /save changes/i)
+
+      await waitFor(() => expect(capturedBodies.has('PATCH:/api/v1/models/model-br')).toBe(true))
+      expect(within(dialog).queryByText(API_KEY_ERROR)).not.toBeInTheDocument()
+    })
+
     it('clearing the role ARN of an IAM model sends bedrock_role_arn ""', async () => {
       const capturedBodies = new Map<string, string>()
       patchSetup(
@@ -1530,6 +1586,45 @@ describe('AWS Bedrock IAM authentication', () => {
       expect(body).not.toHaveProperty('bedrock_role_arn')
     })
 
+    it('blocks adding a keyless api_key bedrock deployment with an inline error and sends no request', async () => {
+      const capturedBodies = new Map<string, string>()
+      setupFetchMock(lbEntries(), capturedBodies)
+      await renderSettled()
+
+      await openCreateDialog()
+      const dialog = getDialog(/add model/i)
+      await dialogFocused()
+      await openInlineBedrockForm(dialog)
+      await userEvent.click(within(dialog).getByRole('button', { name: /^add$/i }))
+
+      expect(await within(dialog).findByText(API_KEY_ERROR)).toBeInTheDocument()
+      expect(within(dialog).getByRole('button', { name: /^add$/i })).toBeInTheDocument()
+      await submitDialog(dialog, /add model/i)
+      expect(
+        await within(dialog).findByText('At least one deployment is required'),
+      ).toBeInTheDocument()
+      expect(capturedBodies.size).toBe(0)
+    })
+
+    it('adds a bedrock deployment once an api key is provided and creates it', async () => {
+      const capturedBodies = new Map<string, string>()
+      setupFetchMock(lbEntries(), capturedBodies)
+      await renderSettled()
+
+      await openCreateDialog()
+      const dialog = getDialog(/add model/i)
+      await dialogFocused()
+      await openInlineBedrockForm(dialog)
+      await userEvent.click(within(dialog).getByRole('button', { name: /^add$/i }))
+      expect(await within(dialog).findByText(API_KEY_ERROR)).toBeInTheDocument()
+      await userEvent.type(within(dialog).getByLabelText(/^api key$/i), 'abwk-1')
+      await userEvent.click(within(dialog).getByRole('button', { name: /^add$/i }))
+      await submitDialog(dialog, /add model/i)
+
+      await waitFor(() => expect(capturedBodies.has(DEPLOYMENTS_POST)).toBe(true))
+      expect(JSON.parse(capturedBodies.get(DEPLOYMENTS_POST)!).api_key).toBe('abwk-1')
+    })
+
     it('non-bedrock deployments send no bedrock fields', async () => {
       const capturedBodies = new Map<string, string>()
       setupFetchMock(lbEntries(), capturedBodies)
@@ -1625,6 +1720,39 @@ describe('AWS Bedrock IAM authentication', () => {
       expect(body).not.toHaveProperty('api_key')
     })
 
+    it('add: blocks a keyless api_key bedrock deployment and sends no request', async () => {
+      const capturedBodies = new Map<string, string>()
+      const model = lbModel([])
+      setupFetchMock(
+        [
+          {
+            matcher: (u) => u.includes('/api/v1/models/model-lb/deployments'),
+            method: 'POST',
+            response: bedrockDeployment(),
+          },
+          ...defaultEntries(MOCK_LICENSE_NO_FALLBACK, { data: [model], has_more: false }),
+        ],
+        capturedBodies,
+      )
+      await renderSettled('lb-model')
+
+      await userEvent.click(screen.getByTitle('Add deployment'))
+      const dialog = getDialog(/add deployment/i)
+      await dialogFocused()
+      await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'br-1')
+      await pickBedrockProvider(dialog)
+      await fillBedrockBasics(dialog)
+      await submitDialog(dialog, /add deployment/i)
+
+      expect(await within(dialog).findByText(API_KEY_ERROR)).toBeInTheDocument()
+      expect(capturedBodies.size).toBe(0)
+
+      await userEvent.type(within(dialog).getByLabelText(/^api key$/i), 'abwk-1')
+      await submitDialog(dialog, /add deployment/i)
+      const key = 'POST:/api/v1/models/model-lb/deployments'
+      await waitFor(() => expect(capturedBodies.has(key)).toBe(true))
+    })
+
     it('add: IAM mode with empty ARN omits bedrock_role_arn', async () => {
       const capturedBodies = new Map<string, string>()
       const model = lbModel([])
@@ -1706,11 +1834,16 @@ describe('AWS Bedrock IAM authentication', () => {
       expect(getComboboxByLabel(dialog, 'authentication')).toHaveTextContent(IAM_LABEL)
       expect(getRoleArnInput(dialog)).toHaveValue(VALID_ROLE_ARN)
       await pickAuth(dialog, 'API key')
+      await userEvent.type(within(dialog).getByLabelText(/^api key$/i), 'new-key')
       await submitDialog(dialog, /save changes/i)
 
       const key = 'PATCH:/api/v1/models/model-lb/deployments/dep-1'
       await waitFor(() => expect(capturedBodies.has(key)).toBe(true))
-      expect(JSON.parse(capturedBodies.get(key)!)).toEqual({ bedrock_auth: 'api_key', bedrock_role_arn: '' })
+      expect(JSON.parse(capturedBodies.get(key)!)).toEqual({
+        api_key: 'new-key',
+        bedrock_auth: 'api_key',
+        bedrock_role_arn: '',
+      })
     })
 
     it('edit: blocks save with an invalid role ARN', async () => {

@@ -581,8 +581,18 @@ func validateBedrock(prefix, modelPrefix, baseURL, region, modelID, auth, roleAR
 	} else if !provider.ValidBedrockModelID(modelID) {
 		errs = append(errs, fmt.Errorf("%s.bedrock_model_id: invalid Bedrock model ID", prefix))
 	}
+	// In api_key mode the key may legitimately be stored only in the database
+	// (Admin API), so YAML does not require it; treat it as present.
+	if provider.NormalizeBedrockAuth(auth) == provider.BedrockAuthAPIKey {
+		hasAPIKey = true
+	}
 	if msg := provider.ValidateBedrockAuth(auth, roleARN, hasAPIKey); msg != "" {
 		errs = append(errs, fmt.Errorf("%s: %s", prefix, msg))
+	}
+	if auth == provider.BedrockAuthIAM && provider.ValidBedrockRegion(region) {
+		if endpointErr := provider.ValidBedrockIAMEndpoint(provider.EffectiveBaseURL(provider.Bedrock, baseURL, region)); endpointErr != nil {
+			errs = append(errs, fmt.Errorf("%s.base_url: %w", prefix, endpointErr))
+		}
 	}
 	if baseURL != "" && !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
 		errs = append(errs, fmt.Errorf("%s.base_url: must start with http:// or https://", prefix))

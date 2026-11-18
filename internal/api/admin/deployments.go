@@ -215,6 +215,9 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 		if msg := provider.ValidateBedrockAuth(req.BedrockAuth, req.BedrockRoleARN, req.APIKey != ""); msg != "" {
 			return apierror.BadRequest(c, msg)
 		}
+		if msg := bedrockIAMEndpointMessage(req.BedrockAuth, req.BaseURL, req.Region); msg != "" {
+			return apierror.BadRequest(c, msg)
+		}
 	} else if req.BedrockAuth != "" || req.BedrockRoleARN != "" {
 		return apierror.BadRequest(c, "bedrock_auth and bedrock_role_arn are only valid for the bedrock provider")
 	}
@@ -413,6 +416,13 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 			req.Provider != nil && dep.Provider != provider.Bedrock,
 			req.BedrockAuth, req.BedrockRoleARN, req.APIKey,
 		); msg != "" {
+			return apierror.BadRequest(c, msg)
+		}
+		mergedAuth := dep.BedrockAuth
+		if req.BedrockAuth != nil {
+			mergedAuth = *req.BedrockAuth
+		}
+		if msg := bedrockIAMEndpointMessage(mergedAuth, mergedBaseURL, mergedRegion); msg != "" {
 			return apierror.BadRequest(c, msg)
 		}
 	} else if (req.BedrockAuth != nil && *req.BedrockAuth != "") || (req.BedrockRoleARN != nil && *req.BedrockRoleARN != "") {
