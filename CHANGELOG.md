@@ -2,6 +2,37 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.31] - 2026-11-18
+
+### Features
+- Native AWS Bedrock provider (`provider: bedrock`) via the Converse API with Bedrock API keys: chat and streaming, tools, prompt caching (`cache_control` to `cachePoint`) and cache token usage, region-derived endpoints with an override for FIPS and PrivateLink. Also usable as a deployment next to another provider (#265)
+- `/v1/rerank` and `/v1/score` are served through the proxy for reranking models; rerank usage reported only as `total_tokens` is counted as prompt tokens. Thanks @martinsotirov (#266)
+- Usage and cost reports show cached read and cache write tokens, the cache hit rate and estimated cache savings; model dialogs expose cached input and cache write prices (#264)
+
+### Fixes
+- Anthropic streams that skip `message_start`, send non-JSON data or an `error` event are aborted and recorded as incomplete instead of as complete requests with zero prompt tokens (#284)
+- Translating adapters (Anthropic, Gemini, Vertex) answer rerank and score requests with `400 endpoint not supported for this model` instead of an empty completion (#266)
+- MCP shutdown no longer reports an empty subscription registry as not drained under load (#267)
+
+### Security
+- Security hardening of user, membership and API key management permissions
+- Security hardening of API key rotation and of team scope for service-account keys
+- Security hardening of outbound request validation for MCP servers and the SSO connection test
+
+### Upgrade notes
+- Database migration `0020_bedrock_fields` adds the Bedrock model fields (#265)
+- Organization admins can no longer change the password or email of, issue or rotate keys for, update or delete keys of, or change or remove the membership of system admins or other organization admins; a system admin is required. Password and email changes and key issuance for users who also belong to another organization are limited to the user and system admins. Organization admins cannot add a system admin to an organization.
+- Keys of a service account that belongs to a team now carry that team's model access, MCP access, limits and budgets. Team keys and keys of team-bound service accounts stop working when the team is deleted.
+- Rotating a key keeps its key-level model and MCP allowlists. Below org admin, only your own keys (and, for team admins, team keys of your team) can be rotated.
+- The SSO connection test in the organization settings requires an `https` issuer that resolves to a public address and does not follow redirects.
+- Release binaries and images are built with Go 1.26.11 (#285)
+
+### Dependencies
+- Go 1.26.11; go-jose 4.1.6, OpenTelemetry 1.47.0, golang.org/x/crypto 0.58.0, golang.org/x/sync 0.24.0, modernc.org/sqlite 1.60.1, sonic 1.15.4, brotli 1.2.7, klauspost/compress 1.20.2; UI dev dependencies and GitHub Actions (#285)
+- Go, UI and Actions dependency updates (#263)
+
+---
+
 ## [0.0.30] - 2026-09-30
 
 ### Features
