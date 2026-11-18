@@ -590,12 +590,15 @@ func validateBedrock(prefix, modelPrefix, baseURL, region, modelID, auth, roleAR
 		errs = append(errs, fmt.Errorf("%s: %s", prefix, msg))
 	}
 	if auth == provider.BedrockAuthIAM && provider.ValidBedrockRegion(region) {
-		if endpointErr := provider.ValidBedrockIAMEndpoint(provider.EffectiveBaseURL(provider.Bedrock, baseURL, region)); endpointErr != nil {
+		if endpointErr := provider.ValidBedrockIAMEndpoint(provider.EffectiveBaseURL(provider.Bedrock, baseURL, region), region); endpointErr != nil {
 			errs = append(errs, fmt.Errorf("%s.base_url: %w", prefix, endpointErr))
 		}
 	}
 	if baseURL != "" && !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
 		errs = append(errs, fmt.Errorf("%s.base_url: must start with http:// or https://", prefix))
+	}
+	if !provider.ValidBedrockBaseURLShape(baseURL) {
+		errs = append(errs, fmt.Errorf("%s.base_url: must not contain a query string or fragment", prefix))
 	}
 	if modelType != "" && modelType != "chat" {
 		errs = append(errs, fmt.Errorf("%s.type: bedrock supports only chat models", modelPrefix))

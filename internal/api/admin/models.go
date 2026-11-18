@@ -551,6 +551,9 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		if req.BaseURL != "" && !hasHTTPScheme(req.BaseURL) {
 			return apierror.BadRequest(c, "base_url must begin with http:// or https://")
 		}
+		if !provider.ValidBedrockBaseURLShape(req.BaseURL) {
+			return apierror.BadRequest(c, "base_url must not contain a query string or fragment")
+		}
 		if msg := bedrockIAMEndpointMessage(req.BedrockAuth, req.BaseURL, req.Region); msg != "" {
 			return apierror.BadRequest(c, msg)
 		}
@@ -915,6 +918,9 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 			}
 			if mergedBaseURL != "" && !hasHTTPScheme(mergedBaseURL) {
 				return apierror.BadRequest(c, "base_url must begin with http:// or https://")
+			}
+			if !provider.ValidBedrockBaseURLShape(mergedBaseURL) {
+				return apierror.BadRequest(c, "base_url must not contain a query string or fragment")
 			}
 			if msg := validateBedrockAuthUpdate(
 				existing.BedrockAuth, existing.BedrockRoleARN, existing.APIKeyEncrypted != nil,
@@ -1435,8 +1441,8 @@ func bedrockIAMEndpointMessage(auth, baseURL, region string) string {
 	if baseURL == "" && !provider.ValidBedrockRegion(region) {
 		return ""
 	}
-	if err := provider.ValidBedrockIAMEndpoint(provider.EffectiveBaseURL(provider.Bedrock, baseURL, region)); err != nil {
-		return "base_url must be an https amazonaws.com, amazonaws.com.cn or api.aws host when bedrock_auth is iam"
+	if err := provider.ValidBedrockIAMEndpoint(provider.EffectiveBaseURL(provider.Bedrock, baseURL, region), region); err != nil {
+		return "base_url must be a Bedrock Runtime endpoint for the configured region when bedrock_auth is iam"
 	}
 	return ""
 }
@@ -1539,6 +1545,9 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 		}
 		if msg := provider.ValidateBedrockAuth(req.BedrockAuth, req.BedrockRoleARN, req.APIKey != ""); msg != "" {
 			return apierror.BadRequest(c, msg)
+		}
+		if !provider.ValidBedrockBaseURLShape(req.BaseURL) {
+			return apierror.BadRequest(c, "base_url must not contain a query string or fragment")
 		}
 		if msg := bedrockIAMEndpointMessage(req.BedrockAuth, req.BaseURL, req.Region); msg != "" {
 			return apierror.BadRequest(c, msg)

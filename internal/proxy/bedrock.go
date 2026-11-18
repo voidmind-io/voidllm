@@ -767,7 +767,7 @@ func (a *BedrockAdapter) MapUpstreamError(statusCode int, header http.Header, bo
 		if strings.Contains(bedrockErrorMessage(body), "authentication failed") {
 			return "invalid_api_key", "Bedrock rejected the credentials"
 		}
-		return "permission_denied", "Bedrock API key is not authorized for this model"
+		return "permission_denied", "Bedrock credentials are not authorized for this model"
 	case "ResourceNotFoundException":
 		return "model_not_found", "Bedrock model or inference profile not found"
 	case "ThrottlingException":
@@ -792,7 +792,7 @@ func (a *BedrockAdapter) MapUpstreamError(statusCode int, header http.Header, bo
 	case http.StatusUnauthorized:
 		return "invalid_api_key", "Bedrock rejected the credentials"
 	case http.StatusForbidden:
-		return "permission_denied", "Bedrock API key is not authorized for this model"
+		return "permission_denied", "Bedrock credentials are not authorized for this model"
 	case http.StatusNotFound:
 		return "not_found", "Bedrock resource not found"
 	case http.StatusTooManyRequests:

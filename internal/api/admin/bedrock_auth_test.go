@@ -25,7 +25,8 @@ const (
 	msgRoleInvalid   = "bedrock_role_arn is invalid"
 	msgBadAuth       = "bedrock_auth must be api_key or iam"
 	msgNonBedrock    = "bedrock_auth and bedrock_role_arn are only valid for the bedrock provider"
-	msgIAMEndpoint   = "base_url must be an https amazonaws.com, amazonaws.com.cn or api.aws host when bedrock_auth is iam"
+	msgIAMEndpoint   = "base_url must be a Bedrock Runtime endpoint for the configured region when bedrock_auth is iam"
+	msgQueryURL      = "base_url must not contain a query string or fragment"
 	msgClearStoredIt = "bedrock_auth iam requires clearing the stored api_key: send api_key as an empty string"
 )
 
@@ -62,6 +63,10 @@ func TestCreateModel_BedrockAuth(t *testing.T) {
 		{name: "iam with key rejected", body: bedrockModelBody(map[string]any{"bedrock_auth": "iam"}), wantStatus: 400, wantErr: msgIAMWithKey},
 		{name: "iam non-AWS base_url", body: bedrockModelBody(map[string]any{"bedrock_auth": "iam", "api_key": nil, "base_url": "https://evil.example.com"}), wantStatus: 400, wantErr: msgIAMEndpoint},
 		{name: "iam http base_url", body: bedrockModelBody(map[string]any{"bedrock_auth": "iam", "api_key": nil, "base_url": "http://bedrock-runtime.eu-central-1.amazonaws.com"}), wantStatus: 400, wantErr: msgIAMEndpoint},
+		{name: "iam region mismatch base_url", body: bedrockModelBody(map[string]any{"bedrock_auth": "iam", "api_key": nil, "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com"}), wantStatus: 400, wantErr: msgIAMEndpoint},
+		{name: "iam other aws service", body: bedrockModelBody(map[string]any{"bedrock_auth": "iam", "api_key": nil, "base_url": "https://xyz.execute-api.eu-central-1.amazonaws.com"}), wantStatus: 400, wantErr: msgIAMEndpoint},
+		{name: "api_key mode query in base_url", body: bedrockModelBody(map[string]any{"base_url": "https://h.example?x=1"}), wantStatus: 400, wantErr: msgQueryURL},
+		{name: "api_key mode fragment in base_url", body: bedrockModelBody(map[string]any{"base_url": "https://h.example#f"}), wantStatus: 400, wantErr: msgQueryURL},
 		{name: "iam vpce base_url", body: bedrockModelBody(map[string]any{"bedrock_auth": "iam", "api_key": nil, "base_url": "https://vpce-0abc.bedrock-runtime.eu-central-1.vpce.amazonaws.com"}), wantStatus: 201, wantAuth: "iam"},
 		{name: "api_key mode without key rejected", body: bedrockModelBody(map[string]any{"api_key": nil}), wantStatus: 400, wantErr: msgKeyRequired},
 		{name: "bad role arn", body: bedrockModelBody(map[string]any{"bedrock_auth": "iam", "api_key": nil, "bedrock_role_arn": "nope"}), wantStatus: 400, wantErr: msgRoleInvalid},
@@ -151,6 +156,7 @@ func TestUpdateModel_BedrockAuth(t *testing.T) {
 		{name: "iam model to non-AWS base_url", create: iamCreate, update: map[string]any{"base_url": "https://evil.example.com"}, wantStatus: 400, wantErr: msgIAMEndpoint, wantAuth: "iam"},
 		{name: "api_key to iam with non-AWS base_url", create: bedrockModelBody(map[string]any{"base_url": "http://localhost:9999"}), update: map[string]any{"bedrock_auth": "iam", "api_key": ""}, wantStatus: 400, wantErr: msgIAMEndpoint, wantAuth: "api_key", wantKey: true},
 		{name: "api_key to iam resetting base_url", create: bedrockModelBody(map[string]any{"base_url": "http://localhost:9999"}), update: map[string]any{"bedrock_auth": "iam", "api_key": "", "base_url": ""}, wantStatus: 200, wantAuth: "iam"},
+		{name: "update base_url with query", create: bedrockModelBody(nil), update: map[string]any{"base_url": "https://h.example/?x=1"}, wantStatus: 400, wantErr: msgQueryURL, wantAuth: "api_key", wantKey: true},
 		{name: "set role on iam model", create: iamCreate, update: map[string]any{"bedrock_role_arn": iamTestRole}, wantStatus: 200, wantAuth: "iam", wantRole: iamTestRole},
 		{name: "change role", create: bedrockModelBody(map[string]any{"bedrock_auth": "iam", "api_key": nil, "bedrock_role_arn": iamTestRole}), update: map[string]any{"bedrock_role_arn": iamTestRole2}, wantStatus: 200, wantAuth: "iam", wantRole: iamTestRole2},
 		{name: "unset role", create: bedrockModelBody(map[string]any{"bedrock_auth": "iam", "api_key": nil, "bedrock_role_arn": iamTestRole}), update: map[string]any{"bedrock_role_arn": ""}, wantStatus: 200, wantAuth: "iam"},
@@ -329,6 +335,7 @@ func TestDeployments_BedrockAuth(t *testing.T) {
 		{name: "iam", body: dep(map[string]any{"bedrock_auth": "iam", "api_key": nil}), wantStatus: 201, wantAuth: "iam"},
 		{name: "iam with role", body: dep(map[string]any{"bedrock_auth": "iam", "api_key": nil, "bedrock_role_arn": iamTestRole}), wantStatus: 201, wantAuth: "iam", wantRole: iamTestRole},
 		{name: "iam with key", body: dep(map[string]any{"bedrock_auth": "iam"}), wantStatus: 400, wantErr: msgIAMWithKey},
+		{name: "api_key mode query in base_url", body: dep(map[string]any{"base_url": "https://h.example?x=1"}), wantStatus: 400, wantErr: msgQueryURL},
 		{name: "iam non-AWS base_url", body: dep(map[string]any{"bedrock_auth": "iam", "api_key": nil, "base_url": "https://evil.example.com"}), wantStatus: 400, wantErr: msgIAMEndpoint},
 		{name: "iam http base_url", body: dep(map[string]any{"bedrock_auth": "iam", "api_key": nil, "base_url": "http://bedrock-runtime.eu-central-1.amazonaws.com"}), wantStatus: 400, wantErr: msgIAMEndpoint},
 		{name: "api_key without key", body: dep(map[string]any{"api_key": nil}), wantStatus: 400, wantErr: msgKeyRequired},
@@ -385,6 +392,7 @@ func TestDeployments_BedrockAuth(t *testing.T) {
 		{name: "iam to api_key with key", create: dep(map[string]any{"bedrock_auth": "iam", "api_key": nil}), update: map[string]any{"bedrock_auth": "api_key", "api_key": "k"}, wantStatus: 200, wantAuth: "api_key", wantKey: true},
 		{name: "iam deployment to non-AWS base_url", create: dep(map[string]any{"bedrock_auth": "iam", "api_key": nil}), update: map[string]any{"base_url": "https://evil.example.com"}, wantStatus: 400, wantErr: msgIAMEndpoint, wantAuth: "iam"},
 		{name: "api_key to iam with non-AWS base_url", create: dep(map[string]any{"base_url": "http://localhost:9999"}), update: map[string]any{"bedrock_auth": "iam", "api_key": ""}, wantStatus: 400, wantErr: msgIAMEndpoint, wantAuth: "api_key", wantKey: true},
+		{name: "update deployment base_url with fragment", create: dep(nil), update: map[string]any{"base_url": "https://h.example#f"}, wantStatus: 400, wantErr: msgQueryURL, wantAuth: "api_key", wantKey: true},
 		{name: "set role", create: dep(map[string]any{"bedrock_auth": "iam", "api_key": nil}), update: map[string]any{"bedrock_role_arn": iamTestRole}, wantStatus: 200, wantAuth: "iam", wantRole: iamTestRole},
 		{name: "unset role", create: dep(map[string]any{"bedrock_auth": "iam", "api_key": nil, "bedrock_role_arn": iamTestRole}), update: map[string]any{"bedrock_role_arn": ""}, wantStatus: 200, wantAuth: "iam"},
 		{name: "role on api_key deployment", create: dep(nil), update: map[string]any{"bedrock_role_arn": iamTestRole}, wantStatus: 400, wantErr: msgRoleNeedsIAM, wantAuth: "api_key", wantKey: true},
@@ -590,6 +598,18 @@ func TestTestConnection_BedrockIAM(t *testing.T) {
 			}
 			if len(seen) != 0 || len(s.calls) != 0 {
 				t.Errorf("%s: probe was sent", name)
+			}
+		}
+	})
+
+	t.Run("query or fragment rejected in any auth mode", func(t *testing.T) {
+		t.Parallel()
+		for _, bad := range []string{"https://h.example?x=1", "https://h.example#f"} {
+			s := &recSigner{}
+			e := newBedrockEnvWithSigner(t, s)
+			code, out := e.call(t, "POST", modelTestConnectionURL(), base(map[string]any{"bedrock_auth": "api_key", "api_key": "bk", "base_url": bad}))
+			if code != 400 || errMessage(out) != msgQueryURL {
+				t.Errorf("%s: status %d body %v", bad, code, out)
 			}
 		}
 	})

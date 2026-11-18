@@ -519,8 +519,8 @@ func TestBedrockHandler_ErrorMapping(t *testing.T) {
 	}{
 		{"validation passes message", 400, "ValidationException", "The maximum tokens you requested exceeds the model limit", false, "invalid_request", "Bedrock rejected the request as invalid"},
 		{"validation on stream request", 400, "ValidationException", "bad input", true, "invalid_request", "Bedrock rejected the request as invalid"},
-		{"access denied static", 403, "AccessDeniedException", "User: arn:aws:iam::" + acct + ":user/alice is not authorized", false, "permission_denied", "Bedrock API key is not authorized for this model"},
-		{"access denied on stream request", 403, "AccessDeniedException", "arn:aws:iam::" + acct + ":role/x", true, "permission_denied", "Bedrock API key is not authorized for this model"},
+		{"access denied static", 403, "AccessDeniedException", "User: arn:aws:iam::" + acct + ":user/alice is not authorized", false, "permission_denied", "Bedrock credentials are not authorized for this model"},
+		{"access denied on stream request", 403, "AccessDeniedException", "arn:aws:iam::" + acct + ":role/x", true, "permission_denied", "Bedrock credentials are not authorized for this model"},
 		{"unrecognized client", 403, "UnrecognizedClientException", "token invalid " + acct, false, "invalid_api_key", "Bedrock rejected the credentials"},
 		{"401 without type", 401, "", "nope " + acct, false, "invalid_api_key", "Bedrock rejected the credentials"},
 		{"expired", 400, "ExpiredTokenException", "expired " + acct, false, "expired_api_key", "Bedrock credentials have expired"},

@@ -1260,7 +1260,7 @@ func (p *ProxyHandler) signBedrock(ctx context.Context, req *http.Request, body 
 		return errNoBedrockSigner
 	}
 	// Defense in depth: never sign a request that is not going to an AWS host.
-	if err := provider.ValidBedrockIAMEndpoint(req.URL.String()); err != nil {
+	if err := provider.ValidBedrockIAMEndpoint(req.URL.String(), model.Region); err != nil {
 		return err
 	}
 	return p.AWSSigner.Sign(ctx, req, body, model.Region, model.BedrockRoleARN)

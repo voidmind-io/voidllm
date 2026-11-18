@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -39,26 +40,28 @@ func (f *fakeSigner) Sign(_ context.Context, req *http.Request, body []byte, reg
 	return nil
 }
 
-// awsURLFor returns an AWS-looking endpoint that awsRouteTransport routes to
-// the local test server at serverURL, so IAM tests pass the AWS-host check.
+// awsURLFor returns a valid eu-central-1 Bedrock VPC endpoint URL that
+// awsRouteTransport routes to the local test server at serverURL, so IAM tests
+// pass the Bedrock host check. The server port is encoded in the endpoint ID.
 func awsURLFor(serverURL string) string {
 	u, err := url.Parse(serverURL)
 	if err != nil {
 		return serverURL
 	}
-	return "https://p" + u.Port() + ".bedrock-runtime.eu-central-1.amazonaws.com"
+	return "https://vpce-" + u.Port() + ".bedrock-runtime.eu-central-1.vpce.amazonaws.com"
 }
+
+// fakeEndpointRe matches exactly the hosts produced by awsURLFor.
+var fakeEndpointRe = regexp.MustCompile(`^vpce-([0-9]+)\.bedrock-runtime\.eu-central-1\.vpce\.amazonaws\.com$`)
 
 // awsRouteTransport rewrites awsURLFor hosts to the local server.
 type awsRouteTransport struct{}
 
 func (awsRouteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	const suffix = ".bedrock-runtime.eu-central-1.amazonaws.com"
-	host := req.URL.Hostname()
-	if strings.HasPrefix(host, "p") && strings.HasSuffix(host, suffix) {
+	if m := fakeEndpointRe.FindStringSubmatch(req.URL.Hostname()); m != nil {
 		r := req.Clone(req.Context())
 		r.URL.Scheme = "http"
-		r.URL.Host = "127.0.0.1:" + strings.TrimSuffix(strings.TrimPrefix(host, "p"), suffix)
+		r.URL.Host = "127.0.0.1:" + m[1]
 		r.Host = r.URL.Host
 		return http.DefaultTransport.RoundTrip(r)
 	}

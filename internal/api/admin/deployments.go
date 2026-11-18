@@ -215,6 +215,9 @@ func (h *Handler) createDeployment(c fiber.Ctx) error {
 		if msg := provider.ValidateBedrockAuth(req.BedrockAuth, req.BedrockRoleARN, req.APIKey != ""); msg != "" {
 			return apierror.BadRequest(c, msg)
 		}
+		if !provider.ValidBedrockBaseURLShape(req.BaseURL) {
+			return apierror.BadRequest(c, "base_url must not contain a query string or fragment")
+		}
 		if msg := bedrockIAMEndpointMessage(req.BedrockAuth, req.BaseURL, req.Region); msg != "" {
 			return apierror.BadRequest(c, msg)
 		}
@@ -417,6 +420,9 @@ func (h *Handler) updateDeployment(c fiber.Ctx) error {
 			req.BedrockAuth, req.BedrockRoleARN, req.APIKey,
 		); msg != "" {
 			return apierror.BadRequest(c, msg)
+		}
+		if !provider.ValidBedrockBaseURLShape(mergedBaseURL) {
+			return apierror.BadRequest(c, "base_url must not contain a query string or fragment")
 		}
 		mergedAuth := dep.BedrockAuth
 		if req.BedrockAuth != nil {

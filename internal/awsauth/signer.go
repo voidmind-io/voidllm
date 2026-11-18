@@ -87,10 +87,13 @@ const (
 // newCredentialsCache wraps p in a credentials cache with the package expiry
 // window and jitter.
 func newCredentialsCache(p aws.CredentialsProvider) *aws.CredentialsCache {
-	return aws.NewCredentialsCache(p, func(o *aws.CredentialsCacheOptions) {
-		o.ExpiryWindow = credentialsExpiryWindow
-		o.ExpiryWindowJitterFrac = credentialsExpiryJitterFrac
-	})
+	return aws.NewCredentialsCache(p, setExpiryWindow)
+}
+
+// setExpiryWindow applies the package expiry window and jitter to o.
+func setExpiryWindow(o *aws.CredentialsCacheOptions) {
+	o.ExpiryWindow = credentialsExpiryWindow
+	o.ExpiryWindowJitterFrac = credentialsExpiryJitterFrac
 }
 
 // roleProviderFactory builds a credentials provider that assumes roleARN in
@@ -106,6 +109,9 @@ type Signer struct {
 	signer *v4.Signer
 	load   baseLoader
 	newRP  roleProviderFactory
+	// loadOpts are extra LoadDefaultConfig options; tests use them to inject a
+	// provider through the real default-chain path.
+	loadOpts []func(*awsconfig.LoadOptions) error
 
 	mu    sync.Mutex
 	base  *aws.Config
@@ -120,9 +126,14 @@ type signerOption func(*Signer)
 func withBaseProvider(provider aws.CredentialsProvider) signerOption {
 	return func(s *Signer) {
 		s.load = func(context.Context) (aws.Config, error) {
-			return aws.Config{Credentials: newCredentialsCache(provider)}, nil
+			return aws.Config{Credentials: aws.NewCredentialsCache(provider)}, nil
 		}
 	}
+}
+
+// withLoadOptions appends options to the LoadDefaultConfig call.
+func withLoadOptions(opts ...func(*awsconfig.LoadOptions) error) signerOption {
+	return func(s *Signer) { s.loadOpts = append(s.loadOpts, opts...) }
 }
 
 // withRoleProviderFactory overrides how role-assuming providers are built.
@@ -139,14 +150,6 @@ func NewSigner() *Signer {
 func newSigner(opts ...signerOption) *Signer {
 	s := &Signer{
 		signer: v4.NewSigner(),
-		load: func(ctx context.Context) (aws.Config, error) {
-			cfg, err := awsconfig.LoadDefaultConfig(ctx)
-			if err != nil {
-				return aws.Config{}, err
-			}
-			cfg.Credentials = newCredentialsCache(cfg.Credentials)
-			return cfg, nil
-		},
 		newRP: func(base aws.Config, roleARN, region string) aws.CredentialsProvider {
 			cfg := base.Copy()
 			cfg.Region = region
@@ -156,10 +159,22 @@ func newSigner(opts ...signerOption) *Signer {
 		},
 		roles: make(map[string]aws.CredentialsProvider),
 	}
+	s.load = s.loadDefault
 	for _, opt := range opts {
 		opt(s)
 	}
 	return s
+}
+
+// loadDefault loads the base configuration from the AWS default chain.
+// LoadDefaultConfig wraps the resolved chain in its own credentials cache, so
+// the expiry window must be passed as a load option; an outer cache could not
+// make credentials refresh any earlier.
+func (s *Signer) loadDefault(ctx context.Context) (aws.Config, error) {
+	loadOpts := append([]func(*awsconfig.LoadOptions) error{
+		awsconfig.WithCredentialsCacheOptions(setExpiryWindow),
+	}, s.loadOpts...)
+	return awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 }
 
 // baseConfig returns the lazily loaded base configuration. A failed load is

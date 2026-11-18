@@ -251,6 +251,40 @@ function validateRoleArn(auth: BedrockAuth, roleArn: string): string | undefined
   return BEDROCK_ROLE_ARN_PATTERN.test(trimmed) ? undefined : BEDROCK_ROLE_ARN_ERROR
 }
 
+const BEDROCK_IAM_ENDPOINT_ERROR =
+  'In IAM mode the endpoint must be the Bedrock Runtime endpoint of the selected region (standard, FIPS, dual-stack or VPC endpoint)'
+const BEDROCK_ENDPOINT_QUERY_ERROR = 'Endpoint must not contain a query or fragment'
+
+function isBedrockRuntimeHost(host: string, region: string): boolean {
+  const r = region.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const patterns = [
+    new RegExp(`^bedrock-runtime(-fips)?\\.${r}\\.amazonaws\\.com$`),
+    new RegExp(`^bedrock-runtime\\.${r}\\.amazonaws\\.com\\.cn$`),
+    new RegExp(`^bedrock-runtime(-fips)?\\.${r}\\.api\\.aws$`),
+    new RegExp(`^vpce-[a-z0-9-]+\\.bedrock-runtime(-fips)?\\.${r}\\.vpce\\.amazonaws\\.com(\\.cn)?$`),
+  ]
+  return patterns.some((re) => re.test(host))
+}
+
+function validateBedrockEndpoint(auth: BedrockAuth, region: string, baseUrl: string): string | undefined {
+  const url = baseUrl.trim()
+  if (!url) return undefined
+  if (url.includes('?') || url.includes('#')) return BEDROCK_ENDPOINT_QUERY_ERROR
+  if (auth !== 'iam') return undefined
+  const trimmedRegion = region.trim().toLowerCase()
+  if (!trimmedRegion) return undefined
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return BEDROCK_IAM_ENDPOINT_ERROR
+  }
+  if (parsed.protocol !== 'https:') return BEDROCK_IAM_ENDPOINT_ERROR
+  if (parsed.port !== '' && parsed.port !== '443') return BEDROCK_IAM_ENDPOINT_ERROR
+  if (parsed.username !== '' || parsed.password !== '') return BEDROCK_IAM_ENDPOINT_ERROR
+  return isBedrockRuntimeHost(parsed.hostname.toLowerCase(), trimmedRegion) ? undefined : BEDROCK_IAM_ENDPOINT_ERROR
+}
+
 const BEDROCK_API_KEY_ERROR = 'API key is required when authentication is set to API key'
 
 interface BedrockFieldsProps {
@@ -400,6 +434,8 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
       const keyRequired =
         bedrockAuth === 'api_key' && (!isEdit || toBedrockAuth(deployment.bedrock_auth) === 'iam')
       if (keyRequired && !apiKey.trim()) next.api_key = BEDROCK_API_KEY_ERROR
+      const endpointError = validateBedrockEndpoint(bedrockAuth, region, baseUrl)
+      if (endpointError) next.base_url = endpointError
     }
     setErrors(next)
     return Object.keys(next).length === 0
@@ -788,6 +824,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       const arnError = validateRoleArn(depFormEntry.bedrockAuth, depFormEntry.bedrockRoleArn)
       if (arnError) next.bedrock_role_arn = arnError
       if (depFormEntry.bedrockAuth === 'api_key' && !depFormEntry.apiKey.trim()) next.api_key = BEDROCK_API_KEY_ERROR
+      const endpointError = validateBedrockEndpoint(depFormEntry.bedrockAuth, depFormEntry.region, depFormEntry.baseUrl)
+      if (endpointError) next.base_url = endpointError
     }
     setDepFormErrors(next)
     return Object.keys(next).length === 0
@@ -855,11 +893,19 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
         const arnError = validateRoleArn(bedrockAuth, bedrockRoleArn)
         if (arnError) next.bedrock_role_arn = arnError
         if (bedrockAuth === 'api_key' && !apiKey.trim()) next.api_key = BEDROCK_API_KEY_ERROR
+        const endpointError = validateBedrockEndpoint(bedrockAuth, region, baseUrl)
+        if (endpointError) next.base_url = endpointError
       }
     } else {
       if (deployments.length === 0) next.deployments = 'At least one deployment is required'
       if (deployments.some((d) => d.provider === 'bedrock' && d.bedrockAuth === 'api_key' && !d.apiKey.trim())) {
         next.deployments = 'Every Bedrock deployment using API key authentication needs an API key'
+      }
+      const badEndpoint = deployments.find(
+        (d) => d.provider === 'bedrock' && validateBedrockEndpoint(d.bedrockAuth, d.region, d.baseUrl),
+      )
+      if (badEndpoint) {
+        next.deployments = `Deployment "${badEndpoint.name}": ${validateBedrockEndpoint(badEndpoint.bedrockAuth, badEndpoint.region, badEndpoint.baseUrl)}`
       }
       if (type !== 'chat' && deployments.some((d) => d.provider === 'bedrock')) {
         next.type = BEDROCK_CHAT_ONLY_ERROR
@@ -1627,6 +1673,8 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
       if (bedrockAuth === 'api_key' && toBedrockAuth(model.bedrock_auth) === 'iam' && !apiKey.trim()) {
         next.api_key = BEDROCK_API_KEY_ERROR
       }
+      const endpointError = validateBedrockEndpoint(bedrockAuth, region, baseUrl)
+      if (endpointError) next.base_url = endpointError
       setErrors(next)
       if (Object.keys(next).length > 0) return
     } else {
@@ -1792,6 +1840,7 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
           value={baseUrl}
           onChange={(e) => setBaseUrl(e.target.value)}
           placeholder={BASE_URL_PLACEHOLDERS[provider] ?? 'https://'}
+          error={errors.base_url}
           disabled={updateModel.isPending}
         />
         {isBedrock && (

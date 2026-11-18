@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -63,26 +64,33 @@ func (f *fakeBedrockSigner) snapshot() []fakeSignCall {
 	return append([]fakeSignCall(nil), f.calls...)
 }
 
-// bhAWSURL returns an AWS-looking endpoint that bhRouteAWS routes to the local
-// upstream test server, so IAM tests satisfy the AWS-host signing check.
+// bhAWSURL returns a valid Bedrock VPC endpoint URL for eu-central-1 that
+// bhRouteAWS routes to the local upstream test server, so IAM tests satisfy the
+// Bedrock host check. The upstream port is encoded in the endpoint ID.
 func bhAWSURL(upstreamURL string) string {
+	return bhAWSURLIn(upstreamURL, "eu-central-1")
+}
+
+// bhAWSURLIn is bhAWSURL for an explicit region.
+func bhAWSURLIn(upstreamURL, region string) string {
 	u, err := url.Parse(upstreamURL)
 	if err != nil {
 		return upstreamURL
 	}
-	return "https://p" + u.Port() + ".bedrock-runtime.eu-central-1.amazonaws.com"
+	return "https://vpce-" + u.Port() + ".bedrock-runtime." + region + ".vpce.amazonaws.com"
 }
 
-// awsRouteTransport rewrites requests for bhAWSURL hosts to the local server.
+// bhFakeEndpointRe matches exactly the hosts produced by bhAWSURLIn.
+var bhFakeEndpointRe = regexp.MustCompile(`^vpce-([0-9]+)\.bedrock-runtime\.[a-z]+-[a-z]+-[0-9]\.vpce\.amazonaws\.com$`)
+
+// awsRouteTransport rewrites requests for bhAWSURLIn hosts to the local server.
 type awsRouteTransport struct{ base http.RoundTripper }
 
 func (t awsRouteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	host := req.URL.Hostname()
-	if strings.HasPrefix(host, "p") && strings.HasSuffix(host, ".bedrock-runtime.eu-central-1.amazonaws.com") {
-		port := strings.TrimSuffix(strings.TrimPrefix(host, "p"), ".bedrock-runtime.eu-central-1.amazonaws.com")
+	if m := bhFakeEndpointRe.FindStringSubmatch(req.URL.Hostname()); m != nil {
 		r := req.Clone(req.Context())
 		r.URL.Scheme = "http"
-		r.URL.Host = "127.0.0.1:" + port
+		r.URL.Host = "127.0.0.1:" + m[1]
 		r.Host = r.URL.Host
 		return t.base.RoundTrip(r)
 	}
@@ -278,7 +286,7 @@ func TestBedrockHandler_IAM_SignFailureFailsOverToSecondDeployment(t *testing.T)
 				_, _ = io.WriteString(w, strings.Replace(bhOKJSON, "pong", "from-two", 1))
 			})
 			dep1 := Deployment{Name: "d1", Provider: "bedrock", BaseURL: bhAWSURL(up1.URL), Region: "eu-central-1", BedrockModelID: "eu.model-one-v1:0", BedrockAuth: "iam", BedrockRoleARN: iamRoleBad, Priority: 1}
-			dep2 := Deployment{Name: "d2", Provider: "bedrock", BaseURL: bhAWSURL(up2.URL), Region: "us-east-1", BedrockModelID: "us.model-two-v1:0", BedrockAuth: "iam", BedrockRoleARN: iamRoleGood, Priority: 2}
+			dep2 := Deployment{Name: "d2", Provider: "bedrock", BaseURL: bhAWSURLIn(up2.URL, "us-east-1"), Region: "us-east-1", BedrockModelID: "us.model-two-v1:0", BedrockAuth: "iam", BedrockRoleARN: iamRoleGood, Priority: 2}
 			env := newBHEnv(t, twoDeploymentRegistry("claude", dep1, dep2))
 			bhRouteAWS(env)
 			env.h.Router = &staticDeploymentPicker{deps: []Deployment{dep1, dep2}}
@@ -348,7 +356,7 @@ func TestBedrockHandler_IAM_AllSignersFail(t *testing.T) {
 				w.WriteHeader(500)
 			})
 			dep1 := Deployment{Name: "d1", Provider: "bedrock", BaseURL: bhAWSURL(up.URL), Region: "eu-central-1", BedrockModelID: "m1-v1:0", BedrockAuth: "iam", Priority: 1}
-			dep2 := Deployment{Name: "d2", Provider: "bedrock", BaseURL: bhAWSURL(up.URL), Region: "us-east-1", BedrockModelID: "m2-v1:0", BedrockAuth: "iam", Priority: 2}
+			dep2 := Deployment{Name: "d2", Provider: "bedrock", BaseURL: bhAWSURLIn(up.URL, "us-east-1"), Region: "us-east-1", BedrockModelID: "m2-v1:0", BedrockAuth: "iam", Priority: 2}
 			env := newBHEnv(t, twoDeploymentRegistry("claude", dep1, dep2))
 			bhRouteAWS(env)
 			env.h.Router = &staticDeploymentPicker{deps: []Deployment{dep1, dep2}}

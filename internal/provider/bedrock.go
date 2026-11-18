@@ -31,21 +31,36 @@ func ValidBedrockRoleARN(arn string) bool {
 }
 
 // ErrBedrockIAMEndpoint is returned by ValidBedrockIAMEndpoint when an endpoint
-// is not an AWS HTTPS host that SigV4 credentials may be sent to.
-var ErrBedrockIAMEndpoint = errors.New("bedrock iam requires an https base_url on an amazonaws.com, amazonaws.com.cn or api.aws host")
+// is not a Bedrock Runtime host that SigV4 credentials may be sent to.
+var ErrBedrockIAMEndpoint = errors.New("bedrock iam requires an https Bedrock Runtime endpoint for the configured region")
 
-// bedrockIAMHostSuffixes are the DNS suffixes SigV4-signed requests may target.
-var bedrockIAMHostSuffixes = []string{".amazonaws.com", ".amazonaws.com.cn", ".api.aws"}
+// bedrockVPCEndpointRe matches the middle part of a Bedrock Runtime VPC
+// interface endpoint DNS name (regional or AZ-specific), without the region.
+var bedrockVPCEndpointRe = regexp.MustCompile(`^vpce-[a-z0-9]+(-[a-z0-9]+)*$`)
 
 // ValidBedrockIAMEndpoint reports whether baseURL is an endpoint to which
-// IAM-signed requests may be sent: https, no userinfo, a DNS host name (not an
-// IP literal) ending in .amazonaws.com, .amazonaws.com.cn or .api.aws,
-// compared case-insensitively. It returns ErrBedrockIAMEndpoint otherwise.
-// This prevents a misconfigured or malicious base_url from receiving signed
-// requests and the credential-derived signature headers.
-func ValidBedrockIAMEndpoint(baseURL string) error {
+// IAM-signed requests for region may be sent. The URL must use https, have no
+// userinfo, query or fragment, port empty or 443, and a DNS host name (not an
+// IP literal) that is exactly one of the documented Bedrock Runtime hosts for
+// region (compared case-insensitively, one trailing dot ignored):
+//
+//   - bedrock-runtime.R.amazonaws.com and bedrock-runtime-fips.R.amazonaws.com
+//   - bedrock-runtime.R.amazonaws.com.cn
+//   - bedrock-runtime.R.api.aws and bedrock-runtime-fips.R.api.aws
+//   - VPC interface endpoints: vpce-<id>[-<az>].bedrock-runtime[-fips].R.vpce.amazonaws.com[.cn]
+//
+// Any other host, including other AWS services, is rejected with
+// ErrBedrockIAMEndpoint. This stops a misconfigured or malicious base_url from
+// receiving signed requests.
+func ValidBedrockIAMEndpoint(baseURL, region string) error {
+	if !ValidBedrockRegion(region) || strings.ContainsAny(baseURL, "?#") {
+		return ErrBedrockIAMEndpoint
+	}
 	u, err := url.Parse(baseURL)
 	if err != nil || u.Scheme != "https" || u.User != nil {
+		return ErrBedrockIAMEndpoint
+	}
+	if port := u.Port(); port != "" && port != "443" {
 		return ErrBedrockIAMEndpoint
 	}
 	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
@@ -55,12 +70,32 @@ func ValidBedrockIAMEndpoint(baseURL string) error {
 	if _, perr := netip.ParseAddr(host); perr == nil {
 		return ErrBedrockIAMEndpoint
 	}
-	for _, suffix := range bedrockIAMHostSuffixes {
-		if strings.HasSuffix(host, suffix) && len(host) > len(suffix) {
+	switch host {
+	case "bedrock-runtime." + region + ".amazonaws.com",
+		"bedrock-runtime-fips." + region + ".amazonaws.com",
+		"bedrock-runtime." + region + ".amazonaws.com.cn",
+		"bedrock-runtime." + region + ".api.aws",
+		"bedrock-runtime-fips." + region + ".api.aws":
+		return nil
+	}
+	for _, suffix := range []string{
+		".bedrock-runtime." + region + ".vpce.amazonaws.com",
+		".bedrock-runtime-fips." + region + ".vpce.amazonaws.com",
+		".bedrock-runtime." + region + ".vpce.amazonaws.com.cn",
+		".bedrock-runtime-fips." + region + ".vpce.amazonaws.com.cn",
+	} {
+		if id, ok := strings.CutSuffix(host, suffix); ok && bedrockVPCEndpointRe.MatchString(id) {
 			return nil
 		}
 	}
 	return ErrBedrockIAMEndpoint
+}
+
+// ValidBedrockBaseURLShape reports whether baseURL, when non-empty, has no
+// query string or fragment. The proxy appends "/model/..." to base_url by
+// string concatenation, so a query or fragment would swallow the path.
+func ValidBedrockBaseURLShape(baseURL string) bool {
+	return !strings.ContainsAny(baseURL, "?#")
 }
 
 // NormalizeBedrockAuth returns the effective Bedrock auth mode, mapping the

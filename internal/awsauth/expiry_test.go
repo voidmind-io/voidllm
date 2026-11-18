@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 )
 
 // TestCredentialsCache_ExpiryWindowApplied verifies credentials that expire
@@ -56,31 +57,70 @@ func TestCredentialsCache_ExpiryWindowApplied(t *testing.T) {
 	}
 }
 
-// TestSigner_BaseAndRoleCachesUseExpiryWindow verifies the Signer's own base
-// and role caches refresh near-expiry credentials.
-func TestSigner_BaseAndRoleCachesUseExpiryWindow(t *testing.T) {
+// TestSigner_DefaultChainUsesExpiryWindow drives the real LoadDefaultConfig
+// path (with an injected provider) and verifies the expiry window is applied by
+// the SDK's own cache, so near-expiry credentials are refreshed before use.
+func TestSigner_DefaultChainUsesExpiryWindow(t *testing.T) {
 	t.Parallel()
-	var baseCalls, roleCalls atomic.Int32
-	near := func(counter *atomic.Int32) aws.CredentialsProvider {
-		return aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
-			counter.Add(1)
-			return aws.Credentials{AccessKeyID: "AKIA", SecretAccessKey: "s", CanExpire: true, Expires: time.Now().Add(2 * time.Minute)}, nil
-		})
-	}
-	s := newSigner(
-		withBaseProvider(near(&baseCalls)),
-		withRoleProviderFactory(func(aws.Config, string, string) aws.CredentialsProvider { return near(&roleCalls) }),
-	)
-	for i := 0; i < 2; i++ {
+	var calls atomic.Int32
+	near := aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+		calls.Add(1)
+		return aws.Credentials{AccessKeyID: "AKIA", SecretAccessKey: "s", CanExpire: true, Expires: time.Now().Add(2 * time.Minute)}, nil
+	})
+	s := newSigner(withLoadOptions(
+		awsconfig.WithCredentialsProvider(near),
+		awsconfig.WithSharedConfigFiles([]string{}),
+		awsconfig.WithSharedCredentialsFiles([]string{}),
+	))
+	for i := 0; i < 3; i++ {
 		if err := s.Sign(context.Background(), newReq(t, "/model/x/converse", nil), nil, "eu-central-1", ""); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("provider calls = %d, want 3 (credentials always inside the expiry window)", got)
+	}
+
+	var longCalls atomic.Int32
+	long := aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+		longCalls.Add(1)
+		return aws.Credentials{AccessKeyID: "AKIA", SecretAccessKey: "s", CanExpire: true, Expires: time.Now().Add(30 * time.Minute)}, nil
+	})
+	s2 := newSigner(withLoadOptions(
+		awsconfig.WithCredentialsProvider(long),
+		awsconfig.WithSharedConfigFiles([]string{}),
+		awsconfig.WithSharedCredentialsFiles([]string{}),
+	))
+	for i := 0; i < 3; i++ {
+		if err := s2.Sign(context.Background(), newReq(t, "/model/x/converse", nil), nil, "eu-central-1", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := longCalls.Load(); got != 1 {
+		t.Errorf("long-lived provider calls = %d, want 1", got)
+	}
+}
+
+// TestSigner_RoleCacheUsesExpiryWindow verifies the role-assumption caches the
+// Signer builds refresh near-expiry credentials.
+func TestSigner_RoleCacheUsesExpiryWindow(t *testing.T) {
+	t.Parallel()
+	var roleCalls atomic.Int32
+	near := aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+		roleCalls.Add(1)
+		return aws.Credentials{AccessKeyID: "AKIA", SecretAccessKey: "s", CanExpire: true, Expires: time.Now().Add(2 * time.Minute)}, nil
+	})
+	s := newSigner(
+		withBaseProvider(staticProvider("")),
+		withRoleProviderFactory(func(aws.Config, string, string) aws.CredentialsProvider { return near }),
+	)
+	for i := 0; i < 2; i++ {
 		if err := s.Sign(context.Background(), newReq(t, "/model/x/converse", nil), nil, "eu-central-1", "arn:aws:iam::123456789012:role/r"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if baseCalls.Load() != 2 || roleCalls.Load() != 2 {
-		t.Errorf("base calls = %d, role calls = %d, want 2 each", baseCalls.Load(), roleCalls.Load())
+	if roleCalls.Load() != 2 {
+		t.Errorf("role provider calls = %d, want 2", roleCalls.Load())
 	}
 }
 

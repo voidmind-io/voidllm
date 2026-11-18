@@ -181,7 +181,14 @@ models:
 
 The same two fields work on a deployment inside a multi-deployment model.
 
-Signed requests may only go to AWS. With `bedrock_auth: iam` the effective endpoint (the regional default or your `base_url`) must use `https` and a host name ending in `.amazonaws.com`, `.amazonaws.com.cn` or `.api.aws`, without credentials in the URL and not an IP address. VPC endpoints such as `vpce-....bedrock-runtime.<region>.vpce.amazonaws.com` are fine. Anything else is rejected at config load and in the Admin API, and VoidLLM refuses to sign such a request at runtime.
+Signed requests may only go to a Bedrock Runtime endpoint of the model's `region`. With `bedrock_auth: iam` the effective endpoint (the regional default or your `base_url`) must use `https` (port 443 or none) and be exactly one of these hosts, where `<region>` is the configured `region`:
+
+- `bedrock-runtime.<region>.amazonaws.com` and `bedrock-runtime-fips.<region>.amazonaws.com`
+- `bedrock-runtime.<region>.amazonaws.com.cn` (China partition)
+- `bedrock-runtime.<region>.api.aws` and `bedrock-runtime-fips.<region>.api.aws` (dual-stack)
+- VPC interface endpoint names such as `vpce-0abc123.bedrock-runtime.<region>.vpce.amazonaws.com` (also the AZ-specific `vpce-0abc123-eu-central-1a...` form and the `-fips` and `.cn` variants)
+
+Other AWS hosts (API Gateway, load balancers, S3 and so on), other regions, IP addresses, URLs with credentials, a query string or a fragment are rejected at config load and in the Admin API, and VoidLLM refuses to sign such a request at runtime. In every auth mode, `base_url` for Bedrock must not contain a query string or fragment.
 
 Credentials are resolved lazily on the first request through the default AWS credential chain (aws-sdk-go-v2), in this order:
 
@@ -301,7 +308,7 @@ Bedrock error responses are mapped to the standard VoidLLM error shape. The HTTP
 | `UnrecognizedClientException`, `InvalidSignatureException`, other 401 | `invalid_api_key` | Bedrock rejected the credentials |
 | `ExpiredTokenException` | `expired_api_key` | Bedrock credentials have expired |
 | `AccessDeniedException` with an authentication failure (an invalid or unknown API key returns 403) | `invalid_api_key` | Bedrock rejected the credentials |
-| `AccessDeniedException`, other 403 | `permission_denied` | Bedrock API key is not authorized for this model |
+| `AccessDeniedException`, other 403 | `permission_denied` | Bedrock credentials are not authorized for this model |
 | `ValidationException` reporting that the account has no Bedrock model access | `permission_denied` | Bedrock model access is not enabled for this AWS account |
 | `ResourceNotFoundException` | `model_not_found` | Bedrock model or inference profile not found |
 | `ThrottlingException`, other 429 | `rate_limit_exceeded` | Bedrock rate limit exceeded |

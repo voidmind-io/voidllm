@@ -2014,3 +2014,229 @@ describe('Cache price fields', () => {
     expect(body).not.toHaveProperty('cache_write_price_per_1m')
   })
 })
+
+// ---------------------------------------------------------------------------
+// Tests: AWS Bedrock endpoint validation
+// ---------------------------------------------------------------------------
+
+const ENDPOINT_ERROR =
+  'In IAM mode the endpoint must be the Bedrock Runtime endpoint of the selected region (standard, FIPS, dual-stack or VPC endpoint)'
+const QUERY_ERROR = 'Endpoint must not contain a query or fragment'
+
+const VALID_IAM_ENDPOINTS = [
+  'https://bedrock-runtime.eu-central-1.amazonaws.com',
+  'https://bedrock-runtime-fips.eu-central-1.amazonaws.com/',
+  'https://bedrock-runtime.eu-central-1.amazonaws.com.cn',
+  'https://bedrock-runtime.eu-central-1.api.aws',
+  'https://bedrock-runtime-fips.eu-central-1.api.aws:443',
+  'https://vpce-0a1b2c.bedrock-runtime.eu-central-1.vpce.amazonaws.com',
+  'https://vpce-0a1b2c.bedrock-runtime-fips.eu-central-1.vpce.amazonaws.com.cn',
+]
+
+const INVALID_IAM_ENDPOINTS = [
+  'https://abc123.execute-api.eu-central-1.amazonaws.com',
+  'https://my-lb-123.eu-central-1.elb.amazonaws.com',
+  'https://bucket.s3.eu-central-1.amazonaws.com',
+  'https://bedrock-runtime.us-east-1.amazonaws.com',
+  'http://bedrock-runtime.eu-central-1.amazonaws.com',
+  'https://bedrock-runtime.eu-central-1.amazonaws.com:8443',
+  'https://bedrock-runtime.eu-central-1.amazonaws.com.evil.com',
+]
+
+describe('AWS Bedrock endpoint validation', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  async function openBedrockSingle(capturedBodies: Map<string, string>, iam: boolean) {
+    setupFetchMock(postModelEntries(), capturedBodies)
+    await renderSettled()
+    await openCreateDialog()
+    const dialog = getDialog(/add model/i)
+    await dialogFocused()
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'claude-br')
+    await pickBedrockProvider(dialog)
+    await fillBedrockBasics(dialog)
+    if (iam) await pickAuth(dialog, IAM_LABEL)
+    else await userEvent.type(within(dialog).getByLabelText(/^api key$/i), 'abwk-1')
+    return dialog
+  }
+
+  it.each(INVALID_IAM_ENDPOINTS)('single create blocks %s in IAM mode with zero requests', async (endpoint) => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockSingle(capturedBodies, true)
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /base url/i }), endpoint)
+    await submitDialog(dialog, /add model/i)
+
+    expect(await within(dialog).findByText(ENDPOINT_ERROR)).toBeInTheDocument()
+    expect(capturedBodies.size).toBe(0)
+  })
+
+  it.each(VALID_IAM_ENDPOINTS)('single create accepts %s in IAM mode', async (endpoint) => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockSingle(capturedBodies, true)
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /base url/i }), endpoint)
+    await submitDialog(dialog, /add model/i)
+
+    await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
+    expect(within(dialog).queryByText(ENDPOINT_ERROR)).not.toBeInTheDocument()
+  })
+
+  it('single create accepts an empty endpoint in IAM mode', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockSingle(capturedBodies, true)
+    await submitDialog(dialog, /add model/i)
+    await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
+  })
+
+  it('single create keeps arbitrary https endpoints allowed in api_key mode', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockSingle(capturedBodies, false)
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /base url/i }), 'https://proxy.internal.example')
+    await submitDialog(dialog, /add model/i)
+    await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
+  })
+
+  it.each([true, false])('single create rejects a query or fragment (iam=%s)', async (iam) => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockSingle(capturedBodies, iam)
+    await userEvent.type(
+      within(dialog).getByRole('textbox', { name: /base url/i }),
+      'https://bedrock-runtime.eu-central-1.amazonaws.com/x?a=b',
+    )
+    await submitDialog(dialog, /add model/i)
+
+    expect(await within(dialog).findByText(QUERY_ERROR)).toBeInTheDocument()
+    expect(capturedBodies.size).toBe(0)
+  })
+
+  it('load-balanced create blocks an invalid IAM endpoint before any request', async () => {
+    const capturedBodies = new Map<string, string>()
+    setupFetchMock(postModelEntries(), capturedBodies)
+    await renderSettled()
+    await openCreateDialog()
+    const dialog = getDialog(/add model/i)
+    await dialogFocused()
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'lb-br')
+    await switchToLoadBalancedTab()
+    await userEvent.click(within(dialog).getByRole('button', { name: /\+ add deployment/i }))
+    await pickBedrockProvider(dialog)
+    const names = within(dialog).getAllByRole('textbox', { name: /^name$/i })
+    await userEvent.type(names[names.length - 1], 'br-1')
+    await fillBedrockBasics(dialog)
+    await pickAuth(dialog, IAM_LABEL)
+    const urls = within(dialog).getAllByRole('textbox', { name: /base url/i })
+    await userEvent.type(urls[urls.length - 1], 'https://bucket.s3.eu-central-1.amazonaws.com')
+    await userEvent.click(within(dialog).getByRole('button', { name: /^add$/i }))
+
+    expect(await within(dialog).findByText(ENDPOINT_ERROR)).toBeInTheDocument()
+    await submitDialog(dialog, /add model/i)
+    expect(capturedBodies.size).toBe(0)
+  })
+
+  it('load-balanced create accepts a matching VPC endpoint', async () => {
+    const capturedBodies = new Map<string, string>()
+    setupFetchMock(
+      [
+        {
+          matcher: (u) => u.includes('/api/v1/models/new-br/deployments'),
+          method: 'POST',
+          response: { id: 'dep-1', name: 'br-1', provider: 'bedrock' },
+        },
+        ...postModelEntries(),
+      ],
+      capturedBodies,
+    )
+    await renderSettled()
+    await openCreateDialog()
+    const dialog = getDialog(/add model/i)
+    await dialogFocused()
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'lb-br')
+    await switchToLoadBalancedTab()
+    await userEvent.click(within(dialog).getByRole('button', { name: /\+ add deployment/i }))
+    await pickBedrockProvider(dialog)
+    const names = within(dialog).getAllByRole('textbox', { name: /^name$/i })
+    await userEvent.type(names[names.length - 1], 'br-1')
+    await fillBedrockBasics(dialog)
+    await pickAuth(dialog, IAM_LABEL)
+    const urls = within(dialog).getAllByRole('textbox', { name: /base url/i })
+    await userEvent.type(urls[urls.length - 1], 'https://vpce-0a1b2c.bedrock-runtime.eu-central-1.vpce.amazonaws.com')
+    await userEvent.click(within(dialog).getByRole('button', { name: /^add$/i }))
+    await submitDialog(dialog, /add model/i)
+
+    await waitFor(() => expect(capturedBodies.has('POST:/api/v1/models/new-br/deployments')).toBe(true))
+  })
+
+  it('edit model blocks a region mismatch in IAM mode and sends no PATCH', async () => {
+    const capturedBodies = new Map<string, string>()
+    const model = makeChatModel({
+      id: 'model-br',
+      name: 'claude-br',
+      provider: 'bedrock',
+      base_url: '',
+      region: 'eu-central-1',
+      bedrock_model_id: 'amazon.nova-lite-v1:0',
+      bedrock_auth: 'iam',
+    })
+    setupFetchMock(
+      [
+        ...defaultEntries(MOCK_LICENSE_NO_FALLBACK, { data: [model], has_more: false }),
+        { matcher: (u) => u.includes('/api/v1/models/model-br'), method: 'PATCH', response: model },
+      ],
+      capturedBodies,
+    )
+    await renderSettled('claude-br')
+
+    const row = (await screen.findByText('claude-br')).closest('tr')
+    if (!row) throw new Error('row not found')
+    await userEvent.click(within(row).getByTitle('Edit model'))
+    const dialog = getDialog(/edit model/i)
+    await dialogFocused()
+    await userEvent.type(
+      within(dialog).getByRole('textbox', { name: /base url/i }),
+      'https://bedrock-runtime.us-east-1.amazonaws.com',
+    )
+    await submitDialog(dialog, /save changes/i)
+
+    expect(await within(dialog).findByText(ENDPOINT_ERROR)).toBeInTheDocument()
+    expect(capturedBodies.size).toBe(0)
+  })
+
+  it('deployment dialog blocks an execute-api host in IAM mode and sends no POST', async () => {
+    const capturedBodies = new Map<string, string>()
+    const model = makeChatModel({
+      id: 'model-lb',
+      name: 'lb-model',
+      strategy: 'round-robin',
+      deployments: [],
+    } as Partial<MockModelResponse>)
+    setupFetchMock(
+      [
+        {
+          matcher: (u) => u.includes('/api/v1/models/model-lb/deployments'),
+          method: 'POST',
+          response: {},
+        },
+        ...defaultEntries(MOCK_LICENSE_NO_FALLBACK, { data: [model], has_more: false }),
+      ],
+      capturedBodies,
+    )
+    await renderSettled('lb-model')
+
+    await userEvent.click(screen.getByTitle('Add deployment'))
+    const dialog = getDialog(/add deployment/i)
+    await dialogFocused()
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'br-1')
+    await pickBedrockProvider(dialog)
+    await fillBedrockBasics(dialog)
+    await pickAuth(dialog, IAM_LABEL)
+    await userEvent.type(
+      within(dialog).getByRole('textbox', { name: /base url/i }),
+      'https://abc123.execute-api.eu-central-1.amazonaws.com',
+    )
+    await submitDialog(dialog, /add deployment/i)
+
+    expect(await within(dialog).findByText(ENDPOINT_ERROR)).toBeInTheDocument()
+    expect(capturedBodies.size).toBe(0)
+  })
+})
