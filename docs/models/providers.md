@@ -93,10 +93,12 @@ models:
 |---|---|---|
 | `region` | yes | AWS region, e.g. `eu-central-1`, `us-gov-west-1`. Must look like a region name (`eu-central-1`); anything else, such as a value containing a dot or a slash, is rejected. |
 | `bedrock_model_id` | yes | Base model ID, cross-region inference profile ID, or ARN. Up to 2048 characters from letters, digits, `.`, `_`, `:`, `/`, `-`. |
-| `api_key` | yes in practice | Bedrock API key, sent as `Authorization: Bearer`. |
+| `bedrock_auth` | no | `api_key` (default) or `iam`. See [IAM authentication](#iam-authentication). |
+| `api_key` | yes with `bedrock_auth: api_key` | Bedrock API key, sent as `Authorization: Bearer`. Must be empty with `bedrock_auth: iam`. |
+| `bedrock_role_arn` | no | IAM role to assume through STS. Only valid with `bedrock_auth: iam`. Must match `arn:aws:iam::<12 digit account>:role/<name>`. |
 | `base_url` | no | Endpoint override. Empty means the regional endpoint (see below). Must start with `http://` or `https://`. |
 
-`region` and `bedrock_model_id` are also available on deployments and in the Admin API (`region`, `bedrock_model_id`). Both are required even when `base_url` is set. Bedrock supports `chat` models only; any other `type` is rejected.
+`region`, `bedrock_model_id`, `bedrock_auth` and `bedrock_role_arn` are also available on deployments and in the Admin API (same field names). Both are required even when `base_url` is set. Bedrock supports `chat` models only; any other `type` is rejected.
 
 ### Endpoint
 
@@ -118,7 +120,12 @@ Many newer models can only be called through an inference profile, not by their 
 
 ### Authentication
 
-Only Bedrock API keys (bearer tokens) are supported. SigV4 signing, IAM roles, the AWS credential chain, IRSA, and AssumeRole are not supported yet.
+Two modes are available, selected with `bedrock_auth` (per model or per deployment):
+
+- `api_key` (default): a Bedrock API key sent as a bearer token. An `api_key` is required in this mode.
+- `iam`: requests are signed with AWS SigV4 using credentials from the AWS credential chain. See [IAM authentication](#iam-authentication).
+
+#### API key mode
 
 - Long-term API keys do not expire on their own (unless you set an expiry when creating them) and are the recommended choice for now.
 - Short-term API keys expire within 12 hours at most. When one expires, requests fail with `expired_api_key` until you update the key.
@@ -157,6 +164,98 @@ Notes:
 - A cross-region inference profile needs the foundation-model ARN in every destination region the profile can route to, hence the `eu-*` wildcard above.
 - Model access must be enabled for the model in your AWS account.
 - A service control policy can deny `bedrock:CallWithBearerToken` (condition key `bedrock:bearerTokenType`). If every request returns `permission_denied`, check this first.
+
+### IAM authentication
+
+With `bedrock_auth: iam`, VoidLLM signs every Bedrock request with SigV4 and sends no bearer token. Leave `api_key` empty in this mode; a configured key is rejected.
+
+```yaml
+models:
+  - name: claude-sonnet-bedrock
+    provider: bedrock
+    region: eu-central-1
+    bedrock_model_id: eu.anthropic.claude-sonnet-4-5-20250929-v1:0
+    bedrock_auth: iam
+    bedrock_role_arn: arn:aws:iam::123456789012:role/voidllm-bedrock   # optional
+```
+
+The same two fields work on a deployment inside a multi-deployment model.
+
+Credentials are resolved lazily on the first request through the default AWS credential chain (aws-sdk-go-v2), in this order:
+
+1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`)
+2. Shared config and credentials files, including profiles (`AWS_PROFILE`) and SSO
+3. Web identity token (`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`), used by IRSA on EKS
+4. Container credentials: ECS task role and EKS Pod Identity
+5. EC2 instance role (IMDS)
+
+If no credentials can be found, requests fail with a 502 `Bedrock IAM credentials unavailable` and the next deployment is tried. Credentials are cached and refreshed before they expire. Credential errors are logged by category only, never with SDK error text.
+
+#### Assuming a role
+
+When `bedrock_role_arn` is set, VoidLLM uses the credentials from the chain above to call `sts:AssumeRole` on that role (session name `voidllm`, in the model's `region`) and signs requests with the temporary credentials. This is useful for cross-account access. Models and deployments can use different roles.
+
+#### IAM policy
+
+The identity that signs the requests (the role from the chain, or the assumed role when `bedrock_role_arn` is set) needs:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowConverse",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:eu-central-1:123456789012:inference-profile/eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "arn:aws:bedrock:eu-*::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+      ]
+    }
+  ]
+}
+```
+
+`bedrock:CallWithBearerToken` is not needed in IAM mode. When `bedrock_role_arn` is used, the base identity also needs `sts:AssumeRole` on the target role, and the target role's trust policy must allow the base identity:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::123456789012:role/voidllm-bedrock"
+    }
+  ]
+}
+```
+
+#### Example: IRSA on EKS with the Helm chart
+
+Create an IAM role for the service account with the Bedrock policy above and a trust policy for the cluster's OIDC provider, then annotate the chart's service account:
+
+```yaml
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/voidllm-bedrock
+
+config:
+  models:
+    - name: claude-sonnet-bedrock
+      provider: bedrock
+      region: eu-central-1
+      bedrock_model_id: eu.anthropic.claude-sonnet-4-5-20250929-v1:0
+      bedrock_auth: iam
+```
+
+EKS injects the web identity token into the pod, and VoidLLM picks it up through the credential chain.
+
+When updating a model through the Admin API from `api_key` to `iam`, send `"api_key": ""` in the same request to clear the stored key. An explicitly empty `api_key` clears the stored key; switching back to `api_key` requires a new key.
 
 ### Request translation
 

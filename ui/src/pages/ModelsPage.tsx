@@ -231,23 +231,53 @@ function HealthBadge({ info }: HealthBadgeProps) {
   )
 }
 
+type BedrockAuth = 'api_key' | 'iam'
+
+const BEDROCK_AUTH_OPTIONS: SelectOption[] = [
+  { value: 'api_key', label: 'API key' },
+  { value: 'iam', label: 'IAM role (AWS credential chain)' },
+]
+
+const BEDROCK_ROLE_ARN_PATTERN = /^arn:aws[a-z-]*:iam::\d{12}:role\/[\w+=,.@/-]+$/
+const BEDROCK_ROLE_ARN_ERROR = 'Role ARN must look like arn:aws:iam::123456789012:role/name'
+
+function toBedrockAuth(value: string | undefined): BedrockAuth {
+  return value === 'iam' ? 'iam' : 'api_key'
+}
+
+function validateRoleArn(auth: BedrockAuth, roleArn: string): string | undefined {
+  const trimmed = roleArn.trim()
+  if (auth !== 'iam' || !trimmed) return undefined
+  return BEDROCK_ROLE_ARN_PATTERN.test(trimmed) ? undefined : BEDROCK_ROLE_ARN_ERROR
+}
+
 interface BedrockFieldsProps {
   region: string
   bedrockModelId: string
+  auth: BedrockAuth
+  roleArn: string
   onRegionChange: (value: string) => void
   onBedrockModelIdChange: (value: string) => void
+  onAuthChange: (value: BedrockAuth) => void
+  onRoleArnChange: (value: string) => void
   regionError?: string
   bedrockModelIdError?: string
+  roleArnError?: string
   disabled?: boolean
 }
 
 function BedrockFields({
   region,
   bedrockModelId,
+  auth,
+  roleArn,
   onRegionChange,
   onBedrockModelIdChange,
+  onAuthChange,
+  onRoleArnChange,
   regionError,
   bedrockModelIdError,
+  roleArnError,
   disabled,
 }: BedrockFieldsProps) {
   return (
@@ -268,6 +298,24 @@ function BedrockFields({
         error={bedrockModelIdError}
         disabled={disabled}
       />
+      <Select
+        label="Authentication"
+        options={BEDROCK_AUTH_OPTIONS}
+        value={auth}
+        onChange={(v) => onAuthChange(toBedrockAuth(v))}
+        disabled={disabled}
+      />
+      {auth === 'iam' && (
+        <Input
+          label="Role ARN (optional)"
+          value={roleArn}
+          onChange={(e) => onRoleArnChange(e.target.value)}
+          placeholder="arn:aws:iam::123456789012:role/voidllm-bedrock"
+          description="Leave empty to use the credentials of the VoidLLM process: environment, profile, IRSA or instance role."
+          error={roleArnError}
+          disabled={disabled}
+        />
+      )}
     </>
   )
 }
@@ -290,6 +338,7 @@ interface DeploymentFormErrors {
   base_url?: string
   region?: string
   bedrock_model_id?: string
+  bedrock_role_arn?: string
 }
 
 function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProps) {
@@ -303,6 +352,8 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
   const [azureApiVersion, setAzureApiVersion] = useState(deployment?.azure_api_version ?? '')
   const [region, setRegion] = useState(deployment?.region ?? '')
   const [bedrockModelId, setBedrockModelId] = useState(deployment?.bedrock_model_id ?? '')
+  const [bedrockAuth, setBedrockAuth] = useState<BedrockAuth>(toBedrockAuth(deployment?.bedrock_auth))
+  const [bedrockRoleArn, setBedrockRoleArn] = useState(deployment?.bedrock_role_arn ?? '')
   const [weight, setWeight] = useState(String(deployment?.weight ?? 1))
   const [priority, setPriority] = useState(String(deployment?.priority ?? 0))
   const [errors, setErrors] = useState<DeploymentFormErrors>({})
@@ -314,6 +365,7 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
   const isPending = createDeployment.isPending || updateDeployment.isPending
   const isAzure = provider === 'azure'
   const isBedrock = provider === 'bedrock'
+  const isIam = isBedrock && bedrockAuth === 'iam'
 
   function handleClose() {
     setName('')
@@ -324,6 +376,8 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
     setAzureApiVersion('')
     setRegion('')
     setBedrockModelId('')
+    setBedrockAuth('api_key')
+    setBedrockRoleArn('')
     setWeight('1')
     setPriority('0')
     setErrors({})
@@ -337,6 +391,10 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
     if (!isEdit && !isBedrock && !baseUrl.trim()) next.base_url = 'Base URL is required'
     if (isBedrock && !region.trim()) next.region = 'AWS region is required'
     if (isBedrock && !bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
+    if (isBedrock) {
+      const arnError = validateRoleArn(bedrockAuth, bedrockRoleArn)
+      if (arnError) next.bedrock_role_arn = arnError
+    }
     setErrors(next)
     return Object.keys(next).length === 0
   }
@@ -357,7 +415,15 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
       } else if (baseUrl.trim() && baseUrl.trim() !== deployment.base_url) {
         params.base_url = baseUrl.trim()
       }
-      if (apiKey.trim()) params.api_key = apiKey.trim()
+      if (isIam) {
+        if (toBedrockAuth(deployment.bedrock_auth) !== 'iam') params.api_key = ''
+      } else if (apiKey.trim()) {
+        params.api_key = apiKey.trim()
+      }
+      if (isBedrock && bedrockAuth !== toBedrockAuth(deployment.bedrock_auth)) params.bedrock_auth = bedrockAuth
+      if (isBedrock && (isIam ? bedrockRoleArn.trim() : '') !== (deployment.bedrock_role_arn ?? '')) {
+        params.bedrock_role_arn = isIam ? bedrockRoleArn.trim() : ''
+      }
       if (isBedrock && region.trim() !== (deployment.region ?? '')) params.region = region.trim()
       if (isBedrock && bedrockModelId.trim() !== (deployment.bedrock_model_id ?? '')) {
         params.bedrock_model_id = bedrockModelId.trim()
@@ -391,11 +457,13 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
             name: name.trim(),
             provider,
             base_url: baseUrl.trim() || undefined,
-            api_key: apiKey.trim() || undefined,
+            api_key: isIam ? undefined : apiKey.trim() || undefined,
             azure_deployment: isAzure && azureDeployment.trim() ? azureDeployment.trim() : undefined,
             azure_api_version: isAzure && azureApiVersion.trim() ? azureApiVersion.trim() : undefined,
             region: isBedrock ? region.trim() : undefined,
             bedrock_model_id: isBedrock ? bedrockModelId.trim() : undefined,
+            bedrock_auth: isBedrock ? bedrockAuth : undefined,
+            bedrock_role_arn: isIam && bedrockRoleArn.trim() ? bedrockRoleArn.trim() : undefined,
             weight: !isNaN(parsedWeight) ? parsedWeight : 1,
             priority: !isNaN(parsedPriority) ? parsedPriority : 0,
           },
@@ -447,23 +515,30 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
             </Button>
           </div>
         )}
-        <Input
-          label="API Key"
-          type="password"
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-          placeholder={isEdit ? 'Leave empty to keep current' : 'sk-...'}
-          description={isEdit ? 'Leave empty to keep current key' : 'Encrypted at rest, never shown again'}
-          disabled={isPending}
-        />
+        {!isIam && (
+          <Input
+            label="API Key"
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder={isEdit ? 'Leave empty to keep current' : 'sk-...'}
+            description={isEdit ? 'Leave empty to keep current key' : 'Encrypted at rest, never shown again'}
+            disabled={isPending}
+          />
+        )}
         {isBedrock && (
           <BedrockFields
             region={region}
             bedrockModelId={bedrockModelId}
+            auth={bedrockAuth}
+            roleArn={bedrockRoleArn}
             onRegionChange={setRegion}
             onBedrockModelIdChange={setBedrockModelId}
+            onAuthChange={setBedrockAuth}
+            onRoleArnChange={setBedrockRoleArn}
             regionError={errors.region}
             bedrockModelIdError={errors.bedrock_model_id}
+            roleArnError={errors.bedrock_role_arn}
             disabled={isPending}
           />
         )}
@@ -532,6 +607,7 @@ interface FormErrors {
   base_url?: string
   region?: string
   bedrock_model_id?: string
+  bedrock_role_arn?: string
   deployments?: string
 }
 
@@ -544,6 +620,8 @@ interface DeploymentFormEntry {
   azureApiVersion: string
   region: string
   bedrockModelId: string
+  bedrockAuth: BedrockAuth
+  bedrockRoleArn: string
   weight: number
   priority: number
 }
@@ -557,6 +635,8 @@ const emptyDeploymentEntry = (): DeploymentFormEntry => ({
   azureApiVersion: '',
   region: '',
   bedrockModelId: '',
+  bedrockAuth: 'api_key',
+  bedrockRoleArn: '',
   weight: 1,
   priority: 0,
 })
@@ -567,6 +647,7 @@ interface InlineDeploymentFormErrors {
   base_url?: string
   region?: string
   bedrock_model_id?: string
+  bedrock_role_arn?: string
 }
 
 function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
@@ -588,6 +669,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const [azureApiVersion, setAzureApiVersion] = useState('')
   const [region, setRegion] = useState('')
   const [bedrockModelId, setBedrockModelId] = useState('')
+  const [bedrockAuth, setBedrockAuth] = useState<BedrockAuth>('api_key')
+  const [bedrockRoleArn, setBedrockRoleArn] = useState('')
   const [timeout, setTimeout] = useState('')
   const [piiFilter, setPiiFilter] = useState('default')
 
@@ -629,6 +712,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     setAzureApiVersion('')
     setRegion('')
     setBedrockModelId('')
+    setBedrockAuth('api_key')
+    setBedrockRoleArn('')
     setTimeout('')
     setStrategy('round-robin')
     setMaxRetries('')
@@ -657,8 +742,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       const body: Record<string, string> = {
         provider,
         base_url: baseUrl.trim(),
-        api_key: apiKey.trim(),
       }
+      if (!isIam) body.api_key = apiKey.trim()
       if (name.trim()) body.model_name = name.trim()
       if (isAzure) {
         if (azureDeployment.trim()) body.azure_deployment = azureDeployment.trim()
@@ -667,6 +752,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       if (isBedrock) {
         body.region = region.trim()
         body.bedrock_model_id = bedrockModelId.trim()
+        body.bedrock_auth = bedrockAuth
+        if (isIam && bedrockRoleArn.trim()) body.bedrock_role_arn = bedrockRoleArn.trim()
       }
       const res = await apiClient<{ success: boolean; message: string }>('/models/test-connection', {
         method: 'POST',
@@ -688,6 +775,10 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     if (!depIsBedrock && !depFormEntry.baseUrl.trim()) next.base_url = 'Base URL is required'
     if (depIsBedrock && !depFormEntry.region.trim()) next.region = 'AWS region is required'
     if (depIsBedrock && !depFormEntry.bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
+    if (depIsBedrock) {
+      const arnError = validateRoleArn(depFormEntry.bedrockAuth, depFormEntry.bedrockRoleArn)
+      if (arnError) next.bedrock_role_arn = arnError
+    }
     setDepFormErrors(next)
     return Object.keys(next).length === 0
   }
@@ -751,6 +842,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
         if (type !== 'chat') next.type = BEDROCK_CHAT_ONLY_ERROR
         if (!region.trim()) next.region = 'AWS region is required'
         if (!bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
+        const arnError = validateRoleArn(bedrockAuth, bedrockRoleArn)
+        if (arnError) next.bedrock_role_arn = arnError
       }
     } else {
       if (deployments.length === 0) next.deployments = 'At least one deployment is required'
@@ -777,7 +870,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       }
 
       if (baseUrl.trim()) params.base_url = baseUrl.trim()
-      if (apiKey.trim()) params.api_key = apiKey.trim()
+      if (!isIam && apiKey.trim()) params.api_key = apiKey.trim()
       if (maxContextTokens.trim()) {
         const parsed = parseInt(maxContextTokens, 10)
         if (!isNaN(parsed)) params.max_context_tokens = parsed
@@ -805,6 +898,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       if (isBedrock) {
         params.region = region.trim()
         params.bedrock_model_id = bedrockModelId.trim()
+        params.bedrock_auth = bedrockAuth
+        if (isIam && bedrockRoleArn.trim()) params.bedrock_role_arn = bedrockRoleArn.trim()
       }
       if (timeout.trim()) params.timeout = timeout.trim()
       if (parsedAliases.length > 0) params.aliases = parsedAliases
@@ -869,11 +964,16 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
               name: dep.name,
               provider: dep.provider,
               base_url: dep.baseUrl || undefined,
-              api_key: dep.apiKey || undefined,
+              api_key: dep.provider === 'bedrock' && dep.bedrockAuth === 'iam' ? undefined : dep.apiKey || undefined,
               azure_deployment: dep.azureDeployment || undefined,
               azure_api_version: dep.azureApiVersion || undefined,
               region: dep.provider === 'bedrock' ? dep.region.trim() : undefined,
               bedrock_model_id: dep.provider === 'bedrock' ? dep.bedrockModelId.trim() : undefined,
+              bedrock_auth: dep.provider === 'bedrock' ? dep.bedrockAuth : undefined,
+              bedrock_role_arn:
+                dep.provider === 'bedrock' && dep.bedrockAuth === 'iam' && dep.bedrockRoleArn.trim()
+                  ? dep.bedrockRoleArn.trim()
+                  : undefined,
               weight: dep.weight,
               priority: dep.priority,
             },
@@ -892,9 +992,11 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
 
   const isAzure = provider === 'azure'
   const isBedrock = provider === 'bedrock'
+  const isIam = isBedrock && bedrockAuth === 'iam'
   const isPending = createModel.isPending || createDeployment.isPending
   const depFormIsAzure = depFormEntry.provider === 'azure'
   const depFormIsBedrock = depFormEntry.provider === 'bedrock'
+  const depFormIsIam = depFormIsBedrock && depFormEntry.bedrockAuth === 'iam'
   const depFormIsOpen = showDeploymentForm || editingDeployment !== null
 
   const fallbackOptions: SelectOption[] = useMemo(() => {
@@ -953,15 +1055,17 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
               error={errors.base_url}
               disabled={isPending}
             />
-            <Input
-              label="API Key"
-              type="password"
-              value={apiKey}
-              onChange={(e) => { setApiKey(e.target.value); setTestResult(null) }}
-              placeholder="sk-..."
-              description="Encrypted at rest, never shown again"
-              disabled={isPending}
-            />
+            {!isIam && (
+              <Input
+                label="API Key"
+                type="password"
+                value={apiKey}
+                onChange={(e) => { setApiKey(e.target.value); setTestResult(null) }}
+                placeholder="sk-..."
+                description="Encrypted at rest, never shown again"
+                disabled={isPending}
+              />
+            )}
             <div className="flex items-center gap-3">
               <Button
                 type="button"
@@ -985,8 +1089,13 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                 bedrockModelId={bedrockModelId}
                 onRegionChange={(v) => { setRegion(v); setTestResult(null) }}
                 onBedrockModelIdChange={(v) => { setBedrockModelId(v); setTestResult(null) }}
+                auth={bedrockAuth}
+                roleArn={bedrockRoleArn}
+                onAuthChange={(v) => { setBedrockAuth(v); setTestResult(null) }}
+                onRoleArnChange={(v) => { setBedrockRoleArn(v); setTestResult(null) }}
                 regionError={errors.region}
                 bedrockModelIdError={errors.bedrock_model_id}
+                roleArnError={errors.bedrock_role_arn}
                 disabled={isPending}
               />
             )}
@@ -1091,20 +1200,27 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                             error={depFormErrors.base_url}
                             disabled={isPending}
                           />
-                          <Input
-                            label="API Key"
-                            type="password"
-                            value={depFormEntry.apiKey}
-                            onChange={(e) => setDepFormEntry((prev) => ({ ...prev, apiKey: e.target.value }))}
-                            placeholder="sk-..."
-                            disabled={isPending}
-                          />
+                          {!depFormIsIam && (
+                            <Input
+                              label="API Key"
+                              type="password"
+                              value={depFormEntry.apiKey}
+                              onChange={(e) => setDepFormEntry((prev) => ({ ...prev, apiKey: e.target.value }))}
+                              placeholder="sk-..."
+                              disabled={isPending}
+                            />
+                          )}
                           {depFormIsBedrock && (
                             <BedrockFields
                               region={depFormEntry.region}
                               bedrockModelId={depFormEntry.bedrockModelId}
                               onRegionChange={(v) => setDepFormEntry((prev) => ({ ...prev, region: v }))}
                               onBedrockModelIdChange={(v) => setDepFormEntry((prev) => ({ ...prev, bedrockModelId: v }))}
+                              auth={depFormEntry.bedrockAuth}
+                              roleArn={depFormEntry.bedrockRoleArn}
+                              onAuthChange={(v) => setDepFormEntry((prev) => ({ ...prev, bedrockAuth: v }))}
+                              onRoleArnChange={(v) => setDepFormEntry((prev) => ({ ...prev, bedrockRoleArn: v }))}
+                              roleArnError={depFormErrors.bedrock_role_arn}
                               regionError={depFormErrors.region}
                               bedrockModelIdError={depFormErrors.bedrock_model_id}
                               disabled={isPending}
@@ -1221,20 +1337,27 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                     error={depFormErrors.base_url}
                     disabled={isPending}
                   />
-                  <Input
-                    label="API Key"
-                    type="password"
-                    value={depFormEntry.apiKey}
-                    onChange={(e) => setDepFormEntry((prev) => ({ ...prev, apiKey: e.target.value }))}
-                    placeholder="sk-..."
-                    disabled={isPending}
-                  />
+                  {!depFormIsIam && (
+                    <Input
+                      label="API Key"
+                      type="password"
+                      value={depFormEntry.apiKey}
+                      onChange={(e) => setDepFormEntry((prev) => ({ ...prev, apiKey: e.target.value }))}
+                      placeholder="sk-..."
+                      disabled={isPending}
+                    />
+                  )}
                   {depFormIsBedrock && (
                     <BedrockFields
                       region={depFormEntry.region}
                       bedrockModelId={depFormEntry.bedrockModelId}
                       onRegionChange={(v) => setDepFormEntry((prev) => ({ ...prev, region: v }))}
                       onBedrockModelIdChange={(v) => setDepFormEntry((prev) => ({ ...prev, bedrockModelId: v }))}
+                      auth={depFormEntry.bedrockAuth}
+                      roleArn={depFormEntry.bedrockRoleArn}
+                      onAuthChange={(v) => setDepFormEntry((prev) => ({ ...prev, bedrockAuth: v }))}
+                      onRoleArnChange={(v) => setDepFormEntry((prev) => ({ ...prev, bedrockRoleArn: v }))}
+                      roleArnError={depFormErrors.bedrock_role_arn}
                       regionError={depFormErrors.region}
                       bedrockModelIdError={depFormErrors.bedrock_model_id}
                       disabled={isPending}
@@ -1447,6 +1570,8 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
   const [azureApiVersion, setAzureApiVersion] = useState(model.azure_api_version ?? '')
   const [region, setRegion] = useState(model.region ?? '')
   const [bedrockModelId, setBedrockModelId] = useState(model.bedrock_model_id ?? '')
+  const [bedrockAuth, setBedrockAuth] = useState<BedrockAuth>(toBedrockAuth(model.bedrock_auth))
+  const [bedrockRoleArn, setBedrockRoleArn] = useState(model.bedrock_role_arn ?? '')
   const [errors, setErrors] = useState<FormErrors>({})
   const [timeout, setTimeout] = useState(model.timeout ?? '')
   const [fallbackModelName, setFallbackModelName] = useState(model.fallback_model_name ?? '')
@@ -1460,6 +1585,7 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
 
   const isAzure = provider === 'azure'
   const isBedrock = provider === 'bedrock'
+  const isIam = isBedrock && bedrockAuth === 'iam'
 
   const fallbackOptions: SelectOption[] = useMemo(() => {
     const allModels = modelsData?.data ?? []
@@ -1479,6 +1605,8 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
       if (type !== 'chat') next.type = BEDROCK_CHAT_ONLY_ERROR
       if (!region.trim()) next.region = 'AWS region is required'
       if (!bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
+      const arnError = validateRoleArn(bedrockAuth, bedrockRoleArn)
+      if (arnError) next.bedrock_role_arn = arnError
       setErrors(next)
       if (Object.keys(next).length > 0) return
     } else {
@@ -1491,7 +1619,11 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
     if (provider !== model.provider) params.provider = provider
     if (type !== (model.type || 'chat')) params.type = type
     if (baseUrl.trim() !== model.base_url) params.base_url = baseUrl.trim()
-    if (apiKey.trim()) params.api_key = apiKey.trim()
+    if (isIam) {
+      if (toBedrockAuth(model.bedrock_auth) !== 'iam') params.api_key = ''
+    } else if (apiKey.trim()) {
+      params.api_key = apiKey.trim()
+    }
 
     if (maxContextTokens.trim()) {
       const parsed = parseInt(maxContextTokens, 10)
@@ -1542,6 +1674,10 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
       if (region.trim() !== (model.region ?? '')) params.region = region.trim()
       if (bedrockModelId.trim() !== (model.bedrock_model_id ?? '')) {
         params.bedrock_model_id = bedrockModelId.trim()
+      }
+      if (bedrockAuth !== toBedrockAuth(model.bedrock_auth)) params.bedrock_auth = bedrockAuth
+      if ((isIam ? bedrockRoleArn.trim() : '') !== (model.bedrock_role_arn ?? '')) {
+        params.bedrock_role_arn = isIam ? bedrockRoleArn.trim() : ''
       }
     }
 
@@ -1651,15 +1787,17 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
             </Button>
           </div>
         )}
-        <Input
-          label="API Key"
-          type="password"
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-          placeholder="Leave empty to keep current key"
-          description="Leave empty to keep current key. Enter a new value to replace."
-          disabled={updateModel.isPending}
-        />
+        {!isIam && (
+          <Input
+            label="API Key"
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder="Leave empty to keep current key"
+            description="Leave empty to keep current key. Enter a new value to replace."
+            disabled={updateModel.isPending}
+          />
+        )}
         <Input
           label="Max Context Tokens"
           type="number"
@@ -1712,8 +1850,13 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
             bedrockModelId={bedrockModelId}
             onRegionChange={setRegion}
             onBedrockModelIdChange={setBedrockModelId}
+            auth={bedrockAuth}
+            roleArn={bedrockRoleArn}
+            onAuthChange={setBedrockAuth}
+            onRoleArnChange={setBedrockRoleArn}
             regionError={errors.region}
             bedrockModelIdError={errors.bedrock_model_id}
+            roleArnError={errors.bedrock_role_arn}
             disabled={updateModel.isPending}
           />
         )}

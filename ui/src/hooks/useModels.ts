@@ -11,6 +11,8 @@ export interface DeploymentResponse {
   azure_api_version?: string
   region?: string
   bedrock_model_id?: string
+  bedrock_auth?: 'api_key' | 'iam'
+  bedrock_role_arn?: string
   weight: number
   priority: number
   is_active: boolean
@@ -34,6 +36,8 @@ export interface ModelResponse {
   azure_api_version?: string
   region?: string
   bedrock_model_id?: string
+  bedrock_auth?: 'api_key' | 'iam'
+  bedrock_role_arn?: string
   timeout?: string
   is_active: boolean
   source: string
@@ -68,6 +72,8 @@ export interface CreateModelParams {
   azure_api_version?: string
   region?: string
   bedrock_model_id?: string
+  bedrock_auth?: 'api_key' | 'iam'
+  bedrock_role_arn?: string
   timeout?: string
   aliases?: string[]
   strategy?: string
@@ -85,6 +91,8 @@ export interface CreateDeploymentParams {
   azure_api_version?: string
   region?: string
   bedrock_model_id?: string
+  bedrock_auth?: 'api_key' | 'iam'
+  bedrock_role_arn?: string
   weight?: number
   priority?: number
 }
@@ -98,6 +106,8 @@ export interface UpdateDeploymentParams {
   azure_api_version?: string
   region?: string
   bedrock_model_id?: string
+  bedrock_auth?: 'api_key' | 'iam'
+  bedrock_role_arn?: string
   weight?: number
   priority?: number
 }
@@ -117,6 +127,8 @@ export interface UpdateModelParams {
   azure_api_version?: string
   region?: string
   bedrock_model_id?: string
+  bedrock_auth?: 'api_key' | 'iam'
+  bedrock_role_arn?: string
   timeout?: string
   aliases?: string[]
   fallback_model_name?: string | null

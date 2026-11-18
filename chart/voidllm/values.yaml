@@ -14,6 +14,9 @@ fullnameOverride: ""
 serviceAccount:
   # -- Create a ServiceAccount
   create: true
+  # -- ServiceAccount annotations, e.g. for IRSA on EKS (Bedrock IAM auth):
+  # annotations:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/voidllm-bedrock
   annotations: {}
   # -- Name override (default: release fullname)
   name: ""

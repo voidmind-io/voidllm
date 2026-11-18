@@ -52,6 +52,10 @@ type createModelRequest struct {
 	Region string `json:"region,omitempty"`
 	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN. Required when provider is "bedrock".
 	BedrockModelID string `json:"bedrock_model_id,omitempty"`
+	// BedrockAuth selects the Bedrock auth mode: "api_key" (default) or "iam".
+	BedrockAuth string `json:"bedrock_auth,omitempty"`
+	// BedrockRoleARN is an optional IAM role to assume. Only valid with bedrock_auth "iam".
+	BedrockRoleARN string `json:"bedrock_role_arn,omitempty"`
 	// Aliases are optional short names that resolve to this model in proxy requests.
 	Aliases []string `json:"aliases"`
 	// Timeout is the per-model upstream timeout as a Go duration string (e.g. "30s",
@@ -104,6 +108,11 @@ type updateModelRequest struct {
 	Region *string `json:"region"`
 	// BedrockModelID, when non-nil, replaces the Bedrock model ID.
 	BedrockModelID *string `json:"bedrock_model_id"`
+	// BedrockAuth, when non-nil, replaces the Bedrock auth mode.
+	BedrockAuth *string `json:"bedrock_auth"`
+	// BedrockRoleARN, when non-nil, replaces the Bedrock role ARN. An empty
+	// string unsets it.
+	BedrockRoleARN *string `json:"bedrock_role_arn"`
 	// Aliases, when non-nil, replaces the full set of aliases for the model.
 	// Pass an empty slice to remove all aliases.
 	Aliases *[]string `json:"aliases"`
@@ -174,7 +183,11 @@ type modelResponse struct {
 	// Region is the AWS region. Non-empty only for provider "bedrock".
 	Region string `json:"region,omitempty"`
 	// BedrockModelID is the Bedrock model ID. Non-empty only for provider "bedrock".
-	BedrockModelID string   `json:"bedrock_model_id,omitempty"`
+	BedrockModelID string `json:"bedrock_model_id,omitempty"`
+	// BedrockAuth is the Bedrock auth mode. Non-empty only for provider "bedrock".
+	BedrockAuth string `json:"bedrock_auth,omitempty"`
+	// BedrockRoleARN is the optional IAM role. Non-empty only for provider "bedrock" with iam auth.
+	BedrockRoleARN string   `json:"bedrock_role_arn,omitempty"`
 	IsActive       bool     `json:"is_active"`
 	Source         string   `json:"source"`
 	Aliases        []string `json:"aliases"`
@@ -257,6 +270,8 @@ func modelToResponse(m *db.Model, fallbackName string) modelResponse {
 		GCPLocation:           m.GCPLocation,
 		Region:                m.Region,
 		BedrockModelID:        m.BedrockModelID,
+		BedrockAuth:           bedrockAuthForProvider(m.Provider, m.BedrockAuth),
+		BedrockRoleARN:        m.BedrockRoleARN,
 		IsActive:              m.IsActive,
 		Source:                m.Source,
 		Aliases:               aliases,
@@ -309,6 +324,8 @@ func dbModelToProxy(m *db.Model, apiKeyPlaintext string, fallbackName string) pr
 		GCPLocation:       m.GCPLocation,
 		Region:            m.Region,
 		BedrockModelID:    m.BedrockModelID,
+		BedrockAuth:       bedrockAuthForProvider(m.Provider, m.BedrockAuth),
+		BedrockRoleARN:    m.BedrockRoleARN,
 		Timeout:           timeout,
 		FallbackModelName: fallbackName,
 		PIIFilter:         m.PIIFilter,
@@ -367,7 +384,7 @@ func modelAAD(id string) []byte {
 // decryptModelAPIKey decrypts the stored encrypted API key for m.
 // It returns an empty string when the model has no API key set.
 func (h *Handler) decryptModelAPIKey(m *db.Model) (string, error) {
-	if m.APIKeyEncrypted == nil {
+	if m.APIKeyEncrypted == nil || (m.Provider == provider.Bedrock && m.BedrockAuth == provider.BedrockAuthIAM) {
 		return "", nil
 	}
 	plaintext, err := crypto.DecryptString(*m.APIKeyEncrypted, h.EncryptionKey, modelAAD(m.ID))
@@ -521,8 +538,14 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 	if req.Provider != "" && !provider.ValidProviders[req.Provider] {
 		return apierror.BadRequest(c, "provider must be one of: "+strings.Join(provider.Names(), ", "))
 	}
+	if req.Provider != provider.Bedrock && (req.BedrockAuth != "" || req.BedrockRoleARN != "") {
+		return apierror.BadRequest(c, "bedrock_auth and bedrock_role_arn are only valid for the bedrock provider")
+	}
 	if req.Strategy == "" && req.Provider == provider.Bedrock {
 		if msg := validateBedrockFields(req.Region, req.BedrockModelID, req.Type); msg != "" {
+			return apierror.BadRequest(c, msg)
+		}
+		if msg := provider.ValidateBedrockAuth(req.BedrockAuth, req.BedrockRoleARN, req.APIKey != ""); msg != "" {
 			return apierror.BadRequest(c, msg)
 		}
 		if req.BaseURL != "" && !hasHTTPScheme(req.BaseURL) {
@@ -617,6 +640,8 @@ func (h *Handler) CreateModel(c fiber.Ctx) error {
 		GCPLocation:           req.GCPLocation,
 		Region:                req.Region,
 		BedrockModelID:        req.BedrockModelID,
+		BedrockAuth:           req.BedrockAuth,
+		BedrockRoleARN:        req.BedrockRoleARN,
 		Source:                "api",
 		CreatedBy:             createdBy,
 		Aliases:               aliasStr,
@@ -888,6 +913,15 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 			if mergedBaseURL != "" && !hasHTTPScheme(mergedBaseURL) {
 				return apierror.BadRequest(c, "base_url must begin with http:// or https://")
 			}
+			if msg := validateBedrockAuthUpdate(
+				existing.BedrockAuth, existing.BedrockRoleARN, existing.APIKeyEncrypted != nil,
+				req.Provider != nil && existing.Provider != provider.Bedrock,
+				req.BedrockAuth, req.BedrockRoleARN, req.APIKey,
+			); msg != "" {
+				return apierror.BadRequest(c, msg)
+			}
+		} else if (req.BedrockAuth != nil && *req.BedrockAuth != "") || (req.BedrockRoleARN != nil && *req.BedrockRoleARN != "") {
+			return apierror.BadRequest(c, "bedrock_auth and bedrock_role_arn are only valid for the bedrock provider")
 		}
 	}
 	// A load-balanced model keeps its endpoints on deployments; a bedrock
@@ -959,11 +993,24 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		GCPLocation:           req.GCPLocation,
 		Region:                req.Region,
 		BedrockModelID:        req.BedrockModelID,
+		BedrockAuth:           req.BedrockAuth,
+		BedrockRoleARN:        req.BedrockRoleARN,
 		Timeout:               req.Timeout,
 		Strategy:              req.Strategy,
 		MaxRetries:            req.MaxRetries,
 		PIIFilter:             piiFilter,
 		ClearPIIFilter:        clearPIIFilter,
+	}
+
+	if params.BedrockAuth != nil && *params.BedrockAuth == "" {
+		apiKeyMode := provider.BedrockAuthAPIKey
+		params.BedrockAuth = &apiKeyMode
+	}
+	if req.Provider != nil && *req.Provider != provider.Bedrock && existing.Provider == provider.Bedrock {
+		// Leaving bedrock: reset the bedrock-only auth settings.
+		apiKeyMode, noRole := provider.BedrockAuthAPIKey, ""
+		params.BedrockAuth = &apiKeyMode
+		params.BedrockRoleARN = &noRole
 	}
 
 	if req.Aliases != nil {
@@ -1009,7 +1056,10 @@ func (h *Handler) UpdateModel(c fiber.Ctx) error {
 		newFallbackName = h.resolveFallbackName(ctx, existing.FallbackModelID)
 	}
 
-	if req.APIKey != nil {
+	if req.APIKey != nil && *req.APIKey == "" {
+		// An explicitly empty api_key clears the stored key.
+		params.ClearAPIKey = true
+	} else if req.APIKey != nil {
 		// The model ID is the AAD — immutable, so no re-encryption is needed on rename.
 		enc, encErr := crypto.EncryptString(*req.APIKey, h.EncryptionKey, modelAAD(modelID))
 		if encErr != nil {
@@ -1293,6 +1343,10 @@ type testConnectionRequest struct {
 	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
 	// Required when Provider is "bedrock".
 	BedrockModelID string `json:"bedrock_model_id,omitempty"`
+	// BedrockAuth is the Bedrock auth mode: "api_key" (default) or "iam".
+	BedrockAuth string `json:"bedrock_auth,omitempty"`
+	// BedrockRoleARN is the optional IAM role assumed in "iam" mode.
+	BedrockRoleARN string `json:"bedrock_role_arn,omitempty"`
 }
 
 // testConnectionResponse is the JSON response returned by TestModelConnection.
@@ -1341,9 +1395,51 @@ func validateProviderIdentity(req testConnectionRequest) (message string, ok boo
 			return "bedrock_model_id is required for bedrock", false
 		case !provider.ValidBedrockModelID(req.BedrockModelID):
 			return "bedrock_model_id is invalid", false
+		case req.BedrockAuth != "" && req.BedrockAuth != provider.BedrockAuthAPIKey && req.BedrockAuth != provider.BedrockAuthIAM:
+			return "bedrock_auth must be api_key or iam", false
+		case req.BedrockAuth == provider.BedrockAuthIAM && req.BedrockRoleARN != "" && !provider.ValidBedrockRoleARN(req.BedrockRoleARN):
+			return "bedrock_role_arn is invalid", false
 		}
 	}
 	return "", true
+}
+
+// bedrockAuthForProvider returns auth for bedrock models and the empty string
+// for every other provider, so responses omit the field for non-bedrock rows.
+func bedrockAuthForProvider(providerName, auth string) string {
+	if providerName != provider.Bedrock {
+		return ""
+	}
+	return provider.NormalizeBedrockAuth(auth)
+}
+
+// validateBedrockAuthUpdate validates the Bedrock auth combination that results
+// from applying a partial update on top of the stored values. It returns an
+// empty string when the update does not touch auth-related fields and the
+// provider is unchanged (so unrelated edits to legacy rows keep working).
+// providerSwitched reports that the update changes the provider to bedrock.
+// reqKey is the api_key from the request: nil leaves the stored key, an empty
+// string clears it.
+func validateBedrockAuthUpdate(storedAuth, storedRole string, storedHasKey, providerSwitched bool, reqAuth, reqRole, reqKey *string) string {
+	if reqAuth == nil && reqRole == nil && reqKey == nil && !providerSwitched {
+		return ""
+	}
+	auth := storedAuth
+	if reqAuth != nil {
+		auth = *reqAuth
+	}
+	role := storedRole
+	if reqRole != nil {
+		role = *reqRole
+	}
+	hasKey := storedHasKey
+	if reqKey != nil {
+		hasKey = *reqKey != ""
+	}
+	if provider.NormalizeBedrockAuth(auth) == provider.BedrockAuthIAM && hasKey && reqKey == nil {
+		return "bedrock_auth iam requires clearing the stored api_key: send api_key as an empty string"
+	}
+	return provider.ValidateBedrockAuth(auth, role, hasKey)
 }
 
 // hasHTTPScheme reports whether rawURL begins with http:// or https://.
@@ -1448,6 +1544,12 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 		GCPLocation:     req.GCPLocation,
 		Region:          req.Region,
 		BedrockModelID:  req.BedrockModelID,
+		BedrockAuth:     req.BedrockAuth,
+		BedrockRoleARN:  req.BedrockRoleARN,
+	}
+	if req.Provider != provider.Bedrock {
+		target.BedrockAuth = ""
+		target.BedrockRoleARN = ""
 	}
 
 	// Probe the provider the same way the proxy hot path would actually talk
@@ -1474,6 +1576,16 @@ func (h *Handler) TestModelConnection(c fiber.Ctx) error {
 		return c.JSON(testConnectionResponse{
 			Success: false,
 			Message: "Invalid base URL format",
+		})
+	}
+
+	if signErr := health.SignProbeRequest(reqCtx, h.AWSSigner, httpReq, target); signErr != nil {
+		h.Log.WarnContext(ctx, "test-connection: bedrock iam signing failed",
+			slog.String("provider", req.Provider),
+		)
+		return c.JSON(testConnectionResponse{
+			Success: false,
+			Message: "Bedrock IAM credentials unavailable",
 		})
 	}
 

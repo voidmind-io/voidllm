@@ -12,7 +12,7 @@ import (
 // deploymentSelectColumns is the ordered column list used in all model_deployments
 // SELECT queries. It must match the scan order in scanDeployment exactly.
 const deploymentSelectColumns = "id, model_id, name, provider, base_url, api_key_encrypted, " +
-	"azure_deployment, azure_api_version, gcp_project, gcp_location, region, bedrock_model_id, " +
+	"azure_deployment, azure_api_version, gcp_project, gcp_location, region, bedrock_model_id, bedrock_auth, bedrock_role_arn, " +
 	"weight, priority, is_active, " +
 	"created_at, updated_at, deleted_at, pii_filter"
 
@@ -37,6 +37,10 @@ type Deployment struct {
 	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
 	// Non-empty only for provider "bedrock".
 	BedrockModelID string
+	// BedrockAuth is the Bedrock auth mode ("api_key" or "iam").
+	BedrockAuth string
+	// BedrockRoleARN is the optional IAM role to assume in "iam" mode.
+	BedrockRoleARN string
 	Weight         int
 	Priority       int
 	IsActive       bool
@@ -67,6 +71,10 @@ type CreateDeploymentParams struct {
 	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
 	// Required when Provider is "bedrock".
 	BedrockModelID string
+	// BedrockAuth is the Bedrock auth mode ("api_key" or "iam"). Empty is stored as "api_key".
+	BedrockAuth string
+	// BedrockRoleARN is the optional IAM role to assume in "iam" mode.
+	BedrockRoleARN string
 	// Weight is the relative probability used for weighted routing. Must be >= 1.
 	Weight int
 	// Priority is the routing preference for the priority strategy; lower value
@@ -85,6 +93,9 @@ type UpdateDeploymentParams struct {
 	Provider        *string
 	BaseURL         *string
 	APIKeyEncrypted *string
+	// ClearAPIKey, when true, sets the stored API key to NULL regardless of
+	// APIKeyEncrypted.
+	ClearAPIKey     bool
 	AzureDeployment *string
 	AzureAPIVersion *string
 	// GCPProject, when non-nil, replaces the stored Google Cloud project ID.
@@ -95,6 +106,10 @@ type UpdateDeploymentParams struct {
 	Region *string
 	// BedrockModelID, when non-nil, replaces the stored Bedrock model ID.
 	BedrockModelID *string
+	// BedrockAuth, when non-nil, replaces the stored Bedrock auth mode.
+	BedrockAuth *string
+	// BedrockRoleARN, when non-nil, replaces the stored Bedrock role ARN.
+	BedrockRoleARN *string
 	// Weight, when non-nil, replaces the stored routing weight.
 	Weight *int
 	// Priority, when non-nil, replaces the stored routing priority.
@@ -129,14 +144,14 @@ func (d *DB) CreateDeployment(ctx context.Context, params CreateDeploymentParams
 	p := d.dialect.Placeholder
 	insertQuery := "INSERT INTO model_deployments " +
 		"(id, model_id, name, provider, base_url, api_key_encrypted, " +
-		"azure_deployment, azure_api_version, gcp_project, gcp_location, region, bedrock_model_id, " +
+		"azure_deployment, azure_api_version, gcp_project, gcp_location, region, bedrock_model_id, bedrock_auth, bedrock_role_arn, " +
 		"weight, priority, is_active, pii_filter, " +
 		"created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " + p(6) + ", " +
 		p(7) + ", " + p(8) + ", " + p(9) + ", " + p(10) + ", " + p(11) + ", " + p(12) + ", " +
-		p(13) + ", " + p(14) + ", " +
-		"1, " + p(15) + ", CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+		p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) + ", " +
+		"1, " + p(17) + ", CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + deploymentSelectColumns +
 		" FROM model_deployments WHERE id = " + p(1) + " AND deleted_at IS NULL"
@@ -156,6 +171,8 @@ func (d *DB) CreateDeployment(ctx context.Context, params CreateDeploymentParams
 			params.GCPLocation,
 			params.Region,
 			params.BedrockModelID,
+			normalizeBedrockAuth(params.BedrockAuth),
+			params.BedrockRoleARN,
 			weight,
 			params.Priority,
 			boolPtrToNullableInt(params.PIIFilter),
@@ -282,7 +299,9 @@ func (d *DB) UpdateDeployment(ctx context.Context, id string, params UpdateDeplo
 		args = append(args, *params.BaseURL)
 		argN++
 	}
-	if params.APIKeyEncrypted != nil {
+	if params.ClearAPIKey {
+		setClauses = append(setClauses, "api_key_encrypted = NULL")
+	} else if params.APIKeyEncrypted != nil {
 		setClauses = append(setClauses, "api_key_encrypted = "+p(argN))
 		args = append(args, *params.APIKeyEncrypted)
 		argN++
@@ -315,6 +334,16 @@ func (d *DB) UpdateDeployment(ctx context.Context, id string, params UpdateDeplo
 	if params.BedrockModelID != nil {
 		setClauses = append(setClauses, "bedrock_model_id = "+p(argN))
 		args = append(args, *params.BedrockModelID)
+		argN++
+	}
+	if params.BedrockAuth != nil {
+		setClauses = append(setClauses, "bedrock_auth = "+p(argN))
+		args = append(args, *params.BedrockAuth)
+		argN++
+	}
+	if params.BedrockRoleARN != nil {
+		setClauses = append(setClauses, "bedrock_role_arn = "+p(argN))
+		args = append(args, *params.BedrockRoleARN)
 		argN++
 	}
 	if params.Weight != nil {
@@ -453,7 +482,7 @@ func scanDeployment(scanner interface{ Scan(...any) error }) (*Deployment, error
 	err := scanner.Scan(
 		&dep.ID, &dep.ModelID, &dep.Name, &dep.Provider, &dep.BaseURL, &dep.APIKeyEncrypted,
 		&dep.AzureDeployment, &dep.AzureAPIVersion, &dep.GCPProject, &dep.GCPLocation,
-		&dep.Region, &dep.BedrockModelID,
+		&dep.Region, &dep.BedrockModelID, &dep.BedrockAuth, &dep.BedrockRoleARN,
 		&dep.Weight, &dep.Priority,
 		&isActiveInt, &dep.CreatedAt, &dep.UpdatedAt, &dep.DeletedAt,
 		&piiFilterInt,

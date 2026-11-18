@@ -58,6 +58,9 @@ type Handler struct {
 	License           *license.Holder          // thread-safe license holder; Load() never returns nil
 	FallbackMaxDepth  int                      // from config; 0 = fallback disabled; exposed via GET /license
 	Log               *slog.Logger
+	// AWSSigner signs Bedrock IAM test-connection probes. Nil makes such
+	// probes report that credentials are unavailable.
+	AWSSigner proxy.BedrockSigner
 	// SSOProvider is the OIDC provider used for SSO login. Nil when SSO is
 	// disabled or unlicensed.
 	SSOProvider *sso.Provider

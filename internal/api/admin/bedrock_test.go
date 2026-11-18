@@ -36,6 +36,13 @@ type bedrockEnv struct {
 
 func newBedrockEnv(t *testing.T) *bedrockEnv {
 	t.Helper()
+	return newBedrockEnvWithSigner(t, nil)
+}
+
+// newBedrockEnvWithSigner is newBedrockEnv with a BedrockSigner installed on
+// the admin Handler for IAM test-connection probes.
+func newBedrockEnvWithSigner(t *testing.T, signer proxy.BedrockSigner) *bedrockEnv {
+	t.Helper()
 	ctx := context.Background()
 	safe := strings.NewReplacer("/", "_", " ", "_", "#", "_").Replace(t.Name())
 	database, err := db.Open(ctx, config.DatabaseConfig{
@@ -57,7 +64,7 @@ func newBedrockEnv(t *testing.T) *bedrockEnv {
 	h := &admin.Handler{
 		DB: database, HMACSecret: testHMACSecret, EncryptionKey: testEncryptionKey, Registry: registry,
 		KeyCache: keyCache, License: license.NewHolder(license.Verify("", true)),
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), AWSSigner: signer,
 	}
 	app := fiber.New()
 	admin.RegisterRoutes(app, h, keyCache, testHMACSecret, nil)
@@ -94,7 +101,7 @@ func errMessage(out map[string]any) string {
 
 func bedrockModelBody(over map[string]any) map[string]any {
 	b := map[string]any{
-		"name": "claude", "provider": "bedrock", "region": bedrockTestRegion, "bedrock_model_id": bedrockTestModelID,
+		"name": "claude", "provider": "bedrock", "api_key": "bk", "region": bedrockTestRegion, "bedrock_model_id": bedrockTestModelID,
 	}
 	for k, v := range over {
 		if v == nil {
@@ -307,13 +314,13 @@ func TestUpdateModel_Bedrock(t *testing.T) {
 		{
 			name:       "switch openai to bedrock with fields accepted",
 			create:     map[string]any{"name": "claude", "provider": "openai", "base_url": openaiURL},
-			update:     map[string]any{"provider": "bedrock", "region": bedrockTestRegion, "bedrock_model_id": bedrockTestModelID, "base_url": ""},
+			update:     map[string]any{"provider": "bedrock", "api_key": "bk", "region": bedrockTestRegion, "bedrock_model_id": bedrockTestModelID, "base_url": ""},
 			wantStatus: 200, wantBaseURL: bedrockDerivedURL,
 		},
 		{
 			name:       "switch embedding openai to bedrock rejected",
 			create:     map[string]any{"name": "claude", "provider": "openai", "base_url": openaiURL, "type": "embedding"},
-			update:     map[string]any{"provider": "bedrock", "region": bedrockTestRegion, "bedrock_model_id": bedrockTestModelID},
+			update:     map[string]any{"provider": "bedrock", "api_key": "bk", "region": bedrockTestRegion, "bedrock_model_id": bedrockTestModelID},
 			wantStatus: 400, wantErr: "bedrock supports only chat models",
 		},
 		{
@@ -418,7 +425,7 @@ func TestDeployments_Bedrock(t *testing.T) {
 	}
 	bedrockDep := func(over map[string]any) map[string]any {
 		b := map[string]any{
-			"name": "bedrock", "provider": "bedrock", "region": bedrockTestRegion, "bedrock_model_id": bedrockTestModelID, "weight": 1,
+			"name": "bedrock", "provider": "bedrock", "api_key": "bk", "region": bedrockTestRegion, "bedrock_model_id": bedrockTestModelID, "weight": 1,
 		}
 		for k, v := range over {
 			if v == nil {
@@ -549,7 +556,7 @@ func TestDeployments_Bedrock(t *testing.T) {
 		{
 			name:       "switch openai to bedrock with fields",
 			create:     map[string]any{"name": "bedrock", "provider": "openai", "base_url": "https://api.openai.com/v1", "weight": 1},
-			update:     map[string]any{"provider": "bedrock", "region": bedrockTestRegion, "bedrock_model_id": bedrockTestModelID, "base_url": ""},
+			update:     map[string]any{"provider": "bedrock", "api_key": "bk", "region": bedrockTestRegion, "bedrock_model_id": bedrockTestModelID, "base_url": ""},
 			wantStatus: 200,
 		},
 		{
@@ -710,7 +717,7 @@ func TestUpdateModel_LoadBalancedBedrockRejectsNonChat(t *testing.T) {
 		t.Fatalf("create model: %v", err)
 	}
 	status, out := e.call(t, "POST", deploymentURL(m.ID), map[string]any{
-		"name": "bedrock", "provider": "bedrock", "region": bedrockTestRegion,
+		"name": "bedrock", "provider": "bedrock", "api_key": "bk", "region": bedrockTestRegion,
 		"bedrock_model_id": bedrockTestModelID, "weight": 1,
 	})
 	if status != 201 {

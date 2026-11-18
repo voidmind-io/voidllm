@@ -11,7 +11,55 @@ const Bedrock = "bedrock"
 var (
 	bedrockRegionRe  = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$`)
 	bedrockModelIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]*$`)
+	bedrockRoleARNRe = regexp.MustCompile(`^arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]{1,512}$`)
 )
+
+// Bedrock authentication modes.
+const (
+	// BedrockAuthAPIKey authenticates with a Bedrock API key sent as a Bearer token.
+	BedrockAuthAPIKey = "api_key"
+	// BedrockAuthIAM authenticates with AWS SigV4 using the AWS credential chain.
+	BedrockAuthIAM = "iam"
+)
+
+// ValidBedrockRoleARN reports whether arn is a syntactically valid IAM role ARN.
+func ValidBedrockRoleARN(arn string) bool {
+	return bedrockRoleARNRe.MatchString(arn)
+}
+
+// NormalizeBedrockAuth returns the effective Bedrock auth mode, mapping the
+// empty string to BedrockAuthAPIKey.
+func NormalizeBedrockAuth(auth string) string {
+	if auth == "" {
+		return BedrockAuthAPIKey
+	}
+	return auth
+}
+
+// ValidateBedrockAuth checks a Bedrock auth configuration and returns a short
+// error message, or the empty string when the combination is valid. auth may be
+// empty (meaning api_key). hasAPIKey reports whether an upstream API key is set.
+func ValidateBedrockAuth(auth, roleARN string, hasAPIKey bool) string {
+	switch NormalizeBedrockAuth(auth) {
+	case BedrockAuthAPIKey:
+		if roleARN != "" {
+			return "bedrock_role_arn requires bedrock_auth iam"
+		}
+		if !hasAPIKey {
+			return "api_key is required for bedrock when bedrock_auth is api_key"
+		}
+	case BedrockAuthIAM:
+		if hasAPIKey {
+			return "api_key must be empty when bedrock_auth is iam"
+		}
+		if roleARN != "" && !ValidBedrockRoleARN(roleARN) {
+			return "bedrock_role_arn is invalid"
+		}
+	default:
+		return "bedrock_auth must be api_key or iam"
+	}
+	return ""
+}
 
 // ValidBedrockRegion reports whether r is a syntactically valid AWS region
 // name. The check is strict because the region is interpolated into a host

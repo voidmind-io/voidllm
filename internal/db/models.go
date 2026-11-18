@@ -17,7 +17,7 @@ import (
 const modelSelectColumns = "id, name, provider, model_type, base_url, api_key_encrypted, " +
 	"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 	"cached_input_price_per_1m, cache_write_price_per_1m, " +
-	"azure_deployment, azure_api_version, gcp_project, gcp_location, region, bedrock_model_id, " +
+	"azure_deployment, azure_api_version, gcp_project, gcp_location, region, bedrock_model_id, bedrock_auth, bedrock_role_arn, " +
 	"is_active, source, created_by, created_at, updated_at, deleted_at, aliases, timeout, " +
 	"strategy, max_retries, fallback_model_id, pii_filter"
 
@@ -54,6 +54,10 @@ type Model struct {
 	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
 	// Non-empty only for provider "bedrock".
 	BedrockModelID string
+	// BedrockAuth is the Bedrock auth mode ("api_key" or "iam").
+	BedrockAuth string
+	// BedrockRoleARN is the optional IAM role to assume in "iam" mode.
+	BedrockRoleARN string
 	IsActive       bool
 	Source         string
 	CreatedBy      *string
@@ -110,6 +114,10 @@ type CreateModelParams struct {
 	// BedrockModelID is the Bedrock model ID, inference profile ID or ARN.
 	// Required when Provider is "bedrock".
 	BedrockModelID string
+	// BedrockAuth is the Bedrock auth mode ("api_key" or "iam"). Empty is stored as "api_key".
+	BedrockAuth string
+	// BedrockRoleARN is the optional IAM role to assume in "iam" mode.
+	BedrockRoleARN string
 	// Source is "yaml" for config-file-sourced models or "api" for Admin API-created models.
 	Source    string
 	CreatedBy *string
@@ -135,11 +143,14 @@ type CreateModelParams struct {
 // UpdateModelParams holds optional fields for updating a model.
 // A nil pointer means the field is not changed.
 type UpdateModelParams struct {
-	Name             *string
-	Provider         *string
-	ModelType        *string
-	BaseURL          *string
-	APIKeyEncrypted  *string
+	Name            *string
+	Provider        *string
+	ModelType       *string
+	BaseURL         *string
+	APIKeyEncrypted *string
+	// ClearAPIKey, when true, sets the stored API key to NULL regardless of
+	// APIKeyEncrypted.
+	ClearAPIKey      bool
 	MaxContextTokens *int
 	InputPricePer1M  *float64
 	OutputPricePer1M *float64
@@ -160,6 +171,10 @@ type UpdateModelParams struct {
 	Region *string
 	// BedrockModelID, when non-nil, replaces the stored Bedrock model ID.
 	BedrockModelID *string
+	// BedrockAuth, when non-nil, replaces the stored Bedrock auth mode.
+	BedrockAuth *string
+	// BedrockRoleARN, when non-nil, replaces the stored Bedrock role ARN.
+	BedrockRoleARN *string
 	// Aliases, when non-nil, replaces the stored comma-separated alias list.
 	// Set to a pointer to an empty string to clear all aliases.
 	Aliases *string
@@ -215,12 +230,14 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 		maxRetries = *params.MaxRetries
 	}
 
+	bedrockAuth := normalizeBedrockAuth(params.BedrockAuth)
+
 	p := d.dialect.Placeholder
 	insertQuery := "INSERT INTO models " +
 		"(id, name, provider, model_type, base_url, api_key_encrypted, " +
 		"max_context_tokens, input_price_per_1m, output_price_per_1m, " +
 		"cached_input_price_per_1m, cache_write_price_per_1m, " +
-		"azure_deployment, azure_api_version, gcp_project, gcp_location, region, bedrock_model_id, " +
+		"azure_deployment, azure_api_version, gcp_project, gcp_location, region, bedrock_model_id, bedrock_auth, bedrock_role_arn, " +
 		"is_active, source, created_by, aliases, timeout, strategy, max_retries, " +
 		"fallback_model_id, pii_filter, created_at, updated_at) " +
 		"VALUES (" +
@@ -228,8 +245,9 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 		p(7) + ", " + p(8) + ", " + p(9) + ", " +
 		p(10) + ", " + p(11) + ", " +
 		p(12) + ", " + p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " +
-		"1, " + p(18) + ", " + p(19) + ", " + p(20) + ", " + p(21) + ", " + p(22) + ", " + p(23) + ", " +
-		p(24) + ", " + p(25) + ", " +
+		p(18) + ", " + p(19) + ", " +
+		"1, " + p(20) + ", " + p(21) + ", " + p(22) + ", " + p(23) + ", " + p(24) + ", " + p(25) + ", " +
+		p(26) + ", " + p(27) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + modelSelectColumns +
@@ -255,6 +273,8 @@ func (d *DB) CreateModel(ctx context.Context, params CreateModelParams) (*Model,
 			params.GCPLocation,
 			params.Region,
 			params.BedrockModelID,
+			bedrockAuth,
+			params.BedrockRoleARN,
 			params.Source,
 			params.CreatedBy,
 			params.Aliases,
@@ -392,7 +412,9 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 		args = append(args, *params.BaseURL)
 		argN++
 	}
-	if params.APIKeyEncrypted != nil {
+	if params.ClearAPIKey {
+		setClauses = append(setClauses, "api_key_encrypted = NULL")
+	} else if params.APIKeyEncrypted != nil {
 		setClauses = append(setClauses, "api_key_encrypted = "+p(argN))
 		args = append(args, *params.APIKeyEncrypted)
 		argN++
@@ -450,6 +472,16 @@ func (d *DB) UpdateModel(ctx context.Context, id string, params UpdateModelParam
 	if params.BedrockModelID != nil {
 		setClauses = append(setClauses, "bedrock_model_id = "+p(argN))
 		args = append(args, *params.BedrockModelID)
+		argN++
+	}
+	if params.BedrockAuth != nil {
+		setClauses = append(setClauses, "bedrock_auth = "+p(argN))
+		args = append(args, *params.BedrockAuth)
+		argN++
+	}
+	if params.BedrockRoleARN != nil {
+		setClauses = append(setClauses, "bedrock_role_arn = "+p(argN))
+		args = append(args, *params.BedrockRoleARN)
 		argN++
 	}
 	if params.Aliases != nil {
@@ -669,6 +701,14 @@ func nullableIntToBoolPtr(v *int64) *bool {
 	return &b
 }
 
+// normalizeBedrockAuth maps an empty Bedrock auth mode to the "api_key" default.
+func normalizeBedrockAuth(auth string) string {
+	if auth == "" {
+		return "api_key"
+	}
+	return auth
+}
+
 // scanModel scans a single model row. The scanner may be a *sql.Row (from
 // QueryRowContext) or *sql.Rows (from QueryContext); both satisfy the interface.
 func scanModel(scanner interface{ Scan(...any) error }) (*Model, error) {
@@ -680,7 +720,7 @@ func scanModel(scanner interface{ Scan(...any) error }) (*Model, error) {
 		&m.MaxContextTokens, &m.InputPricePer1M, &m.OutputPricePer1M,
 		&m.CachedInputPricePer1M, &m.CacheWritePricePer1M,
 		&m.AzureDeployment, &m.AzureAPIVersion, &m.GCPProject, &m.GCPLocation,
-		&m.Region, &m.BedrockModelID,
+		&m.Region, &m.BedrockModelID, &m.BedrockAuth, &m.BedrockRoleARN,
 		&isActiveInt, &m.Source, &m.CreatedBy,
 		&m.CreatedAt, &m.UpdatedAt, &m.DeletedAt, &m.Aliases, &m.Timeout,
 		&m.Strategy, &m.MaxRetries, &m.FallbackModelID,
@@ -764,6 +804,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 				GCPLocation:           m.GCPLocation,
 				Region:                m.Region,
 				BedrockModelID:        m.BedrockModelID,
+				BedrockAuth:           m.BedrockAuth,
+				BedrockRoleARN:        m.BedrockRoleARN,
 				Source:                "yaml",
 				Aliases:               aliases,
 				Timeout:               m.Timeout,
@@ -821,6 +863,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 		gcpLocation := m.GCPLocation
 		region := m.Region
 		bedrockModelID := m.BedrockModelID
+		bedrockAuth := normalizeBedrockAuth(m.BedrockAuth)
+		bedrockRoleARN := m.BedrockRoleARN
 		timeout := m.Timeout
 		strategy := m.Strategy
 		maxRetries := m.MaxRetries
@@ -841,6 +885,8 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 			GCPLocation:           &gcpLocation,
 			Region:                &region,
 			BedrockModelID:        &bedrockModelID,
+			BedrockAuth:           &bedrockAuth,
+			BedrockRoleARN:        &bedrockRoleARN,
 			Aliases:               &aliases,
 			Timeout:               &timeout,
 			Strategy:              &strategy,
@@ -858,6 +904,10 @@ func (d *DB) SyncYAMLModels(ctx context.Context, models []config.ModelConfig, en
 				return fmt.Errorf("sync yaml models: encrypt key for %s: %w", m.Name, encErr)
 			}
 			params.APIKeyEncrypted = &enc
+		} else if m.Provider == "bedrock" && bedrockAuth == "iam" {
+			// IAM mode carries no upstream key: drop any key left over from a
+			// previous api_key configuration.
+			params.ClearAPIKey = true
 		}
 
 		if _, updateErr := d.UpdateModel(ctx, existing.ID, params); updateErr != nil {
@@ -916,6 +966,8 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 				GCPLocation:     cd.GCPLocation,
 				Region:          cd.Region,
 				BedrockModelID:  cd.BedrockModelID,
+				BedrockAuth:     cd.BedrockAuth,
+				BedrockRoleARN:  cd.BedrockRoleARN,
 				Weight:          weight,
 				Priority:        cd.Priority,
 				PIIFilter:       cd.PIIFilter,
@@ -946,6 +998,8 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 		gcpLocation := cd.GCPLocation
 		region := cd.Region
 		bedrockModelID := cd.BedrockModelID
+		bedrockAuth := normalizeBedrockAuth(cd.BedrockAuth)
+		bedrockRoleARN := cd.BedrockRoleARN
 		weight := cd.Weight
 		if weight < 1 {
 			weight = 1
@@ -961,6 +1015,8 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 			GCPLocation:     &gcpLocation,
 			Region:          &region,
 			BedrockModelID:  &bedrockModelID,
+			BedrockAuth:     &bedrockAuth,
+			BedrockRoleARN:  &bedrockRoleARN,
 			Weight:          &weight,
 			Priority:        &priority,
 			// Sync the YAML pii_filter value. Clear to NULL when not set in YAML
@@ -975,6 +1031,10 @@ func (d *DB) syncYAMLDeployments(ctx context.Context, modelID string, cfgDeps []
 				return fmt.Errorf("encrypt api key for deployment %s: %w", cd.Name, encErr)
 			}
 			updateParams.APIKeyEncrypted = &enc
+		} else if cd.Provider == "bedrock" && bedrockAuth == "iam" {
+			// IAM mode carries no upstream key: drop any key left over from a
+			// previous api_key configuration.
+			updateParams.ClearAPIKey = true
 		}
 
 		if _, updateErr := d.UpdateDeployment(ctx, existing.ID, updateParams); updateErr != nil {

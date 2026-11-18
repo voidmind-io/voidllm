@@ -57,6 +57,10 @@ type probeTarget struct {
 	region string
 	// bedrockModelID is the Bedrock model ID. Non-empty only for provider "bedrock".
 	bedrockModelID string
+	// bedrockAuth is the Bedrock auth mode. Non-empty only for provider "bedrock".
+	bedrockAuth string
+	// bedrockRoleARN is the optional IAM role assumed in "iam" mode.
+	bedrockRoleARN string
 }
 
 // asProbeTarget converts t to the exported ProbeTarget shape that
@@ -75,6 +79,8 @@ func (t probeTarget) asProbeTarget() ProbeTarget {
 		GCPLocation:     t.gcpLocation,
 		Region:          t.region,
 		BedrockModelID:  t.bedrockModelID,
+		BedrockAuth:     t.bedrockAuth,
+		BedrockRoleARN:  t.bedrockRoleARN,
 	}
 }
 
@@ -147,6 +153,14 @@ type Checker struct {
 	cfg    config.HealthCheckConfig
 	client *http.Client
 	log    *slog.Logger
+	// signer signs Bedrock IAM probe requests; nil makes such probes fail.
+	signer proxy.BedrockSigner
+}
+
+// SetSigner configures the signer used for Bedrock models with bedrock_auth
+// "iam". It must be called before Start.
+func (c *Checker) SetSigner(signer proxy.BedrockSigner) {
+	c.signer = signer
 }
 
 // NewChecker constructs a Checker that will probe the models in registry
@@ -266,6 +280,8 @@ func (c *Checker) runAll(level probeLevel) {
 				gcpLocation:     m.GCPLocation,
 				region:          m.Region,
 				bedrockModelID:  m.BedrockModelID,
+				bedrockAuth:     m.BedrockAuth,
+				bedrockRoleARN:  m.BedrockRoleARN,
 			}
 			c.runOne(t, level)
 			continue
@@ -285,6 +301,8 @@ func (c *Checker) runAll(level probeLevel) {
 				gcpLocation:     d.GCPLocation,
 				region:          d.Region,
 				bedrockModelID:  d.BedrockModelID,
+				bedrockAuth:     d.BedrockAuth,
+				bedrockRoleARN:  d.BedrockRoleARN,
 			}
 			c.runOne(t, level)
 		}
@@ -297,7 +315,7 @@ func (c *Checker) runOne(t probeTarget, level probeLevel) {
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 
-	latencyMs, err := execProbe(ctx, c.client, t, level)
+	latencyMs, err := execProbe(ctx, c.client, c.signer, t, level)
 
 	// From here on we only touch in-memory state — no network I/O — so hold
 	// mu for the remainder of the function. Health, models, and functional
@@ -385,14 +403,14 @@ func (c *Checker) runOne(t probeTarget, level probeLevel) {
 }
 
 // execProbe dispatches to the appropriate probe function for the given level.
-func execProbe(ctx context.Context, client *http.Client, t probeTarget, level probeLevel) (int64, error) {
+func execProbe(ctx context.Context, client *http.Client, signer proxy.BedrockSigner, t probeTarget, level probeLevel) (int64, error) {
 	switch level {
 	case levelHealth:
 		return probeHealth(ctx, client, t)
 	case levelModels:
-		return probeModels(ctx, client, t)
+		return probeModels(ctx, client, signer, t)
 	case levelFunctional:
-		return probeFunctional(ctx, client, t)
+		return probeFunctional(ctx, client, signer, t)
 	default:
 		return 0, fmt.Errorf("unknown probe level %d", level)
 	}
@@ -438,6 +456,9 @@ var jsonRPCErrorCodePattern = regexp.MustCompile(`JSON-RPC error (-?\d+)`)
 // sanitizeError converts a raw error message to a safe, low-information string
 // that does not expose internal URLs, IP addresses, or stack details.
 func sanitizeError(err error) string {
+	if errors.Is(err, ErrBedrockCredentials) {
+		return ErrBedrockCredentials.Error()
+	}
 	msg := err.Error()
 	if strings.Contains(msg, "connection refused") {
 		return "connection refused"
@@ -513,23 +534,23 @@ func probeHealth(ctx context.Context, client *http.Client, t probeTarget) (int64
 // response. It returns ErrProbeNotApplicable for providers whose adapter has
 // no meaningful model-listing endpoint (azure, vertex, gemini) — see
 // BuildProbeRequest's doc for the full rationale.
-func probeModels(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
-	return probeWithIntent(ctx, client, IntentModelsList, t)
+func probeModels(ctx context.Context, client *http.Client, signer proxy.BedrockSigner, t probeTarget) (int64, error) {
+	return probeWithIntent(ctx, client, signer, IntentModelsList, t)
 }
 
 // probeFunctional dispatches to the appropriate functional probe based on the
 // target's model type. Image, audio_transcription, and tts models are skipped
 // (ErrProbeNotApplicable) because they are too expensive or require special
 // binary input to probe meaningfully.
-func probeFunctional(ctx context.Context, client *http.Client, t probeTarget) (int64, error) {
+func probeFunctional(ctx context.Context, client *http.Client, signer proxy.BedrockSigner, t probeTarget) (int64, error) {
 	switch t.modelType {
 	case "embedding":
-		return probeWithIntent(ctx, client, IntentEmbeddings, t)
+		return probeWithIntent(ctx, client, signer, IntentEmbeddings, t)
 	case "reranking", "image", "audio_transcription", "tts":
 		// Skip — incompatible endpoint or too expensive to probe.
 		return 0, ErrProbeNotApplicable
 	default: // "chat", "completion", ""
-		return probeWithIntent(ctx, client, IntentChat, t)
+		return probeWithIntent(ctx, client, signer, IntentChat, t)
 	}
 }
 
@@ -537,13 +558,16 @@ func probeFunctional(ctx context.Context, client *http.Client, t probeTarget) (i
 // BuildProbeRequest and executes it, returning ErrProbeNotApplicable
 // unchanged so callers (probeFunctional, runOne) can distinguish "skipped"
 // from "failed".
-func probeWithIntent(ctx context.Context, client *http.Client, intent ProbeIntent, t probeTarget) (int64, error) {
+func probeWithIntent(ctx context.Context, client *http.Client, signer proxy.BedrockSigner, intent ProbeIntent, t probeTarget) (int64, error) {
 	req, err := BuildProbeRequest(ctx, intent, t.asProbeTarget())
 	if err != nil {
 		if errors.Is(err, ErrProbeNotApplicable) {
 			return 0, err
 		}
 		return 0, fmt.Errorf("build request: %w", err)
+	}
+	if signErr := SignProbeRequest(ctx, signer, req, t.asProbeTarget()); signErr != nil {
+		return 0, signErr
 	}
 	return doProbeRequest(client, req)
 }
@@ -577,7 +601,7 @@ func doProbeRequest(client *http.Client, req *http.Request) (int64, error) {
 // exact header scheme used barely matters for that check, but Anthropic's
 // x-api-key scheme is still applied for parity with a normal request.
 func setAuthHeaders(req *http.Request, t probeTarget) {
-	if t.apiKey == "" {
+	if t.apiKey == "" || t.asProbeTarget().IsBedrockIAM() {
 		return
 	}
 	if t.provider == "anthropic" {
