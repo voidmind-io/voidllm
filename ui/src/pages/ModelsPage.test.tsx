@@ -2029,6 +2029,7 @@ const VALID_IAM_ENDPOINTS = [
   'https://bedrock-runtime.eu-central-1.amazonaws.com.cn',
   'https://bedrock-runtime.eu-central-1.api.aws',
   'https://bedrock-runtime-fips.eu-central-1.api.aws:443',
+  'https://bedrock-runtime.eu-central-1.amazonaws.com.',
   'https://vpce-0a1b2c.bedrock-runtime.eu-central-1.vpce.amazonaws.com',
   'https://vpce-0a1b2c.bedrock-runtime-fips.eu-central-1.vpce.amazonaws.com.cn',
 ]
@@ -2041,6 +2042,8 @@ const INVALID_IAM_ENDPOINTS = [
   'http://bedrock-runtime.eu-central-1.amazonaws.com',
   'https://bedrock-runtime.eu-central-1.amazonaws.com:8443',
   'https://bedrock-runtime.eu-central-1.amazonaws.com.evil.com',
+  'https://bedrock-runtime.eu-central-1.amazonaws.com:0443',
+  'https://bedrock-runtime.eu-central-1.amazonaws.com..',
 ]
 
 describe('AWS Bedrock endpoint validation', () => {
@@ -2080,6 +2083,19 @@ describe('AWS Bedrock endpoint validation', () => {
 
     await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
     expect(within(dialog).queryByText(ENDPOINT_ERROR)).not.toBeInTheDocument()
+  })
+
+  it('single create sends the trimmed endpoint when it has surrounding whitespace', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockSingle(capturedBodies, true)
+    await userEvent.type(
+      within(dialog).getByRole('textbox', { name: /base url/i }),
+      '  https://bedrock-runtime.eu-central-1.amazonaws.com  ',
+    )
+    await submitDialog(dialog, /add model/i)
+
+    await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
+    expect(JSON.parse(capturedBodies.get(MODELS_POST)!).base_url).toBe('https://bedrock-runtime.eu-central-1.amazonaws.com')
   })
 
   it('single create accepts an empty endpoint in IAM mode', async () => {
@@ -2160,11 +2176,14 @@ describe('AWS Bedrock endpoint validation', () => {
     await fillBedrockBasics(dialog)
     await pickAuth(dialog, IAM_LABEL)
     const urls = within(dialog).getAllByRole('textbox', { name: /base url/i })
-    await userEvent.type(urls[urls.length - 1], 'https://vpce-0a1b2c.bedrock-runtime.eu-central-1.vpce.amazonaws.com')
+    await userEvent.type(urls[urls.length - 1], '  https://vpce-0a1b2c.bedrock-runtime.eu-central-1.vpce.amazonaws.com  ')
     await userEvent.click(within(dialog).getByRole('button', { name: /^add$/i }))
     await submitDialog(dialog, /add model/i)
 
     await waitFor(() => expect(capturedBodies.has('POST:/api/v1/models/new-br/deployments')).toBe(true))
+    expect(JSON.parse(capturedBodies.get('POST:/api/v1/models/new-br/deployments')!).base_url).toBe(
+      'https://vpce-0a1b2c.bedrock-runtime.eu-central-1.vpce.amazonaws.com',
+    )
   })
 
   it('edit model blocks a region mismatch in IAM mode and sends no PATCH', async () => {

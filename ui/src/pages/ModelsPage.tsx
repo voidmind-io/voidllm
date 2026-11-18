@@ -273,16 +273,19 @@ function validateBedrockEndpoint(auth: BedrockAuth, region: string, baseUrl: str
   if (auth !== 'iam') return undefined
   const trimmedRegion = region.trim().toLowerCase()
   if (!trimmedRegion) return undefined
-  let parsed: URL
-  try {
-    parsed = new URL(url)
-  } catch {
-    return BEDROCK_IAM_ENDPOINT_ERROR
+  const match = /^https:\/\/([^/]*)/i.exec(url)
+  if (!match) return BEDROCK_IAM_ENDPOINT_ERROR
+  const authority = match[1]
+  if (authority.includes('@')) return BEDROCK_IAM_ENDPOINT_ERROR
+  const colon = authority.lastIndexOf(':')
+  let host = authority
+  if (colon !== -1) {
+    if (authority.slice(colon + 1) !== '443') return BEDROCK_IAM_ENDPOINT_ERROR
+    host = authority.slice(0, colon)
   }
-  if (parsed.protocol !== 'https:') return BEDROCK_IAM_ENDPOINT_ERROR
-  if (parsed.port !== '' && parsed.port !== '443') return BEDROCK_IAM_ENDPOINT_ERROR
-  if (parsed.username !== '' || parsed.password !== '') return BEDROCK_IAM_ENDPOINT_ERROR
-  return isBedrockRuntimeHost(parsed.hostname.toLowerCase(), trimmedRegion) ? undefined : BEDROCK_IAM_ENDPOINT_ERROR
+  host = host.toLowerCase()
+  if (host.endsWith('.')) host = host.slice(0, -1)
+  return isBedrockRuntimeHost(host, trimmedRegion) ? undefined : BEDROCK_IAM_ENDPOINT_ERROR
 }
 
 const BEDROCK_API_KEY_ERROR = 'API key is required when authentication is set to API key'
@@ -1023,7 +1026,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
             params: {
               name: dep.name,
               provider: dep.provider,
-              base_url: dep.baseUrl || undefined,
+              base_url: dep.baseUrl.trim() || undefined,
               api_key: dep.provider === 'bedrock' && dep.bedrockAuth === 'iam' ? undefined : dep.apiKey || undefined,
               azure_deployment: dep.azureDeployment || undefined,
               azure_api_version: dep.azureApiVersion || undefined,
