@@ -1,5 +1,5 @@
 import React from 'react'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -117,24 +117,42 @@ type FetchMockEntry = {
   matcher: (url: string) => boolean
   response: unknown
   method?: string
+  /** HTTP status to answer with. Defaults to 200; anything >= 400 is an error response. */
+  status?: number
+  /** When set, the entry only matches requests whose body satisfies the predicate. */
+  bodyMatcher?: (body: string) => boolean
+  /** When set, the response is held back until this promise resolves. */
+  gate?: Promise<void>
 }
 
-function setupFetchMock(entries: FetchMockEntry[], capturedBodies?: Map<string, string>) {
+/**
+ * Installs a fetch mock. When `capturedRequests` is given, EVERY request (matched or
+ * not, with or without a body) is recorded under `METHOD:url`; the value is the request
+ * body, or '' when there is none. The map has one entry per distinct key: a repeated
+ * request overwrites the earlier body (last one wins) and keeps its first insertion
+ * position, so use `sentWrites()` to assert repeated requests or their exact order.
+ */
+function setupFetchMock(entries: FetchMockEntry[], capturedRequests?: Map<string, string>) {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString()
     const method = (init?.method ?? 'GET').toUpperCase()
 
+    capturedRequests?.set(`${method}:${url}`, typeof init?.body === 'string' ? init.body : '')
+
     const entry = entries.find(
-      (e) => e.matcher(url) && (!e.method || e.method.toUpperCase() === method),
+      (e) =>
+        e.matcher(url) &&
+        (!e.method || e.method.toUpperCase() === method) &&
+        (!e.bodyMatcher || e.bodyMatcher(typeof init?.body === 'string' ? init.body : '')),
     )
 
     if (entry) {
-      if (capturedBodies && init?.body) {
-        capturedBodies.set(`${method}:${url}`, init.body as string)
-      }
+      if (entry.gate) await entry.gate
+      const status = entry.status ?? 200
       return {
-        ok: true,
-        status: 200,
+        ok: status < 400,
+        status,
+        statusText: status < 400 ? 'OK' : 'error',
         json: () => Promise.resolve(entry.response),
       }
     }
@@ -146,6 +164,19 @@ function setupFetchMock(entries: FetchMockEntry[], capturedBodies?: Map<string, 
       json: () => Promise.resolve({}),
     }
   }))
+}
+
+/** Every non-GET request actually sent to fetch, in call order and including repeats. */
+function sentWrites(): string[] {
+  const calls = (fetch as unknown as { mock: { calls: [RequestInfo | URL, RequestInit | undefined][] } }).mock.calls
+  return calls
+    .map(([input, init]) => `${(init?.method ?? 'GET').toUpperCase()}:${String(input)}`)
+    .filter((k) => !k.startsWith('GET:'))
+}
+
+/** Keys (`METHOD:url`) of all recorded requests that are not GETs, in call order. */
+function writes(captured: Map<string, string>): string[] {
+  return [...captured.keys()].filter((k) => !k.startsWith('GET:'))
 }
 
 function defaultEntries(licensePayload = MOCK_LICENSE_NO_FALLBACK, modelsPayload = { data: MOCK_MODELS_LIST, has_more: false }): FetchMockEntry[] {
@@ -906,8 +937,8 @@ function getRoleArnInput(container: HTMLElement) {
   return within(container).getByRole('textbox', { name: /role arn/i })
 }
 
-async function fillBedrockBasics(dialog: HTMLElement) {
-  await userEvent.type(within(dialog).getByRole('textbox', { name: /aws region/i }), 'eu-central-1')
+async function fillBedrockBasics(dialog: HTMLElement, region = 'eu-central-1') {
+  await userEvent.type(within(dialog).getByRole('textbox', { name: /aws region/i }), region)
   await userEvent.type(within(dialog).getByRole('textbox', { name: /bedrock model id/i }), 'amazon.nova-lite-v1:0')
 }
 
@@ -1603,7 +1634,7 @@ describe('AWS Bedrock IAM authentication', () => {
       expect(
         await within(dialog).findByText('At least one deployment is required'),
       ).toBeInTheDocument()
-      expect(capturedBodies.size).toBe(0)
+      expect(writes(capturedBodies)).toEqual([])
     })
 
     it('adds a bedrock deployment once an api key is provided and creates it', async () => {
@@ -1706,7 +1737,7 @@ describe('AWS Bedrock IAM authentication', () => {
       await userEvent.type(getRoleArnInput(dialog), 'nope')
       await submitDialog(dialog, /add deployment/i)
       expect(await within(dialog).findByText(ARN_ERROR)).toBeInTheDocument()
-      expect(capturedBodies.size).toBe(0)
+      expect(writes(capturedBodies)).toEqual([])
 
       await userEvent.clear(getRoleArnInput(dialog))
       await userEvent.type(getRoleArnInput(dialog), ` ${VALID_ROLE_ARN} `)
@@ -1745,7 +1776,7 @@ describe('AWS Bedrock IAM authentication', () => {
       await submitDialog(dialog, /add deployment/i)
 
       expect(await within(dialog).findByText(API_KEY_ERROR)).toBeInTheDocument()
-      expect(capturedBodies.size).toBe(0)
+      expect(writes(capturedBodies)).toEqual([])
 
       await userEvent.type(within(dialog).getByLabelText(/^api key$/i), 'abwk-1')
       await submitDialog(dialog, /add deployment/i)
@@ -1867,7 +1898,7 @@ describe('AWS Bedrock IAM authentication', () => {
       await submitDialog(dialog, /save changes/i)
 
       expect(await within(dialog).findByText(ARN_ERROR)).toBeInTheDocument()
-      expect(capturedBodies.size).toBe(0)
+      expect(writes(capturedBodies)).toEqual([])
     })
 
     it('edit: non-bedrock deployment shows no Authentication select and sends no bedrock fields', async () => {
@@ -2051,7 +2082,7 @@ describe('AWS Bedrock endpoint validation', () => {
     vi.restoreAllMocks()
   })
 
-  async function openBedrockSingle(capturedBodies: Map<string, string>, iam: boolean) {
+  async function openBedrockSingle(capturedBodies: Map<string, string>, iam: boolean, region = 'eu-central-1') {
     setupFetchMock(postModelEntries(), capturedBodies)
     await renderSettled()
     await openCreateDialog()
@@ -2059,7 +2090,7 @@ describe('AWS Bedrock endpoint validation', () => {
     await dialogFocused()
     await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'claude-br')
     await pickBedrockProvider(dialog)
-    await fillBedrockBasics(dialog)
+    await fillBedrockBasics(dialog, region)
     if (iam) await pickAuth(dialog, IAM_LABEL)
     else await userEvent.type(within(dialog).getByLabelText(/^api key$/i), 'abwk-1')
     return dialog
@@ -2072,7 +2103,7 @@ describe('AWS Bedrock endpoint validation', () => {
     await submitDialog(dialog, /add model/i)
 
     expect(await within(dialog).findByText(ENDPOINT_ERROR)).toBeInTheDocument()
-    expect(capturedBodies.size).toBe(0)
+    expect(writes(capturedBodies)).toEqual([])
   })
 
   it.each(VALID_IAM_ENDPOINTS)('single create accepts %s in IAM mode', async (endpoint) => {
@@ -2123,22 +2154,37 @@ describe('AWS Bedrock endpoint validation', () => {
     await submitDialog(dialog, /add model/i)
 
     expect(await within(dialog).findByText(QUERY_ERROR)).toBeInTheDocument()
-    expect(capturedBodies.size).toBe(0)
+    expect(writes(capturedBodies)).toEqual([])
   })
 
-  it('load-balanced create blocks an invalid IAM endpoint before any request', async () => {
+  it('load-balanced create never sends a deployment with an invalid IAM endpoint', async () => {
     const capturedBodies = new Map<string, string>()
-    setupFetchMock(postModelEntries(), capturedBodies)
+    setupFetchMock(
+      [
+        {
+          matcher: (u) => u.includes('/api/v1/models/new-br/deployments'),
+          method: 'POST',
+          response: { id: 'dep-1', name: 'valid-1', provider: 'openai' },
+        },
+        ...postModelEntries(),
+      ],
+      capturedBodies,
+    )
     await renderSettled()
     await openCreateDialog()
     const dialog = getDialog(/add model/i)
     await dialogFocused()
     await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'lb-br')
     await switchToLoadBalancedTab()
+
+    // One valid deployment, so the minimum-deployment check cannot be what blocks.
+    await addMinimalDeployment(dialog)
+    expect(within(dialog).getByText('primary')).toBeInTheDocument()
+
     await userEvent.click(within(dialog).getByRole('button', { name: /\+ add deployment/i }))
     await pickBedrockProvider(dialog)
     const names = within(dialog).getAllByRole('textbox', { name: /^name$/i })
-    await userEvent.type(names[names.length - 1], 'br-1')
+    await userEvent.type(names[names.length - 1], 'br-bad')
     await fillBedrockBasics(dialog)
     await pickAuth(dialog, IAM_LABEL)
     const urls = within(dialog).getAllByRole('textbox', { name: /base url/i })
@@ -2146,8 +2192,14 @@ describe('AWS Bedrock endpoint validation', () => {
     await userEvent.click(within(dialog).getByRole('button', { name: /^add$/i }))
 
     expect(await within(dialog).findByText(ENDPOINT_ERROR)).toBeInTheDocument()
+    expect(within(dialog).queryByText('br-bad')).not.toBeInTheDocument()
+    expect(sentWrites()).toEqual([])
+
     await submitDialog(dialog, /add model/i)
-    expect(capturedBodies.size).toBe(0)
+    await waitFor(() => expect(sentWrites()).toHaveLength(2))
+    expect(sentWrites()).toEqual([MODELS_POST, 'POST:/api/v1/models/new-br/deployments'])
+    const bodies = JSON.parse(capturedBodies.get('POST:/api/v1/models/new-br/deployments')!)
+    expect(bodies.name).toBe('primary')
   })
 
   it('load-balanced create accepts a matching VPC endpoint', async () => {
@@ -2218,7 +2270,7 @@ describe('AWS Bedrock endpoint validation', () => {
     await submitDialog(dialog, /save changes/i)
 
     expect(await within(dialog).findByText(ENDPOINT_ERROR)).toBeInTheDocument()
-    expect(capturedBodies.size).toBe(0)
+    expect(writes(capturedBodies)).toEqual([])
   })
 
   it('deployment dialog blocks an execute-api host in IAM mode and sends no POST', async () => {
@@ -2256,6 +2308,461 @@ describe('AWS Bedrock endpoint validation', () => {
     await submitDialog(dialog, /add deployment/i)
 
     expect(await within(dialog).findByText(ENDPOINT_ERROR)).toBeInTheDocument()
-    expect(capturedBodies.size).toBe(0)
+    expect(writes(capturedBodies)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tests: Bedrock region / endpoint validation alignment with the backend
+// ---------------------------------------------------------------------------
+
+const CHARS_ERROR = 'Endpoint must not contain whitespace, control characters or malformed percent-escapes'
+const SCHEME_ERROR = 'Endpoint must begin with https:// (or http:// with API key authentication)'
+const REGION_INVALID_ERROR = 'AWS region is not valid (e.g. eu-central-1)'
+
+describe('AWS Bedrock validation alignment', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  async function openBedrockCreate(
+    capturedBodies: Map<string, string>,
+    opts: { iam: boolean; region?: string },
+  ) {
+    setupFetchMock(postModelEntries(), capturedBodies)
+    await renderSettled()
+    await openCreateDialog()
+    const dialog = getDialog(/add model/i)
+    await dialogFocused()
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'claude-br')
+    await pickBedrockProvider(dialog)
+    await fillBedrockBasics(dialog, opts.region ?? 'eu-central-1')
+    if (opts.iam) await pickAuth(dialog, IAM_LABEL)
+    else await userEvent.type(within(dialog).getByLabelText(/^api key$/i), 'abwk-1')
+    return dialog
+  }
+
+  async function pasteEndpoint(dialog: HTMLElement, value: string) {
+    await userEvent.click(within(dialog).getByRole('textbox', { name: /base url/i }))
+    await userEvent.paste(value)
+  }
+
+  it('sends an upper-case region lower-cased', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockCreate(capturedBodies, { iam: true, region: 'EU-CENTRAL-1' })
+    await submitDialog(dialog, /add model/i)
+
+    await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
+    expect(JSON.parse(capturedBodies.get(MODELS_POST)!).region).toBe('eu-central-1')
+  })
+
+  it('validates the endpoint against the normalized (lower-cased) region', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockCreate(capturedBodies, { iam: true, region: 'EU-CENTRAL-1' })
+    await userEvent.type(
+      within(dialog).getByRole('textbox', { name: /base url/i }),
+      'https://bedrock-runtime.eu-central-1.amazonaws.com',
+    )
+    await submitDialog(dialog, /add model/i)
+
+    await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
+    const body = JSON.parse(capturedBodies.get(MODELS_POST)!)
+    expect(body.region).toBe('eu-central-1')
+    expect(body.base_url).toBe('https://bedrock-runtime.eu-central-1.amazonaws.com')
+  })
+
+  it('accepts an upper-case HTTPS:// scheme and sends the URL unchanged', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockCreate(capturedBodies, { iam: true })
+    await userEvent.type(
+      within(dialog).getByRole('textbox', { name: /base url/i }),
+      'HTTPS://bedrock-runtime.eu-central-1.amazonaws.com',
+    )
+    await submitDialog(dialog, /add model/i)
+
+    await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
+    expect(JSON.parse(capturedBodies.get(MODELS_POST)!).base_url).toBe(
+      'HTTPS://bedrock-runtime.eu-central-1.amazonaws.com',
+    )
+  })
+
+  it('rejects a malformed region inline and sends no request', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockCreate(capturedBodies, { iam: false, region: 'nowhere' })
+    await submitDialog(dialog, /add model/i)
+
+    expect(await within(dialog).findByText(REGION_INVALID_ERROR)).toBeInTheDocument()
+    expect(writes(capturedBodies)).toEqual([])
+  })
+
+  it.each([
+    'https://vpce-a--b.bedrock-runtime.eu-central-1.vpce.amazonaws.com',
+  ])('rejects %s in IAM mode with the endpoint error and zero write requests', async (endpoint) => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockCreate(capturedBodies, { iam: true })
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /base url/i }), endpoint)
+    await submitDialog(dialog, /add model/i)
+
+    expect(await within(dialog).findByText(ENDPOINT_ERROR)).toBeInTheDocument()
+    expect(writes(capturedBodies)).toEqual([])
+  })
+
+  it.each([
+    ['a tab in IAM mode', 'https://bedrock-runtime.eu-central-1.amazonaws.com/a\tb', true],
+    ['a tab in api_key mode', 'https://bedrock-runtime.eu-central-1.amazonaws.com/a\tb', false],
+    ['a malformed percent-escape in IAM mode', 'https://bedrock-runtime.eu-central-1.amazonaws.com/%zz', true],
+    ['a malformed percent-escape in api_key mode', 'https://bedrock-runtime.eu-central-1.amazonaws.com/%zz', false],
+  ])('rejects an endpoint containing %s', async (_label, endpoint, iam) => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockCreate(capturedBodies, { iam })
+    await pasteEndpoint(dialog, endpoint)
+    await submitDialog(dialog, /add model/i)
+
+    expect(await within(dialog).findByText(CHARS_ERROR)).toBeInTheDocument()
+    expect(writes(capturedBodies)).toEqual([])
+  })
+
+  it('accepts an http:// endpoint in api_key mode', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockCreate(capturedBodies, { iam: false })
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /base url/i }), 'http://proxy.internal.example:8080')
+    await submitDialog(dialog, /add model/i)
+
+    await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
+    expect(JSON.parse(capturedBodies.get(MODELS_POST)!).base_url).toBe('http://proxy.internal.example:8080')
+  })
+
+  it('rejects a non-http(s) scheme in api_key mode', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockCreate(capturedBodies, { iam: false })
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /base url/i }), 'ftp://proxy.internal.example')
+    await submitDialog(dialog, /add model/i)
+
+    expect(await within(dialog).findByText(SCHEME_ERROR)).toBeInTheDocument()
+    expect(writes(capturedBodies)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tests: Test Connection validates bedrock region and endpoint first
+// ---------------------------------------------------------------------------
+
+describe('AWS Bedrock Test Connection validation', () => {
+  const TEST_CONNECTION_POST = 'POST:/api/v1/models/test-connection'
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  async function openForTestConnection(capturedBodies: Map<string, string>, region: string, endpoint: string) {
+    setupFetchMock(
+      [
+        {
+          matcher: (u) => u.includes('/api/v1/models/test-connection'),
+          method: 'POST',
+          response: { success: true, message: 'ok' },
+        },
+        ...defaultEntries(),
+      ],
+      capturedBodies,
+    )
+    await renderSettled()
+    await openCreateDialog()
+    const dialog = getDialog(/add model/i)
+    await dialogFocused()
+    await pickBedrockProvider(dialog)
+    await fillBedrockBasics(dialog, region)
+    await pickAuth(dialog, IAM_LABEL)
+    if (endpoint) await userEvent.type(within(dialog).getByRole('textbox', { name: /base url/i }), endpoint)
+    return dialog
+  }
+
+  it('shows the endpoint error and sends no request for an invalid IAM endpoint', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openForTestConnection(capturedBodies, 'eu-central-1', 'https://bucket.s3.eu-central-1.amazonaws.com')
+    await userEvent.click(within(dialog).getByRole('button', { name: /test connection/i }))
+
+    expect(await within(dialog).findByText(ENDPOINT_ERROR)).toBeInTheDocument()
+    expect(sentWrites()).toEqual([])
+    expect(capturedBodies.has(TEST_CONNECTION_POST)).toBe(false)
+  })
+
+  it('shows the region error and sends no request for an invalid region', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openForTestConnection(capturedBodies, 'nowhere', '')
+    await userEvent.click(within(dialog).getByRole('button', { name: /test connection/i }))
+
+    expect(await within(dialog).findByText(REGION_INVALID_ERROR)).toBeInTheDocument()
+    expect(sentWrites()).toEqual([])
+  })
+
+  it('sends the request with a normalized region and a valid endpoint', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openForTestConnection(
+      capturedBodies,
+      'EU-CENTRAL-1',
+      'https://bedrock-runtime.eu-central-1.amazonaws.com',
+    )
+    await userEvent.click(within(dialog).getByRole('button', { name: /test connection/i }))
+
+    await waitFor(() => expect(capturedBodies.has(TEST_CONNECTION_POST)).toBe(true))
+    const body = JSON.parse(capturedBodies.get(TEST_CONNECTION_POST)!)
+    expect(body.region).toBe('eu-central-1')
+    expect(body.base_url).toBe('https://bedrock-runtime.eu-central-1.amazonaws.com')
+    expect(within(dialog).queryByText(ENDPOINT_ERROR)).not.toBeInTheDocument()
+  })
+
+  it('clears a previous inline error once the endpoint is corrected', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openForTestConnection(capturedBodies, 'eu-central-1', 'https://bucket.s3.eu-central-1.amazonaws.com')
+    await userEvent.click(within(dialog).getByRole('button', { name: /test connection/i }))
+    expect(await within(dialog).findByText(ENDPOINT_ERROR)).toBeInTheDocument()
+
+    const input = within(dialog).getByRole('textbox', { name: /base url/i })
+    await userEvent.clear(input)
+    await userEvent.type(input, 'https://bedrock-runtime.eu-central-1.amazonaws.com')
+    await userEvent.click(within(dialog).getByRole('button', { name: /test connection/i }))
+
+    await waitFor(() => expect(capturedBodies.has(TEST_CONNECTION_POST)).toBe(true))
+    expect(within(dialog).queryByText(ENDPOINT_ERROR)).not.toBeInTheDocument()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tests: load-balanced create rolls back a partly created model
+// ---------------------------------------------------------------------------
+
+describe('CreateModelDialog - load-balanced create rollback', () => {
+  const NEW_MODEL = '/api/v1/models/new-lb'
+  const DEPLOYMENTS = `${NEW_MODEL}/deployments`
+  const SERVER_MESSAGE = 'deployment quota exceeded.'
+  const NOT_REMOVED_MESSAGE = `${SERVER_MESSAGE} The model "my-lb" was created but could not be removed. Delete it in the models list and try again.`
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  function deferred() {
+    let release!: () => void
+    const promise = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    return { promise, release }
+  }
+
+  function isDeploymentNamed(name: string) {
+    return (body: string) => (JSON.parse(body) as { name?: string }).name === name
+  }
+
+  interface RollbackOpts {
+    deploymentNames?: string[]
+    failDeployment?: string
+    modelStatus?: number
+    deleteDeploymentStatus?: number
+    deleteModelStatus?: number
+    modelPostGate?: Promise<void>
+    deleteDeploymentGate?: Promise<void>
+    deleteModelGate?: Promise<void>
+  }
+
+  function rollbackEntries(opts: RollbackOpts): FetchMockEntry[] {
+    const errorBody = { error: { message: SERVER_MESSAGE } }
+    const names = opts.deploymentNames ?? ['primary', 'secondary']
+    return [
+      {
+        matcher: (u) => u === '/api/v1/models',
+        method: 'POST',
+        status: opts.modelStatus,
+        gate: opts.modelPostGate,
+        response: opts.modelStatus ? errorBody : makeChatModel({ id: 'new-lb', name: 'my-lb' }),
+      },
+      ...names.map((name, i): FetchMockEntry => {
+        const fails = opts.failDeployment === name
+        return {
+          matcher: (u) => u === DEPLOYMENTS,
+          method: 'POST',
+          bodyMatcher: isDeploymentNamed(name),
+          status: fails ? 500 : undefined,
+          response: fails ? errorBody : { id: `dep-${i + 1}`, name },
+        }
+      }),
+      ...names.map((_, i): FetchMockEntry => ({
+        matcher: (u) => u === `${DEPLOYMENTS}/dep-${i + 1}`,
+        method: 'DELETE',
+        status: opts.deleteDeploymentStatus,
+        gate: opts.deleteDeploymentGate,
+        response: opts.deleteDeploymentStatus ? errorBody : {},
+      })),
+      {
+        matcher: (u) => u === NEW_MODEL,
+        method: 'DELETE',
+        status: opts.deleteModelStatus,
+        gate: opts.deleteModelGate,
+        response: opts.deleteModelStatus ? errorBody : {},
+      },
+      ...defaultEntries(),
+    ]
+  }
+
+  async function addNamedDeployment(dialog: HTMLElement, name: string) {
+    await userEvent.click(within(dialog).getByRole('button', { name: /\+ add deployment/i }))
+    const names = within(dialog).getAllByRole('textbox', { name: /^name$/i })
+    await userEvent.type(names[names.length - 1], name)
+    const urls = within(dialog).getAllByRole('textbox', { name: /base url/i })
+    await userEvent.type(urls[urls.length - 1], 'https://api.openai.com/v1')
+    await userEvent.click(within(dialog).getByRole('button', { name: /^add$/i }))
+  }
+
+  async function fillForm(entries: FetchMockEntry[], deploymentNames: string[] = ['primary', 'secondary']) {
+    setupFetchMock(entries)
+    await renderSettled()
+    await openCreateDialog()
+    const dialog = getDialog(/add model/i)
+    await dialogFocused()
+    await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'my-lb')
+    await switchToLoadBalancedTab()
+    for (const name of deploymentNames) await addNamedDeployment(dialog, name)
+    return dialog
+  }
+
+  async function fillAndSubmit(entries: FetchMockEntry[], deploymentNames?: string[]) {
+    const dialog = await fillForm(entries, deploymentNames)
+    await submitDialog(dialog, /add model/i)
+    return dialog
+  }
+
+  function expectDialogKeptValues(dialog: HTMLElement) {
+    expect(dialog).toBeInTheDocument()
+    expect(within(dialog).getByRole('textbox', { name: /^name$/i })).toHaveValue('my-lb')
+    expect(within(dialog).getByText('primary')).toBeInTheDocument()
+    expect(within(dialog).getByText('secondary')).toBeInTheDocument()
+  }
+
+  it('deletes the created deployment and then the model when the second deployment fails', async () => {
+    const dialog = await fillAndSubmit(rollbackEntries({ failDeployment: 'secondary' }))
+
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
+    expect(sentWrites()).toEqual([
+      'POST:/api/v1/models',
+      `POST:${DEPLOYMENTS}`,
+      `POST:${DEPLOYMENTS}`,
+      `DELETE:${DEPLOYMENTS}/dep-1`,
+      `DELETE:${NEW_MODEL}`,
+    ])
+    expectDialogKeptValues(dialog)
+  })
+
+  it('only deletes the model when the first deployment fails', async () => {
+    const dialog = await fillAndSubmit(rollbackEntries({ failDeployment: 'primary' }))
+
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
+    expect(sentWrites()).toEqual(['POST:/api/v1/models', `POST:${DEPLOYMENTS}`, `DELETE:${NEW_MODEL}`])
+    expectDialogKeptValues(dialog)
+  })
+
+  it('deletes the first deployment, then the model, when the middle of three deployments fails', async () => {
+    const names = ['primary', 'secondary', 'tertiary']
+    await fillAndSubmit(rollbackEntries({ deploymentNames: names, failDeployment: 'secondary' }), names)
+
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
+    expect(sentWrites()).toEqual([
+      'POST:/api/v1/models',
+      `POST:${DEPLOYMENTS}`,
+      `POST:${DEPLOYMENTS}`,
+      `DELETE:${DEPLOYMENTS}/dep-1`,
+      `DELETE:${NEW_MODEL}`,
+    ])
+  })
+
+  it('reports nothing saved when the model delete succeeds although a deployment delete failed', async () => {
+    const dialog = await fillAndSubmit(rollbackEntries({ failDeployment: 'secondary', deleteDeploymentStatus: 500 }))
+
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
+    // The model delete is still attempted after a failed deployment delete.
+    expect(sentWrites().slice(-2)).toEqual([`DELETE:${DEPLOYMENTS}/dep-1`, `DELETE:${NEW_MODEL}`])
+    expectDialogKeptValues(dialog)
+  })
+
+  it('reports the model as not removed, with the server message, when the model delete fails', async () => {
+    const dialog = await fillAndSubmit(rollbackEntries({ failDeployment: 'secondary', deleteModelStatus: 500 }))
+
+    expect(await screen.findByText(NOT_REMOVED_MESSAGE)).toBeInTheDocument()
+    expect(screen.queryByText(/Nothing was saved/)).not.toBeInTheDocument()
+    expectDialogKeptValues(dialog)
+  })
+
+  it('sends no DELETE and shows the server message when the model POST itself fails', async () => {
+    const dialog = await fillAndSubmit(rollbackEntries({ modelStatus: 500 }))
+
+    expect(await screen.findByText(SERVER_MESSAGE)).toBeInTheDocument()
+    expect(screen.queryByText(/Nothing was saved/)).not.toBeInTheDocument()
+    expect(sentWrites()).toEqual(['POST:/api/v1/models'])
+    expectDialogKeptValues(dialog)
+  })
+
+  it('does not roll back when every deployment succeeds', async () => {
+    await fillAndSubmit(rollbackEntries({}))
+
+    expect(await screen.findByText('Model added')).toBeInTheDocument()
+    expect(sentWrites().some((w) => w.startsWith('DELETE:'))).toBe(false)
+  })
+
+  it('sends the model DELETE only after the deployment DELETE response resolved', async () => {
+    const gate = deferred()
+    await fillAndSubmit(rollbackEntries({ failDeployment: 'secondary', deleteDeploymentGate: gate.promise }))
+
+    await waitFor(() => expect(sentWrites()).toContain(`DELETE:${DEPLOYMENTS}/dep-1`))
+    // Give a premature model DELETE every chance to show up while the deployment DELETE is unresolved.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(sentWrites()).not.toContain(`DELETE:${NEW_MODEL}`)
+
+    gate.release()
+    await waitFor(() => expect(sentWrites()).toContain(`DELETE:${NEW_MODEL}`))
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
+  })
+
+  it('ignores Escape, the backdrop and the X button while a rollback DELETE is pending', async () => {
+    const gate = deferred()
+    const dialog = await fillAndSubmit(rollbackEntries({ failDeployment: 'secondary', deleteModelGate: gate.promise }))
+    await waitFor(() => expect(sentWrites()).toContain(`DELETE:${NEW_MODEL}`))
+
+    await userEvent.keyboard('{Escape}')
+    fireEvent.mouseDown(dialog.parentElement as HTMLElement)
+    await userEvent.click(within(dialog).getByRole('button', { name: /close/i }))
+    await userEvent.click(within(dialog).getByRole('button', { name: /cancel/i }))
+
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(within(dialog).getByRole('tab', { name: /single endpoint/i })).toBeDisabled()
+    for (const remove of within(dialog).getAllByTitle('Remove deployment')) expect(remove).toBeDisabled()
+
+    gate.release()
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
+    expectDialogKeptValues(dialog)
+
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
+
+  it('sends only one model POST when the submit button is clicked twice while saving', async () => {
+    const gate = deferred()
+    const dialog = await fillForm(rollbackEntries({ modelPostGate: gate.promise }))
+    const submit = within(dialog).getByRole('button', { name: /add model/i })
+
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+    gate.release()
+
+    expect(await screen.findByText('Model added')).toBeInTheDocument()
+    expect(sentWrites().filter((w) => w === 'POST:/api/v1/models')).toHaveLength(1)
+  })
+
+  it('creates the model again with the same name after a successful rollback', async () => {
+    const dialog = await fillAndSubmit(rollbackEntries({ failDeployment: 'secondary' }))
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
+
+    await submitDialog(dialog, /add model/i)
+
+    await waitFor(() => expect(sentWrites().filter((w) => w === 'POST:/api/v1/models')).toHaveLength(2))
+    await waitFor(() => expect(sentWrites().filter((w) => w === `DELETE:${NEW_MODEL}`)).toHaveLength(2))
   })
 })

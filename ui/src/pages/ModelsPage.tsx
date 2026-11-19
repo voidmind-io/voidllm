@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react'
+import React, { useState, useMemo, useRef } from 'react'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Table } from '../components/ui/Table'
 import type { Column } from '../components/ui/Table'
@@ -254,26 +254,64 @@ function validateRoleArn(auth: BedrockAuth, roleArn: string): string | undefined
 const BEDROCK_IAM_ENDPOINT_ERROR =
   'In IAM mode the endpoint must be the Bedrock Runtime endpoint of the selected region (standard, FIPS, dual-stack or VPC endpoint)'
 const BEDROCK_ENDPOINT_QUERY_ERROR = 'Endpoint must not contain a query or fragment'
+const BEDROCK_ENDPOINT_SCHEME_ERROR = 'Endpoint must begin with https:// (or http:// with API key authentication)'
+const BEDROCK_ENDPOINT_CHARS_ERROR = 'Endpoint must not contain whitespace, control characters or malformed percent-escapes'
+const BEDROCK_REGION_REQUIRED_ERROR = 'AWS region is required'
+const BEDROCK_REGION_INVALID_ERROR = 'AWS region is not valid (e.g. eu-central-1)'
+
+// Mirrors bedrockRegionRe in internal/provider/bedrock.go.
+const BEDROCK_REGION_PATTERN = /^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$/
+// Mirrors bedrockVPCEndpointRe in internal/provider/bedrock.go.
+const BEDROCK_VPC_ENDPOINT_PATTERN = /^vpce-[a-z0-9]+(-[a-z0-9]+)*$/
+
+function normalizeBedrockRegion(region: string): string {
+  return region.trim().toLowerCase()
+}
+
+function validateBedrockRegion(region: string): string | undefined {
+  const normalized = normalizeBedrockRegion(region)
+  if (!normalized) return BEDROCK_REGION_REQUIRED_ERROR
+  return BEDROCK_REGION_PATTERN.test(normalized) ? undefined : BEDROCK_REGION_INVALID_ERROR
+}
 
 function isBedrockRuntimeHost(host: string, region: string): boolean {
-  const r = region.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const patterns = [
-    new RegExp(`^bedrock-runtime(-fips)?\\.${r}\\.amazonaws\\.com$`),
-    new RegExp(`^bedrock-runtime\\.${r}\\.amazonaws\\.com\\.cn$`),
-    new RegExp(`^bedrock-runtime(-fips)?\\.${r}\\.api\\.aws$`),
-    new RegExp(`^vpce-[a-z0-9-]+\\.bedrock-runtime(-fips)?\\.${r}\\.vpce\\.amazonaws\\.com(\\.cn)?$`),
+  const direct = [
+    `bedrock-runtime.${region}.amazonaws.com`,
+    `bedrock-runtime-fips.${region}.amazonaws.com`,
+    `bedrock-runtime.${region}.amazonaws.com.cn`,
+    `bedrock-runtime.${region}.api.aws`,
+    `bedrock-runtime-fips.${region}.api.aws`,
   ]
-  return patterns.some((re) => re.test(host))
+  if (direct.includes(host)) return true
+  const suffixes = [
+    `.bedrock-runtime.${region}.vpce.amazonaws.com`,
+    `.bedrock-runtime-fips.${region}.vpce.amazonaws.com`,
+    `.bedrock-runtime.${region}.vpce.amazonaws.com.cn`,
+    `.bedrock-runtime-fips.${region}.vpce.amazonaws.com.cn`,
+  ]
+  return suffixes.some(
+    (suffix) => host.endsWith(suffix) && BEDROCK_VPC_ENDPOINT_PATTERN.test(host.slice(0, host.length - suffix.length)),
+  )
 }
+
+// eslint-disable-next-line no-control-regex
+const BEDROCK_URL_FORBIDDEN_CHARS = /[\s\u0000-\u001f\u007f]/
+const BEDROCK_URL_BAD_PERCENT = /%(?![0-9a-fA-F]{2})/
 
 function validateBedrockEndpoint(auth: BedrockAuth, region: string, baseUrl: string): string | undefined {
   const url = baseUrl.trim()
   if (!url) return undefined
-  if (url.includes('?') || url.includes('#')) return BEDROCK_ENDPOINT_QUERY_ERROR
+  if (BEDROCK_URL_FORBIDDEN_CHARS.test(url) || BEDROCK_URL_BAD_PERCENT.test(url)) return BEDROCK_ENDPOINT_CHARS_ERROR
+  // The server parses the scheme case-insensitively; lower-case only the scheme for the checks below.
+  const checked = url.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, (scheme) => scheme.toLowerCase())
+  if (!checked.startsWith('https://') && !(auth !== 'iam' && checked.startsWith('http://'))) {
+    return auth === 'iam' ? BEDROCK_IAM_ENDPOINT_ERROR : BEDROCK_ENDPOINT_SCHEME_ERROR
+  }
+  if (checked.includes('?') || checked.includes('#')) return BEDROCK_ENDPOINT_QUERY_ERROR
   if (auth !== 'iam') return undefined
-  const trimmedRegion = region.trim().toLowerCase()
+  const trimmedRegion = normalizeBedrockRegion(region)
   if (!trimmedRegion) return undefined
-  const match = /^https:\/\/([^/]*)/i.exec(url)
+  const match = /^https:\/\/([^/]*)/.exec(checked)
   if (!match) return BEDROCK_IAM_ENDPOINT_ERROR
   const authority = match[1]
   if (authority.includes('@')) return BEDROCK_IAM_ENDPOINT_ERROR
@@ -429,7 +467,10 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
     if (!name.trim()) next.name = 'Name is required'
     if (!provider) next.provider = 'Provider is required'
     if (!isEdit && !isBedrock && !baseUrl.trim()) next.base_url = 'Base URL is required'
-    if (isBedrock && !region.trim()) next.region = 'AWS region is required'
+    if (isBedrock) {
+      const regionError = validateBedrockRegion(region)
+      if (regionError) next.region = regionError
+    }
     if (isBedrock && !bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
     if (isBedrock) {
       const arnError = validateRoleArn(bedrockAuth, bedrockRoleArn)
@@ -469,7 +510,7 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
       if (isBedrock && (isIam ? bedrockRoleArn.trim() : '') !== (deployment.bedrock_role_arn ?? '')) {
         params.bedrock_role_arn = isIam ? bedrockRoleArn.trim() : ''
       }
-      if (isBedrock && region.trim() !== (deployment.region ?? '')) params.region = region.trim()
+      if (isBedrock && normalizeBedrockRegion(region) !== (deployment.region ?? '')) params.region = normalizeBedrockRegion(region)
       if (isBedrock && bedrockModelId.trim() !== (deployment.bedrock_model_id ?? '')) {
         params.bedrock_model_id = bedrockModelId.trim()
       }
@@ -505,7 +546,7 @@ function DeploymentDialog({ modelId, deployment, onClose }: DeploymentDialogProp
             api_key: isIam ? undefined : apiKey.trim() || undefined,
             azure_deployment: isAzure && azureDeployment.trim() ? azureDeployment.trim() : undefined,
             azure_api_version: isAzure && azureApiVersion.trim() ? azureApiVersion.trim() : undefined,
-            region: isBedrock ? region.trim() : undefined,
+            region: isBedrock ? normalizeBedrockRegion(region) : undefined,
             bedrock_model_id: isBedrock ? bedrockModelId.trim() : undefined,
             bedrock_auth: isBedrock ? bedrockAuth : undefined,
             bedrock_role_arn: isIam && bedrockRoleArn.trim() ? bedrockRoleArn.trim() : undefined,
@@ -735,15 +776,19 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const [errors, setErrors] = useState<FormErrors>({})
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null)
   const [testing, setTesting] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const submittingRef = useRef(false)
 
   const createModel = useCreateModel()
   const createDeployment = useCreateDeployment()
+  const deleteDeployment = useDeleteDeployment()
+  const deleteModel = useDeleteModel()
   const { toast } = useToast()
   const { data: license } = useLicense()
   const { data: modelsData } = useModels()
   const hasFallbackFeature = license?.features.includes('fallback_chains') ?? false
 
-  function handleClose() {
+  function closeDialog() {
     setMode('single')
     setName('')
     setType('chat')
@@ -777,6 +822,12 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     onClose()
   }
 
+  // User-initiated dismissal (Escape, backdrop, X, Cancel) is ignored while a save or rollback runs.
+  function handleClose() {
+    if (submittingRef.current || isPending) return
+    closeDialog()
+  }
+
   function handleProviderChange(value: string) {
     setProvider(value)
     setBaseUrl('')
@@ -784,6 +835,16 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   }
 
   async function handleTestConnection() {
+    if (isBedrock) {
+      const regionError = validateBedrockRegion(region)
+      const endpointError = validateBedrockEndpoint(bedrockAuth, region, baseUrl)
+      if (regionError || endpointError) {
+        setErrors((prev) => ({ ...prev, region: regionError, base_url: endpointError }))
+        setTestResult(null)
+        return
+      }
+      setErrors((prev) => ({ ...prev, region: undefined, base_url: undefined }))
+    }
     setTesting(true)
     setTestResult(null)
     try {
@@ -798,7 +859,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
         if (azureApiVersion.trim()) body.azure_api_version = azureApiVersion.trim()
       }
       if (isBedrock) {
-        body.region = region.trim()
+        body.region = normalizeBedrockRegion(region)
         body.bedrock_model_id = bedrockModelId.trim()
         body.bedrock_auth = bedrockAuth
         if (isIam && bedrockRoleArn.trim()) body.bedrock_role_arn = bedrockRoleArn.trim()
@@ -821,7 +882,10 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     if (!depFormEntry.provider) next.provider = 'Provider is required'
     const depIsBedrock = depFormEntry.provider === 'bedrock'
     if (!depIsBedrock && !depFormEntry.baseUrl.trim()) next.base_url = 'Base URL is required'
-    if (depIsBedrock && !depFormEntry.region.trim()) next.region = 'AWS region is required'
+    if (depIsBedrock) {
+      const regionError = validateBedrockRegion(depFormEntry.region)
+      if (regionError) next.region = regionError
+    }
     if (depIsBedrock && !depFormEntry.bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
     if (depIsBedrock) {
       const arnError = validateRoleArn(depFormEntry.bedrockAuth, depFormEntry.bedrockRoleArn)
@@ -891,7 +955,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       if (!isBedrock && !baseUrl.trim()) next.base_url = 'Base URL is required'
       if (isBedrock) {
         if (type !== 'chat') next.type = BEDROCK_CHAT_ONLY_ERROR
-        if (!region.trim()) next.region = 'AWS region is required'
+        const regionError = validateBedrockRegion(region)
+        if (regionError) next.region = regionError
         if (!bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
         const arnError = validateRoleArn(bedrockAuth, bedrockRoleArn)
         if (arnError) next.bedrock_role_arn = arnError
@@ -904,6 +969,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       if (deployments.some((d) => d.provider === 'bedrock' && d.bedrockAuth === 'api_key' && !d.apiKey.trim())) {
         next.deployments = 'Every Bedrock deployment using API key authentication needs an API key'
       }
+      // Re-check at submit time: guards against future code paths that change the list without validating it.
       const badEndpoint = deployments.find(
         (d) => d.provider === 'bedrock' && validateBedrockEndpoint(d.bedrockAuth, d.region, d.baseUrl),
       )
@@ -921,6 +987,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
 
   async function handleSubmit(e: React.MouseEvent) {
     e.preventDefault()
+    if (submittingRef.current) return
     if (!validate()) return
 
     const parsedAliases = aliases.split(',').map((a) => a.trim()).filter(Boolean)
@@ -959,7 +1026,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
         if (azureApiVersion.trim()) params.azure_api_version = azureApiVersion.trim()
       }
       if (isBedrock) {
-        params.region = region.trim()
+        params.region = normalizeBedrockRegion(region)
         params.bedrock_model_id = bedrockModelId.trim()
         params.bedrock_auth = bedrockAuth
         if (isIam && bedrockRoleArn.trim()) params.bedrock_role_arn = bedrockRoleArn.trim()
@@ -972,7 +1039,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       createModel.mutate(params, {
         onSuccess: () => {
           toast({ variant: 'success', message: 'Model added' })
-          handleClose()
+          closeDialog()
         },
         onError: (err) => {
           toast({
@@ -1018,10 +1085,15 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       const piiFilterValueLB = piiFilterToParam(piiFilter)
       if (piiFilterValueLB !== undefined) params.pii_filter = piiFilterValueLB
 
+      submittingRef.current = true
+      setSaving(true)
+      let createdModelId: string | null = null
+      const createdDeploymentIds: string[] = []
       try {
         const model = await createModel.mutateAsync(params)
+        createdModelId = model.id
         for (const dep of deployments) {
-          await createDeployment.mutateAsync({
+          const created = await createDeployment.mutateAsync({
             modelId: model.id,
             params: {
               name: dep.name,
@@ -1030,7 +1102,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
               api_key: dep.provider === 'bedrock' && dep.bedrockAuth === 'iam' ? undefined : dep.apiKey || undefined,
               azure_deployment: dep.azureDeployment || undefined,
               azure_api_version: dep.azureApiVersion || undefined,
-              region: dep.provider === 'bedrock' ? dep.region.trim() : undefined,
+              region: dep.provider === 'bedrock' ? normalizeBedrockRegion(dep.region) : undefined,
               bedrock_model_id: dep.provider === 'bedrock' ? dep.bedrockModelId.trim() : undefined,
               bedrock_auth: dep.provider === 'bedrock' ? dep.bedrockAuth : undefined,
               bedrock_role_arn:
@@ -1041,14 +1113,38 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
               priority: dep.priority,
             },
           })
+          createdDeploymentIds.push(created.id)
         }
         toast({ variant: 'success', message: 'Model added' })
-        handleClose()
+        closeDialog()
       } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to add model'
+        if (createdModelId === null) {
+          toast({ variant: 'error', message })
+          return
+        }
+        for (const deploymentId of createdDeploymentIds) {
+          try {
+            await deleteDeployment.mutateAsync({ modelId: createdModelId, deploymentId })
+          } catch {
+            // Best effort: deployments of a deleted model are unreachable, so only the model delete decides the outcome.
+          }
+        }
+        let modelDeleted = true
+        try {
+          await deleteModel.mutateAsync(createdModelId)
+        } catch {
+          modelDeleted = false
+        }
         toast({
           variant: 'error',
-          message: err instanceof Error ? err.message : 'Failed to add model',
+          message: modelDeleted
+            ? `${message} Nothing was saved.`
+            : `${message} The model "${params.name}" was created but could not be removed. Delete it in the models list and try again.`,
         })
+      } finally {
+        submittingRef.current = false
+        setSaving(false)
       }
     }
   }
@@ -1056,7 +1152,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const isAzure = provider === 'azure'
   const isBedrock = provider === 'bedrock'
   const isIam = isBedrock && bedrockAuth === 'iam'
-  const isPending = createModel.isPending || createDeployment.isPending
+  const isPending =
+    saving || createModel.isPending || createDeployment.isPending || deleteDeployment.isPending || deleteModel.isPending
   const depFormIsAzure = depFormEntry.provider === 'azure'
   const depFormIsBedrock = depFormEntry.provider === 'bedrock'
   const depFormIsIam = depFormIsBedrock && depFormEntry.bedrockAuth === 'iam'
@@ -1073,7 +1170,14 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   }, [modelsData, name, type])
 
   return (
-    <Dialog open={open} onClose={handleClose} title="Add Model">
+    <Dialog
+      open={open}
+      onClose={handleClose}
+      title="Add Model"
+      closeOnEscape={!isPending}
+      closeOnBackdrop={!isPending}
+      closeDisabled={isPending}
+    >
       <div className="space-y-4">
         <TabSwitcher
           tabs={[
@@ -1082,6 +1186,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
           ]}
           activeKey={mode}
           onChange={(key) => setMode(key as 'single' | 'loadbalanced')}
+          disabled={isPending}
         />
 
         <Input
@@ -1359,7 +1464,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                             <button
                               type="button"
                               onClick={(e) => handleRemoveDeploymentEntry(index, e)}
-                              className="p-1 rounded text-text-tertiary hover:text-error hover:bg-error/10 transition-colors"
+                              disabled={isPending}
+                              className="p-1 rounded text-text-tertiary hover:text-error hover:bg-error/10 transition-colors disabled:opacity-50 disabled:pointer-events-none"
                               title="Remove deployment"
                             >
                               <IconTrash />
@@ -1669,7 +1775,8 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
     if (isBedrock) {
       const next: FormErrors = {}
       if (type !== 'chat') next.type = BEDROCK_CHAT_ONLY_ERROR
-      if (!region.trim()) next.region = 'AWS region is required'
+      const regionError = validateBedrockRegion(region)
+      if (regionError) next.region = regionError
       if (!bedrockModelId.trim()) next.bedrock_model_id = 'Bedrock model ID is required'
       const arnError = validateRoleArn(bedrockAuth, bedrockRoleArn)
       if (arnError) next.bedrock_role_arn = arnError
@@ -1742,7 +1849,7 @@ function EditModelDialog({ model, onClose }: EditModelDialogProps) {
     }
 
     if (isBedrock) {
-      if (region.trim() !== (model.region ?? '')) params.region = region.trim()
+      if (normalizeBedrockRegion(region) !== (model.region ?? '')) params.region = normalizeBedrockRegion(region)
       if (bedrockModelId.trim() !== (model.bedrock_model_id ?? '')) {
         params.bedrock_model_id = bedrockModelId.trim()
       }
