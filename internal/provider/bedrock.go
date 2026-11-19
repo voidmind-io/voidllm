@@ -60,6 +60,9 @@ func ValidBedrockIAMEndpoint(baseURL, region string) error {
 	if err != nil || u.Scheme != "https" || u.User != nil {
 		return ErrBedrockIAMEndpoint
 	}
+	if strings.HasSuffix(u.Host, ":") {
+		return ErrBedrockIAMEndpoint
+	}
 	if port := u.Port(); port != "" && port != "443" {
 		return ErrBedrockIAMEndpoint
 	}

@@ -31,7 +31,10 @@ func TestValidBedrockIAMEndpoint(t *testing.T) {
 		{"uppercase", "https://Bedrock-Runtime.EU-CENTRAL-1.AmazonAWS.com", r, true},
 		{"trailing dot", "https://bedrock-runtime.eu-central-1.amazonaws.com.", r, true},
 		{"explicit 443", "https://bedrock-runtime.eu-central-1.amazonaws.com:443", r, true},
+		{"no port", "https://bedrock-runtime.eu-central-1.amazonaws.com/model/x", r, true},
 		// rejected
+		{"bare port delimiter", "https://bedrock-runtime.eu-central-1.amazonaws.com:", r, false},
+		{"bare port delimiter with path", "https://bedrock-runtime.eu-central-1.amazonaws.com:/model/x", r, false},
 		{"region mismatch", "https://bedrock-runtime.us-east-1.amazonaws.com", r, false},
 		{"vpce region mismatch", "https://vpce-0abc.bedrock-runtime.us-east-1.vpce.amazonaws.com", r, false},
 		{"invalid region argument", "https://bedrock-runtime.eu-central-1.amazonaws.com", "", false},
