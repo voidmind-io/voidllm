@@ -1,5 +1,5 @@
 import React from 'react'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -121,12 +121,16 @@ type FetchMockEntry = {
   status?: number
   /** When set, the entry only matches requests whose body satisfies the predicate. */
   bodyMatcher?: (body: string) => boolean
+  /** When set, the response is held back until this promise resolves. */
+  gate?: Promise<void>
 }
 
 /**
  * Installs a fetch mock. When `capturedRequests` is given, EVERY request (matched or
- * not, with or without a body) is recorded under `METHOD:url` in call order; the value
- * is the request body, or '' when there is none.
+ * not, with or without a body) is recorded under `METHOD:url`; the value is the request
+ * body, or '' when there is none. The map has one entry per distinct key: a repeated
+ * request overwrites the earlier body (last one wins) and keeps its first insertion
+ * position, so use `sentWrites()` to assert repeated requests or their exact order.
  */
 function setupFetchMock(entries: FetchMockEntry[], capturedRequests?: Map<string, string>) {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -143,11 +147,12 @@ function setupFetchMock(entries: FetchMockEntry[], capturedRequests?: Map<string
     )
 
     if (entry) {
+      if (entry.gate) await entry.gate
       const status = entry.status ?? 200
       return {
         ok: status < 400,
         status,
-        statusText: 'error',
+        statusText: status < 400 ? 'OK' : 'error',
         json: () => Promise.resolve(entry.response),
       }
     }
@@ -2361,7 +2366,24 @@ describe('AWS Bedrock validation alignment', () => {
     await submitDialog(dialog, /add model/i)
 
     await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
-    expect(within(dialog).queryByText(ENDPOINT_ERROR)).not.toBeInTheDocument()
+    const body = JSON.parse(capturedBodies.get(MODELS_POST)!)
+    expect(body.region).toBe('eu-central-1')
+    expect(body.base_url).toBe('https://bedrock-runtime.eu-central-1.amazonaws.com')
+  })
+
+  it('accepts an upper-case HTTPS:// scheme and sends the URL unchanged', async () => {
+    const capturedBodies = new Map<string, string>()
+    const dialog = await openBedrockCreate(capturedBodies, { iam: true })
+    await userEvent.type(
+      within(dialog).getByRole('textbox', { name: /base url/i }),
+      'HTTPS://bedrock-runtime.eu-central-1.amazonaws.com',
+    )
+    await submitDialog(dialog, /add model/i)
+
+    await waitFor(() => expect(capturedBodies.has(MODELS_POST)).toBe(true))
+    expect(JSON.parse(capturedBodies.get(MODELS_POST)!).base_url).toBe(
+      'HTTPS://bedrock-runtime.eu-central-1.amazonaws.com',
+    )
   })
 
   it('rejects a malformed region inline and sends no request', async () => {
@@ -2374,7 +2396,6 @@ describe('AWS Bedrock validation alignment', () => {
   })
 
   it.each([
-    'HTTPS://bedrock-runtime.eu-central-1.amazonaws.com',
     'https://vpce-a--b.bedrock-runtime.eu-central-1.vpce.amazonaws.com',
   ])('rejects %s in IAM mode with the endpoint error and zero write requests', async (endpoint) => {
     const capturedBodies = new Map<string, string>()
@@ -2515,52 +2536,68 @@ describe('CreateModelDialog - load-balanced create rollback', () => {
   const NEW_MODEL = '/api/v1/models/new-lb'
   const DEPLOYMENTS = `${NEW_MODEL}/deployments`
   const SERVER_MESSAGE = 'deployment quota exceeded.'
+  const NOT_REMOVED_MESSAGE = `${SERVER_MESSAGE} The model "my-lb" was created but could not be removed. Delete it in the models list and try again.`
 
   beforeEach(() => {
     vi.restoreAllMocks()
   })
 
+  function deferred() {
+    let release!: () => void
+    const promise = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    return { promise, release }
+  }
+
   function isDeploymentNamed(name: string) {
     return (body: string) => (JSON.parse(body) as { name?: string }).name === name
   }
 
-  function rollbackEntries(opts: {
+  interface RollbackOpts {
+    deploymentNames?: string[]
+    failDeployment?: string
     modelStatus?: number
-    secondDeploymentStatus?: number
     deleteDeploymentStatus?: number
     deleteModelStatus?: number
-  }): FetchMockEntry[] {
+    modelPostGate?: Promise<void>
+    deleteDeploymentGate?: Promise<void>
+    deleteModelGate?: Promise<void>
+  }
+
+  function rollbackEntries(opts: RollbackOpts): FetchMockEntry[] {
     const errorBody = { error: { message: SERVER_MESSAGE } }
+    const names = opts.deploymentNames ?? ['primary', 'secondary']
     return [
       {
         matcher: (u) => u === '/api/v1/models',
         method: 'POST',
         status: opts.modelStatus,
+        gate: opts.modelPostGate,
         response: opts.modelStatus ? errorBody : makeChatModel({ id: 'new-lb', name: 'my-lb' }),
       },
-      {
-        matcher: (u) => u === DEPLOYMENTS,
-        method: 'POST',
-        bodyMatcher: isDeploymentNamed('primary'),
-        response: { id: 'dep-1', name: 'primary' },
-      },
-      {
-        matcher: (u) => u === DEPLOYMENTS,
-        method: 'POST',
-        bodyMatcher: isDeploymentNamed('secondary'),
-        status: opts.secondDeploymentStatus,
-        response: opts.secondDeploymentStatus ? errorBody : { id: 'dep-2', name: 'secondary' },
-      },
-      {
-        matcher: (u) => u === `${DEPLOYMENTS}/dep-1`,
+      ...names.map((name, i): FetchMockEntry => {
+        const fails = opts.failDeployment === name
+        return {
+          matcher: (u) => u === DEPLOYMENTS,
+          method: 'POST',
+          bodyMatcher: isDeploymentNamed(name),
+          status: fails ? 500 : undefined,
+          response: fails ? errorBody : { id: `dep-${i + 1}`, name },
+        }
+      }),
+      ...names.map((_, i): FetchMockEntry => ({
+        matcher: (u) => u === `${DEPLOYMENTS}/dep-${i + 1}`,
         method: 'DELETE',
         status: opts.deleteDeploymentStatus,
+        gate: opts.deleteDeploymentGate,
         response: opts.deleteDeploymentStatus ? errorBody : {},
-      },
+      })),
       {
         matcher: (u) => u === NEW_MODEL,
         method: 'DELETE',
         status: opts.deleteModelStatus,
+        gate: opts.deleteModelGate,
         response: opts.deleteModelStatus ? errorBody : {},
       },
       ...defaultEntries(),
@@ -2576,7 +2613,7 @@ describe('CreateModelDialog - load-balanced create rollback', () => {
     await userEvent.click(within(dialog).getByRole('button', { name: /^add$/i }))
   }
 
-  async function fillAndSubmit(entries: FetchMockEntry[]) {
+  async function fillForm(entries: FetchMockEntry[], deploymentNames: string[] = ['primary', 'secondary']) {
     setupFetchMock(entries)
     await renderSettled()
     await openCreateDialog()
@@ -2584,8 +2621,12 @@ describe('CreateModelDialog - load-balanced create rollback', () => {
     await dialogFocused()
     await userEvent.type(within(dialog).getByRole('textbox', { name: /^name$/i }), 'my-lb')
     await switchToLoadBalancedTab()
-    await addNamedDeployment(dialog, 'primary')
-    await addNamedDeployment(dialog, 'secondary')
+    for (const name of deploymentNames) await addNamedDeployment(dialog, name)
+    return dialog
+  }
+
+  async function fillAndSubmit(entries: FetchMockEntry[], deploymentNames?: string[]) {
+    const dialog = await fillForm(entries, deploymentNames)
     await submitDialog(dialog, /add model/i)
     return dialog
   }
@@ -2598,7 +2639,7 @@ describe('CreateModelDialog - load-balanced create rollback', () => {
   }
 
   it('deletes the created deployment and then the model when the second deployment fails', async () => {
-    const dialog = await fillAndSubmit(rollbackEntries({ secondDeploymentStatus: 500 }))
+    const dialog = await fillAndSubmit(rollbackEntries({ failDeployment: 'secondary' }))
 
     expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
     expect(sentWrites()).toEqual([
@@ -2611,24 +2652,41 @@ describe('CreateModelDialog - load-balanced create rollback', () => {
     expectDialogKeptValues(dialog)
   })
 
-  it('reports a partly created model when the rollback delete of a deployment fails', async () => {
-    const dialog = await fillAndSubmit(rollbackEntries({ secondDeploymentStatus: 500, deleteDeploymentStatus: 500 }))
+  it('only deletes the model when the first deployment fails', async () => {
+    const dialog = await fillAndSubmit(rollbackEntries({ failDeployment: 'primary' }))
 
-    expect(
-      await screen.findByText('Model "my-lb" was partly created. Delete it in the models list and try again.'),
-    ).toBeInTheDocument()
-    expect(screen.queryByText(/Nothing was saved/)).not.toBeInTheDocument()
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
+    expect(sentWrites()).toEqual(['POST:/api/v1/models', `POST:${DEPLOYMENTS}`, `DELETE:${NEW_MODEL}`])
+    expectDialogKeptValues(dialog)
+  })
+
+  it('deletes the first deployment, then the model, when the middle of three deployments fails', async () => {
+    const names = ['primary', 'secondary', 'tertiary']
+    await fillAndSubmit(rollbackEntries({ deploymentNames: names, failDeployment: 'secondary' }), names)
+
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
+    expect(sentWrites()).toEqual([
+      'POST:/api/v1/models',
+      `POST:${DEPLOYMENTS}`,
+      `POST:${DEPLOYMENTS}`,
+      `DELETE:${DEPLOYMENTS}/dep-1`,
+      `DELETE:${NEW_MODEL}`,
+    ])
+  })
+
+  it('reports nothing saved when the model delete succeeds although a deployment delete failed', async () => {
+    const dialog = await fillAndSubmit(rollbackEntries({ failDeployment: 'secondary', deleteDeploymentStatus: 500 }))
+
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
     // The model delete is still attempted after a failed deployment delete.
     expect(sentWrites().slice(-2)).toEqual([`DELETE:${DEPLOYMENTS}/dep-1`, `DELETE:${NEW_MODEL}`])
     expectDialogKeptValues(dialog)
   })
 
-  it('reports a partly created model when the rollback delete of the model fails', async () => {
-    const dialog = await fillAndSubmit(rollbackEntries({ secondDeploymentStatus: 500, deleteModelStatus: 500 }))
+  it('reports the model as not removed, with the server message, when the model delete fails', async () => {
+    const dialog = await fillAndSubmit(rollbackEntries({ failDeployment: 'secondary', deleteModelStatus: 500 }))
 
-    expect(
-      await screen.findByText('Model "my-lb" was partly created. Delete it in the models list and try again.'),
-    ).toBeInTheDocument()
+    expect(await screen.findByText(NOT_REMOVED_MESSAGE)).toBeInTheDocument()
     expect(screen.queryByText(/Nothing was saved/)).not.toBeInTheDocument()
     expectDialogKeptValues(dialog)
   })
@@ -2647,5 +2705,64 @@ describe('CreateModelDialog - load-balanced create rollback', () => {
 
     expect(await screen.findByText('Model added')).toBeInTheDocument()
     expect(sentWrites().some((w) => w.startsWith('DELETE:'))).toBe(false)
+  })
+
+  it('sends the model DELETE only after the deployment DELETE response resolved', async () => {
+    const gate = deferred()
+    await fillAndSubmit(rollbackEntries({ failDeployment: 'secondary', deleteDeploymentGate: gate.promise }))
+
+    await waitFor(() => expect(sentWrites()).toContain(`DELETE:${DEPLOYMENTS}/dep-1`))
+    // Give a premature model DELETE every chance to show up while the deployment DELETE is unresolved.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(sentWrites()).not.toContain(`DELETE:${NEW_MODEL}`)
+
+    gate.release()
+    await waitFor(() => expect(sentWrites()).toContain(`DELETE:${NEW_MODEL}`))
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
+  })
+
+  it('ignores Escape, the backdrop and the X button while a rollback DELETE is pending', async () => {
+    const gate = deferred()
+    const dialog = await fillAndSubmit(rollbackEntries({ failDeployment: 'secondary', deleteModelGate: gate.promise }))
+    await waitFor(() => expect(sentWrites()).toContain(`DELETE:${NEW_MODEL}`))
+
+    await userEvent.keyboard('{Escape}')
+    fireEvent.mouseDown(dialog.parentElement as HTMLElement)
+    await userEvent.click(within(dialog).getByRole('button', { name: /close/i }))
+    await userEvent.click(within(dialog).getByRole('button', { name: /cancel/i }))
+
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(within(dialog).getByRole('tab', { name: /single endpoint/i })).toBeDisabled()
+    for (const remove of within(dialog).getAllByTitle('Remove deployment')) expect(remove).toBeDisabled()
+
+    gate.release()
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
+    expectDialogKeptValues(dialog)
+
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
+
+  it('sends only one model POST when the submit button is clicked twice while saving', async () => {
+    const gate = deferred()
+    const dialog = await fillForm(rollbackEntries({ modelPostGate: gate.promise }))
+    const submit = within(dialog).getByRole('button', { name: /add model/i })
+
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+    gate.release()
+
+    expect(await screen.findByText('Model added')).toBeInTheDocument()
+    expect(sentWrites().filter((w) => w === 'POST:/api/v1/models')).toHaveLength(1)
+  })
+
+  it('creates the model again with the same name after a successful rollback', async () => {
+    const dialog = await fillAndSubmit(rollbackEntries({ failDeployment: 'secondary' }))
+    expect(await screen.findByText(`${SERVER_MESSAGE} Nothing was saved.`)).toBeInTheDocument()
+
+    await submitDialog(dialog, /add model/i)
+
+    await waitFor(() => expect(sentWrites().filter((w) => w === 'POST:/api/v1/models')).toHaveLength(2))
+    await waitFor(() => expect(sentWrites().filter((w) => w === `DELETE:${NEW_MODEL}`)).toHaveLength(2))
   })
 })

@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react'
+import React, { useState, useMemo, useRef } from 'react'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Table } from '../components/ui/Table'
 import type { Column } from '../components/ui/Table'
@@ -302,14 +302,16 @@ function validateBedrockEndpoint(auth: BedrockAuth, region: string, baseUrl: str
   const url = baseUrl.trim()
   if (!url) return undefined
   if (BEDROCK_URL_FORBIDDEN_CHARS.test(url) || BEDROCK_URL_BAD_PERCENT.test(url)) return BEDROCK_ENDPOINT_CHARS_ERROR
-  if (!url.startsWith('https://') && !(auth !== 'iam' && url.startsWith('http://'))) {
+  // The server parses the scheme case-insensitively; lower-case only the scheme for the checks below.
+  const checked = url.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, (scheme) => scheme.toLowerCase())
+  if (!checked.startsWith('https://') && !(auth !== 'iam' && checked.startsWith('http://'))) {
     return auth === 'iam' ? BEDROCK_IAM_ENDPOINT_ERROR : BEDROCK_ENDPOINT_SCHEME_ERROR
   }
-  if (url.includes('?') || url.includes('#')) return BEDROCK_ENDPOINT_QUERY_ERROR
+  if (checked.includes('?') || checked.includes('#')) return BEDROCK_ENDPOINT_QUERY_ERROR
   if (auth !== 'iam') return undefined
   const trimmedRegion = normalizeBedrockRegion(region)
   if (!trimmedRegion) return undefined
-  const match = /^https:\/\/([^/]*)/.exec(url)
+  const match = /^https:\/\/([^/]*)/.exec(checked)
   if (!match) return BEDROCK_IAM_ENDPOINT_ERROR
   const authority = match[1]
   if (authority.includes('@')) return BEDROCK_IAM_ENDPOINT_ERROR
@@ -774,6 +776,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const [errors, setErrors] = useState<FormErrors>({})
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null)
   const [testing, setTesting] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const submittingRef = useRef(false)
 
   const createModel = useCreateModel()
   const createDeployment = useCreateDeployment()
@@ -784,7 +788,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const { data: modelsData } = useModels()
   const hasFallbackFeature = license?.features.includes('fallback_chains') ?? false
 
-  function handleClose() {
+  function closeDialog() {
     setMode('single')
     setName('')
     setType('chat')
@@ -816,6 +820,12 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
     setErrors({})
     setTestResult(null)
     onClose()
+  }
+
+  // User-initiated dismissal (Escape, backdrop, X, Cancel) is ignored while a save or rollback runs.
+  function handleClose() {
+    if (submittingRef.current || isPending) return
+    closeDialog()
   }
 
   function handleProviderChange(value: string) {
@@ -959,6 +969,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       if (deployments.some((d) => d.provider === 'bedrock' && d.bedrockAuth === 'api_key' && !d.apiKey.trim())) {
         next.deployments = 'Every Bedrock deployment using API key authentication needs an API key'
       }
+      // Re-check at submit time: guards against future code paths that change the list without validating it.
       const badEndpoint = deployments.find(
         (d) => d.provider === 'bedrock' && validateBedrockEndpoint(d.bedrockAuth, d.region, d.baseUrl),
       )
@@ -976,6 +987,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
 
   async function handleSubmit(e: React.MouseEvent) {
     e.preventDefault()
+    if (submittingRef.current) return
     if (!validate()) return
 
     const parsedAliases = aliases.split(',').map((a) => a.trim()).filter(Boolean)
@@ -1027,7 +1039,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       createModel.mutate(params, {
         onSuccess: () => {
           toast({ variant: 'success', message: 'Model added' })
-          handleClose()
+          closeDialog()
         },
         onError: (err) => {
           toast({
@@ -1073,6 +1085,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
       const piiFilterValueLB = piiFilterToParam(piiFilter)
       if (piiFilterValueLB !== undefined) params.pii_filter = piiFilterValueLB
 
+      submittingRef.current = true
+      setSaving(true)
       let createdModelId: string | null = null
       const createdDeploymentIds: string[] = []
       try {
@@ -1102,32 +1116,35 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
           createdDeploymentIds.push(created.id)
         }
         toast({ variant: 'success', message: 'Model added' })
-        handleClose()
+        closeDialog()
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Failed to add model'
         if (createdModelId === null) {
           toast({ variant: 'error', message })
           return
         }
-        let rolledBack = true
         for (const deploymentId of createdDeploymentIds) {
           try {
             await deleteDeployment.mutateAsync({ modelId: createdModelId, deploymentId })
           } catch {
-            rolledBack = false
+            // Best effort: deployments of a deleted model are unreachable, so only the model delete decides the outcome.
           }
         }
+        let modelDeleted = true
         try {
           await deleteModel.mutateAsync(createdModelId)
         } catch {
-          rolledBack = false
+          modelDeleted = false
         }
         toast({
           variant: 'error',
-          message: rolledBack
+          message: modelDeleted
             ? `${message} Nothing was saved.`
-            : `Model "${params.name}" was partly created. Delete it in the models list and try again.`,
+            : `${message} The model "${params.name}" was created but could not be removed. Delete it in the models list and try again.`,
         })
+      } finally {
+        submittingRef.current = false
+        setSaving(false)
       }
     }
   }
@@ -1136,7 +1153,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   const isBedrock = provider === 'bedrock'
   const isIam = isBedrock && bedrockAuth === 'iam'
   const isPending =
-    createModel.isPending || createDeployment.isPending || deleteDeployment.isPending || deleteModel.isPending
+    saving || createModel.isPending || createDeployment.isPending || deleteDeployment.isPending || deleteModel.isPending
   const depFormIsAzure = depFormEntry.provider === 'azure'
   const depFormIsBedrock = depFormEntry.provider === 'bedrock'
   const depFormIsIam = depFormIsBedrock && depFormEntry.bedrockAuth === 'iam'
@@ -1153,7 +1170,14 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
   }, [modelsData, name, type])
 
   return (
-    <Dialog open={open} onClose={handleClose} title="Add Model">
+    <Dialog
+      open={open}
+      onClose={handleClose}
+      title="Add Model"
+      closeOnEscape={!isPending}
+      closeOnBackdrop={!isPending}
+      closeDisabled={isPending}
+    >
       <div className="space-y-4">
         <TabSwitcher
           tabs={[
@@ -1162,6 +1186,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
           ]}
           activeKey={mode}
           onChange={(key) => setMode(key as 'single' | 'loadbalanced')}
+          disabled={isPending}
         />
 
         <Input
@@ -1439,7 +1464,8 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                             <button
                               type="button"
                               onClick={(e) => handleRemoveDeploymentEntry(index, e)}
-                              className="p-1 rounded text-text-tertiary hover:text-error hover:bg-error/10 transition-colors"
+                              disabled={isPending}
+                              className="p-1 rounded text-text-tertiary hover:text-error hover:bg-error/10 transition-colors disabled:opacity-50 disabled:pointer-events-none"
                               title="Remove deployment"
                             >
                               <IconTrash />

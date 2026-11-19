@@ -12,6 +12,8 @@ export interface DialogProps {
   className?: string
   closeOnEscape?: boolean
   closeOnBackdrop?: boolean
+  /** Disables the X button, e.g. while a save is in flight. */
+  closeDisabled?: boolean
 }
 
 export function Dialog({
@@ -23,6 +25,7 @@ export function Dialog({
   className,
   closeOnEscape = true,
   closeOnBackdrop = true,
+  closeDisabled = false,
 }: DialogProps) {
   const titleId = useId()
   const panelRef = useRef<HTMLDivElement>(null)
@@ -116,7 +119,8 @@ export function Dialog({
           </h2>
           <button
             onClick={onClose}
-            className="text-text-tertiary hover:text-text-primary transition-colors cursor-pointer"
+            disabled={closeDisabled}
+            className="text-text-tertiary hover:text-text-primary transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
             aria-label="Close"
           >
             <svg
