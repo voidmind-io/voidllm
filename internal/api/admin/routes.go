@@ -168,6 +168,9 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 	// License key management — system_admin only for writes; any member may read.
 	api.Put("/settings/license", auth.RequireRole(auth.RoleSystemAdmin), handler.SetLicense)
 
+	// Trial license request — system_admin only; relays to the license server.
+	api.Post("/license/trial", auth.RequireRole(auth.RoleSystemAdmin), handler.RequestTrial)
+
 	// License — any authenticated user may inspect the current license.
 	api.Get("/license", auth.RequireRole(auth.RoleMember), handler.GetLicense)
 

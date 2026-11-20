@@ -147,13 +147,13 @@ Any OpenAI-compatible SDK works out of the box - just change the base URL to you
 | Database | SQLite (default) or PostgreSQL |
 | Deployment | Docker, Helm chart, graceful shutdown |
 | | |
-| **Pro (€49/mo · €490/yr)** | **Everything above, plus:** |
+| **Pro (€99/mo · €990/yr)** | **Everything above, plus:** |
 | Unlimited orgs + teams | No limit on organizations or teams |
 | Cost reports | Model breakdown, daily trends, budget alerts |
 | Cross-org analytics | Usage and cost across all organizations |
 | Support | Priority email (48h) |
 | | |
-| **Enterprise (€149/mo · €1490/yr)** | **Everything in Pro, plus:** |
+| **Enterprise (€399/mo · €3,990/yr)** | **Everything in Pro, plus:** |
 | SSO / OIDC | Google, Azure AD, Okta, Keycloak, any provider |
 | Per-org SSO | Each organization gets its own Identity Provider |
 | Auto-provisioning | Users created from allowed email domains |
@@ -163,7 +163,11 @@ Any OpenAI-compatible SDK works out of the box - just change the base URL to you
 | Multi-instance | Redis-backed rate limits and budgets across replicas |
 | Support | Dedicated Slack (24h) |
 
-**Founding Member (€999 one-time):** All Enterprise features (current and future), lifetime license, Product Advisory Board, direct founder access, priority support, early access. Limited spots.
+**Enterprise Plus** (from about €1,000/mo, billed annually) adds custom terms for larger deployments - [contact us](mailto:hello@voidmind.io?subject=VoidLLM%20Enterprise%20Plus).
+
+**30-day trial:** try the paid features free for 30 days, no payment data needed. Request it in the UI (System -> License) or at [voidllm.ai/trial](https://voidllm.ai/trial).
+
+Founding Member licenses are no longer offered; existing licenses keep working.
 
 Flat pricing - no per-user fees, no per-request charges. Self-hosted on your infrastructure.
 

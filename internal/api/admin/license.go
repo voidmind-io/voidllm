@@ -60,16 +60,28 @@ type licenseResponse struct {
 	// FallbackMaxDepth is the configured maximum fallback chain depth.
 	// 0 means fallback chains are disabled even if models have fallback configured.
 	FallbackMaxDepth int `json:"fallback_max_depth"`
+	// Trial is true when the license is a time-limited trial.
+	Trial bool `json:"trial"`
+	// DaysLeft is the number of whole days until expiry, or null for perpetual
+	// licenses. It is 0 once the license has expired.
+	DaysLeft *int `json:"days_left"`
+	// Expired is true when the license expired while the process was running
+	// and the instance reverted to community.
+	Expired bool `json:"expired"`
+	// RestartRequired is true when startup-gated features (audit logs, SSO,
+	// OTel) were enabled at startup and a restart is needed to disable them
+	// after the license expired.
+	RestartRequired bool `json:"restart_required"`
 }
 
 // SetLicense handles PUT /api/v1/settings/license.
 //
 // It validates the provided license key and hot-swaps the in-memory license.
-// The heartbeat goroutine is not restarted — a full restart is required for
-// the heartbeat to pick up the new key.
+// If no heartbeat is running yet, one is started with the new key. A heartbeat
+// that is already running keeps using the key it was started with.
 //
 //	@Summary		Set license key
-//	@Description	Validates and activates an enterprise license JWT in memory. Restart VoidLLM to enable heartbeat with the new key.
+//	@Description	Validates and activates an enterprise license JWT in memory and starts the license heartbeat if it is not running.
 //	@Tags			license
 //	@Accept			json
 //	@Produce		json
@@ -132,6 +144,8 @@ func (h *Handler) SetLicense(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to persist license")
 	}
 
+	h.LicenseHeartbeat.Ensure(c.Context(), req.Key)
+
 	keyInfo := auth.KeyInfoFromCtx(c)
 	actorID := ""
 	orgID := ""
@@ -156,7 +170,7 @@ func (h *Handler) SetLicense(c fiber.Ctx) error {
 
 	return c.JSON(setLicenseResponse{
 		Status:  "saved",
-		Message: "License activated. Restart VoidLLM to enable heartbeat with the new key.",
+		Message: "License activated.",
 		License: detail,
 	})
 }
@@ -181,6 +195,16 @@ func (h *Handler) GetLicense(c fiber.Ctx) error {
 		MaxOrgs:          lic.MaxOrgs(),
 		MaxTeams:         lic.MaxTeams(),
 		FallbackMaxDepth: h.FallbackMaxDepth,
+		Trial:            license.IsTrial(lic),
+	}
+	if lic.Edition() == license.EditionCommunity && h.LicenseExpiry.Expired() {
+		resp.Expired = true
+		resp.RestartRequired = h.LicenseExpiry.RestartRequired()
+		if t := h.LicenseExpiry.ExpiredAt(); !t.IsZero() {
+			resp.ExpiresAt = &t
+			zero := 0
+			resp.DaysLeft = &zero
+		}
 	}
 
 	// CustomerID is sensitive — only org_admin and above may see it.
@@ -192,6 +216,11 @@ func (h *Handler) GetLicense(c fiber.Ctx) error {
 	if !lic.ExpiresAt().IsZero() {
 		t := lic.ExpiresAt()
 		resp.ExpiresAt = &t
+		days := int(time.Until(t) / (24 * time.Hour))
+		if days < 0 {
+			days = 0
+		}
+		resp.DaysLeft = &days
 	}
 
 	return c.JSON(resp)

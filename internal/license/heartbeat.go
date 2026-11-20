@@ -19,6 +19,9 @@ const (
 	// DefaultServerURL is the production license verification endpoint.
 	DefaultServerURL = "https://license.voidllm.ai"
 
+	// TrialRequestPath is the license server path that accepts trial requests.
+	TrialRequestPath = "/v1/trial/request"
+
 	// DefaultInterval is the default heartbeat interval.
 	DefaultInterval = 24 * time.Hour
 
@@ -26,8 +29,6 @@ const (
 	// the heartbeat will accept and store a refreshed JWT.
 	refreshThreshold = 7 * 24 * time.Hour
 
-	// initialDelay lets the application fully start before the first heartbeat.
-	initialDelay   = 1 * time.Minute
 	requestTimeout = 30 * time.Second
 
 	// maxResponseSize limits the license server response body to prevent
@@ -50,7 +51,19 @@ type HeartbeatConfig struct {
 	// InstanceID is the stable UUID for this deployment, included in heartbeat
 	// requests so the license server can track instance count.
 	InstanceID string
+	// KeyFunc, when set, returns the license key that is active at call time.
+	// It is consulted before every heartbeat so a key activated after the
+	// heartbeat started is the one verified and refreshed. An empty result
+	// falls back to the previously used key.
+	KeyFunc func() string
+	// OnKeyRefreshed, when set, is called with the previous and the new key
+	// after the license server issued a refreshed JWT.
+	OnKeyRefreshed func(oldKey, newKey string)
 }
+
+// initialDelay lets the application fully start before the first heartbeat.
+// It is a variable so tests can shorten it.
+var initialDelay = 1 * time.Minute
 
 var heartbeatClient = &http.Client{
 	Transport: &http.Transport{
@@ -103,6 +116,24 @@ func StartHeartbeat(holder *Holder, rawKey string, cfg HeartbeatConfig) func() {
 		log := cfg.Log.With(slog.String("component", "license.heartbeat"))
 		currentKey := rawKey
 
+		// beat resolves the active key, then runs one heartbeat with it.
+		beat := func(ctx context.Context, prev string) string {
+			key := prev
+			if cfg.KeyFunc != nil {
+				if k := cfg.KeyFunc(); k != "" {
+					key = k
+				}
+			}
+			if key == "" {
+				return key
+			}
+			next := runHeartbeat(ctx, holder, key, cfg.ServerURL, cfg.InstanceID, log, cfg.DB)
+			if next != key && cfg.OnKeyRefreshed != nil {
+				cfg.OnKeyRefreshed(key, next)
+			}
+			return next
+		}
+
 		// Wait before first heartbeat to let the app fully start.
 		timer := time.NewTimer(initialDelay)
 		defer timer.Stop()
@@ -113,7 +144,7 @@ func StartHeartbeat(holder *Holder, rawKey string, cfg HeartbeatConfig) func() {
 		}
 
 		// Run the first heartbeat immediately after the initial delay.
-		currentKey = runHeartbeat(ctx, holder, currentKey, cfg.ServerURL, cfg.InstanceID, log, cfg.DB)
+		currentKey = beat(ctx, currentKey)
 
 		ticker := time.NewTicker(cfg.Interval)
 		defer ticker.Stop()
@@ -121,7 +152,7 @@ func StartHeartbeat(holder *Holder, rawKey string, cfg HeartbeatConfig) func() {
 		for {
 			select {
 			case <-ticker.C:
-				currentKey = runHeartbeat(ctx, holder, currentKey, cfg.ServerURL, cfg.InstanceID, log, cfg.DB)
+				currentKey = beat(ctx, currentKey)
 			case <-done:
 				return
 			}

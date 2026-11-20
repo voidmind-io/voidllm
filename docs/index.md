@@ -47,7 +47,7 @@ Privacy-first LLM proxy and AI gateway. Self-hosted, single binary, sub-500us ov
 - [SSO / OIDC](enterprise/sso.md) - Google, Azure AD, any OIDC provider
 - [Audit Logs](enterprise/audit.md) - admin action logging
 - [OpenTelemetry](enterprise/otel.md) - distributed tracing
-- [Pricing](enterprise/pricing.md) - Community, Pro, Enterprise, Founding Member
+- [Pricing](enterprise/pricing.md) - Community, Pro, Enterprise, Enterprise Plus, 30-day trial
 
 ## API
 

@@ -60,6 +60,9 @@ type LicenseClaims struct {
 	// CustomerID is an opaque identifier for the licensed customer, used for
 	// support and audit purposes.
 	CustomerID string `json:"customer_id"`
+
+	// Trial marks a time-limited trial license. Omitted for paid licenses.
+	Trial bool `json:"trial,omitempty"`
 }
 
 // Verify parses and cryptographically verifies a VoidLLM enterprise license key.
@@ -126,6 +129,7 @@ func Verify(key string, enterpriseDev bool) License {
 		maxOrgs:     maxOrgs,
 		maxTeams:    maxTeams,
 		customerID:  claims.CustomerID,
+		trial:       claims.Trial,
 	}
 
 	if !lic.Valid() {
@@ -192,6 +196,7 @@ func ValidateKey(key string) (License, error) {
 		maxOrgs:     maxOrgs,
 		maxTeams:    maxTeams,
 		customerID:  claims.CustomerID,
+		trial:       claims.Trial,
 	}
 
 	if !lic.Valid() {

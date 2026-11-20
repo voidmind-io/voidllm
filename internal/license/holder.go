@@ -36,3 +36,9 @@ func (h *Holder) Load() License {
 func (h *Holder) Store(lic License) {
 	h.v.Store(licenseBox{lic: lic})
 }
+
+// compareAndStore replaces the current License with next only when the holder
+// still contains old. It reports whether the replacement happened.
+func (h *Holder) compareAndStore(old, next License) bool {
+	return h.v.CompareAndSwap(licenseBox{lic: old}, licenseBox{lic: next})
+}

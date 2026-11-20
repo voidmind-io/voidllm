@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -570,4 +571,124 @@ func TestStartHeartbeatStops(t *testing.T) {
 	stop()
 
 	// If we reach here the goroutine exited cleanly (wg.Wait() returned).
+}
+
+// recordingVerifyServer records the key of every verify request and answers
+// with respFor(key).
+func recordingVerifyServer(t *testing.T, respFor func(key string) verifyResponse) (*httptest.Server, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var keys []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req verifyRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode verify request: %v", err)
+		}
+		mu.Lock()
+		keys = append(keys, req.Key)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(respFor(req.Key)); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), keys...)
+	}
+}
+
+func waitForKey(t *testing.T, get func() []string, want string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		for _, k := range get() {
+			if k == want {
+				return
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("heartbeat never sent key %q; sent %v", want, get())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func shortenInitialDelay(t *testing.T) {
+	t.Helper()
+	orig := initialDelay
+	initialDelay = time.Millisecond
+	t.Cleanup(func() { initialDelay = orig })
+}
+
+// TestHeartbeatManager_SendsCurrentKey verifies that a key activated after the
+// heartbeat started is the one sent on the next tick.
+func TestHeartbeatManager_SendsCurrentKey(t *testing.T) {
+	shortenInitialDelay(t)
+	srv, sent := recordingVerifyServer(t, func(string) verifyResponse {
+		return verifyResponse{Status: "active"}
+	})
+	m := NewHeartbeatManager(NewHolder(communityLicense{}), HeartbeatConfig{
+		ServerURL: srv.URL, Interval: 10 * time.Millisecond, Log: discardLogger(),
+	})
+	defer m.Stop()
+
+	if !m.Ensure(context.Background(), "key-A") {
+		t.Fatal("first Ensure did not start the heartbeat")
+	}
+	waitForKey(t, sent, "key-A")
+	if m.Ensure(context.Background(), "key-B") {
+		t.Fatal("second Ensure started a second heartbeat")
+	}
+	waitForKey(t, sent, "key-B")
+}
+
+// TestHeartbeatManager_RefreshedKeySentNext verifies that a key refreshed by the
+// license server updates the holder and is the one sent on the following tick.
+func TestHeartbeatManager_RefreshedKeySentNext(t *testing.T) {
+	shortenInitialDelay(t)
+	pub, priv := newTestKeypair(t)
+	withTestPublicKey(t, pub)
+
+	mk := func(in time.Duration) string {
+		return signTestJWT(t, priv, LicenseClaims{
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(in)),
+				IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
+				Issuer:    "voidllm.ai",
+			},
+			Plan: "enterprise", Features: []string{FeatureAuditLogs},
+			MaxOrgs: -1, MaxTeams: -1, CustomerID: "cust_x",
+		})
+	}
+	expiring := mk(3 * 24 * time.Hour)
+	fresh := mk(60 * 24 * time.Hour)
+
+	srv, sent := recordingVerifyServer(t, func(key string) verifyResponse {
+		if key == expiring {
+			return verifyResponse{Status: "active", Plan: "enterprise", Key: fresh}
+		}
+		return verifyResponse{Status: "active"}
+	})
+	lic, err := ValidateKey(expiring)
+	if err != nil {
+		t.Fatalf("ValidateKey: %v", err)
+	}
+	holder := NewHolder(lic)
+	m := NewHeartbeatManager(holder, HeartbeatConfig{
+		ServerURL: srv.URL, Interval: 10 * time.Millisecond, Log: discardLogger(),
+	})
+	defer m.Stop()
+
+	m.Ensure(context.Background(), expiring)
+	waitForKey(t, sent, fresh)
+	if m.currentKey() != fresh {
+		t.Error("manager key was not updated to the refreshed key")
+	}
+	if got := holder.Load().ExpiresAt(); time.Until(got) < 30*24*time.Hour {
+		t.Errorf("holder not updated with refreshed license, expires %v", got)
+	}
 }

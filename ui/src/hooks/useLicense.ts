@@ -10,6 +10,21 @@ export interface LicenseInfo {
   max_teams: number      // -1 = unlimited
   customer_id?: string   // only visible to admins
   fallback_max_depth: number // 0 = fallback disabled
+  trial?: boolean            // true if the active license is a trial
+  days_left?: number         // whole days remaining on a trial
+  expired?: boolean          // true if a trial license has ended
+  restart_required?: boolean // true if a restart is needed to finish a license change
+}
+
+export interface RequestTrialInput {
+  email: string
+  company?: string
+  consent_trial: true
+  consent_marketing: boolean
+}
+
+export interface RequestTrialResponse {
+  status: string // "check_inbox"
 }
 
 export function useLicense() {
@@ -29,5 +44,15 @@ export function useActivateLicense() {
         body: JSON.stringify({ key }),
       }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['license'] }),
+  })
+}
+
+export function useRequestTrial() {
+  return useMutation({
+    mutationFn: (input: RequestTrialInput) =>
+      apiClient<RequestTrialResponse>('/license/trial', {
+        method: 'POST',
+        body: JSON.stringify(input),
+      }),
   })
 }
