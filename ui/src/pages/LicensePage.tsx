@@ -1,12 +1,14 @@
 import { useState } from 'react'
+import type React from 'react'
 import { Navigate } from 'react-router-dom'
 import { PageHeader } from '../components/ui/PageHeader'
+import { Banner } from '../components/ui/Banner'
 import { Badge } from '../components/ui/Badge'
 import { Button } from '../components/ui/Button'
 import { Input } from '../components/ui/Input'
 import { StatCard } from '../components/ui/StatCard'
 import { useMe } from '../hooks/useMe'
-import { useLicense, useActivateLicense } from '../hooks/useLicense'
+import { useLicense, useActivateLicense, useRequestTrial } from '../hooks/useLicense'
 import type { LicenseInfo } from '../hooks/useLicense'
 import { useToast } from '../hooks/useToast'
 import { formatDate } from '../lib/utils'
@@ -263,6 +265,224 @@ function CurrentPlanPanel({
   )
 }
 
+const PRICING_URL = 'https://voidllm.ai/#pricing'
+const CONTACT_URL = 'mailto:hello@voidmind.io'
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+interface LinkButtonProps {
+  href: string
+  variant: 'primary' | 'secondary'
+  children: React.ReactNode
+}
+
+function LinkButton({ href, variant, children }: LinkButtonProps) {
+  const external = href.startsWith('http')
+  return (
+    <a
+      href={href}
+      {...(external ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
+      className={[
+        'inline-flex items-center justify-center rounded-md px-4 py-2 text-sm font-medium transition-colors',
+        'focus:outline-none focus:ring-2 focus:ring-accent/40',
+        variant === 'primary'
+          ? 'bg-accent text-white hover:bg-accent/90'
+          : 'border border-border bg-bg-tertiary text-text-primary hover:border-accent/50',
+      ].join(' ')}
+    >
+      {children}
+    </a>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// LicenseStatusBanners
+// ---------------------------------------------------------------------------
+
+function LicenseStatusBanners({ license }: { license: LicenseInfo }) {
+  if (license.expired === true) {
+    return (
+      <div className="mb-6">
+        <Banner
+          variant="warning"
+          title={
+            license.expired_trial === true
+              ? 'Your trial has ended. Enterprise features are off.'
+              : 'Your license has expired. Enterprise features are off.'
+          }
+          description={
+            license.restart_required === true
+              ? 'Restart VoidLLM to finish switching off SSO, audit logs and tracing.'
+              : undefined
+          }
+        />
+      </div>
+    )
+  }
+  if (license.trial === true && license.valid) {
+    const days = license.days_left ?? 0
+    return (
+      <div className="mb-6 flex items-center gap-3">
+        <div className="flex-1">
+          <Banner
+            variant="info"
+            title={`Enterprise trial: ${days} ${days === 1 ? 'day' : 'days'} left`}
+          />
+        </div>
+        <a
+          href={PRICING_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-sm text-accent hover:underline shrink-0"
+        >
+          View pricing
+        </a>
+      </div>
+    )
+  }
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// TrialCard
+// ---------------------------------------------------------------------------
+
+function TrialCard() {
+  const requestTrial = useRequestTrial()
+  const { toast } = useToast()
+  const [open, setOpen] = useState(false)
+  const [email, setEmail] = useState('')
+  const [company, setCompany] = useState('')
+  const [consentTrial, setConsentTrial] = useState(false)
+  const [consentMarketing, setConsentMarketing] = useState(false)
+  const [requested, setRequested] = useState(false)
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+
+  const trimmedEmail = email.trim()
+  const emailValid = EMAIL_PATTERN.test(trimmedEmail)
+  const canSubmit = emailValid && consentTrial
+
+  function handleSubmit() {
+    if (!canSubmit) return
+    setErrorMessage(null)
+    const trimmedCompany = company.trim()
+    requestTrial.mutate(
+      {
+        email: trimmedEmail,
+        ...(trimmedCompany !== '' ? { company: trimmedCompany } : {}),
+        consent_trial: true,
+        consent_marketing: consentMarketing,
+      },
+      {
+        onSuccess: () => setRequested(true),
+        onError: (err) => {
+          const msg = err instanceof Error ? err.message : 'Failed to request trial'
+          setErrorMessage(msg)
+          toast({ variant: 'error', message: msg })
+        },
+      },
+    )
+  }
+
+  const linkClass = 'text-accent hover:underline'
+
+  return (
+    <div className="rounded-lg border border-accent/30 bg-bg-secondary p-6">
+      <h3 className="text-lg font-semibold text-text-primary mb-1">Try Enterprise free for 30 days</h3>
+      <p className="text-sm text-text-secondary mb-4">
+        Unlocks SSO / OIDC, audit logs, custom roles, OpenTelemetry tracing and model fallback chains.
+      </p>
+
+      {requested ? (
+        <div role="status" className="rounded-md bg-bg-tertiary px-4 py-3 text-sm text-text-secondary">
+          Check your inbox and confirm the email. You will get your key on the confirmation page and by email. Paste it below to activate.
+        </div>
+      ) : !open ? (
+        <Button variant="primary" onClick={() => setOpen(true)}>
+          Start free trial
+        </Button>
+      ) : (
+        <div className="space-y-4">
+          <Input
+            label="Work email"
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="you@company.com"
+            autoComplete="email"
+            disabled={requestTrial.isPending}
+          />
+          <Input
+            label="Company (optional)"
+            value={company}
+            onChange={(e) => setCompany(e.target.value)}
+            autoComplete="organization"
+            maxLength={100}
+            disabled={requestTrial.isPending}
+          />
+
+          <label className="flex items-start gap-3 text-sm text-text-secondary cursor-pointer">
+            <input
+              type="checkbox"
+              checked={consentTrial}
+              onChange={(e) => setConsentTrial(e.target.checked)}
+              disabled={requestTrial.isPending}
+              className="accent-accent h-4 w-4 shrink-0 mt-0.5 cursor-pointer"
+            />
+            <span>
+              Send me a 30-day Enterprise trial key. I agree to the{' '}
+              <a href="https://voidllm.ai/trial#terms" target="_blank" rel="noopener noreferrer" className={linkClass}>trial terms</a>
+              {' '}and the{' '}
+              <a href="https://voidllm.ai/privacy" target="_blank" rel="noopener noreferrer" className={linkClass}>privacy notice</a>.
+            </span>
+          </label>
+
+          <label className="flex items-start gap-3 text-sm text-text-secondary cursor-pointer">
+            <input
+              type="checkbox"
+              checked={consentMarketing}
+              onChange={(e) => setConsentMarketing(e.target.checked)}
+              disabled={requestTrial.isPending}
+              className="accent-accent h-4 w-4 shrink-0 mt-0.5 cursor-pointer"
+            />
+            <span>
+              VoidLLM may contact me by email about my trial and VoidLLM. I can withdraw at any time.
+            </span>
+          </label>
+
+          <p className="text-xs text-text-tertiary">
+            Nothing is sent until you click the button. We send only the email, company and an anonymous instance ID.
+          </p>
+          <p className="text-xs text-text-tertiary">
+            The trial key works on this VoidLLM instance only.
+          </p>
+
+          {errorMessage != null && (
+            <p role="alert" className="text-sm text-error">{errorMessage}</p>
+          )}
+
+          <div className="flex gap-2">
+            <Button
+              variant="primary"
+              disabled={!canSubmit}
+              loading={requestTrial.isPending}
+              onClick={handleSubmit}
+            >
+              Request trial key
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={requestTrial.isPending}
+              onClick={() => setOpen(false)}
+            >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // LoadingSkeleton
 // ---------------------------------------------------------------------------
@@ -330,6 +550,8 @@ export default function LicensePage() {
         description="Manage your VoidLLM license"
       />
 
+      {license != null && <LicenseStatusBanners license={license} />}
+
       {/* Stat row */}
       {license != null && (
         <div className="grid grid-cols-3 gap-4 mb-6">
@@ -374,14 +596,16 @@ export default function LicensePage() {
         {/* Right panel — Upgrade CTAs (60%) — shown only for non-enterprise plans */}
         {!(!isCommunity && !isPro) && (
           <div className="flex-1 space-y-4">
+            {isCommunity && <TrialCard />}
+
             {/* Pro card — shown for community users */}
             {isCommunity && (
               <div className="rounded-lg border border-accent/30 bg-bg-secondary p-6">
                 <div className="flex items-center justify-between mb-2">
                   <h3 className="text-lg font-semibold text-text-primary">Pro</h3>
-                  <span className="text-sm text-accent font-semibold">$299/mo</span>
+                  <span className="text-sm text-accent font-semibold">99 EUR/month</span>
                 </div>
-                <p className="text-xs text-text-tertiary mb-4">$2,990/yr (save 2 months)</p>
+                <p className="text-xs text-text-tertiary mb-4">Everything in Community, plus:</p>
 
                 <div className="space-y-2 mb-4">
                   {proFeatures.map(f => (
@@ -392,12 +616,7 @@ export default function LicensePage() {
                   ))}
                 </div>
 
-                <Button
-                  variant="primary"
-                  onClick={() => window.open('https://voidllm.ai/pricing', '_blank')}
-                >
-                  Upgrade to Pro
-                </Button>
+                <LinkButton href={PRICING_URL} variant="primary">Upgrade to Pro</LinkButton>
               </div>
             )}
 
@@ -405,12 +624,12 @@ export default function LicensePage() {
             <div className="rounded-lg border border-border bg-bg-secondary p-6">
               <div className="flex items-center justify-between mb-2">
                 <h3 className="text-lg font-semibold text-text-primary">Enterprise</h3>
-                <span className="text-sm text-text-secondary font-semibold">$799/mo</span>
+                <span className="text-sm text-text-secondary font-semibold">399 EUR/month</span>
               </div>
               <p className="text-xs text-text-tertiary mb-4">
                 {isCommunity
-                  ? '$7,990/yr (save 2 months) · Everything in Pro, plus:'
-                  : '$7,990/yr (save 2 months) · Everything in your current plan, plus:'}
+                  ? 'Everything in Pro, plus:'
+                  : 'Everything in your current plan, plus:'}
               </p>
 
               <div className="space-y-2 mb-4">
@@ -422,12 +641,18 @@ export default function LicensePage() {
                 ))}
               </div>
 
-              <Button
-                variant="secondary"
-                onClick={() => window.open('https://voidllm.ai/pricing', '_blank')}
-              >
-                Contact Sales
-              </Button>
+              <LinkButton href={PRICING_URL} variant="secondary">Upgrade to Enterprise</LinkButton>
+            </div>
+
+            {/* Enterprise Plus card */}
+            <div className="rounded-lg border border-border bg-bg-secondary p-6">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-lg font-semibold text-text-primary">Enterprise Plus</h3>
+              </div>
+              <p className="text-sm text-text-secondary mb-4">
+                from about 1,000 EUR/month, billed annually
+              </p>
+              <LinkButton href={CONTACT_URL} variant="secondary">Contact us</LinkButton>
             </div>
           </div>
         )}

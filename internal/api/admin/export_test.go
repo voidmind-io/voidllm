@@ -1,6 +1,9 @@
 package admin
 
-import "time"
+import (
+	"net/http"
+	"time"
+)
 
 // SanitizeOriginForLog exposes the internal sanitizeOriginForLog function for
 // white-box testing from the admin_test package.
@@ -85,3 +88,10 @@ func SetMCPListenWriteDeadlineForTest(d time.Duration) (restore func()) {
 // CacheSavings exposes the internal cacheSavings function for white-box
 // testing from the admin_test package.
 var CacheSavings = cacheSavings
+
+// SetTrialEndpoint points the trial request relay at a test server and
+// optionally replaces its HTTP client, for use from the admin_test package.
+func SetTrialEndpoint(h *Handler, baseURL string, client *http.Client) {
+	h.trialBaseURL = baseURL
+	h.trialClient = client
+}

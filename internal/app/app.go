@@ -177,11 +177,28 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		licenseKey = cachedKey
 	}
 
-	lic := license.Verify(licenseKey, enterpriseDev)
+	// The instance ID binds trial keys to this installation. If it cannot be
+	// resolved, bound trial keys are rejected while unbound keys still work.
+	licenseInstanceID, instErr := license.GetOrCreateInstanceID(ctx, database)
+	if instErr != nil {
+		log.LogAttrs(ctx, slog.LevelWarn, "license: instance ID unavailable, bound trial keys will be rejected",
+			slog.String("error", instErr.Error()))
+		licenseInstanceID = ""
+	}
+
+	loadLicense := func(key string) license.License {
+		l, loadErr := license.LoadForStartup(ctx, database, key, enterpriseDev, licenseInstanceID)
+		if loadErr != nil {
+			log.LogAttrs(ctx, slog.LevelWarn, "license: trial check",
+				slog.String("error", loadErr.Error()))
+		}
+		return l
+	}
+	lic := loadLicense(licenseKey)
 
 	// If DB-cached key failed (e.g. corrupted), try config key as fallback.
 	if lic.Edition() != license.EditionEnterprise && configKey != "" && configKey != licenseKey {
-		lic = license.Verify(configKey, enterpriseDev)
+		lic = loadLicense(configKey)
 		if lic.Edition() == license.EditionEnterprise {
 			licenseKey = configKey
 		}
@@ -493,7 +510,9 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	metrics.RegisterDBCollectors(database.SQL())
 	metrics.RegisterUsageCollector(usageLogger)
 
+	startupGated := false
 	if cfg.Settings.Audit.Enabled && lic.HasFeature(license.FeatureAuditLogs) {
+		startupGated = true
 		auditLogger = audit.NewLogger(database, cfg.Settings.Audit, log)
 		auditLogger.Start()
 		log.LogAttrs(ctx, slog.LevelInfo, "audit logging enabled")
@@ -653,6 +672,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	var otelShutdownFn func(context.Context) error
 	var tracer trace.Tracer
 	if cfg.Settings.OTel.Enabled && lic.HasFeature(license.FeatureOTelTracing) {
+		startupGated = true
 		var setupErr error
 		otelShutdownFn, setupErr = voidotel.Setup(ctx,
 			cfg.Settings.OTel.Endpoint,
@@ -676,6 +696,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// SSO/OIDC: initialise only when the feature is licensed and enabled.
 	var ssoProvider *sso.Provider
 	if cfg.Settings.SSO.Enabled && lic.HasFeature(license.FeatureSSOOIDC) {
+		startupGated = true
 		var ssoErr error
 		ssoProvider, ssoErr = sso.NewProvider(ctx, cfg.Settings.SSO)
 		if ssoErr != nil {
@@ -756,6 +777,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		Redis:              redisClient,
 		AuditLogger:        auditLogger,
 		License:            licHolder,
+		LicenseExpiry:      license.NewExpiryState(startupGated),
 		Log:                log,
 		SSOProvider:        ssoProvider,
 		SSOConfig:          cfg.Settings.SSO,
@@ -1434,10 +1456,12 @@ func (a *Application) Start() error {
 		}))
 	}
 
-	// Start heartbeat if a license key was configured, even if it has expired.
-	// An expired key falls back to community at startup, but the heartbeat can
-	// recover by requesting a fresh JWT from the license server.
-	if a.rawLicenseKey != "" && !a.devMode {
+	// Start the heartbeat if a license key was configured, even if it has
+	// expired. An expired key falls back to community at startup, but the
+	// heartbeat can recover by requesting a fresh JWT from the license server.
+	// The manager is also handed to the admin API so a key activated at runtime
+	// starts the heartbeat without a restart.
+	if !a.devMode {
 		instanceID, err := license.GetOrCreateInstanceID(context.Background(), a.database)
 		if err != nil {
 			a.log.Warn("failed to generate instance ID", slog.String("error", err.Error()))
@@ -1447,15 +1471,44 @@ func (a *Application) Start() error {
 			a.log.Info("instance ID", slog.String("id", instanceID))
 		}
 
-		stop := license.StartHeartbeat(a.licHolder, a.rawLicenseKey, license.HeartbeatConfig{
+		hb := license.NewHeartbeatManager(a.licHolder, license.HeartbeatConfig{
 			ServerURL:  license.DefaultServerURL,
 			Interval:   license.DefaultInterval,
 			Log:        a.log,
 			DB:         a.database,
 			InstanceID: instanceID,
+			State:      a.adminHandler.LicenseExpiry,
+			OnDowngrade: func(ctx context.Context) {
+				if a.adminHandler.ReloadModels == nil {
+					return
+				}
+				if err := a.adminHandler.ReloadModels(ctx); err != nil {
+					a.log.LogAttrs(ctx, slog.LevelError, "trial ended: registry reload failed",
+						slog.String("error", err.Error()))
+				}
+			},
 		})
-		a.stopFuncs = append(a.stopFuncs, stop)
+		a.adminHandler.LicenseHeartbeat = hb
+		a.stopFuncs = append(a.stopFuncs, hb.Stop)
+		hb.Ensure(context.Background(), a.rawLicenseKey)
 	}
+
+	// Hourly check that swaps an expired license to community so features do
+	// not stay enabled until the next restart.
+	a.stopFuncs = append(a.stopFuncs, license.StartExpiryWatcher(a.licHolder, license.ExpiryWatcherConfig{
+		Log:   a.log,
+		DB:    a.database,
+		State: a.adminHandler.LicenseExpiry,
+		OnExpired: func(ctx context.Context) {
+			if a.adminHandler.ReloadModels == nil {
+				return
+			}
+			if err := a.adminHandler.ReloadModels(ctx); err != nil {
+				a.log.LogAttrs(ctx, slog.LevelError, "license expiry: registry reload failed",
+					slog.String("error", err.Error()))
+			}
+		},
+	}))
 
 	// Start update checker when running a real build (not dev).
 	// The checker fires after a 5-minute initial delay to keep startup fast.

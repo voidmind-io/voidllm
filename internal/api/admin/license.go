@@ -60,16 +60,31 @@ type licenseResponse struct {
 	// FallbackMaxDepth is the configured maximum fallback chain depth.
 	// 0 means fallback chains are disabled even if models have fallback configured.
 	FallbackMaxDepth int `json:"fallback_max_depth"`
+	// ExpiredTrial is true when the license that expired was a trial, so the UI
+	// can tell "trial ended" from a paid license that lapsed.
+	ExpiredTrial bool `json:"expired_trial"`
+	// Trial is true when the license is a time-limited trial.
+	Trial bool `json:"trial"`
+	// DaysLeft is the number of whole days until expiry, or null for perpetual
+	// licenses. It is 0 once the license has expired.
+	DaysLeft *int `json:"days_left"`
+	// Expired is true when the license expired while the process was running
+	// and the instance reverted to community.
+	Expired bool `json:"expired"`
+	// RestartRequired is true when startup-gated features (audit logs, SSO,
+	// OTel) were enabled at startup and a restart is needed to disable them
+	// after the license expired.
+	RestartRequired bool `json:"restart_required"`
 }
 
 // SetLicense handles PUT /api/v1/settings/license.
 //
 // It validates the provided license key and hot-swaps the in-memory license.
-// The heartbeat goroutine is not restarted — a full restart is required for
-// the heartbeat to pick up the new key.
+// If no heartbeat is running yet, one is started with the new key. A heartbeat
+// that is already running keeps using the key it was started with.
 //
 //	@Summary		Set license key
-//	@Description	Validates and activates an enterprise license JWT in memory. Restart VoidLLM to enable heartbeat with the new key.
+//	@Description	Validates and activates an enterprise license JWT in memory and starts the license heartbeat if it is not running.
 //	@Tags			license
 //	@Accept			json
 //	@Produce		json
@@ -89,15 +104,43 @@ func (h *Handler) SetLicense(c fiber.Ctx) error {
 		return apierror.BadRequest(c, "key is required")
 	}
 
-	lic, err := license.ValidateKey(req.Key)
+	instanceID, err := license.GetOrCreateInstanceID(c.Context(), h.DB)
 	if err != nil {
+		h.Log.LogAttrs(c.Context(), slog.LevelError, "set license: instance id unavailable",
+			slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to resolve instance id")
+	}
+
+	lic, err := license.ValidateKeyForInstance(req.Key, instanceID)
+	if err != nil {
+		if errors.Is(err, license.ErrTrialWrongInstance) {
+			return apierror.BadRequest(c, license.ErrTrialWrongInstance.Error())
+		}
 		if errors.Is(err, license.ErrInvalidKey) {
 			return apierror.BadRequest(c, "invalid license key")
 		}
 		return apierror.InternalError(c, "license validation failed")
 	}
 
-	h.License.Store(lic)
+	if endedErr := license.CheckTrialNotEnded(c.Context(), h.DB, lic); endedErr != nil {
+		if errors.Is(endedErr, license.ErrTrialEnded) {
+			return apierror.BadRequest(c, license.ErrTrialEnded.Error())
+		}
+		h.Log.LogAttrs(c.Context(), slog.LevelError, "set license: ended trial lookup failed",
+			slog.String("error", endedErr.Error()))
+		return apierror.InternalError(c, "license validation failed")
+	}
+
+	// Persist and swap under one lock so the in-memory license, the stored key
+	// and the key the heartbeat sends always belong to the same request, even
+	// when a heartbeat refresh or another activation runs concurrently.
+	if err := h.License.Activate(lic, req.Key, func() error {
+		return h.DB.SetSetting(c.Context(), "license_jwt", req.Key)
+	}); err != nil {
+		h.Log.LogAttrs(c.Context(), slog.LevelError, "set license: activation failed",
+			slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to persist license")
+	}
 
 	// Apply the license change locally by re-gating the registry.
 	// This path is the ONLY re-gate trigger on deployments without Redis;
@@ -127,10 +170,7 @@ func (h *Handler) SetLicense(c fiber.Ctx) error {
 		}
 	}
 
-	// Persist to DB so the license survives restarts.
-	if err := h.DB.SetSetting(c.Context(), "license_jwt", req.Key); err != nil {
-		return apierror.InternalError(c, "failed to persist license")
-	}
+	h.LicenseHeartbeat.Activated(c.Context(), req.Key)
 
 	keyInfo := auth.KeyInfoFromCtx(c)
 	actorID := ""
@@ -156,7 +196,7 @@ func (h *Handler) SetLicense(c fiber.Ctx) error {
 
 	return c.JSON(setLicenseResponse{
 		Status:  "saved",
-		Message: "License activated. Restart VoidLLM to enable heartbeat with the new key.",
+		Message: "License activated.",
 		License: detail,
 	})
 }
@@ -181,6 +221,17 @@ func (h *Handler) GetLicense(c fiber.Ctx) error {
 		MaxOrgs:          lic.MaxOrgs(),
 		MaxTeams:         lic.MaxTeams(),
 		FallbackMaxDepth: h.FallbackMaxDepth,
+		Trial:            license.IsTrial(lic),
+	}
+	if lic.Edition() == license.EditionCommunity && h.LicenseExpiry.Expired() {
+		resp.Expired = true
+		resp.RestartRequired = h.LicenseExpiry.RestartRequired()
+		resp.ExpiredTrial = h.LicenseExpiry.WasTrial()
+		if t := h.LicenseExpiry.ExpiredAt(); !t.IsZero() {
+			resp.ExpiresAt = &t
+			zero := 0
+			resp.DaysLeft = &zero
+		}
 	}
 
 	// CustomerID is sensitive — only org_admin and above may see it.
@@ -192,6 +243,11 @@ func (h *Handler) GetLicense(c fiber.Ctx) error {
 	if !lic.ExpiresAt().IsZero() {
 		t := lic.ExpiresAt()
 		resp.ExpiresAt = &t
+		days := int(time.Until(t) / (24 * time.Hour))
+		if days < 0 {
+			days = 0
+		}
+		resp.DaysLeft = &days
 	}
 
 	return c.JSON(resp)
