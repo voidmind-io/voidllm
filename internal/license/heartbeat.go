@@ -309,7 +309,7 @@ func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL, instan
 		}
 
 	case "revoked":
-		if endTrial(ctx, holder, resp.Status, log) {
+		if endTrial(ctx, holder, rawKey, resp.Status, log, db) {
 			return rawKey
 		}
 		log.Warn("license revoked by server — proxy will fall back to community edition when current license expires",
@@ -317,7 +317,7 @@ func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL, instan
 		)
 
 	case "expired":
-		if endTrial(ctx, holder, resp.Status, log) {
+		if endTrial(ctx, holder, rawKey, resp.Status, log, db) {
 			return rawKey
 		}
 		log.Warn("license expired according to server",
@@ -325,7 +325,7 @@ func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL, instan
 		)
 
 	case "instance_mismatch":
-		if endTrial(ctx, holder, resp.Status, log) {
+		if endTrial(ctx, holder, rawKey, resp.Status, log, db) {
 			return rawKey
 		}
 		log.Warn("license is bound to a different instance according to server")
@@ -348,18 +348,20 @@ func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL, instan
 }
 
 // endTrial swaps a trial license to community when the license server reports
-// that the trial ended or does not belong to this instance. Paid licenses are
-// left alone. It reports whether the swap happened.
-func endTrial(ctx context.Context, holder *Holder, status string, log *slog.Logger) bool {
-	cur := holder.Load()
-	if !IsTrial(cur) {
-		return false
-	}
-	if !holder.compareAndStore(cur, communityLicense{}) {
+// that the trial ended or does not belong to this instance. It acts only when
+// sentKey, the key the request was sent with, is still the active key; paid
+// licenses are left alone. The ended trial's token ID is persisted so the key
+// is not accepted again. It reports whether the swap happened.
+func endTrial(ctx context.Context, holder *Holder, sentKey, status string, log *slog.Logger, db SettingsReadWriter) bool {
+	ent, ok := holder.endTrialFor(sentKey)
+	if !ok {
 		return false
 	}
 	log.LogAttrs(ctx, slog.LevelWarn, "trial license ended according to server, reverting to community edition",
 		slog.String("status", status))
+	if err := RecordEndedTrial(ctx, db, ent); err != nil {
+		log.LogAttrs(ctx, slog.LevelWarn, "failed to persist ended trial", slog.String("error", err.Error()))
+	}
 	return true
 }
 

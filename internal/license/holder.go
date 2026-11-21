@@ -113,3 +113,21 @@ func (h *Holder) refresh(oldKey, newKey string, lic License, persist func() erro
 	h.key = newKey
 	return true, persistErr
 }
+
+// endTrialFor swaps an active trial license to community, but only when
+// sentKey is still the active key (or none is recorded). A verdict from the
+// license server about a key that was replaced meanwhile must not touch the
+// replacement. It returns the ended license and whether the swap happened.
+func (h *Holder) endTrialFor(sentKey string) (*enterpriseLicense, bool) {
+	h.keyMu.Lock()
+	defer h.keyMu.Unlock()
+	if h.key != "" && h.key != sentKey {
+		return nil, false
+	}
+	ent, ok := h.Load().(*enterpriseLicense)
+	if !ok || !ent.trial {
+		return nil, false
+	}
+	h.Store(communityLicense{})
+	return ent, true
+}

@@ -77,6 +77,9 @@ type ExpiryWatcherConfig struct {
 	Now func() time.Time
 	// Log receives the one-time expiry message. Defaults to slog.Default.
 	Log *slog.Logger
+	// DB, when set, persists the token ID of an expired trial so the key is not
+	// accepted again after a restart.
+	DB SettingsReadWriter
 	// State is updated when an expiry is detected. May be nil.
 	State *ExpiryState
 	// OnExpired is invoked once after the holder was swapped to community, for
@@ -146,6 +149,9 @@ func CheckExpiry(ctx context.Context, holder *Holder, cfg ExpiryWatcherConfig) b
 		return false
 	}
 	cfg.State.record(ent)
+	if err := RecordEndedTrial(ctx, cfg.DB, ent); err != nil {
+		log.LogAttrs(ctx, slog.LevelWarn, "failed to persist ended trial", slog.String("error", err.Error()))
+	}
 	log.LogAttrs(ctx, slog.LevelWarn, "license expired, reverting to community edition",
 		slog.Time("expired_at", ent.expiresAt),
 		slog.Bool("restart_required", cfg.State.RestartRequired()),

@@ -184,6 +184,7 @@ func validateKey(key, instanceID string, enforceBinding bool) (License, error) {
 		maxTeams:    maxTeams,
 		customerID:  claims.CustomerID,
 		trial:       claims.Trial,
+		id:          claims.ID,
 	}
 
 	if !lic.Valid() {

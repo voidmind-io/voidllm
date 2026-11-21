@@ -186,11 +186,19 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		licenseInstanceID = ""
 	}
 
-	lic := license.VerifyForInstance(licenseKey, enterpriseDev, licenseInstanceID)
+	loadLicense := func(key string) license.License {
+		l, loadErr := license.LoadForStartup(ctx, database, key, enterpriseDev, licenseInstanceID)
+		if loadErr != nil {
+			log.LogAttrs(ctx, slog.LevelWarn, "license: trial check",
+				slog.String("error", loadErr.Error()))
+		}
+		return l
+	}
+	lic := loadLicense(licenseKey)
 
 	// If DB-cached key failed (e.g. corrupted), try config key as fallback.
 	if lic.Edition() != license.EditionEnterprise && configKey != "" && configKey != licenseKey {
-		lic = license.VerifyForInstance(configKey, enterpriseDev, licenseInstanceID)
+		lic = loadLicense(configKey)
 		if lic.Edition() == license.EditionEnterprise {
 			licenseKey = configKey
 		}
@@ -1489,6 +1497,7 @@ func (a *Application) Start() error {
 	// not stay enabled until the next restart.
 	a.stopFuncs = append(a.stopFuncs, license.StartExpiryWatcher(a.licHolder, license.ExpiryWatcherConfig{
 		Log:   a.log,
+		DB:    a.database,
 		State: a.adminHandler.LicenseExpiry,
 		OnExpired: func(ctx context.Context) {
 			if a.adminHandler.ReloadModels == nil {

@@ -75,6 +75,7 @@ type enterpriseLicense struct {
 	maxTeams    int
 	customerID  string
 	trial       bool
+	id          string
 }
 
 // Edition reports the enterprise tier while the license is valid. An expired
@@ -87,6 +88,10 @@ func (l *enterpriseLicense) Edition() Edition {
 }
 
 func (l *enterpriseLicense) ExpiresAt() time.Time { return l.expiresAt }
+
+// ID returns the license's unique token ID (the JWT "jti" claim), or an empty
+// string when the token has none.
+func (l *enterpriseLicense) ID() string { return l.id }
 
 // Trial reports whether the license was issued as a time-limited trial.
 func (l *enterpriseLicense) Trial() bool { return l.trial }

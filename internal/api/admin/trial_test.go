@@ -628,3 +628,42 @@ func TestSetLicense_TrialInstanceBinding(t *testing.T) {
 		})
 	}
 }
+
+// TestSetLicense_EndedTrialRejected verifies that a trial recorded as ended is
+// refused on activation, while a paid key with the same token ID is accepted.
+func TestSetLicense_EndedTrialRejected(t *testing.T) {
+	pub, priv := licensetest.NewTestKeypair(t)
+	licensetest.WithTestPublicKey(t, pub)
+	app, h, keyCache, _ := setupTrialApp(t, "file:TestSetLicense_EndedTrial?mode=memory&cache=private")
+	token := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-lic")
+
+	sign := func(trial bool) string {
+		return signedLicense(t, priv, "cust", func(c *license.LicenseClaims) {
+			c.Trial = trial
+			c.ID = "jti-shared"
+		})
+	}
+	trialKey, paidKey := sign(true), sign(false)
+
+	if status, body := putLicense(t, app, token, trialKey); status != 200 {
+		t.Fatalf("first activation = %d: %v", status, body)
+	}
+	lic, err := license.ValidateKey(trialKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := license.RecordEndedTrial(context.Background(), h.DB, lic); err != nil {
+		t.Fatal(err)
+	}
+
+	status, body := putLicense(t, app, token, trialKey)
+	if status != 400 {
+		t.Fatalf("ended trial status = %d, want 400: %v", status, body)
+	}
+	if e, _ := body["error"].(map[string]any); e["message"] != "this trial has ended" {
+		t.Errorf("message = %v", e["message"])
+	}
+	if status, body := putLicense(t, app, token, paidKey); status != 200 {
+		t.Errorf("paid key status = %d, want 200: %v", status, body)
+	}
+}

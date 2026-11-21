@@ -122,6 +122,15 @@ func (h *Handler) SetLicense(c fiber.Ctx) error {
 		return apierror.InternalError(c, "license validation failed")
 	}
 
+	if endedErr := license.CheckTrialNotEnded(c.Context(), h.DB, lic); endedErr != nil {
+		if errors.Is(endedErr, license.ErrTrialEnded) {
+			return apierror.BadRequest(c, license.ErrTrialEnded.Error())
+		}
+		h.Log.LogAttrs(c.Context(), slog.LevelError, "set license: ended trial lookup failed",
+			slog.String("error", endedErr.Error()))
+		return apierror.InternalError(c, "license validation failed")
+	}
+
 	// Persist and swap under one lock so the in-memory license, the stored key
 	// and the key the heartbeat sends always belong to the same request, even
 	// when a heartbeat refresh or another activation runs concurrently.

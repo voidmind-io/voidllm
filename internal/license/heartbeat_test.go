@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -970,4 +971,144 @@ func TestValidateKeyForInstance(t *testing.T) {
 	if _, err := ValidateKey(mk(true, "inst-1")); err != nil {
 		t.Errorf("ValidateKey must not enforce binding: %v", err)
 	}
+}
+
+// TestRunHeartbeat_TerminalVerdictForReplacedKeyIgnored verifies that an
+// "expired" verdict for key A, still in flight when trial B was activated,
+// does not end B.
+func TestRunHeartbeat_TerminalVerdictForReplacedKeyIgnored(t *testing.T) {
+	inFlight := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(inFlight)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(verifyResponse{Status: "expired"}); err != nil {
+			t.Errorf("encode: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	holder := NewHolder(communityLicense{})
+	if err := holder.Activate(testEnterprise("A", true, time.Hour), "key-A", nil); err != nil {
+		t.Fatal(err)
+	}
+	db := newFakeSettings()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runHeartbeat(context.Background(), holder, "key-A", srv.URL, "i", discardLogger(), db)
+	}()
+
+	<-inFlight
+	b := testEnterprise("B", true, time.Hour)
+	b.id = "jti-B"
+	if err := holder.Activate(b, "key-B", nil); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	<-done
+
+	if holder.Key() != "key-B" || holder.Load().Edition() != EditionEnterprise || holder.Load().CustomerID() != "B" {
+		t.Errorf("trial B was ended by a verdict for key A: key=%q edition=%v", holder.Key(), holder.Load().Edition())
+	}
+	if got, _ := db.GetSetting(context.Background(), endedTrialsSetting); got != "" {
+		t.Errorf("ended trials = %q, want none", got)
+	}
+}
+
+// TestEndedTrial_PersistedAcrossRestart verifies that a trial ended by the
+// server (or by local expiry) is refused after a restart, while paid keys are
+// never affected.
+func TestEndedTrial_PersistedAcrossRestart(t *testing.T) {
+	pub, priv := newTestKeypair(t)
+	withTestPublicKey(t, pub)
+	mk := func(trial bool, id string) string {
+		return signTestJWT(t, priv, LicenseClaims{
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(time.Hour)),
+				Issuer:    "voidllm.ai",
+				ID:        id,
+			},
+			Plan: "enterprise", Features: []string{FeatureAuditLogs},
+			MaxOrgs: -1, MaxTeams: -1, CustomerID: "c", Trial: trial,
+		})
+	}
+	ctx := context.Background()
+
+	for _, status := range []string{"expired", "revoked", "instance_mismatch"} {
+		t.Run("server "+status, func(t *testing.T) {
+			db := newFakeSettings()
+			trialKey := mk(true, "jti-trial-"+status)
+			paidKey := mk(false, "jti-paid-"+status)
+
+			lic, err := LoadForStartup(ctx, db, trialKey, false, "inst")
+			if err != nil || lic.Edition() != EditionEnterprise {
+				t.Fatalf("fresh trial: edition=%v err=%v", lic.Edition(), err)
+			}
+			holder := NewHolder(lic)
+			holder.seedKey(trialKey)
+			srv := mockVerifyServer(t, verifyResponse{Status: status})
+			runHeartbeat(ctx, holder, trialKey, srv.URL, "inst", discardLogger(), db)
+			if holder.Load().Edition() != EditionCommunity {
+				t.Fatal("trial not ended by server verdict")
+			}
+
+			// Restart: a new holder is built from the same stored key.
+			lic, err = LoadForStartup(ctx, db, trialKey, false, "inst")
+			if !errors.Is(err, ErrTrialEnded) || lic.Edition() != EditionCommunity {
+				t.Errorf("after restart: edition=%v err=%v, want community/ErrTrialEnded", lic.Edition(), err)
+			}
+			if err := CheckTrialNotEnded(ctx, db, mustValidate(t, trialKey)); !errors.Is(err, ErrTrialEnded) ||
+				!errors.Is(err, ErrInvalidKey) || !strings.Contains(err.Error(), "this trial has ended") {
+				t.Errorf("CheckTrialNotEnded = %v", err)
+			}
+
+			// Paid keys are never affected, even if one was passed to Record.
+			paid := mustValidate(t, paidKey)
+			if err := RecordEndedTrial(ctx, db, paid); err != nil {
+				t.Fatal(err)
+			}
+			if lic, err := LoadForStartup(ctx, db, paidKey, false, "inst"); err != nil || lic.Edition() != EditionEnterprise {
+				t.Errorf("paid key: edition=%v err=%v", lic.Edition(), err)
+			}
+		})
+	}
+
+	t.Run("local expiry", func(t *testing.T) {
+		db := newFakeSettings()
+		ent := testEnterprise("c", true, -time.Minute)
+		ent.id = "jti-local"
+		holder := NewHolder(ent)
+		if !CheckExpiry(ctx, holder, ExpiryWatcherConfig{DB: db, State: NewExpiryState(false), Log: discardLogger()}) {
+			t.Fatal("no swap")
+		}
+		if err := CheckTrialNotEnded(ctx, db, ent); !errors.Is(err, ErrTrialEnded) {
+			t.Errorf("CheckTrialNotEnded = %v, want ErrTrialEnded", err)
+		}
+	})
+
+	t.Run("list is capped", func(t *testing.T) {
+		db := newFakeSettings()
+		for i := 0; i < maxEndedTrials+5; i++ {
+			l := testEnterprise("c", true, time.Hour)
+			l.id = "id-" + strconv.Itoa(i)
+			if err := RecordEndedTrial(ctx, db, l); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ids, err := loadEndedTrials(ctx, db)
+		if err != nil || len(ids) != maxEndedTrials || ids[len(ids)-1] != "id-"+strconv.Itoa(maxEndedTrials+4) {
+			t.Errorf("len=%d err=%v", len(ids), err)
+		}
+	})
+}
+
+func mustValidate(t *testing.T, key string) License {
+	t.Helper()
+	lic, err := ValidateKey(key)
+	if err != nil {
+		t.Fatalf("ValidateKey: %v", err)
+	}
+	return lic
 }
