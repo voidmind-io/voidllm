@@ -265,7 +265,7 @@ function CurrentPlanPanel({
   )
 }
 
-const PRICING_URL = 'https://voidllm.ai/pricing'
+const PRICING_URL = 'https://voidllm.ai/#pricing'
 const CONTACT_URL = 'mailto:hello@voidmind.io'
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
@@ -304,7 +304,11 @@ function LicenseStatusBanners({ license }: { license: LicenseInfo }) {
       <div className="mb-6">
         <Banner
           variant="warning"
-          title="Your trial has ended. Enterprise features are off."
+          title={
+            license.expired_trial === true
+              ? 'Your trial has ended. Enterprise features are off.'
+              : 'Your license has expired. Enterprise features are off.'
+          }
           description={
             license.restart_required === true
               ? 'Restart VoidLLM to finish switching off SSO, audit logs and tracing.'
@@ -412,6 +416,7 @@ function TrialCard() {
             value={company}
             onChange={(e) => setCompany(e.target.value)}
             autoComplete="organization"
+            maxLength={100}
             disabled={requestTrial.isPending}
           />
 
@@ -446,6 +451,9 @@ function TrialCard() {
 
           <p className="text-xs text-text-tertiary">
             Nothing is sent until you click the button. We send only the email, company and an anonymous instance ID.
+          </p>
+          <p className="text-xs text-text-tertiary">
+            The trial key works on this VoidLLM instance only.
           </p>
 
           {errorMessage != null && (

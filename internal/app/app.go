@@ -177,11 +177,20 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		licenseKey = cachedKey
 	}
 
-	lic := license.Verify(licenseKey, enterpriseDev)
+	// The instance ID binds trial keys to this installation. If it cannot be
+	// resolved, bound trial keys are rejected while unbound keys still work.
+	licenseInstanceID, instErr := license.GetOrCreateInstanceID(ctx, database)
+	if instErr != nil {
+		log.LogAttrs(ctx, slog.LevelWarn, "license: instance ID unavailable, bound trial keys will be rejected",
+			slog.String("error", instErr.Error()))
+		licenseInstanceID = ""
+	}
+
+	lic := license.VerifyForInstance(licenseKey, enterpriseDev, licenseInstanceID)
 
 	// If DB-cached key failed (e.g. corrupted), try config key as fallback.
 	if lic.Edition() != license.EditionEnterprise && configKey != "" && configKey != licenseKey {
-		lic = license.Verify(configKey, enterpriseDev)
+		lic = license.VerifyForInstance(configKey, enterpriseDev, licenseInstanceID)
 		if lic.Edition() == license.EditionEnterprise {
 			licenseKey = configKey
 		}
@@ -1460,6 +1469,16 @@ func (a *Application) Start() error {
 			Log:        a.log,
 			DB:         a.database,
 			InstanceID: instanceID,
+			State:      a.adminHandler.LicenseExpiry,
+			OnDowngrade: func(ctx context.Context) {
+				if a.adminHandler.ReloadModels == nil {
+					return
+				}
+				if err := a.adminHandler.ReloadModels(ctx); err != nil {
+					a.log.LogAttrs(ctx, slog.LevelError, "trial ended: registry reload failed",
+						slog.String("error", err.Error()))
+				}
+			},
 		})
 		a.adminHandler.LicenseHeartbeat = hb
 		a.stopFuncs = append(a.stopFuncs, hb.Stop)

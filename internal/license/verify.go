@@ -63,9 +63,19 @@ type LicenseClaims struct {
 
 	// Trial marks a time-limited trial license. Omitted for paid licenses.
 	Trial bool `json:"trial,omitempty"`
+
+	// InstanceID binds a trial license to one VoidLLM instance. When a trial
+	// license carries it, only the instance with this ID accepts the key.
+	InstanceID string `json:"instance_id,omitempty"`
 }
 
-// Verify parses and cryptographically verifies a VoidLLM enterprise license key.
+// ErrTrialWrongInstance is wrapped by ErrInvalidKey errors returned for a trial
+// license that is bound to a different VoidLLM instance.
+var ErrTrialWrongInstance = errors.New("this trial key belongs to another VoidLLM instance")
+
+// Verify parses and cryptographically verifies a VoidLLM enterprise license key
+// without checking trial instance binding. Use VerifyForInstance wherever this
+// instance's ID is known.
 //
 //   - If enterpriseDev is true, a devLicense is returned regardless of key.
 //   - If key is empty, a communityLicense is returned.
@@ -73,6 +83,16 @@ type LicenseClaims struct {
 //   - On any error (parse failure, bad signature, expired), a warning is logged
 //     and a communityLicense is returned so the proxy always starts.
 func Verify(key string, enterpriseDev bool) License {
+	return verifyLicense(key, enterpriseDev, "", false)
+}
+
+// VerifyForInstance behaves like Verify and additionally rejects (falling back
+// to community) a trial license bound to an instance other than instanceID.
+func VerifyForInstance(key string, enterpriseDev bool, instanceID string) License {
+	return verifyLicense(key, enterpriseDev, instanceID, true)
+}
+
+func verifyLicense(key string, enterpriseDev bool, instanceID string, enforceBinding bool) License {
 	if enterpriseDev {
 		slog.Warn("enterprise dev mode active — all features enabled, not for production use")
 		return devLicense{}
@@ -82,74 +102,37 @@ func Verify(key string, enterpriseDev bool) License {
 		return communityLicense{}
 	}
 
-	claims := &LicenseClaims{}
-	token, err := jwt.ParseWithClaims(key, claims, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodEd25519); !ok {
-			return nil, jwt.ErrSignatureInvalid
-		}
-		return embeddedPublicKey, nil
-	}, jwt.WithExpirationRequired(), jwt.WithIssuer("voidllm.ai"))
+	lic, err := validateKey(key, instanceID, enforceBinding)
 	if err != nil {
 		slog.Warn("license verification failed, falling back to community edition",
 			slog.String("error", err.Error()),
 		)
 		return communityLicense{}
 	}
-
-	if !token.Valid {
-		slog.Warn("license token is not valid, falling back to community edition")
-		return communityLicense{}
-	}
-
-	featureSet := make(map[string]struct{}, len(claims.Features))
-	for _, f := range claims.Features {
-		featureSet[f] = struct{}{}
-	}
-
-	if claims.ExpiresAt == nil {
-		slog.Warn("license JWT missing expiry claim, falling back to community edition")
-		return communityLicense{}
-	}
-	expiresAt := claims.ExpiresAt.Time
-
-	maxOrgs := claims.MaxOrgs
-	if maxOrgs == 0 {
-		maxOrgs = CommunityMaxOrgs
-	}
-
-	maxTeams := claims.MaxTeams
-	if maxTeams == 0 {
-		maxTeams = CommunityMaxTeams
-	}
-
-	lic := &enterpriseLicense{
-		features:    featureSet,
-		featureList: append([]string(nil), claims.Features...),
-		expiresAt:   expiresAt,
-		maxOrgs:     maxOrgs,
-		maxTeams:    maxTeams,
-		customerID:  claims.CustomerID,
-		trial:       claims.Trial,
-	}
-
-	if !lic.Valid() {
-		slog.Warn("license has expired, falling back to community edition",
-			slog.Time("expired_at", expiresAt),
-		)
-		return communityLicense{}
-	}
-
 	return lic
 }
 
 // ValidateKey parses and verifies a license key, returning the resulting License
-// on success or an error describing why validation failed.
+// on success or an error describing why validation failed. It does not check
+// trial instance binding; use ValidateKeyForInstance where the instance ID is
+// known.
 //
 // Unlike Verify, ValidateKey does not fall back to communityLicense on failure —
 // it returns ErrInvalidKey (wrapped) so callers can distinguish a valid key from
 // a rejected one. It is intended for use by the SetLicense API handler, where a
 // hard error is the correct response to a bad key.
 func ValidateKey(key string) (License, error) {
+	return validateKey(key, "", false)
+}
+
+// ValidateKeyForInstance is ValidateKey plus trial instance binding: a trial
+// license that carries an instance_id is accepted only when it equals
+// instanceID. The error then wraps both ErrInvalidKey and ErrTrialWrongInstance.
+func ValidateKeyForInstance(key, instanceID string) (License, error) {
+	return validateKey(key, instanceID, true)
+}
+
+func validateKey(key, instanceID string, enforceBinding bool) (License, error) {
 	if key == "" {
 		return nil, fmt.Errorf("%w: key is empty", ErrInvalidKey)
 	}
@@ -173,6 +156,10 @@ func ValidateKey(key string) (License, error) {
 		return nil, fmt.Errorf("%w: missing expiry claim", ErrInvalidKey)
 	}
 	expiresAt := claims.ExpiresAt.Time
+
+	if enforceBinding && claims.Trial && claims.InstanceID != "" && claims.InstanceID != instanceID {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidKey, ErrTrialWrongInstance)
+	}
 
 	maxOrgs := claims.MaxOrgs
 	if maxOrgs == 0 {

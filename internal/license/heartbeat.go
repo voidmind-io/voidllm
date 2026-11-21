@@ -51,19 +51,23 @@ type HeartbeatConfig struct {
 	// InstanceID is the stable UUID for this deployment, included in heartbeat
 	// requests so the license server can track instance count.
 	InstanceID string
-	// KeyFunc, when set, returns the license key that is active at call time.
-	// It is consulted before every heartbeat so a key activated after the
-	// heartbeat started is the one verified and refreshed. An empty result
-	// falls back to the previously used key.
-	KeyFunc func() string
-	// OnKeyRefreshed, when set, is called with the previous and the new key
-	// after the license server issued a refreshed JWT.
-	OnKeyRefreshed func(oldKey, newKey string)
+	// Trigger, when set, requests an extra heartbeat soon after a new license
+	// key was activated, ahead of the regular schedule.
+	Trigger <-chan struct{}
+	// State, when set, is updated if the heartbeat ends a trial license.
+	State *ExpiryState
+	// OnDowngrade, when set, runs after the heartbeat swapped a trial license
+	// to community, for example to re-gate the model registry.
+	OnDowngrade func(ctx context.Context)
 }
 
 // initialDelay lets the application fully start before the first heartbeat.
 // It is a variable so tests can shorten it.
 var initialDelay = 1 * time.Minute
+
+// activationDelay is how long after a key activation the extra heartbeat
+// fires. It is a variable so tests can shorten it.
+var activationDelay = 10 * time.Second
 
 var heartbeatClient = &http.Client{
 	Transport: &http.Transport{
@@ -114,24 +118,41 @@ func StartHeartbeat(holder *Holder, rawKey string, cfg HeartbeatConfig) func() {
 		defer wg.Done()
 
 		log := cfg.Log.With(slog.String("component", "license.heartbeat"))
-		currentKey := rawKey
+		holder.seedKey(rawKey)
 
-		// beat resolves the active key, then runs one heartbeat with it.
-		beat := func(ctx context.Context, prev string) string {
-			key := prev
-			if cfg.KeyFunc != nil {
-				if k := cfg.KeyFunc(); k != "" {
-					key = k
+		// beat sends the key that is active right now, which may differ from
+		// the one this goroutine started with.
+		beat := func(ctx context.Context) {
+			key := holder.Key()
+			if key == "" {
+				return
+			}
+			before := holder.Load()
+			runHeartbeat(ctx, holder, key, cfg.ServerURL, cfg.InstanceID, log, cfg.DB)
+			ent, wasEnterprise := before.(*enterpriseLicense)
+			if _, nowCommunity := holder.Load().(communityLicense); wasEnterprise && ent.trial && nowCommunity {
+				cfg.State.record(ent)
+				if cfg.OnDowngrade != nil {
+					cfg.OnDowngrade(ctx)
 				}
 			}
-			if key == "" {
-				return key
+		}
+
+		// triggered waits briefly after an activation, then clears the
+		// multi-pod dedup marker so the new key is verified right away.
+		triggered := func() bool {
+			select {
+			case <-time.After(activationDelay):
+			case <-done:
+				return false
 			}
-			next := runHeartbeat(ctx, holder, key, cfg.ServerURL, cfg.InstanceID, log, cfg.DB)
-			if next != key && cfg.OnKeyRefreshed != nil {
-				cfg.OnKeyRefreshed(key, next)
+			if cfg.DB != nil {
+				if err := cfg.DB.SetSetting(ctx, "heartbeat_last_sent", ""); err != nil {
+					log.LogAttrs(ctx, slog.LevelDebug, "failed to clear heartbeat timestamp",
+						slog.String("error", err.Error()))
+				}
 			}
-			return next
+			return true
 		}
 
 		// Wait before first heartbeat to let the app fully start.
@@ -139,12 +160,16 @@ func StartHeartbeat(holder *Holder, rawKey string, cfg HeartbeatConfig) func() {
 		defer timer.Stop()
 		select {
 		case <-timer.C:
+		case <-cfg.Trigger:
+			if !triggered() {
+				return
+			}
 		case <-done:
 			return
 		}
 
 		// Run the first heartbeat immediately after the initial delay.
-		currentKey = beat(ctx, currentKey)
+		beat(ctx)
 
 		ticker := time.NewTicker(cfg.Interval)
 		defer ticker.Stop()
@@ -152,7 +177,12 @@ func StartHeartbeat(holder *Holder, rawKey string, cfg HeartbeatConfig) func() {
 		for {
 			select {
 			case <-ticker.C:
-				currentKey = beat(ctx, currentKey)
+				beat(ctx)
+			case <-cfg.Trigger:
+				if !triggered() {
+					return
+				}
+				beat(ctx)
 			case <-done:
 				return
 			}
@@ -220,7 +250,7 @@ func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL, instan
 				(!expiresAt.IsZero() && time.Until(expiresAt) < refreshThreshold)
 
 			if needsRefresh {
-				newLic, valErr := ValidateKey(resp.Key)
+				newLic, valErr := ValidateKeyForInstance(resp.Key, instanceID)
 				if valErr != nil {
 					log.Warn("received invalid refresh key from server",
 						slog.String("error", valErr.Error()),
@@ -248,13 +278,19 @@ func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL, instan
 					return rawKey
 				}
 
-				holder.Store(newLic)
+				var persist func() error
 				if db != nil {
-					if dbErr := db.SetSetting(ctx, "license_jwt", resp.Key); dbErr != nil {
-						log.Warn("failed to persist refreshed license to database",
-							slog.String("error", dbErr.Error()),
-						)
-					}
+					persist = func() error { return db.SetSetting(ctx, "license_jwt", resp.Key) }
+				}
+				applied, refreshErr := holder.refresh(rawKey, resp.Key, newLic, persist)
+				if refreshErr != nil {
+					log.Warn("failed to persist refreshed license to database",
+						slog.String("error", refreshErr.Error()),
+					)
+				}
+				if !applied {
+					log.Info("refreshed license dropped, another key was activated meanwhile")
+					return rawKey
 				}
 				log.Info("license refreshed",
 					slog.String("plan", resp.Plan),
@@ -273,14 +309,26 @@ func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL, instan
 		}
 
 	case "revoked":
+		if endTrial(ctx, holder, resp.Status, log) {
+			return rawKey
+		}
 		log.Warn("license revoked by server — proxy will fall back to community edition when current license expires",
 			slog.String("revoked_at", resp.RevokedAt),
 		)
 
 	case "expired":
+		if endTrial(ctx, holder, resp.Status, log) {
+			return rawKey
+		}
 		log.Warn("license expired according to server",
 			slog.String("plan", resp.Plan),
 		)
+
+	case "instance_mismatch":
+		if endTrial(ctx, holder, resp.Status, log) {
+			return rawKey
+		}
+		log.Warn("license is bound to a different instance according to server")
 
 	case "unknown":
 		log.Warn("license not recognized by server")
@@ -297,6 +345,22 @@ func runHeartbeat(ctx context.Context, holder *Holder, rawKey, serverURL, instan
 	}
 
 	return rawKey
+}
+
+// endTrial swaps a trial license to community when the license server reports
+// that the trial ended or does not belong to this instance. Paid licenses are
+// left alone. It reports whether the swap happened.
+func endTrial(ctx context.Context, holder *Holder, status string, log *slog.Logger) bool {
+	cur := holder.Load()
+	if !IsTrial(cur) {
+		return false
+	}
+	if !holder.compareAndStore(cur, communityLicense{}) {
+		return false
+	}
+	log.LogAttrs(ctx, slog.LevelWarn, "trial license ended according to server, reverting to community edition",
+		slog.String("status", status))
+	return true
 }
 
 // sendVerifyRequest posts the license key to the server and returns the parsed response.

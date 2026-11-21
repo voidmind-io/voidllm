@@ -186,6 +186,26 @@ describe('LicensePage trial request', () => {
     expect(await screen.findAllByText(message)).not.toHaveLength(0)
   })
 
+  it('shows a 400 trial_rejected message inline', async () => {
+    const message = 'This email cannot receive a trial'
+    setupFetch(COMMUNITY, { status: 400, body: { error: { code: 'trial_rejected', message } } })
+    renderPage()
+    const user = await openForm()
+    await user.type(screen.getByLabelText('Work email'), 'dev@company.com')
+    await user.click(boxA())
+    await user.click(submitBtn())
+    const alerts = await screen.findAllByRole('alert')
+    expect(alerts.some((a) => a.tagName === 'P' && a.textContent === message)).toBe(true)
+  })
+
+  it('shows the instance-only note and limits company length', async () => {
+    setupFetch(COMMUNITY)
+    renderPage()
+    await openForm()
+    expect(screen.getByText('The trial key works on this VoidLLM instance only.')).toBeInTheDocument()
+    expect(screen.getByLabelText('Company (optional)')).toHaveAttribute('maxlength', '100')
+  })
+
   it('links to the terms and privacy notice', async () => {
     setupFetch(COMMUNITY)
     renderPage()
@@ -211,19 +231,27 @@ describe('LicensePage banners and pricing', () => {
     })
     renderPage()
     expect(await screen.findByText('Enterprise trial: 12 days left')).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: 'View pricing' })).toHaveAttribute('href', 'https://voidllm.ai/pricing')
+    expect(screen.getByRole('link', { name: 'View pricing' })).toHaveAttribute('href', 'https://voidllm.ai/#pricing')
     expect(screen.queryByText('Try Enterprise free for 30 days')).not.toBeInTheDocument()
   })
 
   it('shows the expired banner with restart hint', async () => {
-    setupFetch({ ...COMMUNITY, trial: true, expired: true, restart_required: true })
+    setupFetch({ ...COMMUNITY, trial: false, expired: true, expired_trial: true, restart_required: true })
     renderPage()
     expect(await screen.findByText('Your trial has ended. Enterprise features are off.')).toBeInTheDocument()
     expect(screen.getByText('Restart VoidLLM to finish switching off SSO, audit logs and tracing.')).toBeInTheDocument()
   })
 
+  it('shows the license-expired banner for a paid expiry', async () => {
+    setupFetch({ ...COMMUNITY, trial: false, expired: true, expired_trial: false, restart_required: true })
+    renderPage()
+    expect(await screen.findByText('Your license has expired. Enterprise features are off.')).toBeInTheDocument()
+    expect(screen.queryByText('Your trial has ended. Enterprise features are off.')).not.toBeInTheDocument()
+    expect(screen.getByText('Restart VoidLLM to finish switching off SSO, audit logs and tracing.')).toBeInTheDocument()
+  })
+
   it('omits the restart hint when no restart is required', async () => {
-    setupFetch({ ...COMMUNITY, trial: true, expired: true, restart_required: false })
+    setupFetch({ ...COMMUNITY, trial: false, expired: true, expired_trial: true, restart_required: false })
     renderPage()
     await screen.findByText('Your trial has ended. Enterprise features are off.')
     expect(screen.queryByText(/Restart VoidLLM to finish/)).not.toBeInTheDocument()
@@ -236,8 +264,8 @@ describe('LicensePage banners and pricing', () => {
     expect(screen.getByText('399 EUR/month')).toBeInTheDocument()
     expect(screen.getByText('from about 1,000 EUR/month, billed annually')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Contact us' })).toHaveAttribute('href', 'mailto:hello@voidmind.io')
-    expect(screen.getByRole('link', { name: 'Upgrade to Pro' })).toHaveAttribute('href', 'https://voidllm.ai/pricing')
-    expect(screen.getByRole('link', { name: 'Upgrade to Enterprise' })).toHaveAttribute('href', 'https://voidllm.ai/pricing')
+    expect(screen.getByRole('link', { name: 'Upgrade to Pro' })).toHaveAttribute('href', 'https://voidllm.ai/#pricing')
+    expect(screen.getByRole('link', { name: 'Upgrade to Enterprise' })).toHaveAttribute('href', 'https://voidllm.ai/#pricing')
     expect(screen.queryByText(/\$299|\$799/)).not.toBeInTheDocument()
   })
 })

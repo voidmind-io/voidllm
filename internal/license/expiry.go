@@ -18,6 +18,7 @@ const DefaultExpiryCheckInterval = time.Hour
 type ExpiryState struct {
 	expired      atomic.Bool
 	expiredAtNs  atomic.Int64
+	wasTrial     atomic.Bool
 	startupGated bool
 }
 
@@ -45,6 +46,21 @@ func (s *ExpiryState) ExpiredAt() time.Time {
 		return time.Time{}
 	}
 	return time.Unix(0, ns).UTC()
+}
+
+// WasTrial reports whether the license that was swapped out was a trial.
+func (s *ExpiryState) WasTrial() bool {
+	return s != nil && s.wasTrial.Load()
+}
+
+// record notes that ent ended while the process was running.
+func (s *ExpiryState) record(ent *enterpriseLicense) {
+	if s == nil {
+		return
+	}
+	s.wasTrial.Store(ent.trial)
+	s.expiredAtNs.Store(ent.expiresAt.UnixNano())
+	s.expired.Store(true)
 }
 
 // RestartRequired reports whether the license expired while startup-gated
@@ -129,10 +145,7 @@ func CheckExpiry(ctx context.Context, holder *Holder, cfg ExpiryWatcherConfig) b
 	if !holder.compareAndStore(cur, communityLicense{}) {
 		return false
 	}
-	if cfg.State != nil {
-		cfg.State.expiredAtNs.Store(ent.expiresAt.UnixNano())
-		cfg.State.expired.Store(true)
-	}
+	cfg.State.record(ent)
 	log.LogAttrs(ctx, slog.LevelWarn, "license expired, reverting to community edition",
 		slog.Time("expired_at", ent.expiresAt),
 		slog.Bool("restart_required", cfg.State.RestartRequired()),

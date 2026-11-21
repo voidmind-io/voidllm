@@ -7,11 +7,14 @@ package license
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -624,6 +627,48 @@ func shortenInitialDelay(t *testing.T) {
 	t.Cleanup(func() { initialDelay = orig })
 }
 
+// fakeSettings is an in-memory SettingsReadWriter.
+type fakeSettings struct {
+	mu sync.Mutex
+	m  map[string]string
+	// ignoreDedup drops writes of the heartbeat dedup timestamp so every tick
+	// sends.
+	ignoreDedup bool
+}
+
+func newFakeSettings() *fakeSettings { return &fakeSettings{m: map[string]string{}} }
+
+func (f *fakeSettings) GetSetting(_ context.Context, k string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.m[k], nil
+}
+
+func (f *fakeSettings) SetSetting(_ context.Context, k, v string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ignoreDedup && k == "heartbeat_last_sent" {
+		return nil
+	}
+	f.m[k] = v
+	return nil
+}
+
+func (f *fakeSettings) SetSettingIfNotExists(_ context.Context, k, v string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.m[k]; !ok {
+		f.m[k] = v
+	}
+	return nil
+}
+
+func testEnterprise(customer string, trial bool, in time.Duration) *enterpriseLicense {
+	l := newExpiringLicense(time.Now().Add(in), trial)
+	l.customerID = customer
+	return l
+}
+
 // TestHeartbeatManager_SendsCurrentKey verifies that a key activated after the
 // heartbeat started is the one sent on the next tick.
 func TestHeartbeatManager_SendsCurrentKey(t *testing.T) {
@@ -631,7 +676,8 @@ func TestHeartbeatManager_SendsCurrentKey(t *testing.T) {
 	srv, sent := recordingVerifyServer(t, func(string) verifyResponse {
 		return verifyResponse{Status: "active"}
 	})
-	m := NewHeartbeatManager(NewHolder(communityLicense{}), HeartbeatConfig{
+	holder := NewHolder(communityLicense{})
+	m := NewHeartbeatManager(holder, HeartbeatConfig{
 		ServerURL: srv.URL, Interval: 10 * time.Millisecond, Log: discardLogger(),
 	})
 	defer m.Stop()
@@ -640,6 +686,9 @@ func TestHeartbeatManager_SendsCurrentKey(t *testing.T) {
 		t.Fatal("first Ensure did not start the heartbeat")
 	}
 	waitForKey(t, sent, "key-A")
+	if err := holder.Activate(testEnterprise("c", false, time.Hour), "key-B", nil); err != nil {
+		t.Fatal(err)
+	}
 	if m.Ensure(context.Background(), "key-B") {
 		t.Fatal("second Ensure started a second heartbeat")
 	}
@@ -647,7 +696,8 @@ func TestHeartbeatManager_SendsCurrentKey(t *testing.T) {
 }
 
 // TestHeartbeatManager_RefreshedKeySentNext verifies that a key refreshed by the
-// license server updates the holder and is the one sent on the following tick.
+// license server updates the holder, the stored setting and is the one sent on
+// the following tick.
 func TestHeartbeatManager_RefreshedKeySentNext(t *testing.T) {
 	shortenInitialDelay(t)
 	pub, priv := newTestKeypair(t)
@@ -678,17 +728,246 @@ func TestHeartbeatManager_RefreshedKeySentNext(t *testing.T) {
 		t.Fatalf("ValidateKey: %v", err)
 	}
 	holder := NewHolder(lic)
+	db := newFakeSettings()
+	db.ignoreDedup = true
 	m := NewHeartbeatManager(holder, HeartbeatConfig{
-		ServerURL: srv.URL, Interval: 10 * time.Millisecond, Log: discardLogger(),
+		ServerURL: srv.URL, Interval: 10 * time.Millisecond, Log: discardLogger(), DB: db, InstanceID: "i",
 	})
 	defer m.Stop()
 
 	m.Ensure(context.Background(), expiring)
 	waitForKey(t, sent, fresh)
-	if m.currentKey() != fresh {
-		t.Error("manager key was not updated to the refreshed key")
+	if holder.Key() != fresh {
+		t.Error("holder key was not updated to the refreshed key")
+	}
+	if got, _ := db.GetSetting(context.Background(), "license_jwt"); got != fresh {
+		t.Error("refreshed key was not persisted")
 	}
 	if got := holder.Load().ExpiresAt(); time.Until(got) < 30*24*time.Hour {
 		t.Errorf("holder not updated with refreshed license, expires %v", got)
+	}
+}
+
+// TestHolder_StaleRefreshDropped verifies that a refresh for a key that was
+// replaced by an activation is written nowhere.
+func TestHolder_StaleRefreshDropped(t *testing.T) {
+	holder := NewHolder(communityLicense{})
+	db := newFakeSettings()
+	activate := func(lic License, key string) {
+		t.Helper()
+		err := holder.Activate(lic, key, func() error { return db.SetSetting(context.Background(), "license_jwt", key) })
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	activate(testEnterprise("A", false, time.Hour), "key-A")
+	activate(testEnterprise("B", false, time.Hour), "key-B")
+
+	applied, err := holder.refresh("key-A", "key-A2", testEnterprise("A2", false, time.Hour),
+		func() error { return db.SetSetting(context.Background(), "license_jwt", "key-A2") })
+	if err != nil || applied {
+		t.Fatalf("stale refresh applied=%v err=%v, want dropped", applied, err)
+	}
+	if holder.Key() != "key-B" || holder.Load().CustomerID() != "B" {
+		t.Errorf("holder = %q/%q, want key-B/B", holder.Key(), holder.Load().CustomerID())
+	}
+	if got, _ := db.GetSetting(context.Background(), "license_jwt"); got != "key-B" {
+		t.Errorf("db key = %q, want key-B", got)
+	}
+
+	applied, err = holder.refresh("key-B", "key-B2", testEnterprise("B", false, 2*time.Hour),
+		func() error { return db.SetSetting(context.Background(), "license_jwt", "key-B2") })
+	if err != nil || !applied || holder.Key() != "key-B2" {
+		t.Fatalf("current refresh applied=%v err=%v key=%q", applied, err, holder.Key())
+	}
+}
+
+// TestHolder_ConcurrentActivateAndRefresh verifies, under -race, that however
+// activations and refreshes interleave, the holder, the persisted key and the
+// recorded key end on the same value.
+func TestHolder_ConcurrentActivateAndRefresh(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		holder := NewHolder(communityLicense{})
+		db := newFakeSettings()
+		persist := func(key string) func() error {
+			return func() error { return db.SetSetting(context.Background(), "license_jwt", key) }
+		}
+		if err := holder.Activate(testEnterprise("k0", false, time.Hour), "k0", persist("k0")); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		for i := 1; i <= 8; i++ {
+			key := "k" + string(rune('0'+i))
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				if err := holder.Activate(testEnterprise(key, false, time.Hour), key, persist(key)); err != nil {
+					t.Error(err)
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				refreshed := key + "-refreshed"
+				if _, err := holder.refresh("k0", refreshed, testEnterprise(refreshed, false, time.Hour), persist(refreshed)); err != nil {
+					t.Error(err)
+				}
+			}()
+		}
+		wg.Wait()
+
+		got, _ := db.GetSetting(context.Background(), "license_jwt")
+		if holder.Key() != got || holder.Load().CustomerID() != got {
+			t.Fatalf("round %d diverged: key=%q db=%q customer=%q", round, holder.Key(), got, holder.Load().CustomerID())
+		}
+	}
+}
+
+// TestHeartbeatManager_ActivatedTriggersSoon verifies that a newly activated
+// key is verified shortly after activation, even when the multi-pod dedup
+// marker says a heartbeat was sent recently and the daily tick is far away.
+func TestHeartbeatManager_ActivatedTriggersSoon(t *testing.T) {
+	shortenInitialDelay(t)
+	origDelay := activationDelay
+	activationDelay = 20 * time.Millisecond
+	t.Cleanup(func() { activationDelay = origDelay })
+
+	srv, sent := recordingVerifyServer(t, func(string) verifyResponse { return verifyResponse{Status: "active"} })
+	db := newFakeSettings()
+	holder := NewHolder(communityLicense{})
+	m := NewHeartbeatManager(holder, HeartbeatConfig{
+		ServerURL: srv.URL, Interval: time.Hour, Log: discardLogger(), DB: db, InstanceID: "i",
+	})
+	defer m.Stop()
+
+	m.Ensure(context.Background(), "key-A")
+	waitForKey(t, sent, "key-A")
+	// The first beat recorded a fresh dedup timestamp; B must still go out.
+	if last, _ := db.GetSetting(context.Background(), "heartbeat_last_sent"); last == "" {
+		t.Fatal("dedup marker not set after first heartbeat")
+	}
+	if err := holder.Activate(testEnterprise("B", false, time.Hour), "key-B", nil); err != nil {
+		t.Fatal(err)
+	}
+	m.Activated(context.Background(), "key-B")
+	waitForKey(t, sent, "key-B")
+}
+
+// TestRunHeartbeat_TrialTermination verifies that trial licenses are swapped to
+// community when the server reports the trial ended, while paid licenses are
+// left alone.
+func TestRunHeartbeat_TrialTermination(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   string
+		trial    bool
+		wantSwap bool
+	}{
+		{"trial expired", "expired", true, true},
+		{"trial revoked", "revoked", true, true},
+		{"trial instance mismatch", "instance_mismatch", true, true},
+		{"trial active", "active", true, false},
+		{"trial unknown", "unknown", true, false},
+		{"paid expired", "expired", false, false},
+		{"paid revoked", "revoked", false, false},
+		{"paid instance mismatch", "instance_mismatch", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := mockVerifyServer(t, verifyResponse{Status: tt.status})
+			holder := NewHolder(testEnterprise("c", tt.trial, time.Hour))
+			runHeartbeat(context.Background(), holder, "k", srv.URL, "i", discardLogger(), nil)
+			swapped := holder.Load().Edition() == EditionCommunity
+			if swapped != tt.wantSwap {
+				t.Errorf("swapped = %v, want %v", swapped, tt.wantSwap)
+			}
+		})
+	}
+}
+
+// TestHeartbeatManager_TrialEndedRecordsState verifies that the heartbeat flags
+// the expiry state with was_trial and runs the downgrade hook.
+func TestHeartbeatManager_TrialEndedRecordsState(t *testing.T) {
+	shortenInitialDelay(t)
+	srv, _ := recordingVerifyServer(t, func(string) verifyResponse { return verifyResponse{Status: "expired"} })
+	holder := NewHolder(testEnterprise("c", true, time.Hour))
+	state := NewExpiryState(true)
+	var downgraded atomic.Int32
+	m := NewHeartbeatManager(holder, HeartbeatConfig{
+		ServerURL: srv.URL, Interval: time.Hour, Log: discardLogger(),
+		State: state, OnDowngrade: func(context.Context) { downgraded.Add(1) },
+	})
+	defer m.Stop()
+	m.Ensure(context.Background(), "trial-key")
+
+	deadline := time.After(5 * time.Second)
+	for !state.Expired() {
+		select {
+		case <-deadline:
+			t.Fatal("state never flagged")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if !state.WasTrial() || !state.RestartRequired() {
+		t.Errorf("wasTrial=%v restart=%v, want true/true", state.WasTrial(), state.RestartRequired())
+	}
+	if downgraded.Load() != 1 {
+		t.Errorf("OnDowngrade calls = %d, want 1", downgraded.Load())
+	}
+}
+
+// TestValidateKeyForInstance verifies trial instance binding.
+func TestValidateKeyForInstance(t *testing.T) {
+	pub, priv := newTestKeypair(t)
+	withTestPublicKey(t, pub)
+
+	mk := func(trial bool, instance string) string {
+		return signTestJWT(t, priv, LicenseClaims{
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(time.Hour)),
+				Issuer:    "voidllm.ai",
+			},
+			Plan: "enterprise", Features: []string{FeatureAuditLogs},
+			MaxOrgs: -1, MaxTeams: -1, CustomerID: "c", Trial: trial, InstanceID: instance,
+		})
+	}
+	tests := []struct {
+		name     string
+		key      string
+		instance string
+		wantErr  bool
+	}{
+		{"bound trial, same instance", mk(true, "inst-1"), "inst-1", false},
+		{"bound trial, other instance", mk(true, "inst-1"), "inst-2", true},
+		{"bound trial, unknown instance", mk(true, "inst-1"), "", true},
+		{"unbound trial", mk(true, ""), "inst-2", false},
+		{"paid with instance claim is not bound", mk(false, "inst-1"), "inst-2", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lic, err := ValidateKeyForInstance(tt.key, tt.instance)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				if !errors.Is(err, ErrInvalidKey) || !errors.Is(err, ErrTrialWrongInstance) {
+					t.Errorf("err = %v, want ErrInvalidKey and ErrTrialWrongInstance", err)
+				}
+				if !strings.Contains(err.Error(), "this trial key belongs to another VoidLLM instance") {
+					t.Errorf("err message = %q", err)
+				}
+			}
+			verified := VerifyForInstance(tt.key, false, tt.instance)
+			if tt.wantErr == (verified.Edition() == EditionEnterprise) {
+				t.Errorf("VerifyForInstance edition = %v, wantErr %v", verified.Edition(), tt.wantErr)
+			}
+			if !tt.wantErr && lic == nil {
+				t.Error("nil license")
+			}
+		})
+	}
+	// Legacy entry points do not enforce binding (offline CLI use).
+	if _, err := ValidateKey(mk(true, "inst-1")); err != nil {
+		t.Errorf("ValidateKey must not enforce binding: %v", err)
 	}
 }

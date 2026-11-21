@@ -103,6 +103,9 @@ func TestCheckExpiry(t *testing.T) {
 			if got := CheckExpiry(context.Background(), holder, cfg); got != tt.wantSwap {
 				t.Fatalf("CheckExpiry = %v, want %v", got, tt.wantSwap)
 			}
+			if state.WasTrial() != (tt.wantSwap && tt.name == "expired gated") {
+				t.Errorf("WasTrial = %v for %q", state.WasTrial(), tt.name)
+			}
 			if state.Expired() != tt.wantSwap || state.RestartRequired() != tt.wantRestart {
 				t.Errorf("state expired=%v restart=%v, want %v/%v",
 					state.Expired(), state.RestartRequired(), tt.wantSwap, tt.wantRestart)
@@ -124,16 +127,38 @@ func TestCheckExpiry(t *testing.T) {
 }
 
 func TestStartExpiryWatcher_SwapsOnTick(t *testing.T) {
-	holder := NewHolder(newExpiringLicense(time.Now().Add(-time.Minute), false))
+	expiry := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	var nowNs atomic.Int64
+	nowNs.Store(expiry.Add(-time.Hour).UnixNano())
+	var checks atomic.Int32
+	holder := NewHolder(newExpiringLicense(expiry, true))
 	state := NewExpiryState(false)
 	stop := StartExpiryWatcher(holder, ExpiryWatcherConfig{
 		Interval: 10 * time.Millisecond,
-		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		State:    state,
+		Now: func() time.Time {
+			checks.Add(1)
+			return time.Unix(0, nowNs.Load()).UTC()
+		},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		State: state,
 	})
 	defer stop()
 
+	// Several ticks pass while the license is still valid: no swap.
 	deadline := time.After(2 * time.Second)
+	for checks.Load() < 4 {
+		select {
+		case <-deadline:
+			t.Fatal("watcher did not tick")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if state.Expired() || holder.Load().Edition() != EditionEnterprise {
+		t.Fatal("license swapped before it expired")
+	}
+
+	// The clock passes the expiry between ticks.
+	nowNs.Store(expiry.Add(time.Minute).UnixNano())
 	for !state.Expired() {
 		select {
 		case <-deadline:
@@ -144,8 +169,8 @@ func TestStartExpiryWatcher_SwapsOnTick(t *testing.T) {
 	if holder.Load().Edition() != EditionCommunity {
 		t.Errorf("edition = %v, want community", holder.Load().Edition())
 	}
-	if state.ExpiredAt().IsZero() {
-		t.Error("ExpiredAt is zero")
+	if state.ExpiredAt().IsZero() || !state.WasTrial() {
+		t.Errorf("ExpiredAt=%v WasTrial=%v", state.ExpiredAt(), state.WasTrial())
 	}
 }
 

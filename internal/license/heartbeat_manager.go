@@ -8,60 +8,48 @@ import (
 
 // HeartbeatManager starts the license heartbeat at most once per process. It
 // lets a license key activated at runtime begin heartbeating without a
-// restart, while guarding against a second heartbeat goroutine.
+// restart, while guarding against a second heartbeat goroutine. The key the
+// heartbeat sends is always the one the Holder currently carries.
 type HeartbeatManager struct {
-	holder *Holder
-	cfg    HeartbeatConfig
-	start  func(*Holder, string, HeartbeatConfig) func()
+	holder  *Holder
+	cfg     HeartbeatConfig
+	start   func(*Holder, string, HeartbeatConfig) func()
+	trigger chan struct{}
 
 	mu      sync.Mutex
 	stop    func()
 	running bool
-	key     string
 }
 
 // NewHeartbeatManager returns a manager that starts heartbeats against holder
 // using cfg. When cfg.InstanceID is empty and cfg.DB is set, the instance ID is
 // resolved lazily on first start.
 func NewHeartbeatManager(holder *Holder, cfg HeartbeatConfig) *HeartbeatManager {
-	return &HeartbeatManager{holder: holder, cfg: cfg, start: StartHeartbeat}
-}
-
-// currentKey returns the most recently activated license key.
-func (m *HeartbeatManager) currentKey() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.key
-}
-
-// keyRefreshed records a key issued by the license server, unless a different
-// key was activated while the heartbeat request was in flight.
-func (m *HeartbeatManager) keyRefreshed(oldKey, newKey string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.key == oldKey {
-		m.key = newKey
+	return &HeartbeatManager{
+		holder:  holder,
+		cfg:     cfg,
+		start:   StartHeartbeat,
+		trigger: make(chan struct{}, 1),
 	}
 }
 
-// Ensure records rawKey as the active license key and starts the heartbeat if
-// none is running. A running heartbeat picks up the new key on its next tick.
-// It reports whether a heartbeat was started by this call. A nil manager or
-// empty key is a no-op.
+// Ensure starts the heartbeat if none is running. rawKey seeds the holder's
+// active key when it has none; an already recorded key is never replaced, so a
+// concurrent activation wins. It reports whether a heartbeat was started by
+// this call. A nil manager or empty key is a no-op.
 func (m *HeartbeatManager) Ensure(ctx context.Context, rawKey string) bool {
 	if m == nil || rawKey == "" {
 		return false
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.key = rawKey
+	m.holder.seedKey(rawKey)
 	if m.running {
 		return false
 	}
 
 	cfg := m.cfg
-	cfg.KeyFunc = m.currentKey
-	cfg.OnKeyRefreshed = m.keyRefreshed
+	cfg.Trigger = m.trigger
 	if cfg.InstanceID == "" && cfg.DB != nil {
 		id, err := GetOrCreateInstanceID(ctx, cfg.DB)
 		if err != nil {
@@ -76,9 +64,24 @@ func (m *HeartbeatManager) Ensure(ctx context.Context, rawKey string) bool {
 		}
 	}
 
-	m.stop = m.start(m.holder, rawKey, cfg)
+	m.stop = m.start(m.holder, m.holder.Key(), cfg)
 	m.running = true
 	return true
+}
+
+// Activated must be called after a new key was installed with Holder.Activate.
+// It starts the heartbeat if needed and requests one extra heartbeat soon, so
+// the new key is verified (and refreshed if due) without waiting for the next
+// daily tick. A nil manager is a no-op.
+func (m *HeartbeatManager) Activated(ctx context.Context, rawKey string) {
+	if m == nil {
+		return
+	}
+	m.Ensure(ctx, rawKey)
+	select {
+	case m.trigger <- struct{}{}:
+	default:
+	}
 }
 
 // Stop halts the heartbeat if one is running and allows a later Ensure to

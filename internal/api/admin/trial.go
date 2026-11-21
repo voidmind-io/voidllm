@@ -9,7 +9,7 @@ import (
 	"net/mail"
 	"strings"
 	"time"
-	"unicode/utf8"
+	"unicode/utf16"
 
 	"github.com/gofiber/fiber/v3"
 	apihealth "github.com/voidmind-io/voidllm/internal/api/health"
@@ -30,6 +30,7 @@ const (
 	maxTrialEmailLen    = 254
 	maxTrialCompanyLen  = 200
 
+	trialRejectedMessage    = "The license server rejected the request. Check the email address."
 	trialUnavailableMessage = "Could not reach the license server. You can request a trial at https://voidllm.ai/trial"
 	trialRateLimitMessage   = "Too many trial requests. Please try again later."
 )
@@ -100,7 +101,7 @@ func (h *Handler) RequestTrial(c fiber.Ctx) error {
 	if !validTrialEmail(email) {
 		return apierror.BadRequest(c, "a valid email is required")
 	}
-	if utf8.RuneCountInString(company) > maxTrialCompanyLen {
+	if utf16Len(company) > maxTrialCompanyLen {
 		return apierror.BadRequest(c, "company must be at most 200 characters")
 	}
 	if !req.ConsentTrial {
@@ -132,6 +133,9 @@ func (h *Handler) RequestTrial(c fiber.Ctx) error {
 	case status == http.StatusAccepted:
 		h.Log.LogAttrs(ctx, slog.LevelInfo, "trial requested")
 		return c.Status(fiber.StatusAccepted).JSON(trialResponse{Status: "check_inbox"})
+	case status == http.StatusBadRequest:
+		h.Log.LogAttrs(ctx, slog.LevelInfo, "trial request failed", slog.String("category", "rejected"))
+		return apierror.Send(c, fiber.StatusBadRequest, "trial_rejected", trialRejectedMessage)
 	case status == http.StatusTooManyRequests:
 		h.Log.LogAttrs(ctx, slog.LevelInfo, "trial request failed", slog.String("category", "rate_limited"))
 		return apierror.Send(c, fiber.StatusTooManyRequests, "rate_limited", trialRateLimitMessage)
@@ -176,9 +180,15 @@ func (h *Handler) postTrial(ctx context.Context, payload trialUpstreamRequest) (
 	return resp.StatusCode, nil
 }
 
+// utf16Len returns the length of s in UTF-16 code units, the unit the license
+// server counts, so both sides agree on the limits for non-ASCII input.
+func utf16Len(s string) int {
+	return len(utf16.Encode([]rune(s)))
+}
+
 // validTrialEmail reports whether s is a bare RFC 5322 address of acceptable length.
 func validTrialEmail(s string) bool {
-	if s == "" || len(s) > maxTrialEmailLen {
+	if s == "" || utf16Len(s) > maxTrialEmailLen {
 		return false
 	}
 	addr, err := mail.ParseAddress(s)

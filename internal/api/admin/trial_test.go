@@ -2,6 +2,7 @@ package admin_test
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -159,6 +161,8 @@ func TestRequestTrial_Validation(t *testing.T) {
 		{"email too long", with("email", strings.Repeat("a", 250)+"@b.co"), 400},
 		{"company 200 ok", with("company", strings.Repeat("c", 200)), 202},
 		{"company 201 too long", with("company", strings.Repeat("c", 201)), 400},
+		{"company 100 astral runes = 200 utf16 units ok", with("company", strings.Repeat("\U0001F600", 100)), 202},
+		{"company 101 astral runes = 202 utf16 units too long", with("company", strings.Repeat("\U0001F600", 101)), 400},
 		{"no company ok", map[string]any{"email": "a@b.co", "consent_trial": true}, 202},
 	}
 	for _, tt := range tests {
@@ -225,16 +229,8 @@ func TestRequestTrial_UpstreamMapping(t *testing.T) {
 		{
 			name:       "400 from upstream",
 			upstream:   func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(400) },
-			wantStatus: 502,
-			wantCode:   "trial_unavailable",
-		},
-		{
-			name: "redirect not followed",
-			upstream: func(w http.ResponseWriter, r *http.Request) {
-				http.Redirect(w, r, "/elsewhere", http.StatusFound)
-			},
-			wantStatus: 502,
-			wantCode:   "trial_unavailable",
+			wantStatus: 400,
+			wantCode:   "trial_rejected",
 		},
 		{
 			name: "timeout",
@@ -270,6 +266,12 @@ func TestRequestTrial_UpstreamMapping(t *testing.T) {
 					t.Errorf("error = %v, want code %q and fixed message", e, tt.wantCode)
 				}
 			}
+			if tt.wantStatus == 400 {
+				e, _ := body["error"].(map[string]any)
+				if e["code"] != tt.wantCode || e["message"] != "The license server rejected the request. Check the email address." {
+					t.Errorf("error = %v, want code %q and fixed message", e, tt.wantCode)
+				}
+			}
 			if tt.wantStatus == 429 {
 				e, _ := body["error"].(map[string]any)
 				if e["code"] != tt.wantCode {
@@ -277,6 +279,33 @@ func TestRequestTrial_UpstreamMapping(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRequestTrial_RedirectNotFollowed fails if the client follows redirects:
+// the redirect target would be hit.
+func TestRequestTrial_RedirectNotFollowed(t *testing.T) {
+	app, h, keyCache, _ := setupTrialApp(t, "file:TestRequestTrial_Redirect?mode=memory&cache=private")
+	var targetHits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc(license.TrialRequestPath, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/elsewhere", http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("/elsewhere", func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		w.WriteHeader(202)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	admin.SetTrialEndpoint(h, srv.URL, nil)
+	token := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-trial")
+
+	status, _ := postTrial(t, app, token, validTrialBody())
+	if status != 502 {
+		t.Errorf("status = %d, want 502", status)
+	}
+	if got := targetHits.Load(); got != 0 {
+		t.Errorf("redirect target hit %d times, want 0 (redirects must not be followed)", got)
 	}
 }
 
@@ -414,6 +443,22 @@ func TestGetLicense_TrialAndExpiryFields(t *testing.T) {
 		})
 	}
 
+	// A paid license that expired must not be reported as an ended trial.
+	t.Run("expired paid license", func(t *testing.T) {
+		app, h, keyCache, _ := setupTrialApp(t, "file:TestGetLicense_ExpiredPaid?mode=memory&cache=private")
+		h.License.Store(mk(false, 1500*time.Millisecond))
+		state := license.NewExpiryState(false)
+		h.LicenseExpiry = state
+		time.Sleep(2100 * time.Millisecond)
+		if !license.CheckExpiry(context.Background(), h.License, license.ExpiryWatcherConfig{State: state}) {
+			t.Fatal("CheckExpiry did not swap")
+		}
+		body := getLicenseJSON(t, app, addTestKey(t, keyCache, auth.RoleMember, "org-x"))
+		if body["expired"] != true || body["expired_trial"] != false {
+			t.Errorf("expired/expired_trial = %v/%v, want true/false", body["expired"], body["expired_trial"])
+		}
+	})
+
 	// Expired at runtime: the watcher swapped the license to community.
 	expiryTests := []struct {
 		name        string
@@ -438,6 +483,9 @@ func TestGetLicense_TrialAndExpiryFields(t *testing.T) {
 			body := getLicenseJSON(t, app, token)
 			if body["expired"] != true || body["restart_required"] != tt.wantRestart {
 				t.Errorf("expired/restart_required = %v/%v, want true/%v", body["expired"], body["restart_required"], tt.wantRestart)
+			}
+			if body["expired_trial"] != true {
+				t.Errorf("expired_trial = %v, want true for an expired trial", body["expired_trial"])
 			}
 			if body["edition"] != "community" || body["days_left"] != float64(0) || body["expires_at"] == nil {
 				t.Errorf("edition/days_left/expires_at = %v/%v/%v", body["edition"], body["days_left"], body["expires_at"])
@@ -466,3 +514,117 @@ func getLicenseJSON(t *testing.T, app *fiber.App, token string) map[string]any {
 }
 
 func jwtDate(t time.Time) *jwt.NumericDate { return jwt.NewNumericDate(t) }
+
+func signedLicense(t *testing.T, priv ed25519.PrivateKey, customer string, mutate func(*license.LicenseClaims)) string {
+	t.Helper()
+	claims := licensetest.NewEnterpriseClaims([]string{license.FeatureAuditLogs})
+	claims.CustomerID = customer
+	if mutate != nil {
+		mutate(&claims)
+	}
+	return licensetest.SignTestJWT(t, priv, claims)
+}
+
+func putLicense(t *testing.T, app *fiber.App, token, key string) (int, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest("PUT", "/api/v1/settings/license", bodyJSON(t, map[string]string{"key": key}))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	out := map[string]any{}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+// TestSetLicense_ConcurrentActivationsStayConsistent verifies, under -race,
+// that concurrent PUTs leave the holder, the stored key and the heartbeat key
+// on the same request.
+func TestSetLicense_ConcurrentActivationsStayConsistent(t *testing.T) {
+	pub, priv := licensetest.NewTestKeypair(t)
+	licensetest.WithTestPublicKey(t, pub)
+	app, h, keyCache, _ := setupTrialApp(t, "file:TestSetLicense_Concurrent?mode=memory&cache=private")
+	token := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-lic")
+
+	keys := map[string]string{} // raw key -> customer id
+	var ordered []string
+	for i := 0; i < 6; i++ {
+		cust := "cust-" + string(rune('a'+i))
+		k := signedLicense(t, priv, cust, nil)
+		keys[k] = cust
+		ordered = append(ordered, k)
+	}
+
+	var wg sync.WaitGroup
+	for _, k := range ordered {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if status, body := putLicense(t, app, token, k); status != 200 {
+				t.Errorf("PUT status = %d: %v", status, body)
+			}
+		}()
+	}
+	wg.Wait()
+
+	stored, err := h.DB.GetSetting(context.Background(), "license_jwt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.License.Key() != stored {
+		t.Error("holder key and stored license_jwt diverged")
+	}
+	if got := h.License.Load().CustomerID(); got != keys[stored] {
+		t.Errorf("holder customer = %q, stored key belongs to %q", got, keys[stored])
+	}
+}
+
+// TestSetLicense_TrialInstanceBinding verifies a trial bound to another
+// instance is rejected with a clear message and leaves the license untouched.
+func TestSetLicense_TrialInstanceBinding(t *testing.T) {
+	pub, priv := licensetest.NewTestKeypair(t)
+	licensetest.WithTestPublicKey(t, pub)
+	app, h, keyCache, _ := setupTrialApp(t, "file:TestSetLicense_Binding?mode=memory&cache=private")
+	token := addTestKey(t, keyCache, auth.RoleSystemAdmin, "org-lic")
+
+	own, err := license.GetOrCreateInstanceID(context.Background(), h.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := func(instance string) string {
+		return signedLicense(t, priv, "cust-trial", func(c *license.LicenseClaims) {
+			c.Trial = true
+			c.InstanceID = instance
+		})
+	}
+	tests := []struct {
+		name       string
+		key        string
+		wantStatus int
+	}{
+		{"other instance", bound("some-other-instance"), 400},
+		{"own instance", bound(own), 200},
+		{"unbound trial", bound(""), 200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := h.License.Key()
+			status, body := putLicense(t, app, token, tt.key)
+			if status != tt.wantStatus {
+				t.Fatalf("status = %d, want %d: %v", status, tt.wantStatus, body)
+			}
+			if tt.wantStatus == 400 {
+				e, _ := body["error"].(map[string]any)
+				if e["message"] != "this trial key belongs to another VoidLLM instance" {
+					t.Errorf("message = %v", e["message"])
+				}
+				if h.License.Key() != before {
+					t.Error("rejected key changed the holder")
+				}
+			}
+		})
+	}
+}

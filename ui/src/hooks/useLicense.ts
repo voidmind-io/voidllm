@@ -12,7 +12,8 @@ export interface LicenseInfo {
   fallback_max_depth: number // 0 = fallback disabled
   trial?: boolean            // true if the active license is a trial
   days_left?: number         // whole days remaining on a trial
-  expired?: boolean          // true if a trial license has ended
+  expired?: boolean          // true if a license has expired
+  expired_trial?: boolean    // true if the expired license was a trial
   restart_required?: boolean // true if a restart is needed to finish a license change
 }
 

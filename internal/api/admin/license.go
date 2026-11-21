@@ -60,6 +60,9 @@ type licenseResponse struct {
 	// FallbackMaxDepth is the configured maximum fallback chain depth.
 	// 0 means fallback chains are disabled even if models have fallback configured.
 	FallbackMaxDepth int `json:"fallback_max_depth"`
+	// ExpiredTrial is true when the license that expired was a trial, so the UI
+	// can tell "trial ended" from a paid license that lapsed.
+	ExpiredTrial bool `json:"expired_trial"`
 	// Trial is true when the license is a time-limited trial.
 	Trial bool `json:"trial"`
 	// DaysLeft is the number of whole days until expiry, or null for perpetual
@@ -101,15 +104,34 @@ func (h *Handler) SetLicense(c fiber.Ctx) error {
 		return apierror.BadRequest(c, "key is required")
 	}
 
-	lic, err := license.ValidateKey(req.Key)
+	instanceID, err := license.GetOrCreateInstanceID(c.Context(), h.DB)
 	if err != nil {
+		h.Log.LogAttrs(c.Context(), slog.LevelError, "set license: instance id unavailable",
+			slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to resolve instance id")
+	}
+
+	lic, err := license.ValidateKeyForInstance(req.Key, instanceID)
+	if err != nil {
+		if errors.Is(err, license.ErrTrialWrongInstance) {
+			return apierror.BadRequest(c, license.ErrTrialWrongInstance.Error())
+		}
 		if errors.Is(err, license.ErrInvalidKey) {
 			return apierror.BadRequest(c, "invalid license key")
 		}
 		return apierror.InternalError(c, "license validation failed")
 	}
 
-	h.License.Store(lic)
+	// Persist and swap under one lock so the in-memory license, the stored key
+	// and the key the heartbeat sends always belong to the same request, even
+	// when a heartbeat refresh or another activation runs concurrently.
+	if err := h.License.Activate(lic, req.Key, func() error {
+		return h.DB.SetSetting(c.Context(), "license_jwt", req.Key)
+	}); err != nil {
+		h.Log.LogAttrs(c.Context(), slog.LevelError, "set license: activation failed",
+			slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to persist license")
+	}
 
 	// Apply the license change locally by re-gating the registry.
 	// This path is the ONLY re-gate trigger on deployments without Redis;
@@ -139,12 +161,7 @@ func (h *Handler) SetLicense(c fiber.Ctx) error {
 		}
 	}
 
-	// Persist to DB so the license survives restarts.
-	if err := h.DB.SetSetting(c.Context(), "license_jwt", req.Key); err != nil {
-		return apierror.InternalError(c, "failed to persist license")
-	}
-
-	h.LicenseHeartbeat.Ensure(c.Context(), req.Key)
+	h.LicenseHeartbeat.Activated(c.Context(), req.Key)
 
 	keyInfo := auth.KeyInfoFromCtx(c)
 	actorID := ""
@@ -200,6 +217,7 @@ func (h *Handler) GetLicense(c fiber.Ctx) error {
 	if lic.Edition() == license.EditionCommunity && h.LicenseExpiry.Expired() {
 		resp.Expired = true
 		resp.RestartRequired = h.LicenseExpiry.RestartRequired()
+		resp.ExpiredTrial = h.LicenseExpiry.WasTrial()
 		if t := h.LicenseExpiry.ExpiredAt(); !t.IsZero() {
 			resp.ExpiresAt = &t
 			zero := 0
