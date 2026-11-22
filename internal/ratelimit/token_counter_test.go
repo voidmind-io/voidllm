@@ -742,3 +742,47 @@ func BenchmarkTokenCounter_CheckTokens(b *testing.B) {
 		}
 	})
 }
+
+// TestCheckTokens_RetryAfterLatestReset verifies that the returned LimitError
+// carries the latest reset among all exceeded windows.
+func TestCheckTokens_RetryAfterLatestReset(t *testing.T) {
+	t.Parallel()
+
+	tc := NewTokenCounter()
+	s := Scopes{KeyID: "ra-key", OrgID: "ra-org"}
+	tc.Add(s, 100)
+
+	const tol = 5 * time.Second
+	near := func(got, want time.Duration) bool {
+		d := got - want
+		return d > -tol && d < tol
+	}
+
+	now := time.Now().UTC()
+	untilMidnight := nextUTCMidnight(now).Sub(now)
+	untilMonth := nextUTCMonth(now).Sub(now)
+
+	daily := ScopeLimits{Org: Limits{DailyTokenLimit: 100}}
+	d, ok := RetryAfterFromError(tc.CheckTokens(s, daily))
+	if !ok || !near(d, untilMidnight) {
+		t.Errorf("daily RetryAfter = %v, want ~%v", d, untilMidnight)
+	}
+
+	monthly := ScopeLimits{Key: Limits{MonthlyTokenLimit: 100}}
+	d, ok = RetryAfterFromError(tc.CheckTokens(s, monthly))
+	if !ok || !near(d, untilMonth) {
+		t.Errorf("monthly RetryAfter = %v, want ~%v", d, untilMonth)
+	}
+
+	// Daily (org) and monthly (key) exceeded at once: blocked until the month
+	// resets, regardless of which scope is checked first.
+	both := ScopeLimits{Key: Limits{MonthlyTokenLimit: 100}, Org: Limits{DailyTokenLimit: 100}}
+	err := tc.CheckTokens(s, both)
+	if !errors.Is(err, ErrTokenBudgetExceeded) {
+		t.Fatalf("err = %v, want ErrTokenBudgetExceeded", err)
+	}
+	d, ok = RetryAfterFromError(err)
+	if !ok || !near(d, untilMonth) {
+		t.Errorf("combined RetryAfter = %v, want ~%v (latest reset)", d, untilMonth)
+	}
+}

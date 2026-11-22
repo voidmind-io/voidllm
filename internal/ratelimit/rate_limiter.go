@@ -85,13 +85,22 @@ func (r *RateLimiter) CheckRate(s Scopes, l ScopeLimits) error {
 		if c.rpm > 0 {
 			entry := r.loadOrCreate(&r.minuteCounters, c.scope)
 			if !r.tryIncrement(entry, minuteWindow, int64(c.rpm)) {
-				return ErrRateLimitExceeded
+				retry := now.Truncate(time.Minute).Add(time.Minute).Sub(now)
+				// When the day budget of this scope is exhausted too, the
+				// request stays blocked until the day window resets.
+				if c.rpd > 0 {
+					day := r.loadOrCreate(&r.dayCounters, c.scope)
+					if day.windowStart.Load() == dayWindow && day.count.Load() >= int64(c.rpd) {
+						retry = nextUTCMidnight(now).Sub(now)
+					}
+				}
+				return &LimitError{Err: ErrRateLimitExceeded, RetryAfter: retry}
 			}
 		}
 		if c.rpd > 0 {
 			entry := r.loadOrCreate(&r.dayCounters, c.scope)
 			if !r.tryIncrement(entry, dayWindow, int64(c.rpd)) {
-				return ErrRateLimitExceeded
+				return &LimitError{Err: ErrRateLimitExceeded, RetryAfter: nextUTCMidnight(now).Sub(now)}
 			}
 		}
 	}

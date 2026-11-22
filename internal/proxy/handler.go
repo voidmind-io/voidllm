@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"path"
 	"strconv"
@@ -1026,6 +1027,7 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 				slog.String("key_id", keyInfo.ID),
 				slog.String("org_id", keyInfo.OrgID),
 			)
+			setRetryAfter(c, err)
 			if err := apierror.SendProxy(c, fiber.StatusTooManyRequests, "rate_limit_exceeded", "rate limit exceeded"); err != nil {
 				return err
 			}
@@ -1040,6 +1042,10 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 				slog.String("key_id", keyInfo.ID),
 				slog.String("org_id", keyInfo.OrgID),
 			)
+			// A budget only resets at a window boundary: tell clients not to
+			// retry-loop (x-should-retry) and when the budget frees up.
+			setRetryAfter(c, err)
+			c.Set("x-should-retry", "false")
 			if err := apierror.SendProxy(c, fiber.StatusTooManyRequests, "token_limit_exceeded", "token budget exceeded"); err != nil {
 				return err
 			}
@@ -1048,6 +1054,21 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 	}
 
 	return nil
+}
+
+// setRetryAfter sets the Retry-After header (whole seconds, at least 1) from
+// the reset delay carried by a ratelimit.LimitError. It is a no-op when err
+// carries none.
+func setRetryAfter(c fiber.Ctx, err error) {
+	d, ok := ratelimit.RetryAfterFromError(err)
+	if !ok {
+		return
+	}
+	secs := int64(math.Ceil(d.Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	c.Set("Retry-After", strconv.FormatInt(secs, 10))
 }
 
 // resolveModel performs scoped alias resolution followed by registry lookup and

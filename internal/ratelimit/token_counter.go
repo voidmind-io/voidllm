@@ -81,66 +81,46 @@ func (tc *TokenCounter) Add(s Scopes, tokens int64) {
 
 // CheckTokens verifies that no scope has exceeded its token budget. Each scope
 // is checked against its own limit independently. The user scope is skipped
-// when UserID is empty. Returns ErrTokenBudgetExceeded if any scope is over
-// budget.
+// when UserID is empty. When any scope is over budget it returns a *LimitError
+// wrapping ErrTokenBudgetExceeded whose RetryAfter is the time until the
+// latest reset among all exceeded windows, because the request stays blocked
+// until every exceeded window has reset (next UTC midnight for daily budgets,
+// the 1st of the next UTC month for monthly ones).
 func (tc *TokenCounter) CheckTokens(s Scopes, l ScopeLimits) error {
 	now := time.Now().UTC()
 	dayWindow := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Unix()
 	monthWindow := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).Unix()
+	dayReset := nextUTCMidnight(now).Sub(now)
+	monthReset := nextUTCMonth(now).Sub(now)
 
-	// Check key limits against key usage.
-	if l.Key.DailyTokenLimit > 0 {
-		if tc.getCount(&tc.dailyCounters, "key:"+s.KeyID, dayWindow) >= l.Key.DailyTokenLimit {
-			return ErrTokenBudgetExceeded
+	var retry time.Duration
+	exceeded := false
+	check := func(m *sync.Map, scope string, window, limit int64, reset time.Duration) {
+		if limit <= 0 || tc.getCount(m, scope, window) < limit {
+			return
 		}
+		if !exceeded || reset > retry {
+			retry = reset
+		}
+		exceeded = true
 	}
-	if l.Key.MonthlyTokenLimit > 0 {
-		if tc.getCount(&tc.monthlyCounters, "key:"+s.KeyID, monthWindow) >= l.Key.MonthlyTokenLimit {
-			return ErrTokenBudgetExceeded
-		}
+	checkScope := func(scope string, lim Limits) {
+		check(&tc.dailyCounters, scope, dayWindow, lim.DailyTokenLimit, dayReset)
+		check(&tc.monthlyCounters, scope, monthWindow, lim.MonthlyTokenLimit, monthReset)
 	}
 
-	// Check per-user limits against the user's org-bound usage.
+	checkScope("key:"+s.KeyID, l.Key)
 	if s.UserID != "" {
-		userScope := "user:" + s.OrgID + ":" + s.UserID
-		if l.User.DailyTokenLimit > 0 {
-			if tc.getCount(&tc.dailyCounters, userScope, dayWindow) >= l.User.DailyTokenLimit {
-				return ErrTokenBudgetExceeded
-			}
-		}
-		if l.User.MonthlyTokenLimit > 0 {
-			if tc.getCount(&tc.monthlyCounters, userScope, monthWindow) >= l.User.MonthlyTokenLimit {
-				return ErrTokenBudgetExceeded
-			}
-		}
+		checkScope("user:"+s.OrgID+":"+s.UserID, l.User)
 	}
-
-	// Check team limits against team usage.
 	if s.TeamID != "" {
-		if l.Team.DailyTokenLimit > 0 {
-			if tc.getCount(&tc.dailyCounters, "team:"+s.TeamID, dayWindow) >= l.Team.DailyTokenLimit {
-				return ErrTokenBudgetExceeded
-			}
-		}
-		if l.Team.MonthlyTokenLimit > 0 {
-			if tc.getCount(&tc.monthlyCounters, "team:"+s.TeamID, monthWindow) >= l.Team.MonthlyTokenLimit {
-				return ErrTokenBudgetExceeded
-			}
-		}
+		checkScope("team:"+s.TeamID, l.Team)
 	}
+	checkScope("org:"+s.OrgID, l.Org)
 
-	// Check org limits against org usage.
-	if l.Org.DailyTokenLimit > 0 {
-		if tc.getCount(&tc.dailyCounters, "org:"+s.OrgID, dayWindow) >= l.Org.DailyTokenLimit {
-			return ErrTokenBudgetExceeded
-		}
+	if exceeded {
+		return &LimitError{Err: ErrTokenBudgetExceeded, RetryAfter: retry}
 	}
-	if l.Org.MonthlyTokenLimit > 0 {
-		if tc.getCount(&tc.monthlyCounters, "org:"+s.OrgID, monthWindow) >= l.Org.MonthlyTokenLimit {
-			return ErrTokenBudgetExceeded
-		}
-	}
-
 	return nil
 }
 
