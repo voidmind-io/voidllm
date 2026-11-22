@@ -701,8 +701,12 @@ func TestChangePasswordAndRevokeOtherSessions(t *testing.T) {
 	otherUserSession := makeSessionKey(otherUser, "otherU00")
 
 	newHash := "$2a$10$newhashnewhashnewhashnewhashnewhashnewhashnewhashne"
-	if err := d.ChangePasswordAndRevokeOtherSessions(ctx, user.ID, newHash, currentSession.ID); err != nil {
+	revokedHashes, err := d.ChangePasswordAndRevokeOtherSessions(ctx, user.ID, newHash, currentSession.ID)
+	if err != nil {
 		t.Fatalf("ChangePasswordAndRevokeOtherSessions() error = %v", err)
+	}
+	if len(revokedHashes) != 1 || revokedHashes[0] != otherSession.KeyHash {
+		t.Errorf("revoked hashes = %v, want exactly [%s]", revokedHashes, otherSession.KeyHash)
 	}
 
 	// Password hash must be updated in the DB.
@@ -774,7 +778,7 @@ func TestChangePasswordAndRevokeOtherSessions_NotFound(t *testing.T) {
 	session2 := makeSessionKey("nf-sess2")
 
 	const nonExistentUserID = "00000000-0000-0000-0000-000000000000"
-	err := d.ChangePasswordAndRevokeOtherSessions(ctx, nonExistentUserID, "somehash", session1.ID)
+	_, err := d.ChangePasswordAndRevokeOtherSessions(ctx, nonExistentUserID, "somehash", session1.ID)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("ChangePasswordAndRevokeOtherSessions() error = %v, want ErrNotFound", err)
 	}

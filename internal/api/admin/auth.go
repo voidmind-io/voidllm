@@ -169,9 +169,11 @@ func (h *Handler) Login(c fiber.Ctx) error {
 	}
 
 	// Revoke previous session keys for this user so only one session exists.
-	if err := h.DB.RevokeUserSessions(ctx, userID); err != nil {
+	if revoked, err := h.DB.RevokeUserSessions(ctx, userID); err != nil {
 		h.Log.ErrorContext(ctx, "login: revoke old sessions", slog.String("error", err.Error()))
 		// Non-fatal: proceed with login even if cleanup fails.
+	} else {
+		h.evictRevokedSessions(ctx, revoked)
 	}
 
 	key, err := keygen.Generate(keygen.KeyTypeSession)
@@ -333,6 +335,17 @@ func (h *Handler) publishKeyInvalidation(ctx context.Context, keyHash string) {
 	}
 }
 
+// evictRevokedSessions removes the given key hashes from the local key cache
+// and publishes each one on Redis so peer nodes drop them too. Callers pass
+// the hashes returned by the DB revocation methods, so sessions that were only
+// cached on another node are covered.
+func (h *Handler) evictRevokedSessions(ctx context.Context, keyHashes []string) {
+	for _, keyHash := range keyHashes {
+		h.KeyCache.Delete(keyHash)
+		h.publishKeyInvalidation(ctx, keyHash)
+	}
+}
+
 // Logout handles POST /api/v1/auth/logout. When the calling key is a session
 // key it is deleted from the database and evicted from the key cache, so the
 // token is rejected immediately. Any other key type (user, team, service
@@ -357,12 +370,16 @@ func (h *Handler) Logout(c fiber.Ctx) error {
 	}
 
 	ctx := c.Context()
-	if err := h.DB.RevokeSessionKey(ctx, keyInfo.ID); err != nil {
+	hashes, err := h.DB.RevokeSessionKey(ctx, keyInfo.ID)
+	if err != nil {
 		h.Log.ErrorContext(ctx, "logout: revoke session key", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to log out")
 	}
-	h.KeyCache.Delete(keyInfo.Hash)
-	h.publishKeyInvalidation(ctx, keyInfo.Hash)
+	if len(hashes) == 0 {
+		// The row is already gone; still drop the presented token from the cache.
+		hashes = []string{keyInfo.Hash}
+	}
+	h.evictRevokedSessions(ctx, hashes)
 
 	if h.AuditLogger != nil {
 		h.AuditLogger.Log(audit.Event{
@@ -468,7 +485,8 @@ func (h *Handler) ChangeOwnPassword(c fiber.Ctx) error {
 	// Update the password hash and revoke all other sessions atomically.
 	// If either operation fails the transaction rolls back, leaving the DB
 	// consistent: neither the password nor the session list is partially updated.
-	if err := h.DB.ChangePasswordAndRevokeOtherSessions(ctx, keyInfo.UserID, newHashStr, keyInfo.ID); err != nil {
+	revoked, err := h.DB.ChangePasswordAndRevokeOtherSessions(ctx, keyInfo.UserID, newHashStr, keyInfo.ID)
+	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "user not found")
 		}
@@ -476,25 +494,9 @@ func (h *Handler) ChangeOwnPassword(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update password")
 	}
 
-	// Evict the user's other session keys from the in-memory key cache so that
-	// revoked sessions are rejected immediately without waiting for the next
-	// periodic cache refresh. Only session keys are evicted: the DB revocation
-	// above deletes only session_key rows, so long-lived user, team and service
-	// account keys carrying this UserID must stay authenticated.
-	// Collect hashes first — Range holds a read lock, so Delete (write lock)
-	// must not be called inside the Range closure.
-	var toEvict []string
-	currentKeyID := keyInfo.ID
-	h.KeyCache.Range(func(keyHash string, ki auth.KeyInfo) bool {
-		if ki.UserID == keyInfo.UserID && ki.KeyType == keygen.KeyTypeSession && ki.ID != currentKeyID {
-			toEvict = append(toEvict, keyHash)
-		}
-		return true
-	})
-	for _, keyHash := range toEvict {
-		h.KeyCache.Delete(keyHash)
-		h.publishKeyInvalidation(ctx, keyHash)
-	}
+	// Evict exactly the sessions the DB revoked, locally and on peers, so they
+	// are rejected immediately even if they were only cached on another node.
+	h.evictRevokedSessions(ctx, revoked)
 
 	if h.AuditLogger != nil {
 		h.AuditLogger.Log(audit.Event{

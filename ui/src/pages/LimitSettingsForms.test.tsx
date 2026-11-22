@@ -49,6 +49,7 @@ const ME = {
 
 let patchBodies: Record<string, unknown>[] = []
 let serverLimits: typeof LIMITS = { ...LIMITS }
+let patchOverride: Partial<typeof LIMITS> = {}
 
 function json(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -60,13 +61,14 @@ function json(body: unknown): Response {
 beforeEach(() => {
   patchBodies = []
   serverLimits = { ...LIMITS }
+  patchOverride = {}
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string, init?: RequestInit) => {
       if (init?.method === 'PATCH') {
         const body = JSON.parse(String(init.body)) as Record<string, unknown>
         patchBodies.push(body)
-        return json(url.includes('/teams/') ? { ...TEAM, ...serverLimits, ...body } : { ...ORG, ...serverLimits, ...body })
+        return json(url.includes('/teams/') ? { ...TEAM, ...serverLimits, ...body, ...patchOverride } : { ...ORG, ...serverLimits, ...body, ...patchOverride })
       }
       if (url.includes('/teams/')) return json({ ...TEAM, ...serverLimits })
       if (url.endsWith('/orgs/org-1')) return json({ ...ORG, ...serverLimits })
@@ -172,5 +174,18 @@ describe.each(FORMS)('$name limit fields', ({ render: mount, queryKey, entity })
     await user.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(patchBodies).toHaveLength(1))
     expect(patchBodies[0]).toEqual({ name: 'Renamed' })
+  })
+
+  it('adopts the server-returned values after save and is not dirty', async () => {
+    const { user } = await setup()
+    const input = screen.getByLabelText('Daily Token Limit')
+    await user.clear(input)
+    await user.type(input, '12345')
+    patchOverride = { daily_token_limit: 777 }
+    await user.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(patchBodies).toHaveLength(1))
+    expect(patchBodies[0]).toEqual({ daily_token_limit: 12345 })
+    await waitFor(() => expect(input).toHaveValue('777'))
+    expect(screen.getByRole('button', { name: /save changes/i })).toBeDisabled()
   })
 })

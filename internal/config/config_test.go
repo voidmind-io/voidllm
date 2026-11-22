@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2164,6 +2165,11 @@ func TestLoad_FileWithoutDatabaseIgnoresEnvDSN(t *testing.T) {
 	t.Setenv("VOIDLLM_DATABASE_DSN", "env.db")
 	t.Setenv("VOIDLLM_DATABASE_DRIVER", "sqlite")
 
+	var logBuf strings.Builder
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
 	path := writeTemp(t, "voidllm.yaml", "server:\n  proxy:\n    port: 8080\nsettings:\n  usage:\n    buffer_size: 100\n")
 	cfg, _, err := config.Load(path)
 	if err != nil {
@@ -2171,6 +2177,15 @@ func TestLoad_FileWithoutDatabaseIgnoresEnvDSN(t *testing.T) {
 	}
 	if cfg.Database.DSN == "env.db" {
 		t.Errorf("DSN = %q: VOIDLLM_DATABASE_DSN must not apply in the file path", cfg.Database.DSN)
+	}
+	logs := logBuf.String()
+	for _, want := range []string{"level=WARN", "VOIDLLM_DATABASE_DSN", "VOIDLLM_DATABASE_DRIVER", "database.dsn: ${VOIDLLM_DATABASE_DSN}"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("log output lacks %q:\n%s", want, logs)
+		}
+	}
+	if strings.Contains(logs, "env.db") {
+		t.Errorf("log output leaks the env value:\n%s", logs)
 	}
 }
 

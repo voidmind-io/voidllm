@@ -114,8 +114,9 @@ function TeamSettingsForm({ team, orgId, canEdit }: TeamSettingsFormProps) {
 
     updateTeam.mutate(params,
       {
-        onSuccess: () => {
-          setBase((prev) => ({ ...prev, ...params }))
+        onSuccess: (updated) => {
+          setBase(updated)
+          setForm(formFromTeam(updated))
           toast({ variant: 'success', message: 'Team settings saved' })
         },
         onError: (err) => {

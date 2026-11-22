@@ -110,8 +110,9 @@ function OrgSettingsForm({ org }: OrgSettingsFormProps) {
     if (requestsPerDay.value !== base.requests_per_day) params.requests_per_day = requestsPerDay.value
 
     updateOrg.mutate(params, {
-      onSuccess: () => {
-        setBase((prev) => ({ ...prev, ...params }))
+      onSuccess: (updated) => {
+        setBase(updated)
+        setForm(formFromOrg(updated))
         toast({ variant: 'success', message: 'Settings saved' })
       },
       onError: (err) => {

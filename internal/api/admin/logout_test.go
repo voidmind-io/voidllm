@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 
@@ -184,5 +185,84 @@ func TestChangeOwnPassword_RevokesOtherSessionsWithAccessRows(t *testing.T) {
 	}
 	if got := doGet(t, app, "/api/v1/me", token); got != fiber.StatusOK {
 		t.Errorf("current session /me = %d, want 200", got)
+	}
+	models, err := database.GetKeyModelAccess(ctx, otherKI.ID)
+	if err != nil {
+		t.Fatalf("GetKeyModelAccess: %v", err)
+	}
+	if len(models) != 0 {
+		t.Errorf("access rows of revoked session left: %v", models)
+	}
+}
+
+// createUncachedSession inserts a session key into the DB only. The returned
+// hash is what a peer node would have cached.
+func createUncachedSession(t *testing.T, database *db.DB, orgID, userID string) (token, hash string) {
+	t.Helper()
+	token, err := keygen.Generate(keygen.KeyTypeSession)
+	if err != nil {
+		t.Fatalf("keygen.Generate: %v", err)
+	}
+	hash = keygen.Hash(token, testHMACSecret)
+	exp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if _, err := database.CreateAPIKey(context.Background(), db.CreateAPIKeyParams{
+		KeyHash: hash, KeyHint: keygen.Hint(token), KeyType: keygen.KeyTypeSession,
+		Name: "peer session", OrgID: orgID, UserID: &userID, ExpiresAt: &exp, CreatedBy: userID,
+	}); err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+	return token, hash
+}
+
+// TestSessionRevocation_UsesDBHashes proves eviction follows the hashes the DB
+// revoked and not a scan of the local cache: the cached entry deliberately
+// carries no user ID, and one revoked session was never cached locally.
+func TestSessionRevocation_UsesDBHashes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		revoke func(t *testing.T, app *fiber.App, email, token string)
+	}{
+		{"change password", func(t *testing.T, app *fiber.App, email, token string) {
+			if status, msg := doChangePassword(t, app, token, "hunter2batteries", "correct-horse-staple"); status != fiber.StatusOK {
+				t.Fatalf("change password = %d (%s)", status, msg)
+			}
+		}},
+		{"login", func(t *testing.T, app *fiber.App, email, _ string) {
+			doLogin(t, app, email, "hunter2batteries")
+		}},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			email := "revoke-hashes-" + string(rune('a'+i)) + "@example.com"
+			app, database, keyCache := setupTestApp(t, "file:TestSessionRevocation_"+string(rune('a'+i))+"?mode=memory&cache=private")
+			user := setupLocalUser(t, database, "revoke-hashes-org-"+string(rune('a'+i)), email, "Rev User", "hunter2batteries")
+			_, orgID, err := database.ResolveUserRole(context.Background(), user.ID)
+			if err != nil {
+				t.Fatalf("ResolveUserRole: %v", err)
+			}
+			current := doLogin(t, app, email, "hunter2batteries")
+
+			_, uncachedHash := createUncachedSession(t, database, orgID, user.ID)
+			_, oddHash := createUncachedSession(t, database, orgID, user.ID)
+			keyCache.Set(oddHash, auth.KeyInfo{ID: "ghost", KeyType: keygen.KeyTypeSession})
+			keyCache.Set(uncachedHash, auth.KeyInfo{ID: "ghost2", KeyType: keygen.KeyTypeSession})
+			keyCache.Delete(uncachedHash) // simulate a session only cached on a peer
+
+			tc.revoke(t, app, email, current)
+
+			if _, ok := keyCache.Get(oddHash); ok {
+				t.Error("revoked session with unrelated cache entry was not evicted by hash")
+			}
+			var n int
+			if err := database.SQL().QueryRowContext(context.Background(),
+				"SELECT COUNT(*) FROM api_keys WHERE key_hash IN (?, ?)", oddHash, uncachedHash).Scan(&n); err != nil {
+				t.Fatalf("count: %v", err)
+			}
+			if n != 0 {
+				t.Errorf("%d revoked sessions still in DB", n)
+			}
+		})
 	}
 }

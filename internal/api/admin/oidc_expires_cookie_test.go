@@ -24,6 +24,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/license"
 	"github.com/voidmind-io/voidllm/internal/sso"
+	"github.com/voidmind-io/voidllm/pkg/keygen"
 )
 
 // newMockIdP starts an OIDC identity provider that issues one RS256 ID token
@@ -117,13 +118,36 @@ func TestOIDCCallback_SetsExpiresAtCookie(t *testing.T) {
 	app := fiber.New()
 	admin.RegisterRoutes(app, handler, keyCache, testHMACSecret, nil)
 
-	req := httptest.NewRequest("GET", "/api/v1/auth/oidc/callback?code=abc&state="+state, nil)
-	req.Header.Set("Cookie", "voidllm_oidc_state="+state+"|"+nonce)
-	resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
-	if err != nil {
-		t.Fatalf("callback: %v", err)
+	callback := func() *http.Response {
+		req := httptest.NewRequest("GET", "/api/v1/auth/oidc/callback?code=abc&state="+state, nil)
+		req.Header.Set("Cookie", "voidllm_oidc_state="+state+"|"+nonce)
+		r, callErr := app.Test(req, fiber.TestConfig{Timeout: testTimeout})
+		if callErr != nil {
+			t.Fatalf("callback: %v", callErr)
+		}
+		return r
 	}
+
+	first := callback()
+	first.Body.Close()
+	var firstToken string
+	for _, ck := range first.Cookies() {
+		if ck.Name == "voidllm_oidc_token" {
+			firstToken = ck.Value
+		}
+	}
+	firstHash := keygen.Hash(firstToken, testHMACSecret)
+	if _, ok := keyCache.Get(firstHash); !ok {
+		t.Fatal("first SSO session not cached")
+	}
+
+	resp := callback()
 	defer resp.Body.Close()
+
+	// The second callback must revoke and evict the first session.
+	if _, ok := keyCache.Get(firstHash); ok {
+		t.Error("previous SSO session still cached after a new callback")
+	}
 
 	if loc := resp.Header.Get("Location"); loc != "/auth/callback" {
 		t.Fatalf("redirect = %q, want /auth/callback", loc)

@@ -322,9 +322,11 @@ func (h *Handler) OIDCCallback(c fiber.Ctx) error {
 	}
 
 	// Step 10: Revoke existing sessions.
-	if err := h.DB.RevokeUserSessions(ctx, user.ID); err != nil {
+	if revoked, err := h.DB.RevokeUserSessions(ctx, user.ID); err != nil {
 		h.Log.ErrorContext(ctx, "oidc callback: revoke old sessions", slog.String("error", err.Error()))
 		// Non-fatal: proceed even if cleanup fails.
+	} else {
+		h.evictRevokedSessions(ctx, revoked)
 	}
 
 	// Step 11: Generate a new session key valid for 24 hours.

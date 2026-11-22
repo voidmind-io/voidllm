@@ -826,6 +826,7 @@ func Load(path string) (*Config, bool, error) {
 	}
 
 	applyEnvFallbacks(&cfg)
+	warnIgnoredDatabaseEnv(&cfg)
 	cfg.setDefaults()
 
 	// If license_file is set and the inline license key is empty, read the
@@ -893,6 +894,23 @@ func applyEnvFallbacks(cfg *Config) {
 	if cfg.Settings.LicenseFile == "" {
 		fill(&cfg.Settings.License, "VOIDLLM_LICENSE", "settings.license")
 	}
+}
+
+// warnIgnoredDatabaseEnv logs a warning when the YAML leaves the database DSN
+// or driver empty while the matching VOIDLLM_DATABASE_* variable is set. The
+// variables are deliberately not applied with a config file; the warning tells
+// the operator how to opt in. Values are never logged.
+func warnIgnoredDatabaseEnv(cfg *Config) {
+	ignored := func(configured, env, setting string) {
+		if configured == "" && os.Getenv(env) != "" {
+			slog.Warn("config: environment variable ignored when a config file is used; reference it in the YAML instead",
+				slog.String("env", env),
+				slog.String("hint", setting+": ${"+env+"}"),
+			)
+		}
+	}
+	ignored(cfg.Database.DSN, "VOIDLLM_DATABASE_DSN", "database.dsn")
+	ignored(cfg.Database.Driver, "VOIDLLM_DATABASE_DRIVER", "database.driver")
 }
 
 // loadDefaults returns a Config populated entirely from environment
