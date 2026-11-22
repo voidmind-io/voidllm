@@ -1,6 +1,6 @@
 ---
 title: "Coding Agents for Teams"
-description: "Give every developer their own VoidLLM key, put budgets and rate limits on the team, and see which coding tools work through the proxy today."
+description: "Give every developer their own VoidLLM key, put budgets and rate limits on the team, and connect Claude Code, Codex CLI and other coding tools through the proxy."
 section: guides
 order: 1
 ---
@@ -10,26 +10,66 @@ How to run AI coding tools for a team through VoidLLM: one key per developer, on
 
 ## What works today
 
-VoidLLM serves the OpenAI-compatible API (`/v1/chat/completions` and the other endpoints listed in the [API reference](../api/overview.md)). It does not serve the Anthropic Messages API (`/v1/messages`) or the OpenAI Responses API (`/v1/responses`). Requests to those paths are rejected with `400 unsupported API endpoint`. That check comes after authentication, the body size and `model` field checks, rate and token limits, and model resolution, so a request with a bad key, no `model`, an over-limit key or an unknown model gets that error instead.
+VoidLLM serves three API formats on `/v1`:
 
-That decides which tools can use it as their LLM endpoint. This table only lists what was run on 2026-11-22 against a local VoidLLM build of `main` at commit `a8a93d9`, not what should work in theory:
+- the OpenAI-compatible API (`/v1/chat/completions` and the other endpoints listed in the [API reference](../api/overview.md)), for every provider,
+- the Anthropic Messages API (`POST /v1/messages`, `POST /v1/messages/count_tokens`), forwarded natively to models with `provider: anthropic`,
+- the OpenAI Responses API (`POST /v1/responses`), forwarded natively to models with `provider: openai`, `custom`, `vllm` or `ollama`.
+
+The native endpoints are what Claude Code and Codex CLI use. A request to a native endpoint for a model whose provider does not support it is rejected with `400 endpoint not supported for this model`. Details are in the [API reference](../api/overview.md#native-endpoints).
+
+This table only lists what was run on 2026-11-22 against a local VoidLLM build, not what should work in theory:
 
 | Client | Version | Result |
 |---|---|---|
 | `curl`, OpenAI model (`/v1/chat/completions`) | - | Works |
 | `curl`, Anthropic model (`/v1/chat/completions`, translated to the Messages API) | - | Works |
-| `curl`, `POST /v1/messages` | - | `400 unsupported API endpoint` |
-| `curl`, `POST /v1/responses` | - | `400 unsupported API endpoint` |
-| Claude Code, `ANTHROPIC_BASE_URL` pointed at VoidLLM | 2.1.330 | `API Error: 400 unsupported API endpoint` |
+| `curl`, Anthropic model, `POST /v1/messages` with streaming | - | Works |
+| Claude Code, `ANTHROPIC_BASE_URL` pointed at VoidLLM | 2.1.330 | Works |
+| Claude Code, key with exhausted token budget | 2.1.330 | Stops at once: `API Error: Request rejected (429) · token budget exceeded` |
 | Claude Code, VoidLLM as MCP server (`claude mcp list`) | 2.1.330 | Connected |
-| Codex CLI, custom provider pointed at VoidLLM | 0.169.1 | `400 unsupported API endpoint` |
+| Codex CLI, custom provider pointed at VoidLLM | 0.169.1 | Works |
+| Codex CLI, key with exhausted token budget | 0.169.1 | Stops at once: `ERROR: Quota exceeded. Check your plan and billing details.` |
 | Cursor | - | Not tested |
 | Windsurf | - | Not tested |
 
-Why the two CLI tools fail:
+### Claude Code
 
-- Claude Code sends requests to `/v1/messages` when `ANTHROPIC_BASE_URL` is set. Anthropic documents this in its [gateway compatibility guide](https://code.claude.com/docs/en/llm-gateway-protocol.md): a gateway must expose the Anthropic Messages format, and forward `anthropic-version` and `anthropic-beta` unchanged.
-- Codex CLI documents `wire_api = "responses"` as the only supported value for a custom provider, see the [Codex configuration reference](https://developers.openai.com/codex/config-reference).
+Claude Code sends its requests to `/v1/messages` under `ANTHROPIC_BASE_URL` (see Anthropic's [gateway compatibility guide](https://code.claude.com/docs/en/llm-gateway-protocol.md)). Set the base URL to the VoidLLM root, without `/v1`, and the credential to a VoidLLM key:
+
+```bash
+export ANTHROPIC_BASE_URL=https://voidllm.example.com
+export ANTHROPIC_AUTH_TOKEN=vl_uk_...   # sent as Authorization: Bearer
+# or
+export ANTHROPIC_API_KEY=vl_uk_...      # sent as x-api-key
+```
+
+Claude Code sends Anthropic model IDs, so the models it asks for must exist in VoidLLM with `provider: anthropic`, either under that exact name or as an alias. That is the main model and, for background tasks, possibly the default Haiku model: Anthropic's guide says that behind `ANTHROPIC_BASE_URL` background tasks use the main model, or the default Haiku model when `ANTHROPIC_API_KEY` is set and `ANTHROPIC_AUTH_TOKEN` is not. To pin the models to names you have configured, set `ANTHROPIC_MODEL` (or use `--model`) and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, see the [Claude Code model configuration](https://code.claude.com/docs/en/model-config.md).
+
+`/v1/messages/count_tokens` is served too, so `/context` shows exact counts. It creates no usage record.
+
+Anthropic's guide asks gateways to forward `anthropic-beta` verbatim. VoidLLM forwards it only when it is a comma-separated list of lowercase letters, digits and hyphens, without spaces and at most 512 bytes; otherwise the header is dropped. See [Which headers reach the provider](#which-headers-reach-the-provider).
+
+### Codex CLI
+
+Codex CLI uses the Responses API for a custom provider (`wire_api = "responses"`, see the [Codex configuration reference](https://developers.openai.com/codex/config-reference)). In `~/.codex/config.toml`:
+
+```toml
+model = "your-model"          # a VoidLLM model name or alias
+model_provider = "voidllm"
+
+[model_providers.voidllm]
+name = "VoidLLM"
+base_url = "https://voidllm.example.com/v1"
+env_key = "VOIDLLM_API_KEY"
+wire_api = "responses"
+```
+
+Then `export VOIDLLM_API_KEY=vl_uk_...`. The model must be a VoidLLM model (or alias) with `provider: openai`, `custom`, `vllm` or `ollama`, and the upstream must implement `/responses`. VoidLLM proxies the Responses API statelessly: it sets `store: false` when the request does not set `store`, and rejects `previous_response_id`, `conversation` and `background: true`.
+
+### When a budget runs out
+
+When a key's daily or monthly token budget (or one inherited from its team, membership or org) is used up, VoidLLM answers `429` with `x-should-retry: false` and `Retry-After` set to the seconds until the budget resets (next midnight UTC for a daily budget, the 1st of the next month UTC for a monthly one). On `/v1/responses` the error also carries `type: insufficient_quota`. Both CLIs then stop with the error instead of retrying, as in the table above. A request rate limit (`requests_per_minute`, `requests_per_day`) also sets `Retry-After`, but not `x-should-retry`.
 
 Cursor documents that requests made with your own API key are routed through Cursor's servers ([bring your own API key](https://cursor.com/help/models-and-usage/api-keys.md)). The current Cursor docs list OpenAI, Anthropic, Google, Azure and AWS Bedrock keys and do not describe a custom base URL. We did not test Cursor against VoidLLM, so check that your Cursor version has the setting before you plan around it.
 
@@ -170,7 +210,7 @@ export OPENAI_BASE_URL=https://voidllm.example.com/v1
 export OPENAI_API_KEY=vl_uk_...
 ```
 
-Many tools read these two variables, others have the same two fields in their settings. Use an alias or model name from `GET /v1/models` as the model.
+Many tools read these two variables, others have the same two fields in their settings. Use an alias or model name from `GET /v1/models` as the model. For Claude Code and Codex CLI, see [Claude Code](#claude-code) and [Codex CLI](#codex-cli) above.
 
 ## What the limits look like in practice
 
@@ -186,11 +226,14 @@ Budgets are in tokens and requests, not currency. Cost figures in the usage view
 
 ## Which headers reach the provider
 
-VoidLLM does not pass client headers through. For the requests it forwards, it copies only four allowlisted headers from the client: `Content-Type`, `Accept`, `Accept-Language` and `X-Request-ID`. The client's `Authorization` header is not forwarded. The provider's own authentication is set from the model config, and `User-Agent` is set to `VoidLLM/0.1`. The request body is held in memory and may be rewritten (model alias to model name), translated for providers such as Anthropic, or anonymized if you enable [PII anonymization](../security/pii.md). It is never written to disk.
+VoidLLM does not pass client headers through. For the requests it forwards, it copies only four allowlisted headers from the client: `Content-Type`, `Accept`, `Accept-Language` and `X-Request-ID`, plus the version and beta headers of the native endpoints described below. The client's `Authorization` and `x-api-key` headers are not forwarded. The provider's own authentication is set from the model config, and `User-Agent` is set to `VoidLLM/0.1`. The request body is held in memory and may be rewritten (model alias to model name), translated for providers such as Anthropic, or anonymized if you enable [PII anonymization](../security/pii.md). It is never written to disk.
 
-For models with `provider: anthropic`, the request goes to `/v1/messages` with the upstream key in `x-api-key` and `anthropic-version: 2023-06-01`. A client-supplied `anthropic-version` or `anthropic-beta` header is not forwarded. This is what the code does. We also checked it against a local test upstream at commit `a8a93d9`: the upstream saw `anthropic-version: 2023-06-01`, the copied `X-Request-ID`, and no `anthropic-beta` or custom headers.
+On the native endpoints the body is forwarded as sent, apart from the model name and, on `/v1/responses`, the `store: false` default. It is not translated, and it is not anonymized (see [PII filtering](../api/overview.md#pii-filtering-on-native-endpoints)).
 
-This is one more reason Claude Code cannot go through VoidLLM today: Anthropic's guide says a gateway must forward `anthropic-beta` unchanged.
+- **`/v1/messages` and `/v1/messages/count_tokens`:** the upstream key goes in `x-api-key`. The client's `anthropic-version` is forwarded when it has the form `YYYY-MM-DD`, otherwise `2023-06-01` is sent. The client's `anthropic-beta` is forwarded when it is a comma-separated list of lowercase letters, digits and hyphens, without spaces and at most 512 bytes; otherwise it is dropped.
+- **`/v1/responses`:** the upstream key goes in `Authorization: Bearer`. The client's `OpenAI-Beta` is forwarded when it is a comma-separated list of lowercase letters, digits and `-`, `_`, `.`, `=`, at most 512 bytes; otherwise it is dropped.
+
+For `/v1/chat/completions` on a model with `provider: anthropic`, the request is translated and sent to `/v1/messages` with the upstream key in `x-api-key` and `anthropic-version: 2023-06-01`. A client-supplied `anthropic-version` or `anthropic-beta` header is not forwarded on that path. We checked this against a local test upstream at commit `a8a93d9`: the upstream saw `anthropic-version: 2023-06-01`, the copied `X-Request-ID`, and no `anthropic-beta` or custom headers.
 
 ## Usage per developer
 
@@ -205,7 +248,7 @@ Each row has the group label (the developer's display name), request count, prom
 
 ## Claude Code as MCP client
 
-Claude Code can use VoidLLM as an [MCP server](../mcp/ide-integration.md), which gives it the management tools and any MCP servers you register. That does not route its LLM requests through VoidLLM.
+Claude Code can use VoidLLM as an [MCP server](../mcp/ide-integration.md), which gives it the management tools and any MCP servers you register. This is independent of routing its LLM requests through VoidLLM (see [Claude Code](#claude-code) above); you can use either or both.
 
 Current Claude Code requires a `type` on remote servers, a `url` entry without it is skipped. Share this `.mcp.json` in a repository:
 

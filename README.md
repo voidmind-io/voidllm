@@ -131,6 +131,7 @@ Any OpenAI-compatible SDK works out of the box - just change the base URL to you
 | Feature | Details |
 |---|---|
 | OpenAI-compatible proxy | `/v1/chat/completions`, embeddings, rerank, score, images, audio, streaming |
+| Native APIs for coding agents | `/v1/messages` (Anthropic, for Claude Code) and `/v1/responses` (OpenAI-compatible, for Codex CLI), forwarded without translation |
 | Multi-provider routing | OpenAI, Anthropic, Azure, Gemini, Vertex AI, AWS Bedrock, Ollama, vLLM, any custom endpoint |
 | Load balancing | Round-robin, least-latency, weighted, priority across deployments |
 | Automatic failover | Retry on 5xx/timeout, circuit breakers, health-aware routing |
