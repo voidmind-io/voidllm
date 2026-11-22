@@ -45,10 +45,12 @@ export interface AuditLogParams {
   frozenWindow?: AuditWindow | null
   limit: number
   cursor: string
+  /** Extra gate (e.g. license feature); the query also requires an orgId. */
+  enabled?: boolean
 }
 
 export function useAuditLog(params: AuditLogParams) {
-  const { orgId, resourceType, action, range, frozenWindow, limit, cursor } = params
+  const { orgId, resourceType, action, range, frozenWindow, limit, cursor, enabled = true } = params
   const pinned = cursor && frozenWindow ? frozenWindow : null
 
   return useQuery({
@@ -66,7 +68,7 @@ export function useAuditLog(params: AuditLogParams) {
       const res = await apiClient<AuditLogResponse>(`/audit-logs?${query.toString()}`)
       return { ...res, window }
     },
-    enabled: !!orgId,
+    enabled: enabled && !!orgId,
     staleTime: cursor ? 30_000 : 0,
     refetchInterval: cursor ? false : 60_000,
   })

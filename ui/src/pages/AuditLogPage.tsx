@@ -218,6 +218,7 @@ export default function AuditLogPage() {
     frozenWindow: pageWindow,
     limit: pageSize,
     cursor: currentCursor,
+    enabled: !!license && license.features.includes('audit_logs'),
   })
 
   if (license && !license.features.includes('audit_logs')) {
