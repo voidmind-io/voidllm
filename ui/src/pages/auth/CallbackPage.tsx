@@ -9,9 +9,11 @@ function getCookie(name: string): string | null {
 export default function CallbackPage() {
   useEffect(() => {
     const token = getCookie('voidllm_oidc_token')
+    const expiresAt = getCookie('voidllm_oidc_expires_at')
     if (token) {
-      storeSession(token)
+      storeSession(token, expiresAt ?? undefined)
       document.cookie = 'voidllm_oidc_token=; path=/auth/callback; max-age=0'
+      document.cookie = 'voidllm_oidc_expires_at=; path=/auth/callback; max-age=0'
       window.location.href = '/'
     } else {
       window.location.href = '/login?error=sso_error'

@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
+	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 	"github.com/voidmind-io/voidllm/pkg/keygen"
 )
 
@@ -317,6 +319,20 @@ type changeOwnPasswordRequest struct {
 	NewPassword     string `json:"new_password"`
 }
 
+// publishKeyInvalidation tells peer nodes over Redis to drop the given key
+// hash from their caches. It is a no-op when Redis is not configured, and a
+// publish failure is logged rather than returned.
+func (h *Handler) publishKeyInvalidation(ctx context.Context, keyHash string) {
+	if h.Redis == nil {
+		return
+	}
+	if err := h.Redis.PublishInvalidation(ctx, voidredis.ChannelKeys, keyHash); err != nil {
+		h.Log.LogAttrs(ctx, slog.LevelWarn, "redis: publish key invalidation failed",
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
 // Logout handles POST /api/v1/auth/logout. When the calling key is a session
 // key it is deleted from the database and evicted from the key cache, so the
 // token is rejected immediately. Any other key type (user, team, service
@@ -346,6 +362,7 @@ func (h *Handler) Logout(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to log out")
 	}
 	h.KeyCache.Delete(keyInfo.Hash)
+	h.publishKeyInvalidation(ctx, keyInfo.Hash)
 
 	if h.AuditLogger != nil {
 		h.AuditLogger.Log(audit.Event{
@@ -476,6 +493,7 @@ func (h *Handler) ChangeOwnPassword(c fiber.Ctx) error {
 	})
 	for _, keyHash := range toEvict {
 		h.KeyCache.Delete(keyHash)
+		h.publishKeyInvalidation(ctx, keyHash)
 	}
 
 	if h.AuditLogger != nil {

@@ -46,12 +46,14 @@ docker run -d --name voidllm \
   ghcr.io/voidmind-io/voidllm:latest
 ```
 
-The admin key, encryption key, license and database settings are read from the
-YAML file first. When one of `settings.admin_key`, `settings.encryption_key`,
-`settings.license`, `database.dsn` or `database.driver` is missing or empty, the
-matching environment variable (`VOIDLLM_ADMIN_KEY`, `VOIDLLM_ENCRYPTION_KEY`,
-`VOIDLLM_LICENSE`, `VOIDLLM_DATABASE_DSN`, `VOIDLLM_DATABASE_DRIVER`) is used
-instead. A value set in the YAML always wins over the environment.
+When `settings.admin_key`, `settings.encryption_key` or `settings.license` is
+missing or empty in the YAML, the matching environment variable
+(`VOIDLLM_ADMIN_KEY`, `VOIDLLM_ENCRYPTION_KEY`, `VOIDLLM_LICENSE`) is used
+instead, and one log line names each setting filled this way. A value set in
+the YAML always wins, and `VOIDLLM_LICENSE` is ignored when `settings.license_file`
+is set. The database is not read from the environment when you use a config
+file: set `database.dsn` and `database.driver` in the YAML, or reference
+`${VOIDLLM_DATABASE_DSN}` there.
 
 See [Configuration Reference](../configuration.md) for all YAML options.
 

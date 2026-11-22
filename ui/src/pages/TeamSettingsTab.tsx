@@ -47,6 +47,9 @@ function TeamSettingsForm({ team, orgId, canEdit }: TeamSettingsFormProps) {
   const { toast } = useToast()
 
   const [form, setForm] = useState<FormState>(() => formFromTeam(team))
+  // Snapshot of the values the user saw; changes are computed against it so a
+  // background refetch cannot cause untouched fields to overwrite newer values.
+  const [base, setBase] = useState<TeamResponse>(team)
   const [nameError, setNameError] = useState<string | undefined>()
   const [slugError, setSlugError] = useState<string | undefined>()
 
@@ -63,12 +66,12 @@ function TeamSettingsForm({ team, orgId, canEdit }: TeamSettingsFormProps) {
   )
 
   const isDirty =
-    form.name !== team.name ||
-    form.slug !== team.slug ||
-    dailyTokenLimit.value !== team.daily_token_limit ||
-    monthlyTokenLimit.value !== team.monthly_token_limit ||
-    requestsPerMinute.value !== team.requests_per_minute ||
-    requestsPerDay.value !== team.requests_per_day
+    form.name !== base.name ||
+    form.slug !== base.slug ||
+    dailyTokenLimit.value !== base.daily_token_limit ||
+    monthlyTokenLimit.value !== base.monthly_token_limit ||
+    requestsPerMinute.value !== base.requests_per_minute ||
+    requestsPerDay.value !== base.requests_per_day
 
   function patch(field: keyof FormState) {
     return (e: React.ChangeEvent<HTMLInputElement>) =>
@@ -102,16 +105,17 @@ function TeamSettingsForm({ team, orgId, canEdit }: TeamSettingsFormProps) {
     const params: Partial<CreateTeamParams> = {}
     const name = form.name.trim()
     const slug = form.slug.trim()
-    if (name !== team.name) params.name = name
-    if (slug !== team.slug) params.slug = slug
-    if (dailyTokenLimit.value !== team.daily_token_limit) params.daily_token_limit = dailyTokenLimit.value
-    if (monthlyTokenLimit.value !== team.monthly_token_limit) params.monthly_token_limit = monthlyTokenLimit.value
-    if (requestsPerMinute.value !== team.requests_per_minute) params.requests_per_minute = requestsPerMinute.value
-    if (requestsPerDay.value !== team.requests_per_day) params.requests_per_day = requestsPerDay.value
+    if (name !== base.name) params.name = name
+    if (slug !== base.slug) params.slug = slug
+    if (dailyTokenLimit.value !== base.daily_token_limit) params.daily_token_limit = dailyTokenLimit.value
+    if (monthlyTokenLimit.value !== base.monthly_token_limit) params.monthly_token_limit = monthlyTokenLimit.value
+    if (requestsPerMinute.value !== base.requests_per_minute) params.requests_per_minute = requestsPerMinute.value
+    if (requestsPerDay.value !== base.requests_per_day) params.requests_per_day = requestsPerDay.value
 
     updateTeam.mutate(params,
       {
         onSuccess: () => {
+          setBase((prev) => ({ ...prev, ...params }))
           toast({ variant: 'success', message: 'Team settings saved' })
         },
         onError: (err) => {

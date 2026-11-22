@@ -48,6 +48,7 @@ const ME = {
 }
 
 let patchBodies: Record<string, unknown>[] = []
+let serverLimits: typeof LIMITS = { ...LIMITS }
 
 function json(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -58,16 +59,17 @@ function json(body: unknown): Response {
 
 beforeEach(() => {
   patchBodies = []
+  serverLimits = { ...LIMITS }
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string, init?: RequestInit) => {
       if (init?.method === 'PATCH') {
         const body = JSON.parse(String(init.body)) as Record<string, unknown>
         patchBodies.push(body)
-        return json(url.includes('/teams/') ? { ...TEAM, ...body } : { ...ORG, ...body })
+        return json(url.includes('/teams/') ? { ...TEAM, ...serverLimits, ...body } : { ...ORG, ...serverLimits, ...body })
       }
-      if (url.includes('/teams/')) return json(TEAM)
-      if (url.endsWith('/orgs/org-1')) return json(ORG)
+      if (url.includes('/teams/')) return json({ ...TEAM, ...serverLimits })
+      if (url.endsWith('/orgs/org-1')) return json({ ...ORG, ...serverLimits })
       return json(ME)
     }),
   )
@@ -77,7 +79,7 @@ function renderAt(ui: React.ReactElement, path: string, routePath: string) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
-  return render(
+  const utils = render(
     <QueryClientProvider client={queryClient}>
       <ToastProvider>
         <MemoryRouter initialEntries={[path]}>
@@ -88,26 +90,31 @@ function renderAt(ui: React.ReactElement, path: string, routePath: string) {
       </ToastProvider>
     </QueryClientProvider>,
   )
+  return { queryClient, ...utils }
 }
 
-const FORMS: { name: string; render: () => void }[] = [
-  { name: 'SettingsPage', render: () => renderAt(<SettingsPage />, '/org/settings', '/org/settings') },
+const FORMS: { name: string; queryKey: unknown[]; entity: object; render: () => { queryClient: QueryClient } }[] = [
+  { name: 'SettingsPage', queryKey: ['org', 'org-1'], entity: ORG, render: () => renderAt(<SettingsPage />, '/org/settings', '/org/settings') },
   {
     name: 'OrgDetailSettingsTab',
+    queryKey: ['org', 'org-1'],
+    entity: ORG,
     render: () => renderAt(<OrgDetailSettingsTab />, '/orgs/org-1/settings', '/orgs/:orgId/settings'),
   },
   {
     name: 'TeamSettingsTab',
+    queryKey: ['teams', 'org-1', 'detail', 'team-1'],
+    entity: TEAM,
     render: () => renderAt(<TeamSettingsTab />, '/teams/team-1/settings', '/teams/:teamId/settings'),
   },
 ]
 
-describe.each(FORMS)('$name limit fields', ({ render: mount }) => {
+describe.each(FORMS)('$name limit fields', ({ render: mount, queryKey, entity }) => {
   async function setup() {
-    mount()
+    const { queryClient } = mount()
     const input = (await screen.findByLabelText('Daily Token Limit')) as HTMLInputElement
     const save = screen.getByRole('button', { name: /save changes/i })
-    return { input, save, user: userEvent.setup() }
+    return { input, save, queryClient, user: userEvent.setup() }
   }
 
   it.each(['-5', 'abc', '1e6', '9007199254740992'])(
@@ -141,5 +148,29 @@ describe.each(FORMS)('$name limit fields', ({ render: mount }) => {
     await user.click(save)
     await waitFor(() => expect(patchBodies).toHaveLength(1))
     expect(patchBodies[0]).toEqual({ daily_token_limit: 12345 })
+  })
+
+  it('typing 0 into a field that is already 0 is not dirty and sends nothing', async () => {
+    serverLimits = { ...LIMITS, daily_token_limit: 0 }
+    const { input, save, user } = await setup()
+    await user.clear(input)
+    await user.type(input, '0')
+    expect(input).not.toHaveAttribute('aria-invalid')
+    expect(save).toBeDisabled()
+    expect(patchBodies).toHaveLength(0)
+  })
+
+  it('does not overwrite a refetched limit when only the name changes', async () => {
+    serverLimits = { ...LIMITS, daily_token_limit: 0 }
+    const { queryClient, user } = await setup()
+    const input = screen.getByLabelText('Daily Token Limit')
+    expect(input).toHaveValue('0')
+    queryClient.setQueryData(queryKey, { ...entity, ...LIMITS, daily_token_limit: 5000 })
+    const name = screen.getByLabelText('Name')
+    await user.clear(name)
+    await user.type(name, 'Renamed')
+    await user.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(patchBodies).toHaveLength(1))
+    expect(patchBodies[0]).toEqual({ name: 'Renamed' })
   })
 })

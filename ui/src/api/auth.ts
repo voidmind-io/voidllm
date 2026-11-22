@@ -1,15 +1,20 @@
-import apiClient from './client'
+import { LOCAL_STORAGE_KEY } from '../lib/constants'
 
 const LOGOUT_TIMEOUT_MS = 3000
 
 /**
- * Best-effort server-side logout. Revokes the session on the server; any
- * failure (network, timeout, 401) is ignored so local logout always proceeds.
+ * Best-effort server-side logout. Uses fetch directly (not apiClient) so the
+ * client's 401 handler does not fire mid-logout. All failures are swallowed so
+ * local logout always proceeds.
  */
 export async function logoutRequest(): Promise<void> {
   try {
-    await apiClient<void>('/auth/logout', {
+    await fetch('/api/v1/auth/logout', {
       method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${localStorage.getItem(LOCAL_STORAGE_KEY) ?? ''}`,
+      },
       signal: AbortSignal.timeout(LOGOUT_TIMEOUT_MS),
     })
   } catch {

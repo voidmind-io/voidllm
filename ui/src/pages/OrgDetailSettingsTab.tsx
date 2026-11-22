@@ -44,6 +44,9 @@ function OrgSettingsForm({ org }: OrgSettingsFormProps) {
   const { toast } = useToast()
 
   const [form, setForm] = useState<FormState>(() => formFromOrg(org))
+  // Snapshot of the values the user saw; changes are computed against it so a
+  // background refetch cannot cause untouched fields to overwrite newer values.
+  const [base, setBase] = useState<OrgResponse>(org)
   const [nameError, setNameError] = useState<string | undefined>()
   const [slugError, setSlugError] = useState<string | undefined>()
 
@@ -60,12 +63,12 @@ function OrgSettingsForm({ org }: OrgSettingsFormProps) {
   )
 
   const isDirty =
-    form.name !== org.name ||
-    form.slug !== org.slug ||
-    dailyTokenLimit.value !== org.daily_token_limit ||
-    monthlyTokenLimit.value !== org.monthly_token_limit ||
-    requestsPerMinute.value !== org.requests_per_minute ||
-    requestsPerDay.value !== org.requests_per_day
+    form.name !== base.name ||
+    form.slug !== base.slug ||
+    dailyTokenLimit.value !== base.daily_token_limit ||
+    monthlyTokenLimit.value !== base.monthly_token_limit ||
+    requestsPerMinute.value !== base.requests_per_minute ||
+    requestsPerDay.value !== base.requests_per_day
 
   function patch(field: keyof FormState) {
     return (e: React.ChangeEvent<HTMLInputElement>) =>
@@ -99,15 +102,16 @@ function OrgSettingsForm({ org }: OrgSettingsFormProps) {
     const params: UpdateOrgParams = {}
     const name = form.name.trim()
     const slug = form.slug.trim()
-    if (name !== org.name) params.name = name
-    if (slug !== org.slug) params.slug = slug
-    if (dailyTokenLimit.value !== org.daily_token_limit) params.daily_token_limit = dailyTokenLimit.value
-    if (monthlyTokenLimit.value !== org.monthly_token_limit) params.monthly_token_limit = monthlyTokenLimit.value
-    if (requestsPerMinute.value !== org.requests_per_minute) params.requests_per_minute = requestsPerMinute.value
-    if (requestsPerDay.value !== org.requests_per_day) params.requests_per_day = requestsPerDay.value
+    if (name !== base.name) params.name = name
+    if (slug !== base.slug) params.slug = slug
+    if (dailyTokenLimit.value !== base.daily_token_limit) params.daily_token_limit = dailyTokenLimit.value
+    if (monthlyTokenLimit.value !== base.monthly_token_limit) params.monthly_token_limit = monthlyTokenLimit.value
+    if (requestsPerMinute.value !== base.requests_per_minute) params.requests_per_minute = requestsPerMinute.value
+    if (requestsPerDay.value !== base.requests_per_day) params.requests_per_day = requestsPerDay.value
 
     updateOrg.mutate(params, {
       onSuccess: () => {
+        setBase((prev) => ({ ...prev, ...params }))
         toast({ variant: 'success', message: 'Settings saved' })
       },
       onError: (err) => {

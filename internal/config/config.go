@@ -868,25 +868,31 @@ func findConfigFile() (string, error) {
 	return "", fmt.Errorf("no config file found; set VOIDLLM_CONFIG or place voidllm.yaml in the current directory")
 }
 
-// applyEnvFallbacks fills the admin key, encryption key, license, database DSN
-// and database driver from VOIDLLM_ADMIN_KEY, VOIDLLM_ENCRYPTION_KEY,
-// VOIDLLM_LICENSE, VOIDLLM_DATABASE_DSN and VOIDLLM_DATABASE_DRIVER, but only
-// for fields that are still empty. Values set in the YAML file always win. The
-// license variable is ignored when settings.license_file is set, so an explicit
-// license file keeps precedence over the environment.
+// applyEnvFallbacks fills the admin key, encryption key and license from
+// VOIDLLM_ADMIN_KEY, VOIDLLM_ENCRYPTION_KEY and VOIDLLM_LICENSE, but only for
+// fields that are still empty, so values set in the YAML file always win. The
+// license variable is ignored when settings.license_file is set. Every field
+// that is filled from the environment is logged by setting name (never by
+// value). Database DSN and driver are deliberately not covered: an ambient
+// variable must not silently switch a YAML deployment to another database.
 func applyEnvFallbacks(cfg *Config) {
-	fill := func(dst *string, name string) {
-		if *dst == "" {
-			*dst = os.Getenv(name)
+	fill := func(dst *string, env, setting string) {
+		if *dst != "" {
+			return
+		}
+		if v := os.Getenv(env); v != "" {
+			*dst = v
+			slog.Info("config: setting filled from environment",
+				slog.String("setting", setting),
+				slog.String("env", env),
+			)
 		}
 	}
-	fill(&cfg.Settings.AdminKey, "VOIDLLM_ADMIN_KEY")
-	fill(&cfg.Settings.EncryptionKey, "VOIDLLM_ENCRYPTION_KEY")
+	fill(&cfg.Settings.AdminKey, "VOIDLLM_ADMIN_KEY", "settings.admin_key")
+	fill(&cfg.Settings.EncryptionKey, "VOIDLLM_ENCRYPTION_KEY", "settings.encryption_key")
 	if cfg.Settings.LicenseFile == "" {
-		fill(&cfg.Settings.License, "VOIDLLM_LICENSE")
+		fill(&cfg.Settings.License, "VOIDLLM_LICENSE", "settings.license")
 	}
-	fill(&cfg.Database.DSN, "VOIDLLM_DATABASE_DSN")
-	fill(&cfg.Database.Driver, "VOIDLLM_DATABASE_DRIVER")
 }
 
 // loadDefaults returns a Config populated entirely from environment
@@ -895,6 +901,8 @@ func applyEnvFallbacks(cfg *Config) {
 func loadDefaults() (*Config, error) {
 	var cfg Config
 	applyEnvFallbacks(&cfg)
+	cfg.Database.DSN = os.Getenv("VOIDLLM_DATABASE_DSN")
+	cfg.Database.Driver = os.Getenv("VOIDLLM_DATABASE_DRIVER")
 	cfg.setDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("config: %w", err)

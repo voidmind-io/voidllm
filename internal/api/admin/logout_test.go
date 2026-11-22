@@ -127,3 +127,62 @@ func TestLogout_NonSessionAndUnauthenticated(t *testing.T) {
 		})
 	}
 }
+
+func TestLogout_SessionWithAccessRows(t *testing.T) {
+	t.Parallel()
+
+	const email = "logout-access@example.com"
+	app, database, keyCache := setupTestApp(t, "file:TestLogout_AccessRows?mode=memory&cache=private")
+	setupLocalUser(t, database, "logout-access-org", email, "Logout User", "hunter2batteries")
+	token := doLogin(t, app, email, "hunter2batteries")
+
+	ctx := context.Background()
+	hash := keygen.Hash(token, testHMACSecret)
+	ki, ok := keyCache.Get(hash)
+	if !ok {
+		t.Fatal("session not in cache")
+	}
+	if err := database.SetKeyModelAccess(ctx, ki.ID, []string{"gpt-4o"}); err != nil {
+		t.Fatalf("SetKeyModelAccess: %v", err)
+	}
+
+	if got := doLogout(t, app, token); got != fiber.StatusNoContent {
+		t.Fatalf("logout with access rows = %d, want 204", got)
+	}
+	models, err := database.GetKeyModelAccess(ctx, ki.ID)
+	if err != nil {
+		t.Fatalf("GetKeyModelAccess: %v", err)
+	}
+	if len(models) != 0 {
+		t.Errorf("access rows left after logout: %v", models)
+	}
+}
+
+func TestChangeOwnPassword_RevokesOtherSessionsWithAccessRows(t *testing.T) {
+	t.Parallel()
+
+	const email = "chpwd-access@example.com"
+	app, database, keyCache := setupTestApp(t, "file:TestChPwd_AccessRows?mode=memory&cache=private")
+	user := setupLocalUser(t, database, "chpwd-access-org", email, "Pwd User", "hunter2batteries")
+	token := doLogin(t, app, email, "hunter2batteries")
+	other := injectSession(t, database, keyCache, user, "other session")
+
+	ctx := context.Background()
+	otherKI, ok := keyCache.Get(keygen.Hash(other, testHMACSecret))
+	if !ok {
+		t.Fatal("other session not in cache")
+	}
+	if err := database.SetKeyModelAccess(ctx, otherKI.ID, []string{"gpt-4o"}); err != nil {
+		t.Fatalf("SetKeyModelAccess: %v", err)
+	}
+
+	if status, msg := doChangePassword(t, app, token, "hunter2batteries", "correct-horse-staple"); status != fiber.StatusOK {
+		t.Fatalf("change password = %d (%s), want 200", status, msg)
+	}
+	if got := doGet(t, app, "/api/v1/me", other); got != fiber.StatusUnauthorized {
+		t.Errorf("other session /me = %d, want 401", got)
+	}
+	if got := doGet(t, app, "/api/v1/me", token); got != fiber.StatusOK {
+		t.Errorf("current session /me = %d, want 200", got)
+	}
+}

@@ -295,15 +295,27 @@ func (d *DB) UpdateAPIKey(ctx context.Context, id string, params UpdateAPIKeyPar
 // DeleteAPIKey soft-deletes an active API key by setting deleted_at.
 // It returns ErrNotFound if the key does not exist or is already deleted.
 
-// RevokeSessionKey hard-deletes a single session key by ID. Only rows with
-// key_type session_key are affected, so a non-session key ID is a no-op.
+// RevokeSessionKey hard-deletes a single session key by ID together with any
+// model and MCP access rows that reference it, in one transaction. Only rows
+// with key_type session_key are affected, so a non-session key ID is a no-op.
 // It is idempotent: revoking an already-removed session returns nil.
 func (d *DB) RevokeSessionKey(ctx context.Context, keyID string) error {
 	p := d.dialect.Placeholder
-	query := "DELETE FROM api_keys WHERE id = " + p(1) + " AND key_type = " + p(2)
+	sessionIDs := "SELECT id FROM api_keys WHERE id = " + p(1) + " AND key_type = " + p(2)
 
-	if _, err := d.sql.ExecContext(ctx, query, keyID, "session_key"); err != nil {
-		return fmt.Errorf("revoke session key %s: %w", keyID, translateError(err))
+	err := d.WithTx(ctx, func(q Querier) error {
+		for _, table := range []string{"key_model_access", "key_mcp_access"} {
+			if _, err := q.ExecContext(ctx, "DELETE FROM "+table+" WHERE key_id IN ("+sessionIDs+")", keyID, "session_key"); err != nil {
+				return fmt.Errorf("delete %s: %w", table, translateError(err))
+			}
+		}
+		if _, err := q.ExecContext(ctx, "DELETE FROM api_keys WHERE id = "+p(1)+" AND key_type = "+p(2), keyID, "session_key"); err != nil {
+			return fmt.Errorf("delete session key: %w", translateError(err))
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("revoke session key %s: %w", keyID, err)
 	}
 	return nil
 }
@@ -314,11 +326,21 @@ func (d *DB) RevokeSessionKey(ctx context.Context, keyID string) error {
 // prevents the api_keys table from filling up with dead sessions.
 func (d *DB) RevokeUserSessions(ctx context.Context, userID string) error {
 	p := d.dialect.Placeholder
-	query := "DELETE FROM api_keys WHERE user_id = " + p(1) + " AND key_type = " + p(2)
+	sessionIDs := "SELECT id FROM api_keys WHERE user_id = " + p(1) + " AND key_type = " + p(2)
 
-	_, err := d.sql.ExecContext(ctx, query, userID, "session_key")
+	err := d.WithTx(ctx, func(q Querier) error {
+		for _, table := range []string{"key_model_access", "key_mcp_access"} {
+			if _, err := q.ExecContext(ctx, "DELETE FROM "+table+" WHERE key_id IN ("+sessionIDs+")", userID, "session_key"); err != nil {
+				return fmt.Errorf("delete %s: %w", table, translateError(err))
+			}
+		}
+		if _, err := q.ExecContext(ctx, "DELETE FROM api_keys WHERE user_id = "+p(1)+" AND key_type = "+p(2), userID, "session_key"); err != nil {
+			return fmt.Errorf("delete sessions: %w", translateError(err))
+		}
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("revoke user sessions %s: %w", userID, translateError(err))
+		return fmt.Errorf("revoke user sessions %s: %w", userID, err)
 	}
 	return nil
 }
@@ -339,6 +361,10 @@ func (d *DB) ChangePasswordAndRevokeOtherSessions(ctx context.Context, userID, n
 		" AND key_type = " + p(2) +
 		" AND id != " + p(3)
 
+	sessionIDs := "SELECT id FROM api_keys WHERE user_id = " + p(1) +
+		" AND key_type = " + p(2) +
+		" AND id != " + p(3)
+
 	return d.WithTx(ctx, func(q Querier) error {
 		result, err := q.ExecContext(ctx, updateQuery, newPasswordHash, userID)
 		if err != nil {
@@ -350,6 +376,12 @@ func (d *DB) ChangePasswordAndRevokeOtherSessions(ctx context.Context, userID, n
 		}
 		if n == 0 {
 			return ErrNotFound
+		}
+
+		for _, table := range []string{"key_model_access", "key_mcp_access"} {
+			if _, err := q.ExecContext(ctx, "DELETE FROM "+table+" WHERE key_id IN ("+sessionIDs+")", userID, "session_key", exceptKeyID); err != nil {
+				return fmt.Errorf("delete %s of other sessions: %w", table, translateError(err))
+			}
 		}
 
 		if _, err := q.ExecContext(ctx, deleteQuery, userID, "session_key", exceptKeyID); err != nil {

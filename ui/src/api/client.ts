@@ -1,5 +1,6 @@
 import { LOCAL_STORAGE_KEY } from '../lib/constants'
 import { clearSession } from '../lib/session'
+import { queryClient } from '../lib/queryClient'
 
 const apiClient = async <T>(endpoint: string, options?: RequestInit): Promise<T> => {
   const key = localStorage.getItem(LOCAL_STORAGE_KEY) ?? ''
@@ -14,6 +15,7 @@ const apiClient = async <T>(endpoint: string, options?: RequestInit): Promise<T>
 
   if (res.status === 401) {
     clearSession()
+    queryClient.clear()
     window.location.href = '/login'
     throw new Error('Session expired')
   }

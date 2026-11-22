@@ -3,6 +3,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { RequireAuth } from './App'
 import { LOCAL_STORAGE_KEY, SESSION_EXPIRY_KEY } from './lib/constants'
+import { queryClient } from './lib/queryClient'
 
 vi.mock('./components/layout/Shell', () => ({
   Shell: () => <div>shell</div>,
@@ -30,8 +31,10 @@ describe('RequireAuth session expiry', () => {
   it('logs out on load when expires_at has passed', () => {
     localStorage.setItem(LOCAL_STORAGE_KEY, 'vl_sk_x')
     localStorage.setItem(SESSION_EXPIRY_KEY, '2020-01-01T00:00:00Z')
+    queryClient.setQueryData(['me'], { id: 'prev-user' })
     renderGuard()
     expect(screen.getByText('login page')).toBeInTheDocument()
+    expect(queryClient.getQueryData(['me'])).toBeUndefined()
     expect(localStorage.getItem(LOCAL_STORAGE_KEY)).toBeNull()
     expect(localStorage.getItem(SESSION_EXPIRY_KEY)).toBeNull()
   })
@@ -47,6 +50,7 @@ describe('RequireAuth session expiry', () => {
     vi.useFakeTimers()
     localStorage.setItem(LOCAL_STORAGE_KEY, 'vl_sk_x')
     localStorage.setItem(SESSION_EXPIRY_KEY, new Date(Date.now() + 5_000).toISOString())
+    queryClient.setQueryData(['me'], { id: 'prev-user' })
     renderGuard()
     expect(screen.getByText('shell')).toBeInTheDocument()
     act(() => {
@@ -54,5 +58,6 @@ describe('RequireAuth session expiry', () => {
     })
     expect(screen.getByText('login page')).toBeInTheDocument()
     expect(localStorage.getItem(LOCAL_STORAGE_KEY)).toBeNull()
+    expect(queryClient.getQueryData(['me'])).toBeUndefined()
   })
 })
