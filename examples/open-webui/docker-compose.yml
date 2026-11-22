@@ -2,9 +2,14 @@
 #
 # Traffic flow: Open WebUI -> VoidLLM (/v1, team key) -> Ollama (OpenAI-compatible /v1)
 #
-# Ollama has no published port and sits on its own network ("backend") that
-# Open WebUI is not attached to. The only way to reach it is through VoidLLM,
-# so every request is authenticated, limited and counted per team.
+# Ollama has no published port and sits on its own container network
+# ("backend") that Open WebUI is not attached to. Inside Docker, the only
+# way to reach it is through VoidLLM, so every inference request is
+# authenticated, limited and counted per team.
+#
+# Published ports are bound to 127.0.0.1 only. To expose VoidLLM or
+# Open WebUI beyond this host, put a TLS reverse proxy in front of them
+# (see docs/deployment/reverse-proxy.md) instead of widening the bindings.
 #
 # See README.md in this directory for the step-by-step setup.
 
@@ -22,7 +27,7 @@ services:
     depends_on:
       - ollama
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./voidllm.yaml:/etc/voidllm/voidllm.yaml:ro
       - voidllm_data:/data
@@ -39,7 +44,7 @@ services:
     depends_on:
       - voidllm
     ports:
-      - "3000:8080"
+      - "127.0.0.1:3000:8080"
     volumes:
       - open_webui_data:/app/backend/data
     environment:

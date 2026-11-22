@@ -7,12 +7,19 @@ budgets, model allowlists and usage tracking.
 Browser -> Open WebUI (:3000) -> VoidLLM (:8080, team key) -> Ollama (internal only)
 ```
 
-Ollama has no published port and sits on a network Open WebUI is not part
-of. Open WebUI only knows VoidLLM's `/v1` endpoint and a VoidLLM team key, so
-every request is authenticated, limited and counted per team.
+Ollama has no published port and sits on a container network Open WebUI is
+not attached to. Open WebUI only knows VoidLLM's `/v1` endpoint and a VoidLLM
+team key, so every inference request is authenticated, limited and counted
+per team.
 
-Tested with: VoidLLM `0.0.31`, Open WebUI `v0.13.4`, Ollama `0.40.17`,
-model `qwen2.5:0.5b`, Docker Compose 5.6.1 (2026-11-22).
+Both published ports (8080 for VoidLLM, 3000 for Open WebUI) are bound to
+`127.0.0.1`. To make them reachable from other machines, put a TLS reverse
+proxy in front (see
+[Reverse Proxy](../../docs/deployment/reverse-proxy.md)) rather than changing
+the bindings to `0.0.0.0`.
+
+Tested with (recorded run on 2026-11-22): VoidLLM `0.0.31`, Open WebUI
+`v0.13.4`, Ollama `0.40.17`, model `qwen2.5:0.5b`, Docker Compose 5.6.1.
 
 Full background (per-team separation, budgets, what is and is not stored):
 [docs/deployment/open-webui.md](../../docs/deployment/open-webui.md)
@@ -60,7 +67,7 @@ export ADMIN=vl_uk_...   # the key from the log
 
 Everything below can also be done in the VoidLLM UI. The bootstrap created
 an organization named "Default" (rename it in the UI, or set
-`bootstrap.org_name` in `voidllm.yaml` before the first start). The
+`settings.bootstrap.org_name` in `voidllm.yaml` before the first start). The
 Community edition has one organization; teams are the unit you separate.
 
 ```bash
@@ -71,7 +78,8 @@ TEAM=$(curl -s -X POST http://localhost:8080/api/v1/orgs/$ORG/teams \
   -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
   -d '{"name":"Support","slug":"support","daily_token_limit":200000,"requests_per_minute":60}' | jq -r .id)
 
-# Optional: restrict the team to specific models (empty list = all models)
+# Optional: restrict the team to specific models
+# (empty list = inherit the org's model access)
 curl -s -X PUT http://localhost:8080/api/v1/orgs/$ORG/teams/$TEAM/model-access \
   -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
   -d '{"models":["qwen2.5:0.5b"]}'
@@ -116,7 +124,8 @@ curl -s "http://localhost:8080/api/v1/orgs/$ORG/usage?group_by=team&from=$FROM&t
 ```
 
 Or open the Usage page in the VoidLLM UI. You see tokens, request counts and
-durations per team and model. No prompt or response content.
+durations per team and model for proxied inference requests (model listing
+calls are not counted). No prompt or response content.
 
 ## Clean up
 

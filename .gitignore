@@ -7,7 +7,7 @@ ui/dist/
 
 # Config (never commit secrets)
 voidllm.yaml
-!examples/**/voidllm.yaml
+!/examples/open-webui/voidllm.yaml
 *.license.jwt
 
 # Database
@@ -18,7 +18,7 @@ voidllm.yaml
 # Environment
 .env
 .env.*
-!.env.example
+!/examples/open-webui/.env.example
 
 # IDE
 .idea/
