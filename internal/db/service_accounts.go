@@ -332,39 +332,18 @@ func scanServiceAccountWithCounts(rows interface {
 // that user ID; pass "" for no filter. limit controls the maximum number of records
 // returned. includeDeleted controls whether soft-deleted service accounts are included.
 func (d *DB) ListServiceAccountsWithCounts(ctx context.Context, orgID, createdBy, cursor string, limit int, includeDeleted bool) ([]ServiceAccountWithCounts, error) {
-	p := d.dialect.Placeholder
-	argN := 1
-	now := FormatTimestamp(time.Now())
+	q := d.newQueryArgs()
+	// The expires_at threshold is the first placeholder in the SELECT list.
+	query := fmt.Sprintf(saWithCountsBase, q.bind(FormatTimestamp(time.Now())))
 
-	// p(1) is always the expires_at threshold used inside the CASE expression.
-	args := []any{now}
-	argN++ // argN=2
-
-	var conditions []string
-	conditions = append(conditions, "sa.org_id = "+p(argN))
-	args = append(args, orgID)
-	argN++
-
-	if !includeDeleted {
-		conditions = append(conditions, "sa.deleted_at IS NULL")
-	}
-	if createdBy != "" {
-		conditions = append(conditions, "sa.created_by = "+p(argN))
-		args = append(args, createdBy)
-		argN++
-	}
+	conditions := serviceAccountScopeConditions(q, orgID, createdBy, includeDeleted)
 	if cursor != "" {
-		conditions = append(conditions, "sa.id > "+p(argN))
-		args = append(args, cursor)
-		argN++
+		conditions = append(conditions, "sa.id > "+q.bind(cursor))
 	}
 
-	query := fmt.Sprintf(saWithCountsBase, p(1))
-	if len(conditions) > 0 {
-		query += " WHERE " + strings.Join(conditions, " AND ")
-	}
-	query += " GROUP BY sa.id ORDER BY sa.id ASC LIMIT " + p(argN)
-	args = append(args, limit)
+	query += " WHERE " + strings.Join(conditions, " AND ")
+	query += " GROUP BY sa.id ORDER BY sa.id ASC LIMIT " + q.bind(limit)
+	args := q.args
 
 	rows, err := d.sql.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -418,4 +397,46 @@ func scanServiceAccount(row *sql.Row) (*ServiceAccount, error) {
 		return nil, err
 	}
 	return &sa, nil
+}
+
+// serviceAccountScopeConditions returns the WHERE conditions that decide which
+// service accounts a list call sees. It is shared by
+// ListServiceAccountsWithCounts and SummarizeServiceAccounts so the list and
+// its summary can never diverge.
+func serviceAccountScopeConditions(q *queryArgs, orgID, createdBy string, includeDeleted bool) []string {
+	conditions := []string{"sa.org_id = " + q.bind(orgID)}
+	if !includeDeleted {
+		conditions = append(conditions, "sa.deleted_at IS NULL")
+	}
+	if createdBy != "" {
+		conditions = append(conditions, "sa.created_by = "+q.bind(createdBy))
+	}
+	return conditions
+}
+
+// ServiceAccountsSummary holds aggregate figures over a whole service account list scope.
+type ServiceAccountsSummary struct {
+	// Total is the number of service accounts in scope.
+	Total int
+	// OrgScoped is the number of service accounts without a team.
+	OrgScoped int
+	// TeamScoped is the number of service accounts bound to a team.
+	TeamScoped int
+}
+
+// SummarizeServiceAccounts aggregates the service accounts that
+// ListServiceAccountsWithCounts would return for the same arguments across all pages.
+func (d *DB) SummarizeServiceAccounts(ctx context.Context, orgID, createdBy string, includeDeleted bool) (*ServiceAccountsSummary, error) {
+	q := d.newQueryArgs()
+	query := "SELECT COUNT(*), " +
+		"COALESCE(SUM(CASE WHEN sa.team_id IS NULL THEN 1 ELSE 0 END), 0), " +
+		"COALESCE(SUM(CASE WHEN sa.team_id IS NOT NULL THEN 1 ELSE 0 END), 0) " +
+		"FROM service_accounts sa WHERE " +
+		strings.Join(serviceAccountScopeConditions(q, orgID, createdBy, includeDeleted), " AND ")
+
+	var s ServiceAccountsSummary
+	if err := d.sql.QueryRowContext(ctx, query, q.args...).Scan(&s.Total, &s.OrgScoped, &s.TeamScoped); err != nil {
+		return nil, fmt.Errorf("SummarizeServiceAccounts: %w", err)
+	}
+	return &s, nil
 }

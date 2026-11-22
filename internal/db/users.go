@@ -253,28 +253,19 @@ func (d *DB) GetUserByEmail(ctx context.Context, email string) (*User, error) {
 // limit controls the maximum number of records returned.
 // includeDeleted controls whether soft-deleted users are included.
 func (d *DB) ListUsers(ctx context.Context, cursor string, limit int, includeDeleted bool) ([]User, error) {
-	p := d.dialect.Placeholder
-	argN := 1
-	var conditions []string
-	var args []any
-
-	if !includeDeleted {
-		conditions = append(conditions, "deleted_at IS NULL")
-	}
+	q := d.newQueryArgs()
+	conditions := userScopeConditions(includeDeleted)
 	if cursor != "" {
-		conditions = append(conditions, "id > "+p(argN))
-		args = append(args, cursor)
-		argN++
+		conditions = append(conditions, "id > "+q.bind(cursor))
 	}
 
 	query := "SELECT " + userSelectColumns + " FROM users"
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
-	query += " ORDER BY id ASC LIMIT " + p(argN)
-	args = append(args, limit)
+	query += " ORDER BY id ASC LIMIT " + q.bind(limit)
 
-	rows, err := d.sql.QueryContext(ctx, query, args...)
+	rows, err := d.sql.QueryContext(ctx, query, q.args...)
 	if err != nil {
 		return nil, fmt.Errorf("ListUsers query: %w", err)
 	}
@@ -508,4 +499,42 @@ func scanUser(row *sql.Row) (*User, error) {
 	}
 	u.IsSystemAdmin = isSystemAdminInt != 0
 	return &u, nil
+}
+
+// userScopeConditions returns the WHERE conditions that decide which users a
+// list call sees. It is shared by ListUsers and SummarizeUsers so the list and
+// its summary can never diverge.
+func userScopeConditions(includeDeleted bool) []string {
+	var conditions []string
+	if !includeDeleted {
+		conditions = append(conditions, "deleted_at IS NULL")
+	}
+	return conditions
+}
+
+// UsersSummary holds aggregate figures over a whole user list scope.
+type UsersSummary struct {
+	// Total is the number of users in scope.
+	Total int
+	// SystemAdmins is the number of users flagged as system admin.
+	SystemAdmins int
+	// SSO is the number of users authenticated through OIDC.
+	SSO int
+}
+
+// SummarizeUsers aggregates the users that ListUsers would return for the same
+// includeDeleted value across all pages.
+func (d *DB) SummarizeUsers(ctx context.Context, includeDeleted bool) (*UsersSummary, error) {
+	query := "SELECT COUNT(*), " +
+		"COALESCE(SUM(CASE WHEN is_system_admin <> 0 THEN 1 ELSE 0 END), 0), " +
+		"COALESCE(SUM(CASE WHEN auth_provider = 'oidc' THEN 1 ELSE 0 END), 0) FROM users"
+	if conditions := userScopeConditions(includeDeleted); len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	var s UsersSummary
+	if err := d.sql.QueryRowContext(ctx, query).Scan(&s.Total, &s.SystemAdmins, &s.SSO); err != nil {
+		return nil, fmt.Errorf("SummarizeUsers: %w", err)
+	}
+	return &s, nil
 }

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -148,43 +149,17 @@ func (d *DB) GetAPIKey(ctx context.Context, id string) (*APIKey, error) {
 // includeDeleted controls whether soft-deleted keys are included.
 // userID and teamID are optional equality filters; an empty string means no filter is applied.
 func (d *DB) ListAPIKeys(ctx context.Context, orgID, userID, teamID, cursor string, limit int, includeDeleted bool) ([]APIKey, error) {
-	p := d.dialect.Placeholder
-	argN := 1
-	var conditions []string
-	var args []any
-
-	conditions = append(conditions, "org_id = "+p(argN))
-	args = append(args, orgID)
-	argN++
-
-	// Session keys are internal (login tokens) — never expose them in the API list.
-	conditions = append(conditions, "key_type != 'session_key'")
-
-	if !includeDeleted {
-		conditions = append(conditions, "deleted_at IS NULL")
-	}
-	if userID != "" {
-		conditions = append(conditions, "user_id = "+p(argN))
-		args = append(args, userID)
-		argN++
-	}
-	if teamID != "" {
-		conditions = append(conditions, "team_id = "+p(argN))
-		args = append(args, teamID)
-		argN++
-	}
+	q := d.newQueryArgs()
+	conditions := apiKeyScopeConditions(q, orgID, userID, teamID, includeDeleted)
 	if cursor != "" {
-		conditions = append(conditions, "id > "+p(argN))
-		args = append(args, cursor)
-		argN++
+		conditions = append(conditions, "id > "+q.bind(cursor))
 	}
 
 	query := "SELECT " + apiKeySelectColumns + " FROM api_keys" +
 		" WHERE " + strings.Join(conditions, " AND ") +
-		" ORDER BY id ASC LIMIT " + p(argN)
-	args = append(args, limit)
+		" ORDER BY id ASC LIMIT " + q.bind(limit)
 
-	rows, err := d.sql.QueryContext(ctx, query, args...)
+	rows, err := d.sql.QueryContext(ctx, query, q.args...)
 	if err != nil {
 		return nil, fmt.Errorf("list api keys query: %w", err)
 	}
@@ -678,4 +653,58 @@ func scanAPIKey(row *sql.Row) (*APIKey, error) {
 		return nil, err
 	}
 	return &k, nil
+}
+
+// apiKeyScopeConditions returns the WHERE conditions that decide which keys a
+// list call sees. It is shared by ListAPIKeys and SummarizeAPIKeys so the list
+// and its summary can never diverge.
+func apiKeyScopeConditions(q *queryArgs, orgID, userID, teamID string, includeDeleted bool) []string {
+	conditions := []string{
+		"org_id = " + q.bind(orgID),
+		// Session keys are internal (login tokens) - never expose them in the API list.
+		"key_type != 'session_key'",
+	}
+	if !includeDeleted {
+		conditions = append(conditions, "deleted_at IS NULL")
+	}
+	if userID != "" {
+		conditions = append(conditions, "user_id = "+q.bind(userID))
+	}
+	if teamID != "" {
+		conditions = append(conditions, "team_id = "+q.bind(teamID))
+	}
+	return conditions
+}
+
+// APIKeysSummary holds aggregate figures over a whole key list scope.
+type APIKeysSummary struct {
+	// Total is the number of keys in scope.
+	Total int
+	// Active is the number of non-deleted keys without an expiry or whose expiry is in the future.
+	Active int
+	// ExpiringSoon is the number of active keys expiring within the next 7 days.
+	ExpiringSoon int
+}
+
+// apiKeyExpiringSoonWindow is how far ahead a key counts as expiring soon.
+const apiKeyExpiringSoonWindow = 7 * 24 * time.Hour
+
+// SummarizeAPIKeys aggregates the keys that ListAPIKeys would return for the
+// same arguments across all pages.
+func (d *DB) SummarizeAPIKeys(ctx context.Context, orgID, userID, teamID string, includeDeleted bool) (*APIKeysSummary, error) {
+	q := d.newQueryArgs()
+	now := time.Now()
+	nowTS := FormatTimestamp(now)
+
+	query := "SELECT COUNT(*), " +
+		"COALESCE(SUM(CASE WHEN deleted_at IS NULL AND (expires_at IS NULL OR expires_at > " + q.bind(nowTS) + ") THEN 1 ELSE 0 END), 0), " +
+		"COALESCE(SUM(CASE WHEN deleted_at IS NULL AND expires_at IS NOT NULL AND expires_at > " + q.bind(nowTS) +
+		" AND expires_at <= " + q.bind(FormatTimestamp(now.Add(apiKeyExpiringSoonWindow))) + " THEN 1 ELSE 0 END), 0)" +
+		" FROM api_keys WHERE " + strings.Join(apiKeyScopeConditions(q, orgID, userID, teamID, includeDeleted), " AND ")
+
+	var s APIKeysSummary
+	if err := d.sql.QueryRowContext(ctx, query, q.args...).Scan(&s.Total, &s.Active, &s.ExpiringSoon); err != nil {
+		return nil, fmt.Errorf("SummarizeAPIKeys: %w", err)
+	}
+	return &s, nil
 }

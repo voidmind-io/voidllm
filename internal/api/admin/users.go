@@ -56,6 +56,19 @@ type paginatedUsersResponse struct {
 	Data    []userResponse `json:"data"`
 	HasMore bool           `json:"has_more"`
 	Cursor  string         `json:"next_cursor,omitempty"`
+	// Summary is present only when the request has summary=true.
+	Summary *usersSummaryResponse `json:"summary,omitempty"`
+}
+
+// usersSummaryResponse holds aggregate figures over every listed user,
+// independent of pagination.
+type usersSummaryResponse struct {
+	// Total is the number of users in scope.
+	Total int `json:"total"`
+	// SystemAdmins is the number of users flagged as system admin.
+	SystemAdmins int `json:"system_admins"`
+	// SSO is the number of users authenticated through OIDC.
+	SSO int `json:"sso"`
 }
 
 // userToResponse converts a db.User to its API wire representation. For
@@ -280,6 +293,7 @@ func (h *Handler) GetUser(c fiber.Ctx) error {
 // @Param        limit            query     int     false  "Page size (default 20, max 100)"
 // @Param        cursor           query     string  false  "Pagination cursor (UUIDv7 of the last seen user)"
 // @Param        include_deleted  query     bool    false  "Include soft-deleted users"
+// @Param        summary          query     bool    false  "Include aggregate counts over all users"
 // @Success      200              {object}  paginatedUsersResponse
 // @Failure      400              {object}  swaggerErrorResponse
 // @Failure      401              {object}  swaggerErrorResponse
@@ -322,6 +336,14 @@ func (h *Handler) ListUsers(c fiber.Ctx) error {
 	}
 	if hasMore && len(users) > 0 {
 		resp.Cursor = users[len(users)-1].ID
+	}
+	if wantsSummary(c) {
+		summary, err := h.DB.SummarizeUsers(c.Context(), includeDeleted)
+		if err != nil {
+			h.Log.ErrorContext(c.Context(), "summarize users", slog.String("error", err.Error()))
+			return apierror.InternalError(c, "failed to summarize users")
+		}
+		resp.Summary = &usersSummaryResponse{Total: summary.Total, SystemAdmins: summary.SystemAdmins, SSO: summary.SSO}
 	}
 	return c.JSON(resp)
 }

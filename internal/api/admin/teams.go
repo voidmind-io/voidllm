@@ -54,6 +54,24 @@ type paginatedTeamsResponse struct {
 	Data    []teamResponse `json:"data"`
 	HasMore bool           `json:"has_more"`
 	Cursor  string         `json:"next_cursor,omitempty"`
+	// Summary is present only when the request has summary=true.
+	Summary *teamsSummaryResponse `json:"summary,omitempty"`
+}
+
+// teamsSummaryResponse holds aggregate figures over every team the caller can
+// list, independent of pagination.
+type teamsSummaryResponse struct {
+	// Total is the number of teams in scope.
+	Total int `json:"total"`
+	// Members is the number of distinct users that belong to any team in scope.
+	Members int `json:"members"`
+	// Keys is the number of non-deleted, non-expired keys scoped to a team in scope.
+	Keys int `json:"keys"`
+}
+
+// teamsSummaryToResponse converts a db.TeamsSummary to its API wire representation.
+func teamsSummaryToResponse(s *db.TeamsSummary) *teamsSummaryResponse {
+	return &teamsSummaryResponse{Total: s.Total, Members: s.Members, Keys: s.Keys}
 }
 
 // teamToResponse converts a db.Team to its API wire representation.
@@ -234,6 +252,7 @@ func (h *Handler) GetTeam(c fiber.Ctx) error {
 // @Param        limit            query     int     false  "Page size (default 20, max 100)"
 // @Param        cursor           query     string  false  "Pagination cursor (UUIDv7 of the last seen team)"
 // @Param        include_deleted  query     bool    false  "Include soft-deleted teams (system admin only)"
+// @Param        summary          query     bool    false  "Include aggregate counts over the whole visible scope"
 // @Success      200              {object}  paginatedTeamsResponse
 // @Failure      400              {object}  swaggerErrorResponse
 // @Failure      401              {object}  swaggerErrorResponse
@@ -262,6 +281,14 @@ func (h *Handler) ListTeams(c fiber.Ctx) error {
 		}
 		for i := range teams {
 			resp.Data[i] = teamWithCountsToResponse(&teams[i])
+		}
+		if wantsSummary(c) {
+			summary, err := h.DB.SummarizeUserTeams(c.Context(), orgID, keyInfo.UserID)
+			if err != nil {
+				h.Log.ErrorContext(c.Context(), "summarize teams for user", slog.String("error", err.Error()))
+				return apierror.InternalError(c, "failed to summarize teams")
+			}
+			resp.Summary = teamsSummaryToResponse(summary)
 		}
 		return c.JSON(resp)
 	}
@@ -292,6 +319,14 @@ func (h *Handler) ListTeams(c fiber.Ctx) error {
 	}
 	if hasMore && len(teams) > 0 {
 		resp.Cursor = teams[len(teams)-1].ID
+	}
+	if wantsSummary(c) {
+		summary, err := h.DB.SummarizeTeams(c.Context(), orgID, includeDeleted)
+		if err != nil {
+			h.Log.ErrorContext(c.Context(), "summarize teams", slog.String("error", err.Error()))
+			return apierror.InternalError(c, "failed to summarize teams")
+		}
+		resp.Summary = teamsSummaryToResponse(summary)
 	}
 	return c.JSON(resp)
 }

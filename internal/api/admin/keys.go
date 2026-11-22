@@ -89,6 +89,19 @@ type paginatedAPIKeysResponse struct {
 	Data    []apiKeyResponse `json:"data"`
 	HasMore bool             `json:"has_more"`
 	Cursor  string           `json:"next_cursor,omitempty"`
+	// Summary is present only when the request has summary=true.
+	Summary *apiKeysSummaryResponse `json:"summary,omitempty"`
+}
+
+// apiKeysSummaryResponse holds aggregate figures over every key the caller can
+// list, independent of pagination.
+type apiKeysSummaryResponse struct {
+	// Total is the number of keys in scope.
+	Total int `json:"total"`
+	// Active is the number of non-deleted keys without an expiry or with an expiry in the future.
+	Active int `json:"active"`
+	// ExpiringSoon is the number of active keys that expire within the next 7 days.
+	ExpiringSoon int `json:"expiring_soon"`
 }
 
 // validKeyTypes is the set of accepted key_type values.
@@ -628,6 +641,7 @@ func (h *Handler) GetAPIKey(c fiber.Ctx) error {
 // @Param        limit            query     int     false  "Page size (default 20, max 100)"
 // @Param        cursor           query     string  false  "Pagination cursor (UUIDv7 of the last seen key)"
 // @Param        include_deleted  query     bool    false  "Include soft-deleted keys (system admin only)"
+// @Param        summary          query     bool    false  "Include aggregate counts over the whole visible scope"
 // @Success      200              {object}  paginatedAPIKeysResponse
 // @Failure      400              {object}  swaggerErrorResponse
 // @Failure      401              {object}  swaggerErrorResponse
@@ -698,6 +712,14 @@ func (h *Handler) ListAPIKeys(c fiber.Ctx) error {
 	}
 	if hasMore && len(keys) > 0 {
 		resp.Cursor = keys[len(keys)-1].ID
+	}
+	if wantsSummary(c) {
+		summary, err := h.DB.SummarizeAPIKeys(c.Context(), orgID, filterUserID, filterTeamID, includeDeleted)
+		if err != nil {
+			h.Log.ErrorContext(c.Context(), "summarize api keys", slog.String("error", err.Error()))
+			return apierror.InternalError(c, "failed to summarize api keys")
+		}
+		resp.Summary = &apiKeysSummaryResponse{Total: summary.Total, Active: summary.Active, ExpiringSoon: summary.ExpiringSoon}
 	}
 	return c.JSON(resp)
 }

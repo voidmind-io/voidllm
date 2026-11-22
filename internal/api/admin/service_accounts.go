@@ -41,6 +41,19 @@ type paginatedServiceAccountsResponse struct {
 	Data    []serviceAccountResponse `json:"data"`
 	HasMore bool                     `json:"has_more"`
 	Cursor  string                   `json:"next_cursor,omitempty"`
+	// Summary is present only when the request has summary=true.
+	Summary *serviceAccountsSummaryResponse `json:"summary,omitempty"`
+}
+
+// serviceAccountsSummaryResponse holds aggregate figures over every service
+// account the caller can list, independent of pagination.
+type serviceAccountsSummaryResponse struct {
+	// Total is the number of service accounts in scope.
+	Total int `json:"total"`
+	// OrgScoped is the number of service accounts without a team.
+	OrgScoped int `json:"org_scoped"`
+	// TeamScoped is the number of service accounts bound to a team.
+	TeamScoped int `json:"team_scoped"`
 }
 
 // serviceAccountToResponse converts a db.ServiceAccountWithCounts to its API wire representation.
@@ -189,6 +202,7 @@ func (h *Handler) GetServiceAccount(c fiber.Ctx) error {
 // @Param        limit            query     int     false  "Page size (default 20, max 100)"
 // @Param        cursor           query     string  false  "Pagination cursor (UUIDv7 of the last seen service account)"
 // @Param        include_deleted  query     bool    false  "Include soft-deleted service accounts (system admin only)"
+// @Param        summary          query     bool    false  "Include aggregate counts over the whole visible scope"
 // @Success      200              {object}  paginatedServiceAccountsResponse
 // @Failure      400              {object}  swaggerErrorResponse
 // @Failure      401              {object}  swaggerErrorResponse
@@ -244,6 +258,14 @@ func (h *Handler) ListServiceAccounts(c fiber.Ctx) error {
 	}
 	if hasMore && len(accounts) > 0 {
 		resp.Cursor = accounts[len(accounts)-1].ID
+	}
+	if wantsSummary(c) {
+		summary, err := h.DB.SummarizeServiceAccounts(c.Context(), orgID, filterCreatedBy, includeDeleted)
+		if err != nil {
+			h.Log.ErrorContext(c.Context(), "summarize service accounts", slog.String("error", err.Error()))
+			return apierror.InternalError(c, "failed to summarize service accounts")
+		}
+		resp.Summary = &serviceAccountsSummaryResponse{Total: summary.Total, OrgScoped: summary.OrgScoped, TeamScoped: summary.TeamScoped}
 	}
 	return c.JSON(resp)
 }

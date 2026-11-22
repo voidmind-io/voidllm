@@ -326,10 +326,17 @@ const teamWithCountsBase = "SELECT t.id, t.org_id, t.name, t.slug, " +
 	"t.requests_per_minute, t.requests_per_day, " +
 	"t.created_at, t.updated_at, t.deleted_at, " +
 	"COUNT(DISTINCT tm.user_id) AS member_count, " +
-	"COUNT(DISTINCT CASE WHEN ak.deleted_at IS NULL " +
+	"COUNT(DISTINCT " + teamActiveKeyCase + ") AS key_count" +
+	teamCountsFrom
+
+// teamActiveKeyCase is the CASE expression selecting the IDs of non-deleted,
+// non-expired keys of a team. The %s token is the expires_at threshold placeholder.
+const teamActiveKeyCase = "CASE WHEN ak.deleted_at IS NULL " +
 	"AND (ak.expires_at IS NULL OR ak.expires_at > %s) " +
-	"THEN ak.id END) AS key_count " +
-	"FROM teams t " +
+	"THEN ak.id END"
+
+// teamCountsFrom is the FROM clause shared by the list and summary queries.
+const teamCountsFrom = " FROM teams t " +
 	"LEFT JOIN team_memberships tm ON tm.team_id = t.id " +
 	"LEFT JOIN api_keys ak ON ak.team_id = t.id"
 
@@ -357,32 +364,18 @@ func scanTeamWithCounts(rows interface {
 // from the beginning. limit controls the maximum number of records returned.
 // includeDeleted controls whether soft-deleted teams are included.
 func (d *DB) ListTeamsWithCounts(ctx context.Context, orgID string, cursor string, limit int, includeDeleted bool) ([]TeamWithCounts, error) {
-	p := d.dialect.Placeholder
-	argN := 1
-	now := FormatTimestamp(time.Now())
+	q := d.newQueryArgs()
+	// The expires_at threshold is the first placeholder in the SELECT list.
+	query := fmt.Sprintf(teamWithCountsBase, q.bind(FormatTimestamp(time.Now())))
 
-	// p(1) is always the expires_at threshold used inside the CASE expression.
-	args := []any{now}
-	argN++ // argN=2
-
-	var conditions []string
-	conditions = append(conditions, "t.org_id = "+p(argN))
-	args = append(args, orgID)
-	argN++
-
-	if !includeDeleted {
-		conditions = append(conditions, "t.deleted_at IS NULL")
-	}
+	conditions := teamScopeConditions(q, orgID, includeDeleted)
 	if cursor != "" {
-		conditions = append(conditions, "t.id > "+p(argN))
-		args = append(args, cursor)
-		argN++
+		conditions = append(conditions, "t.id > "+q.bind(cursor))
 	}
 
-	query := fmt.Sprintf(teamWithCountsBase, p(1))
 	query += " WHERE " + strings.Join(conditions, " AND ")
-	query += " GROUP BY t.id ORDER BY t.id ASC LIMIT " + p(argN)
-	args = append(args, limit)
+	query += " GROUP BY t.id ORDER BY t.id ASC LIMIT " + q.bind(limit)
+	args := q.args
 
 	rows, err := d.sql.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -429,16 +422,14 @@ func (d *DB) GetTeamWithCounts(ctx context.Context, id string) (*TeamWithCounts,
 // member of, joined via team_memberships. Results are ordered by team ID ascending.
 // It is used to enforce team-scoped visibility for team_admin callers.
 func (d *DB) ListUserTeams(ctx context.Context, orgID, userID string) ([]TeamWithCounts, error) {
-	p := d.dialect.Placeholder
-	now := FormatTimestamp(time.Now())
-
-	// p(1)=expires_at threshold, p(2)=org_id, p(3)=user_id.
-	query := fmt.Sprintf(teamWithCountsBase, p(1)) +
-		" INNER JOIN team_memberships tm2 ON tm2.team_id = t.id AND tm2.user_id = " + p(3) +
-		" WHERE t.org_id = " + p(2) + " AND t.deleted_at IS NULL" +
+	q := d.newQueryArgs()
+	query := fmt.Sprintf(teamWithCountsBase, q.bind(FormatTimestamp(time.Now()))) +
+		userTeamsJoin(q, userID) +
+		" WHERE " + strings.Join(teamScopeConditions(q, orgID, false), " AND ") +
 		" GROUP BY t.id ORDER BY t.id ASC"
+	args := q.args
 
-	rows, err := d.sql.QueryContext(ctx, query, now, orgID, userID)
+	rows, err := d.sql.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("ListUserTeams query: %w", err)
 	}
@@ -472,4 +463,62 @@ func scanTeam(row *sql.Row) (*Team, error) {
 		return nil, err
 	}
 	return &t, nil
+}
+
+// teamScopeConditions returns the WHERE conditions that decide which teams of
+// an org are visible to a list call. It is shared by ListTeamsWithCounts and
+// SummarizeTeams so the list and its summary can never diverge.
+func teamScopeConditions(q *queryArgs, orgID string, includeDeleted bool) []string {
+	conditions := []string{"t.org_id = " + q.bind(orgID)}
+	if !includeDeleted {
+		conditions = append(conditions, "t.deleted_at IS NULL")
+	}
+	return conditions
+}
+
+// TeamsSummary holds aggregate figures over a whole team list scope.
+type TeamsSummary struct {
+	// Total is the number of teams in scope.
+	Total int
+	// Members is the number of distinct users that belong to any team in scope.
+	Members int
+	// Keys is the number of non-deleted, non-expired keys scoped to a team in scope.
+	Keys int
+}
+
+// SummarizeTeams aggregates the teams that ListTeamsWithCounts would return
+// for the same orgID and includeDeleted across all pages.
+func (d *DB) SummarizeTeams(ctx context.Context, orgID string, includeDeleted bool) (*TeamsSummary, error) {
+	q := d.newQueryArgs()
+	query := teamsSummarySelect(q) + teamCountsFrom +
+		" WHERE " + strings.Join(teamScopeConditions(q, orgID, includeDeleted), " AND ")
+	return d.scanTeamsSummary(ctx, "SummarizeTeams", query, q.args)
+}
+
+// SummarizeUserTeams aggregates the teams that ListUserTeams would return for
+// the same orgID and userID.
+func (d *DB) SummarizeUserTeams(ctx context.Context, orgID, userID string) (*TeamsSummary, error) {
+	q := d.newQueryArgs()
+	query := teamsSummarySelect(q) + teamCountsFrom + userTeamsJoin(q, userID) +
+		" WHERE " + strings.Join(teamScopeConditions(q, orgID, false), " AND ")
+	return d.scanTeamsSummary(ctx, "SummarizeUserTeams", query, q.args)
+}
+
+// teamsSummarySelect builds the aggregate SELECT list for team summaries.
+func teamsSummarySelect(q *queryArgs) string {
+	return "SELECT COUNT(DISTINCT t.id), COUNT(DISTINCT tm.user_id), " +
+		"COUNT(DISTINCT " + fmt.Sprintf(teamActiveKeyCase, q.bind(FormatTimestamp(time.Now()))) + ")"
+}
+
+// userTeamsJoin restricts a team query to teams the given user belongs to.
+func userTeamsJoin(q *queryArgs, userID string) string {
+	return " INNER JOIN team_memberships tm2 ON tm2.team_id = t.id AND tm2.user_id = " + q.bind(userID)
+}
+
+func (d *DB) scanTeamsSummary(ctx context.Context, op, query string, args []any) (*TeamsSummary, error) {
+	var s TeamsSummary
+	if err := d.sql.QueryRowContext(ctx, query, args...).Scan(&s.Total, &s.Members, &s.Keys); err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+	return &s, nil
 }
