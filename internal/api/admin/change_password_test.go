@@ -587,3 +587,99 @@ func TestChangeOwnPassword_SessionInvalidation(t *testing.T) {
 		t.Errorf("token1 after change: status = %d, want 200 (current session must remain valid)", got)
 	}
 }
+
+// TestChangeOwnPassword_OnlySessionKeysEvicted verifies that a password change
+// evicts only the user's other session keys from the cache. Long-lived user
+// keys and team keys carrying the same UserID must remain cached and valid.
+func TestChangeOwnPassword_OnlySessionKeysEvicted(t *testing.T) {
+	t.Parallel()
+
+	const (
+		oldPwd = "evictold123"
+		newPwd = "evictnew456"
+		email  = "changepwd-evict@example.com"
+	)
+
+	app, database, keyCache := setupTestApp(t, "file:TestChangePwd_OnlySessionEvicted?mode=memory&cache=private")
+	setupLocalUser(t, database, "evict-org", email, "Evict User", oldPwd)
+
+	token1 := doLogin(t, app, email, oldPwd)
+
+	ctx := context.Background()
+	userObj, err := database.GetUserByEmail(ctx, email)
+	if err != nil {
+		t.Fatalf("GetUserByEmail: %v", err)
+	}
+	role, orgID, err := database.ResolveUserRole(ctx, userObj.ID)
+	if err != nil {
+		t.Fatalf("ResolveUserRole: %v", err)
+	}
+
+	token2 := injectSession(t, database, keyCache, userObj, "Second session")
+
+	// A long-lived user key, persisted in the DB and cached.
+	userKeyRaw, err := keygen.Generate(keygen.KeyTypeUser)
+	if err != nil {
+		t.Fatalf("Generate user key: %v", err)
+	}
+	userKeyHash := keygen.Hash(userKeyRaw, testHMACSecret)
+	userKey, err := database.CreateAPIKey(ctx, db.CreateAPIKeyParams{
+		KeyHash:   userKeyHash,
+		KeyHint:   keygen.Hint(userKeyRaw),
+		KeyType:   keygen.KeyTypeUser,
+		Name:      "user key",
+		OrgID:     orgID,
+		UserID:    &userObj.ID,
+		CreatedBy: userObj.ID,
+	})
+	if err != nil {
+		t.Fatalf("CreateAPIKey user key: %v", err)
+	}
+	keyCache.Set(userKeyHash, auth.KeyInfo{
+		ID:      userKey.ID,
+		KeyType: keygen.KeyTypeUser,
+		Role:    role,
+		OrgID:   orgID,
+		UserID:  userObj.ID,
+		Name:    "user key",
+	})
+
+	// A team key whose KeyInfo carries the creating user's UserID.
+	teamKeyRaw, err := keygen.Generate(keygen.KeyTypeTeam)
+	if err != nil {
+		t.Fatalf("Generate team key: %v", err)
+	}
+	teamKeyHash := keygen.Hash(teamKeyRaw, testHMACSecret)
+	keyCache.Set(teamKeyHash, auth.KeyInfo{
+		ID:      "team-key-id",
+		KeyType: keygen.KeyTypeTeam,
+		Role:    auth.RoleMember,
+		OrgID:   orgID,
+		UserID:  userObj.ID,
+		TeamID:  "team-1",
+		Name:    "team key",
+	})
+
+	if status, msg := doChangePassword(t, app, token1, oldPwd, newPwd); status != fiber.StatusOK {
+		t.Fatalf("change password: status = %d, msg: %s", status, msg)
+	}
+
+	if _, ok := keyCache.Get(keygen.Hash(token2, testHMACSecret)); ok {
+		t.Error("second session still in cache after password change")
+	}
+	if got := doGet(t, app, "/api/v1/me", token2); got != fiber.StatusUnauthorized {
+		t.Errorf("second session status = %d, want 401", got)
+	}
+	if got := doGet(t, app, "/api/v1/me", token1); got != fiber.StatusOK {
+		t.Errorf("current session status = %d, want 200", got)
+	}
+	if _, ok := keyCache.Get(userKeyHash); !ok {
+		t.Error("user key evicted from cache by password change")
+	}
+	if got := doGet(t, app, "/api/v1/me", userKeyRaw); got != fiber.StatusOK {
+		t.Errorf("user key status = %d, want 200", got)
+	}
+	if _, ok := keyCache.Get(teamKeyHash); !ok {
+		t.Error("team key evicted from cache by password change")
+	}
+}
