@@ -30,6 +30,9 @@ func TestMiddleware_XAPIKey(t *testing.T) {
 		{"empty-scheme authorization blocks x-api-key", func(v string) map[string]string {
 			return map[string]string{"Authorization": "Bearer ", "x-api-key": v}
 		}, fiber.StatusUnauthorized},
+		{"empty authorization header blocks x-api-key", func(v string) map[string]string {
+			return map[string]string{"Authorization": "", "x-api-key": v}
+		}, fiber.StatusUnauthorized},
 		{"invalid bearer wins over valid x-api-key", func(v string) map[string]string {
 			return map[string]string{"Authorization": "Bearer vl_uk_invalid", "x-api-key": v}
 		}, fiber.StatusUnauthorized},

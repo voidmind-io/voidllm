@@ -259,7 +259,15 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 	}
 
 	trackDone := p.initShutdownTracking()
-	defer trackDone()
+	// The streaming path hands trackDone to the stream writer, which releases
+	// it when the stream (and any native disconnect drain) has finished.
+	// Every other path releases it here when Handle returns.
+	streamOwnsTracking := false
+	defer func() {
+		if !streamOwnsTracking {
+			trackDone()
+		}
+	}()
 
 	maxReqBody, maxRespBody, maxStreamDur := p.resolveEffectiveLimits()
 
@@ -573,8 +581,13 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		if p.CircuitBreakers != nil && !isRateLimited(resp.StatusCode) {
 			breaker = p.CircuitBreakers.Get(deploymentKey(currentModel.Name, usedDep.Name))
 		}
-		return p.handleStreamingResponse(c, resp, cancelUpstream, currentModel,
+		err := p.handleStreamingResponse(c, resp, cancelUpstream, currentModel,
 			keyInfo, adapter, usedDep, startTime, requestID, requestedModelName, effectiveStreamDur, maxRespBody, trackDone, breaker, piiFilter)
+		// SendStreamWriter starts the writer goroutine synchronously inside
+		// fasthttp's SetBodyStreamWriter (NewStreamReader), so once it has
+		// been installed the writer always runs and releases trackDone.
+		streamOwnsTracking = err == nil
+		return err
 	}
 
 	defer cancelUpstream()
@@ -1402,8 +1415,9 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 	// handled inside the closure. SendStreamWriter's goroutine outlives
 	// Handle's return, so none of them must be deferred at Handle scope —
 	// that would fire before the goroutine has finished reading the body.
-	// trackDone is safe to pass directly: sync.Once ensures it fires exactly
-	// once whether the top-level defer or this goroutine runs first.
+	// The writer goroutine owns trackDone once installed: fasthttp's
+	// NewStreamReader starts it immediately and it always runs to completion,
+	// so Handle skips its own release after a successful install.
 	return c.SendStreamWriter(func(w *bufio.Writer) {
 		metrics.ActiveStreams.Inc()
 		defer metrics.ActiveStreams.Dec()
@@ -1911,6 +1925,13 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			// nativeDisconnectDrain; the stream timer above bounds it by the
 			// remaining stream deadline.
 			if clientDisconnected && nat != nil && !terminalSeen {
+				// Free a half-open probe slot now rather than after the drain.
+				// A client disconnect is a neutral outcome; clearing breaker
+				// keeps the switch below from recording a second one.
+				if breaker != nil {
+					breaker.RecordNeutral()
+					breaker = nil
+				}
 				drainTimer := time.AfterFunc(nativeDisconnectDrain, cancelUpstream)
 				for scanner.Scan() {
 					line := scanner.Bytes()

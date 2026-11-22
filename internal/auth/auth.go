@@ -101,20 +101,20 @@ type KeyInfo struct {
 }
 
 // Middleware returns a Fiber handler that authenticates requests via Bearer token
-// or, on /v1/* proxy routes without any Authorization header, the x-api-key
-// header. It computes
+// or, on /v1/* proxy routes without any Authorization header (present but
+// empty counts as present), the x-api-key header. It computes
 // HMAC-SHA256 of the token with hmacSecret, looks up the hash in keyCache,
 // checks expiration, and stores the KeyInfo in the request context.
 func Middleware(keyCache *cache.Cache[string, KeyInfo], hmacSecret []byte) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		// x-api-key (the Anthropic SDK default) is accepted on the proxy routes
 		// (/v1/*) only, and only when the request carries no Authorization
-		// header at all: any Authorization header, whatever its scheme, takes
-		// precedence and is never combined with x-api-key. The admin API stays
+		// header at all: any Authorization header, whatever its scheme or
+		// value (even empty), takes precedence and is never combined with x-api-key. The admin API stays
 		// Bearer-only.
 		authz := c.Get("Authorization")
 		token := extractBearerToken(authz)
-		if authz == "" && strings.HasPrefix(c.Path(), "/v1/") {
+		if c.Request().Header.Peek("Authorization") == nil && strings.HasPrefix(c.Path(), "/v1/") {
 			token = strings.TrimSpace(c.Get("x-api-key"))
 		}
 		if token == "" {
