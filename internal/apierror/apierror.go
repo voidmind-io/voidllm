@@ -12,8 +12,10 @@ type Response struct {
 }
 
 // Detail holds the machine-readable error code, a human-readable message,
-// and an optional request correlation ID.
+// and an optional request correlation ID. Type is an optional OpenAI-style
+// error type and is omitted unless set.
 type Detail struct {
+	Type      string `json:"type,omitempty"`
 	Code      string `json:"code"`
 	Message   string `json:"message"`
 	RequestID string `json:"request_id,omitempty"`

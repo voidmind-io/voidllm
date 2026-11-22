@@ -81,3 +81,27 @@ func SendProxy(c fiber.Ctx, status int, code, message string) error {
 	}
 	return Send(c, status, code, message)
 }
+
+// QuotaErrorType is the OpenAI error type for an exhausted quota. Clients such
+// as the Codex CLI treat it as a terminal condition instead of honouring a long
+// Retry-After.
+const QuotaErrorType = "insufficient_quota"
+
+// SendProxyQuota behaves like SendProxy, except that on the OpenAI Responses
+// endpoint (/v1/responses) the error additionally carries the OpenAI quota
+// type (QuotaErrorType) so clients stop instead of sleeping for the whole
+// Retry-After. The VoidLLM code is preserved. All other paths, including the
+// Anthropic envelope, are identical to SendProxy.
+func SendProxyQuota(c fiber.Ctx, status int, code, message string) error {
+	if strings.ToLower(path.Clean(c.Path())) != "/v1/responses" {
+		return SendProxy(c, status, code, message)
+	}
+	return c.Status(status).JSON(Response{
+		Error: Detail{
+			Type:      QuotaErrorType,
+			Code:      code,
+			Message:   message,
+			RequestID: RequestIDFromCtx(c),
+		},
+	})
+}

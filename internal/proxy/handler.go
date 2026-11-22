@@ -1070,7 +1070,7 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 			// retry-loop (x-should-retry) and when the budget frees up.
 			setRetryAfter(c, err)
 			c.Set("x-should-retry", "false")
-			if err := apierror.SendProxy(c, fiber.StatusTooManyRequests, "token_limit_exceeded", "token budget exceeded"); err != nil {
+			if err := apierror.SendProxyQuota(c, fiber.StatusTooManyRequests, "token_limit_exceeded", "token budget exceeded"); err != nil {
 				return err
 			}
 			return errResponseSent

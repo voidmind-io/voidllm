@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -113,5 +115,64 @@ func TestLimitRejection_RequestRateHeaders(t *testing.T) {
 				t.Errorf("Retry-After = %q, want 1..60 (minute window)", resp.Header.Get("Retry-After"))
 			}
 		})
+	}
+}
+
+func TestLimitRejection_TokenBudgetBodyShape(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		path    string
+		wantErr map[string]string
+	}{
+		{path: "/v1/responses", wantErr: map[string]string{"type": "insufficient_quota", "code": "token_limit_exceeded", "message": "token budget exceeded"}},
+		{path: "/v1/chat/completions", wantErr: map[string]string{"code": "token_limit_exceeded", "message": "token budget exceeded"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			t.Parallel()
+			info := auth.KeyInfo{ID: "tok-key", KeyType: keygen.KeyTypeUser, OrgID: "tok-org", Role: auth.RoleMember, DailyTokenLimit: 100}
+			app, h, key := limitApp(t, info)
+			h.TokenCounter.Add(ratelimit.Scopes{KeyID: "tok-key", OrgID: "tok-org"}, 100)
+
+			resp := postLimited(t, app, tt.path, key)
+			if resp.StatusCode != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want 429", resp.StatusCode)
+			}
+			if resp.Header.Get("Retry-After") == "" || resp.Header.Get("x-should-retry") != "false" {
+				t.Errorf("Retry-After=%q x-should-retry=%q", resp.Header.Get("Retry-After"), resp.Header.Get("x-should-retry"))
+			}
+			var body struct {
+				Error map[string]string `json:"error"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			delete(body.Error, "request_id")
+			if !reflect.DeepEqual(body.Error, tt.wantErr) {
+				t.Errorf("error = %v, want %v", body.Error, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLimitRejection_TokenBudgetMessagesKeepsAnthropicEnvelope(t *testing.T) {
+	t.Parallel()
+	info := auth.KeyInfo{ID: "tok-key", KeyType: keygen.KeyTypeUser, OrgID: "tok-org", Role: auth.RoleMember, DailyTokenLimit: 100}
+	app, h, key := limitApp(t, info)
+	h.TokenCounter.Add(ratelimit.Scopes{KeyID: "tok-key", OrgID: "tok-org"}, 100)
+
+	resp := postLimited(t, app, "/v1/messages", key)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", resp.StatusCode)
+	}
+	var body struct {
+		Type  string            `json:"type"`
+		Error map[string]string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Type != "error" || body.Error["type"] != "rate_limit_error" {
+		t.Errorf("body = %+v, want anthropic rate_limit_error envelope", body)
 	}
 }
