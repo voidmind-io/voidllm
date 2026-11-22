@@ -1,0 +1,40 @@
+# VoidLLM config for the Open WebUI + Ollama recipe.
+# Secrets (VOIDLLM_ENCRYPTION_KEY, VOIDLLM_ADMIN_KEY) come from the environment,
+# see .env.example. Full reference: docs/configuration.md
+
+settings:
+  # With a config file present, secrets are read only through these
+  # interpolations, not picked up from the environment automatically.
+  admin_key: ${VOIDLLM_ADMIN_KEY}
+  encryption_key: ${VOIDLLM_ENCRYPTION_KEY}
+
+server:
+  proxy:
+    port: 8080
+    # CPU-only Ollama can be slow; give streamed answers room to finish.
+    write_timeout: 300s
+    max_stream_duration: 290s
+
+database:
+  driver: sqlite
+  dsn: /data/voidllm.db
+
+models:
+  # The model name must match the Ollama model tag exactly, because VoidLLM
+  # forwards it upstream as the "model" field. Pull it with:
+  #   docker compose exec ollama ollama pull qwen2.5:0.5b
+  - name: qwen2.5:0.5b
+    provider: ollama
+    base_url: http://ollama:11434/v1
+    aliases: [default]
+    max_context_tokens: 32768
+    # Local model, no per-token cost. Set prices here if you want VoidLLM's
+    # cost reports to reflect internal chargeback rates.
+    pricing:
+      input_per_1m: 0
+      output_per_1m: 0
+
+  # Add more Ollama models the same way, e.g.:
+  # - name: llama3.2:3b
+  #   provider: ollama
+  #   base_url: http://ollama:11434/v1

@@ -20,6 +20,7 @@ Privacy-first LLM proxy and AI gateway. Self-hosted, single binary, sub-500us ov
 - [Kubernetes](deployment/kubernetes.md) - Helm chart, Istio, health probes
 - [Reverse Proxy](deployment/reverse-proxy.md) - Nginx, Caddy, Traefik
 - [Database](deployment/database.md) - SQLite, PostgreSQL, migration
+- [Open WebUI](deployment/open-webui.md) - Open WebUI + Ollama behind VoidLLM, per-team keys and budgets
 
 ## Guides
 
