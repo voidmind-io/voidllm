@@ -295,6 +295,19 @@ func (d *DB) UpdateAPIKey(ctx context.Context, id string, params UpdateAPIKeyPar
 // DeleteAPIKey soft-deletes an active API key by setting deleted_at.
 // It returns ErrNotFound if the key does not exist or is already deleted.
 
+// RevokeSessionKey hard-deletes a single session key by ID. Only rows with
+// key_type session_key are affected, so a non-session key ID is a no-op.
+// It is idempotent: revoking an already-removed session returns nil.
+func (d *DB) RevokeSessionKey(ctx context.Context, keyID string) error {
+	p := d.dialect.Placeholder
+	query := "DELETE FROM api_keys WHERE id = " + p(1) + " AND key_type = " + p(2)
+
+	if _, err := d.sql.ExecContext(ctx, query, keyID, "session_key"); err != nil {
+		return fmt.Errorf("revoke session key %s: %w", keyID, translateError(err))
+	}
+	return nil
+}
+
 // RevokeUserSessions hard-deletes all session keys for a user.
 // Called during login and OIDC callback to ensure only one session exists per
 // user. Session keys are ephemeral — no audit trail needed, hard delete

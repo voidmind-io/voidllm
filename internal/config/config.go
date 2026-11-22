@@ -825,6 +825,7 @@ func Load(path string) (*Config, bool, error) {
 		return nil, false, fmt.Errorf("config: unmarshal yaml: %w", err)
 	}
 
+	applyEnvFallbacks(&cfg)
 	cfg.setDefaults()
 
 	// If license_file is set and the inline license key is empty, read the
@@ -867,16 +868,33 @@ func findConfigFile() (string, error) {
 	return "", fmt.Errorf("no config file found; set VOIDLLM_CONFIG or place voidllm.yaml in the current directory")
 }
 
+// applyEnvFallbacks fills the admin key, encryption key, license, database DSN
+// and database driver from VOIDLLM_ADMIN_KEY, VOIDLLM_ENCRYPTION_KEY,
+// VOIDLLM_LICENSE, VOIDLLM_DATABASE_DSN and VOIDLLM_DATABASE_DRIVER, but only
+// for fields that are still empty. Values set in the YAML file always win. The
+// license variable is ignored when settings.license_file is set, so an explicit
+// license file keeps precedence over the environment.
+func applyEnvFallbacks(cfg *Config) {
+	fill := func(dst *string, name string) {
+		if *dst == "" {
+			*dst = os.Getenv(name)
+		}
+	}
+	fill(&cfg.Settings.AdminKey, "VOIDLLM_ADMIN_KEY")
+	fill(&cfg.Settings.EncryptionKey, "VOIDLLM_ENCRYPTION_KEY")
+	if cfg.Settings.LicenseFile == "" {
+		fill(&cfg.Settings.License, "VOIDLLM_LICENSE")
+	}
+	fill(&cfg.Database.DSN, "VOIDLLM_DATABASE_DSN")
+	fill(&cfg.Database.Driver, "VOIDLLM_DATABASE_DRIVER")
+}
+
 // loadDefaults returns a Config populated entirely from environment
 // variables and built-in defaults. It is used when no configuration
 // file is found.
 func loadDefaults() (*Config, error) {
 	var cfg Config
-	cfg.Settings.AdminKey = os.Getenv("VOIDLLM_ADMIN_KEY")
-	cfg.Settings.EncryptionKey = os.Getenv("VOIDLLM_ENCRYPTION_KEY")
-	cfg.Settings.License = os.Getenv("VOIDLLM_LICENSE")
-	cfg.Database.DSN = os.Getenv("VOIDLLM_DATABASE_DSN")
-	cfg.Database.Driver = os.Getenv("VOIDLLM_DATABASE_DRIVER")
+	applyEnvFallbacks(&cfg)
 	cfg.setDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("config: %w", err)

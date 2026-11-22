@@ -317,6 +317,55 @@ type changeOwnPasswordRequest struct {
 	NewPassword     string `json:"new_password"`
 }
 
+// Logout handles POST /api/v1/auth/logout. When the calling key is a session
+// key it is deleted from the database and evicted from the key cache, so the
+// token is rejected immediately. Any other key type (user, team, service
+// account) is left untouched and the call still succeeds, which lets clients
+// call logout unconditionally.
+//
+// @Summary      Log out
+// @Description  Revokes the calling session key. For non-session API keys this is a no-op that still returns 204.
+// @Tags         auth
+// @Success      204  "No Content"
+// @Failure      401  {object}  swaggerErrorResponse
+// @Failure      500  {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /auth/logout [post]
+func (h *Handler) Logout(c fiber.Ctx) error {
+	keyInfo := auth.KeyInfoFromCtx(c)
+	if keyInfo == nil {
+		return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "missing authentication")
+	}
+	if keyInfo.KeyType != keygen.KeyTypeSession {
+		return c.SendStatus(fiber.StatusNoContent)
+	}
+
+	ctx := c.Context()
+	if err := h.DB.RevokeSessionKey(ctx, keyInfo.ID); err != nil {
+		h.Log.ErrorContext(ctx, "logout: revoke session key", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to log out")
+	}
+	h.KeyCache.Delete(keyInfo.Hash)
+
+	if h.AuditLogger != nil {
+		h.AuditLogger.Log(audit.Event{
+			Timestamp:    time.Now().UTC(),
+			OrgID:        keyInfo.OrgID,
+			ActorID:      keyInfo.UserID,
+			ActorType:    "user",
+			ActorKeyID:   keyInfo.ID,
+			Action:       "logout",
+			ResourceType: "session",
+			ResourceID:   keyInfo.ID,
+			IPAddress:    c.IP(),
+			StatusCode:   fiber.StatusNoContent,
+			RequestID:    apierror.RequestIDFromCtx(c),
+		})
+	}
+
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
 // ChangeOwnPassword handles POST /api/v1/me/password. It verifies the caller's
 // current password, then replaces it with the new one and invalidates all other
 // active sessions for the user. The current session remains valid.

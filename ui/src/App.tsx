@@ -1,4 +1,5 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { useEffect } from 'react'
+import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import LoginPage from './pages/auth/LoginPage'
 import CallbackPage from './pages/auth/CallbackPage'
@@ -40,6 +41,7 @@ import { ToastProvider } from './hooks/useToast'
 import { Shell } from './components/layout/Shell'
 import { PageHeader } from './components/ui/PageHeader'
 import { LOCAL_STORAGE_KEY } from './lib/constants'
+import { clearSession, isSessionExpired, msUntilSessionExpiry } from './lib/session'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -61,9 +63,32 @@ function PlaceholderPage({ title, description }: { title: string; description?: 
   )
 }
 
-function RequireAuth() {
+export function RequireAuth() {
+  const navigate = useNavigate()
   const token = localStorage.getItem(LOCAL_STORAGE_KEY)
-  if (!token) return <Navigate to="/login" replace />
+  const expired = isSessionExpired()
+
+  useEffect(() => {
+    if (!token) return
+    let timer: number | undefined
+    const schedule = () => {
+      const delay = msUntilSessionExpiry()
+      if (delay === null) return
+      timer = window.setTimeout(() => {
+        if (isSessionExpired()) {
+          clearSession()
+          navigate('/login', { replace: true })
+        } else {
+          schedule()
+        }
+      }, delay)
+    }
+    schedule()
+    return () => window.clearTimeout(timer)
+  }, [token, navigate])
+
+  if (token && expired) clearSession()
+  if (!token || expired) return <Navigate to="/login" replace />
   return <Shell />
 }
 

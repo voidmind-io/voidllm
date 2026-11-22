@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { LOCAL_STORAGE_KEY } from '../../lib/constants'
+import { storeSession } from '../../lib/session'
 
 function getCookie(name: string): string | null {
   const match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'))
@@ -10,7 +10,7 @@ export default function CallbackPage() {
   useEffect(() => {
     const token = getCookie('voidllm_oidc_token')
     if (token) {
-      localStorage.setItem(LOCAL_STORAGE_KEY, token)
+      storeSession(token)
       document.cookie = 'voidllm_oidc_token=; path=/auth/callback; max-age=0'
       window.location.href = '/'
     } else {

@@ -2050,3 +2050,99 @@ func TestMCPConfig_EffectiveStreamMaxBytes(t *testing.T) {
 		})
 	}
 }
+
+// ---- applyEnvFallbacks -----------------------------------------------------
+
+func TestLoad_EnvFallbacks(t *testing.T) {
+	// t.Setenv forbids t.Parallel.
+	const noSecretsYAML = `
+server:
+  proxy:
+    port: 8080
+settings:
+  usage:
+    buffer_size: 100
+`
+	const fileSecretsYAML = `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: from-file.db
+settings:
+  admin_key: file-admin-key-0123456789abcdef0123456789
+  encryption_key: bbbbbbbbbbbbbbbb
+  usage:
+    buffer_size: 100
+`
+	tests := []struct {
+		name       string
+		yaml       string
+		wantAdmin  string
+		wantEncKey string
+		wantDSN    string
+	}{
+		{
+			name:       "file without secrets takes env values",
+			yaml:       noSecretsYAML,
+			wantAdmin:  "env-admin-key-0123456789abcdef0123456789",
+			wantEncKey: "aaaaaaaaaaaaaaaa",
+			wantDSN:    "env.db",
+		},
+		{
+			name:       "file values win over env",
+			yaml:       fileSecretsYAML,
+			wantAdmin:  "file-admin-key-0123456789abcdef0123456789",
+			wantEncKey: "bbbbbbbbbbbbbbbb",
+			wantDSN:    "from-file.db",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VOIDLLM_ADMIN_KEY", "env-admin-key-0123456789abcdef0123456789")
+			t.Setenv("VOIDLLM_ENCRYPTION_KEY", "aaaaaaaaaaaaaaaa")
+			t.Setenv("VOIDLLM_DATABASE_DSN", "env.db")
+			t.Setenv("VOIDLLM_DATABASE_DRIVER", "sqlite")
+
+			cfg, usedDefaults, err := config.Load(writeTemp(t, "voidllm.yaml", tc.yaml))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if usedDefaults {
+				t.Error("usedDefaults = true, want false")
+			}
+			if cfg.Settings.AdminKey != tc.wantAdmin {
+				t.Errorf("AdminKey = %q, want %q", cfg.Settings.AdminKey, tc.wantAdmin)
+			}
+			if cfg.Settings.EncryptionKey != tc.wantEncKey {
+				t.Errorf("EncryptionKey = %q, want %q", cfg.Settings.EncryptionKey, tc.wantEncKey)
+			}
+			if cfg.Database.DSN != tc.wantDSN {
+				t.Errorf("DSN = %q, want %q", cfg.Database.DSN, tc.wantDSN)
+			}
+			if cfg.Database.Driver != "sqlite" {
+				t.Errorf("Driver = %q, want sqlite", cfg.Database.Driver)
+			}
+		})
+	}
+}
+
+func TestLoad_NoFileUsesEnv(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("VOIDLLM_CONFIG", "")
+	t.Setenv("VOIDLLM_ADMIN_KEY", "env-admin-key-0123456789abcdef0123456789")
+	t.Setenv("VOIDLLM_ENCRYPTION_KEY", "aaaaaaaaaaaaaaaa")
+	t.Setenv("VOIDLLM_DATABASE_DSN", "env.db")
+
+	cfg, usedDefaults, err := config.Load("")
+	if err != nil {
+		t.Skipf("no config file may exist at /etc/voidllm: %v", err)
+	}
+	if !usedDefaults {
+		t.Skip("a config file exists on this host")
+	}
+	if cfg.Settings.AdminKey != "env-admin-key-0123456789abcdef0123456789" || cfg.Database.DSN != "env.db" {
+		t.Errorf("env not applied: admin=%q dsn=%q", cfg.Settings.AdminKey, cfg.Database.DSN)
+	}
+}

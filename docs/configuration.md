@@ -84,12 +84,14 @@ database:
   conn_max_lifetime: 5m
 ```
 
-For config-less startup (no YAML file), these environment variables override the defaults:
+These environment variables apply with or without a YAML file. Precedence: a value set in the YAML wins, otherwise the environment variable is used, otherwise the default.
 
 | Variable | Default | Description |
 |---|---|---|
 | `VOIDLLM_DATABASE_DSN` | `./voidllm.db` (standalone), `/data/voidllm.db` (Docker) | Database file path or PostgreSQL DSN |
 | `VOIDLLM_DATABASE_DRIVER` | `sqlite` | Database driver - `sqlite` or `postgres` |
+
+The same precedence applies to `VOIDLLM_ADMIN_KEY`, `VOIDLLM_ENCRYPTION_KEY` and `VOIDLLM_LICENSE` (see [Settings](#settings)). `VOIDLLM_LICENSE` is ignored when `settings.license_file` is set.
 
 ## Models
 
