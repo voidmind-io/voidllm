@@ -17,6 +17,10 @@ import (
 	"github.com/voidmind-io/voidllm/internal/shutdown"
 )
 
+// testHTTPClient bounds every request in this file so an early failure fails
+// fast instead of hanging until the package test timeout.
+var testHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
 func waitInFlight(t *testing.T, st *shutdown.State, want int64) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -36,6 +40,8 @@ func TestHandle_StreamKeepsShutdownTrackingUntilStreamEnds(t *testing.T) {
 	t.Parallel()
 
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseStream := func() { releaseOnce.Do(func() { close(release) }) }
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -55,6 +61,9 @@ func TestHandle_StreamKeepsShutdownTrackingUntilStreamEnds(t *testing.T) {
 	st := shutdown.New()
 	h.ShutdownState = st
 	baseURL, rawKey := startAuthedTestServer(t, h, terminationKeyInfo("org-shutdown-stream"))
+	// Registered after the proxy server so it runs before the server shutdown
+	// and upstream.Close (LIFO) and unblocks any request still held upstream.
+	t.Cleanup(releaseStream)
 
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/chat/completions",
 		strings.NewReader(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"stream":true}`, modelName)))
@@ -63,7 +72,7 @@ func TestHandle_StreamKeepsShutdownTrackingUntilStreamEnds(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+rawKey)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := testHTTPClient.Do(req)
 	if err != nil {
 		t.Fatalf("do request: %v", err)
 	}
@@ -73,13 +82,14 @@ func TestHandle_StreamKeepsShutdownTrackingUntilStreamEnds(t *testing.T) {
 	if _, err := br.ReadString('\n'); err != nil {
 		t.Fatalf("read first line: %v", err)
 	}
-	// Handle has long returned by now; the stream is still live.
-	time.Sleep(100 * time.Millisecond)
+	// fasthttp writes the response only after the handler has returned, so
+	// receiving stream data proves Handle has returned; the stream is still
+	// live because the upstream is blocked on release.
 	if got := st.InFlight(); got != 1 {
 		t.Fatalf("InFlight while stream live = %d, want 1", got)
 	}
 
-	close(release)
+	releaseStream()
 	if _, err := io.Copy(io.Discard, br); err != nil {
 		t.Fatalf("drain body: %v", err)
 	}
@@ -87,11 +97,25 @@ func TestHandle_StreamKeepsShutdownTrackingUntilStreamEnds(t *testing.T) {
 }
 
 // TestHandle_NonStreamPathsReleaseShutdownTracking verifies buffered responses
-// and early errors still release the in-flight slot when Handle returns.
+// and early errors still release the in-flight slot when Handle returns, and
+// that the slot was actually held while the request was in progress.
 func TestHandle_NonStreamPathsReleaseShutdownTracking(t *testing.T) {
 	t.Parallel()
 
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	entered := make(chan struct{}, 1)
+	proceed := make(chan struct{})
+	var proceedOnce sync.Once
+	unblock := func() { proceedOnce.Do(func() { close(proceed) }) }
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-proceed:
+		case <-r.Context().Done():
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
 	}))
@@ -102,23 +126,82 @@ func TestHandle_NonStreamPathsReleaseShutdownTracking(t *testing.T) {
 	st := shutdown.New()
 	h.ShutdownState = st
 	baseURL, rawKey := startAuthedTestServer(t, h, terminationKeyInfo("org-shutdown-buffered"))
+	// Registered after the proxy server so it runs before the server shutdown
+	// and upstream.Close (LIFO) and unblocks any request still held upstream.
+	t.Cleanup(unblock)
 
-	for name, model := range map[string]string{"buffered": modelName, "unknown model": "no-such-model"} {
+	newReq := func(t *testing.T, model string) *http.Request {
+		t.Helper()
 		req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/chat/completions",
 			strings.NewReader(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}]}`, model)))
 		if err != nil {
-			t.Fatalf("%s: build request: %v", name, err)
+			t.Fatalf("build request: %v", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+rawKey)
-		resp, err := http.DefaultClient.Do(req)
+		return req
+	}
+
+	t.Run("buffered", func(t *testing.T) {
+		type result struct {
+			status int
+			err    error
+		}
+		done := make(chan result, 1)
+		req := newReq(t, modelName)
+		go func() {
+			resp, err := testHTTPClient.Do(req)
+			if err != nil {
+				done <- result{err: err}
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			done <- result{status: resp.StatusCode}
+		}()
+
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("upstream was not reached within deadline")
+		}
+		if got := st.InFlight(); got != 1 {
+			t.Fatalf("InFlight while request blocked upstream = %d, want 1", got)
+		}
+
+		unblock()
+		var res result
+		select {
+		case res = <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("request did not complete within deadline")
+		}
+		if res.err != nil {
+			t.Fatalf("do request: %v", res.err)
+		}
+		if res.status != http.StatusOK {
+			t.Errorf("status = %d, want %d", res.status, http.StatusOK)
+		}
+		// The response is written only after Handle has returned.
+		if got := st.InFlight(); got != 0 {
+			t.Errorf("InFlight after Handle returned = %d, want 0", got)
+		}
+	})
+
+	t.Run("unknown model", func(t *testing.T) {
+		resp, err := testHTTPClient.Do(newReq(t, "no-such-model"))
 		if err != nil {
-			t.Fatalf("%s: do request: %v", name, err)
+			t.Fatalf("do request: %v", err)
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		waitInFlight(t, st, 0)
-	}
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+		}
+		if got := st.InFlight(); got != 0 {
+			t.Errorf("InFlight after Handle returned = %d, want 0", got)
+		}
+	})
 }
 
 // TestHandle_NativeDisconnectDrain_ReleasesProbeSlotOnce verifies that a
@@ -130,7 +213,6 @@ func TestHandle_NativeDisconnectDrain_ReleasesProbeSlotOnce(t *testing.T) {
 	finish := make(chan struct{})
 	var finishOnce sync.Once
 	closeFinish := func() { finishOnce.Do(func() { close(finish) }) }
-	t.Cleanup(closeFinish)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -166,14 +248,21 @@ func TestHandle_NativeDisconnectDrain_ReleasesProbeSlotOnce(t *testing.T) {
 	h.CircuitBreakers = halfOpenBreakerWithFreeSlot(t, depKey)
 	b := h.CircuitBreakers.Get(depKey)
 	baseURL, rawKey := startAuthedTestServer(t, h, terminationKeyInfo("org-native-drain"))
+	// Registered after the proxy server so it runs before the server shutdown
+	// and upstream.Close (LIFO) and unblocks any request still held upstream.
+	t.Cleanup(closeFinish)
 
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		t.Fatalf("parse url: %v", err)
 	}
-	conn, err := net.Dial("tcp", u.Host)
+	conn, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
 	}
 	body := fmt.Sprintf(`{"model":%q,"stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`, modelName)
 	fmt.Fprintf(conn, "POST /v1/messages HTTP/1.1\r\nHost: %s\r\nx-api-key: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
@@ -206,8 +295,8 @@ func TestHandle_NativeDisconnectDrain_ReleasesProbeSlotOnce(t *testing.T) {
 
 	closeFinish()
 	waitForLoggedStatusCode(t, d)
-	// Give any erroneous second record time to land.
-	time.Sleep(100 * time.Millisecond)
+	// The breaker outcome is recorded before the usage event is logged, so any
+	// erroneous second record has already landed by now.
 
 	// A second neutral record would have released the slot just taken above.
 	if b.Allow() {
