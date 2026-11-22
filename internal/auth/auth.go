@@ -101,15 +101,20 @@ type KeyInfo struct {
 }
 
 // Middleware returns a Fiber handler that authenticates requests via Bearer token
-// or, when no Bearer token is present, the x-api-key header. It computes
+// or, on /v1/* proxy routes without any Authorization header, the x-api-key
+// header. It computes
 // HMAC-SHA256 of the token with hmacSecret, looks up the hash in keyCache,
 // checks expiration, and stores the KeyInfo in the request context.
 func Middleware(keyCache *cache.Cache[string, KeyInfo], hmacSecret []byte) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		// A Bearer token wins; the x-api-key header (the Anthropic SDK default)
-		// is only consulted when no Bearer token is present.
-		token := extractBearerToken(c.Get("Authorization"))
-		if token == "" {
+		// x-api-key (the Anthropic SDK default) is accepted on the proxy routes
+		// (/v1/*) only, and only when the request carries no Authorization
+		// header at all: any Authorization header, whatever its scheme, takes
+		// precedence and is never combined with x-api-key. The admin API stays
+		// Bearer-only.
+		authz := c.Get("Authorization")
+		token := extractBearerToken(authz)
+		if authz == "" && strings.HasPrefix(c.Path(), "/v1/") {
 			token = strings.TrimSpace(c.Get("x-api-key"))
 		}
 		if token == "" {
@@ -143,8 +148,8 @@ func Middleware(keyCache *cache.Cache[string, KeyInfo], hmacSecret []byte) fiber
 // extractBearerToken parses a Bearer token from an Authorization header value.
 // Returns the token string, or empty string if the header is absent or malformed.
 func extractBearerToken(header string) string {
-	token, ok := strings.CutPrefix(header, "Bearer ")
-	if !ok {
+	scheme, token, ok := strings.Cut(header, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
 		return ""
 	}
 	token = strings.TrimSpace(token)

@@ -271,6 +271,11 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		return err
 	}
 
+	if format == formatResponses && hasStatefulResponsesParam(body) {
+		return apierror.SendProxy(c, fiber.StatusBadRequest, "unsupported_parameter",
+			"previous_response_id, conversation and background are not supported")
+	}
+
 	keyInfo := auth.KeyInfoFromCtx(c)
 	requestID := apierror.RequestIDFromCtx(c)
 
@@ -449,7 +454,7 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			break
 		}
 
-		next, hasFallback := p.nextFallback(currentModel.Name, visited, format)
+		next, hasFallback := p.nextFallback(currentModel.Name, visited, format, keyInfo)
 		if !hasFallback {
 			// No fallback model configured — keep resp as-is so it can be
 			// forwarded to the client (even if it is a 5xx).
@@ -868,7 +873,13 @@ func (p *ProxyHandler) tryModel(
 			}
 			p.Cooldowns.Mark(depKey, retryAfterOrDefault(currentResp))
 		} else if breaker != nil && !isStreamingResponse(currentResp, currentAdapter) {
-			if currentResp.StatusCode >= 500 {
+			if path.Clean(strings.TrimPrefix(c.Path(), "/v1/")) == messagesCountTokensPath {
+				// count_tokens is a cheap side endpoint that does not exercise
+				// generation: its outcome says nothing reliable about the
+				// deployment's health, so it neither resets accumulated
+				// failures (success) nor trips the breaker (failure).
+				breaker.RecordNeutral()
+			} else if currentResp.StatusCode >= 500 {
 				breaker.RecordFailure()
 			} else {
 				breaker.RecordSuccess()
@@ -1167,7 +1178,7 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 
 	// Determine if body needs mutation.
 	needsModelReplace := envelope.Model != model.Name
-	needsStreamOpts := envelope.Stream && format == formatChat && (adapter == nil || isAzureAdapter(adapter))
+	needsStreamOpts := envelope.Stream && !format.native() && (adapter == nil || isAzureAdapter(adapter))
 
 	var modifiedBody []byte
 	if needsModelReplace || needsStreamOpts {
@@ -1178,6 +1189,10 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 		// made because c.Body() is backed by fasthttp's arena which is recycled
 		// after Handle returns.
 		modifiedBody = append([]byte(nil), body...)
+	}
+
+	if format == formatResponses {
+		modifiedBody = defaultResponsesStore(modifiedBody)
 	}
 
 	if adapter != nil {
@@ -1456,6 +1471,8 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 		// that the record accurately reflects the stream was not successful, while
 		// still capturing the partial token counts that the upstream consumed.
 		streamIncomplete := false
+		// nativeOK is true when a native stream ended on its clean terminal event.
+		nativeOK := false
 
 		if needsContentRestore {
 			// Incremental PII restore path (Stage 0b).
@@ -1888,6 +1905,26 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				}
 			}
 
+			// The client hung up mid-stream on a native endpoint: keep reading the
+			// upstream without writing, so the usage that arrives with the
+			// terminal event is still captured and charged. The read is bounded by
+			// nativeDisconnectDrain; the stream timer above bounds it by the
+			// remaining stream deadline.
+			if clientDisconnected && nat != nil && !terminalSeen {
+				drainTimer := time.AfterFunc(nativeDisconnectDrain, cancelUpstream)
+				for scanner.Scan() {
+					line := scanner.Bytes()
+					if len(line) == 0 {
+						if nat.endEvent() != termNone {
+							break
+						}
+						continue
+					}
+					nat.observe(line)
+				}
+				drainTimer.Stop()
+			}
+
 			// scanErr is logged unconditionally for observability whenever
 			// non-nil, independent of how it is ultimately classified below.
 			scanErr := scanner.Err()
@@ -1974,6 +2011,7 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			if terminalSeen && (nativeKind == termFailed || nativeKind == termIncomplete) {
 				streamIncomplete = true
 			}
+			nativeOK = terminalSeen && nativeKind == termOK
 
 			if breaker != nil && !plainAborted {
 				switch {
@@ -2027,6 +2065,9 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				}
 			}
 			streamUI = normalizeRerankScoreUsage(upstreamPath, streamUI)
+			if nativeOK && streamUI == (UsageInfo{}) {
+				p.warnNoNativeUsage(model.Name, requestID, format)
+			}
 			durationMS := int(time.Since(startTime).Milliseconds())
 			// Use the upstream HTTP status for successful, complete streams. For
 			// aborted or truncated streams (no clean [DONE]) log StatusBadGateway
@@ -2155,6 +2196,9 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 		var ui UsageInfo
 		if format.native() {
 			ui = usageFromNativeBody(format, usageBody)
+			if ui == (UsageInfo{}) {
+				p.warnNoNativeUsage(model.Name, requestID, format)
+			}
 		} else {
 			ui = normalizeRerankScoreUsage(upstreamPath, extractUsage(usageBody))
 		}

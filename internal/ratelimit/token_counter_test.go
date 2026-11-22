@@ -774,9 +774,10 @@ func TestCheckTokens_RetryAfterLatestReset(t *testing.T) {
 		t.Errorf("monthly RetryAfter = %v, want ~%v", d, untilMonth)
 	}
 
-	// Daily (org) and monthly (key) exceeded at once: blocked until the month
-	// resets, regardless of which scope is checked first.
-	both := ScopeLimits{Key: Limits{MonthlyTokenLimit: 100}, Org: Limits{DailyTokenLimit: 100}}
+	// Daily (key, checked first) and monthly (org, checked last) exceeded at
+	// once: blocked until the month resets. Returning the first exceeded window
+	// would report the daily reset and fail this assertion.
+	both := ScopeLimits{Key: Limits{DailyTokenLimit: 100}, Org: Limits{MonthlyTokenLimit: 100}}
 	err := tc.CheckTokens(s, both)
 	if !errors.Is(err, ErrTokenBudgetExceeded) {
 		t.Fatalf("err = %v, want ErrTokenBudgetExceeded", err)

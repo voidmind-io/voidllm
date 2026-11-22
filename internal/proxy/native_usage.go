@@ -160,13 +160,19 @@ func (n *nativeStream) observe(line []byte) {
 				}
 			}
 		case "message_delta":
+			// Newer API versions report cumulative input and cache figures here
+			// as well; the larger of start and delta wins, output comes from the
+			// delta.
 			var ev struct {
-				Usage struct {
-					OutputTokens int `json:"output_tokens"`
-				} `json:"usage"`
+				Usage messagesUsage `json:"usage"`
 			}
-			if jsonx.Unmarshal(data, &ev) == nil && ev.Usage.OutputTokens > 0 {
-				n.msg.OutputTokens = ev.Usage.OutputTokens
+			if jsonx.Unmarshal(data, &ev) == nil {
+				n.msg.InputTokens = max(n.msg.InputTokens, ev.Usage.InputTokens)
+				n.msg.CacheReadInputTokens = max(n.msg.CacheReadInputTokens, ev.Usage.CacheReadInputTokens)
+				n.msg.CacheCreationInputTokens = max(n.msg.CacheCreationInputTokens, ev.Usage.CacheCreationInputTokens)
+				if ev.Usage.OutputTokens > 0 {
+					n.msg.OutputTokens = ev.Usage.OutputTokens
+				}
 			}
 		case "message_stop":
 			n.pending = termOK
@@ -196,12 +202,6 @@ func (n *nativeStream) observe(line []byte) {
 			n.pending = termFailed
 		}
 	}
-}
-
-// pendingTerminal returns the terminal classification of the event currently
-// being read without clearing it.
-func (n *nativeStream) pendingTerminal() nativeTerminal {
-	return n.pending
 }
 
 // endEvent is called at an SSE event boundary. It returns the terminal

@@ -2,9 +2,14 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"errors"
-	"fmt"
+	"log/slog"
 	"strings"
+	"time"
+
+	"github.com/voidmind-io/voidllm/internal/auth"
+	"github.com/voidmind-io/voidllm/internal/jsonx"
 )
 
 // apiFormat identifies the wire format of a proxied endpoint. It is derived
@@ -160,14 +165,21 @@ func (p *ProxyHandler) nativeUsableModel(m Model, f apiFormat) (Model, nativeBlo
 // nextFallback returns the next fallback model for currentName. For native
 // endpoints, fallback targets without a usable deployment are skipped (and
 // marked visited) rather than ending the chain, and the returned model is
-// narrowed to its usable deployments.
-func (p *ProxyHandler) nextFallback(currentName string, visited map[string]bool, f apiFormat) (Model, bool) {
+// narrowed to its usable deployments. Access is checked before skipping: a
+// target denied to keyInfo is returned as-is so the chain stops there.
+func (p *ProxyHandler) nextFallback(currentName string, visited map[string]bool, f apiFormat, keyInfo *auth.KeyInfo) (Model, bool) {
 	for {
 		next, ok := p.Registry.FallbackFor(currentName, visited)
 		if !ok {
 			return Model{}, false
 		}
 		if !f.native() {
+			return next, true
+		}
+		// A target the key may not use ends the chain exactly like in the chat
+		// loop: it is returned unchanged so the caller's access check stops
+		// there. Only provider-incompatible targets the key may use are skipped.
+		if p.AccessCache != nil && keyInfo != nil && !p.AccessCache.Check(keyInfo.OrgID, keyInfo.TeamID, keyInfo.ID, next.Name) {
 			return next, true
 		}
 		usable, block := p.nativeUsableModel(next, f)
@@ -201,7 +213,9 @@ func writeFormatAbortEvent(w *bufio.Writer, f apiFormat, code string) bool {
 	case formatMessages:
 		_, err = w.WriteString("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"stream aborted\"}}\n\n")
 	case formatResponses:
-		_, err = fmt.Fprintf(w, "event: error\ndata: {\"type\":\"error\",\"code\":%q,\"message\":\"stream aborted\"}\n\n", code)
+		// code is a static identifier made of lowercase letters and
+		// underscores, so it needs no JSON escaping.
+		_, err = w.WriteString("event: error\ndata: {\"type\":\"error\",\"code\":\"" + code + "\",\"message\":\"stream aborted\"}\n\n")
 	default:
 		return writeStreamAbortEvent(w, code)
 	}
@@ -209,4 +223,67 @@ func writeFormatAbortEvent(w *bufio.Writer, f apiFormat, code string) bool {
 		return false
 	}
 	return w.Flush() == nil
+}
+
+// nativeDisconnectDrain bounds how long a native stream keeps being read after
+// the client disconnected, so the usage reported with the terminal event is
+// still captured.
+const nativeDisconnectDrain = 30 * time.Second
+
+// warnNoNativeUsage logs one metadata-only warning for a native response that
+// completed successfully without any usage figures. It never carries content.
+func (p *ProxyHandler) warnNoNativeUsage(model, requestID string, f apiFormat) {
+	format := "messages"
+	if f == formatResponses {
+		format = "responses"
+	}
+	p.Log.LogAttrs(context.Background(), slog.LevelWarn, "native response completed without usage",
+		slog.String("model", model),
+		slog.String("request_id", requestID),
+		slog.String("format", format),
+	)
+}
+
+// hasStatefulResponsesParam reports whether a Responses request body uses a
+// server-side state feature VoidLLM does not proxy: a non-null
+// previous_response_id or conversation (which would let a request read another
+// tenant's stored context) or background: true (an unbilled asynchronous job).
+// A body that is not a JSON object is left to the upstream to reject.
+func hasStatefulResponsesParam(body []byte) bool {
+	var doc map[string]jsonx.RawMessage
+	if jsonx.Unmarshal(body, &doc) != nil {
+		return false
+	}
+	nonNull := func(key string) bool {
+		raw, ok := doc[key]
+		return ok && !isJSONNull(raw)
+	}
+	if nonNull("previous_response_id") || nonNull("conversation") {
+		return true
+	}
+	var background bool
+	if raw, ok := doc["background"]; ok && jsonx.Unmarshal(raw, &background) == nil && background {
+		return true
+	}
+	return false
+}
+
+// defaultResponsesStore sets store:false on a Responses request body that does
+// not carry a store field, so responses are not persisted upstream by default
+// (privacy). A store value sent by the client, whatever it is, is kept. A body
+// that is not a JSON object is returned unchanged.
+func defaultResponsesStore(body []byte) []byte {
+	var doc map[string]jsonx.RawMessage
+	if jsonx.Unmarshal(body, &doc) != nil {
+		return body
+	}
+	if _, ok := doc["store"]; ok {
+		return body
+	}
+	doc["store"] = jsonx.RawMessage(`false`)
+	out, err := jsonx.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	return out
 }
