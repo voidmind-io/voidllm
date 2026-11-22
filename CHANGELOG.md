@@ -2,6 +2,42 @@
 
 All notable changes to VoidLLM are documented in this file.
 
+## [0.0.32] - 2026-11-22
+
+### Features
+- Native `POST /v1/messages`, `/v1/messages/count_tokens` (provider `anthropic`) and `POST /v1/responses` (providers `openai`, `custom`, `vllm`, `ollama`), so Claude Code and Codex CLI run through VoidLLM with the same keys, model access, limits, budgets and usage tracking. `x-api-key` is accepted on `/v1/*` when no `Authorization` header is sent; `anthropic-version`, `anthropic-beta` and `OpenAI-Beta` are forwarded after validation; `/v1/responses` is stateless (#297)
+- Limit rejections send `Retry-After`; token-budget rejections also send `x-should-retry: false` and, on `/v1/responses`, `error.type: insufficient_quota`, so clients stop instead of retrying until the reset (#297)
+- Bedrock IAM auth (`bedrock_auth: iam`) via the AWS default credential chain (environment, profiles and SSO, IRSA and EKS Pod Identity, ECS and EC2 roles) with optional `bedrock_role_arn`; signed requests only go to Bedrock Runtime endpoints of the configured region (#288)
+- 30-day Enterprise trial requested from the License page; expired licenses fall back to Community without a restart (#290)
+- `POST /api/v1/auth/logout` ends the UI session on the server; the UI signs out when the session expires (#293)
+- MCP server page offers config snippets for Claude Code and Cursor (#293)
+
+### Fixes
+- API keys keep working after a password change; only the revoked session keys are evicted from the key cache. Thanks @arhuman (#291)
+- Graceful shutdown waits for running streams to finish instead of releasing them when the handler returns (#297)
+- A load-balanced model whose deployment fails to save is rolled back in the UI, and the dialog keeps its values for a retry; Bedrock region and endpoint validation in the UI matches the server (#289)
+- Org and team limit fields accept only whole numbers of 0 or more, in the UI and the API (#293)
+- With a config file, `VOIDLLM_ADMIN_KEY`, `VOIDLLM_ENCRYPTION_KEY` and `VOIDLLM_LICENSE` are used when the file leaves them empty (#293)
+- License dedup test waits for the marker instead of reading it once (#292)
+
+### Security
+- Revoked sessions are removed from the key cache on all instances (#293)
+
+### Upgrade notes
+- Database migration `0021_bedrock_auth` adds the Bedrock auth fields (#288)
+- Sending `"api_key": ""` in a model or deployment update now clears the stored key (any provider). Creating a Bedrock model in `api_key` mode via the Admin API requires a key; a Bedrock `base_url` must not contain a query string or fragment (#288)
+- Pricing: Pro 99 EUR/month, Enterprise 399 EUR/month, Enterprise Plus from about 1,000 EUR/month billed annually. Founding Member is no longer offered; existing licenses keep working (#290)
+
+### Dependencies
+- aws-sdk-go-v2 (`aws`, `config`, `credentials/stscreds`, `service/sts`) for Bedrock IAM auth (#288)
+
+### Docs
+- Coding agents guide (Claude Code, Codex CLI, MCP clients), API routes, Gemini and Vertex (#295, #297)
+- Supply chain page; release images carry SBOM attestations (#294)
+- Open WebUI with Ollama recipe (#296)
+
+---
+
 ## [0.0.31] - 2026-11-18
 
 ### Features
