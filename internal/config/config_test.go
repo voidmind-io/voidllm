@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2048,5 +2049,165 @@ func TestMCPConfig_EffectiveStreamMaxBytes(t *testing.T) {
 				t.Errorf("EffectiveStreamMaxBytes() = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// ---- applyEnvFallbacks -----------------------------------------------------
+
+func TestLoad_EnvFallbacks(t *testing.T) {
+	// t.Setenv forbids t.Parallel.
+	const noSecretsYAML = `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: from-file.db
+settings:
+  usage:
+    buffer_size: 100
+`
+	const fileSecretsYAML = `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: from-file.db
+settings:
+  admin_key: file-admin-key-0123456789abcdef0123456789
+  encryption_key: bbbbbbbbbbbbbbbb
+  usage:
+    buffer_size: 100
+`
+	const licenseFileYAML = `
+server:
+  proxy:
+    port: 8080
+database:
+  driver: sqlite
+  dsn: from-file.db
+settings:
+  encryption_key: bbbbbbbbbbbbbbbb
+  license_file: %s
+  usage:
+    buffer_size: 100
+`
+	tests := []struct {
+		name        string
+		yaml        string
+		licenseFile string
+		wantAdmin   string
+		wantEncKey  string
+		wantLicense string
+	}{
+		{
+			name:        "file without secrets takes env values",
+			yaml:        noSecretsYAML,
+			wantAdmin:   "env-admin-key-0123456789abcdef0123456789",
+			wantEncKey:  "aaaaaaaaaaaaaaaa",
+			wantLicense: "env-license",
+		},
+		{
+			name:        "file values win over env",
+			yaml:        fileSecretsYAML,
+			wantAdmin:   "file-admin-key-0123456789abcdef0123456789",
+			wantEncKey:  "bbbbbbbbbbbbbbbb",
+			wantLicense: "env-license",
+		},
+		{
+			name:        "license_file set ignores VOIDLLM_LICENSE",
+			yaml:        licenseFileYAML,
+			licenseFile: "file-license-jwt\n",
+			wantAdmin:   "env-admin-key-0123456789abcdef0123456789",
+			wantEncKey:  "bbbbbbbbbbbbbbbb",
+			wantLicense: "file-license-jwt",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VOIDLLM_ADMIN_KEY", "env-admin-key-0123456789abcdef0123456789")
+			t.Setenv("VOIDLLM_ENCRYPTION_KEY", "aaaaaaaaaaaaaaaa")
+			t.Setenv("VOIDLLM_LICENSE", "env-license")
+			t.Setenv("VOIDLLM_DATABASE_DSN", "env.db")
+			t.Setenv("VOIDLLM_DATABASE_DRIVER", "postgres")
+
+			yamlText := tc.yaml
+			if tc.licenseFile != "" {
+				yamlText = fmt.Sprintf(tc.yaml, writeTemp(t, "license.jwt", tc.licenseFile))
+			}
+			cfg, usedDefaults, err := config.Load(writeTemp(t, "voidllm.yaml", yamlText))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if usedDefaults {
+				t.Error("usedDefaults = true, want false")
+			}
+			if cfg.Settings.AdminKey != tc.wantAdmin {
+				t.Errorf("AdminKey = %q, want %q", cfg.Settings.AdminKey, tc.wantAdmin)
+			}
+			if cfg.Settings.EncryptionKey != tc.wantEncKey {
+				t.Errorf("EncryptionKey = %q, want %q", cfg.Settings.EncryptionKey, tc.wantEncKey)
+			}
+			if cfg.Settings.License != tc.wantLicense {
+				t.Errorf("License = %q, want %q", cfg.Settings.License, tc.wantLicense)
+			}
+			// DSN and driver env must never reach a deployment configured by file.
+			if cfg.Database.DSN != "from-file.db" || cfg.Database.Driver != "sqlite" {
+				t.Errorf("database = %q/%q, want from-file.db/sqlite (env must not apply)", cfg.Database.DSN, cfg.Database.Driver)
+			}
+		})
+	}
+}
+
+func TestLoad_FileWithoutDatabaseIgnoresEnvDSN(t *testing.T) {
+	t.Setenv("VOIDLLM_ENCRYPTION_KEY", "aaaaaaaaaaaaaaaa")
+	t.Setenv("VOIDLLM_DATABASE_DSN", "env.db")
+	t.Setenv("VOIDLLM_DATABASE_DRIVER", "sqlite")
+
+	var logBuf strings.Builder
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	path := writeTemp(t, "voidllm.yaml", "server:\n  proxy:\n    port: 8080\nsettings:\n  usage:\n    buffer_size: 100\n")
+	cfg, _, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Database.DSN == "env.db" {
+		t.Errorf("DSN = %q: VOIDLLM_DATABASE_DSN must not apply in the file path", cfg.Database.DSN)
+	}
+	logs := logBuf.String()
+	for _, want := range []string{"level=WARN", "VOIDLLM_DATABASE_DSN", "VOIDLLM_DATABASE_DRIVER", "database.dsn: ${VOIDLLM_DATABASE_DSN}"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("log output lacks %q:\n%s", want, logs)
+		}
+	}
+	if strings.Contains(logs, "env.db") {
+		t.Errorf("log output leaks the env value:\n%s", logs)
+	}
+}
+
+func TestLoad_NoFileUsesEnv(t *testing.T) {
+	if _, err := os.Stat("/etc/voidllm/voidllm.yaml"); err == nil {
+		t.Skip("config file exists on this host at /etc/voidllm/voidllm.yaml")
+	}
+	t.Chdir(t.TempDir())
+	t.Setenv("VOIDLLM_CONFIG", "")
+	t.Setenv("VOIDLLM_ADMIN_KEY", "env-admin-key-0123456789abcdef0123456789")
+	t.Setenv("VOIDLLM_ENCRYPTION_KEY", "aaaaaaaaaaaaaaaa")
+	t.Setenv("VOIDLLM_DATABASE_DSN", "env.db")
+	t.Setenv("VOIDLLM_DATABASE_DRIVER", "sqlite")
+
+	cfg, usedDefaults, err := config.Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !usedDefaults {
+		t.Fatal("usedDefaults = false, want true")
+	}
+	if cfg.Settings.AdminKey != "env-admin-key-0123456789abcdef0123456789" || cfg.Database.DSN != "env.db" || cfg.Database.Driver != "sqlite" {
+		t.Errorf("env not applied: admin=%q dsn=%q driver=%q", cfg.Settings.AdminKey, cfg.Database.DSN, cfg.Database.Driver)
 	}
 }

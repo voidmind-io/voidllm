@@ -4,17 +4,13 @@ import { Input } from '../components/ui/Input'
 import { Button } from '../components/ui/Button'
 import { useMe } from '../hooks/useMe'
 import { useTeam, useUpdateTeam } from '../hooks/useTeams'
-import type { TeamResponse } from '../hooks/useTeams'
+import type { CreateTeamParams, TeamResponse } from '../hooks/useTeams'
 import { useToast } from '../hooks/useToast'
+import { parseLimitInput } from '../lib/utils'
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function parseLimit(value: string): number {
-  const n = parseInt(value, 10)
-  return isNaN(n) || n < 0 ? 0 : n
-}
 
 interface FormState {
   name: string
@@ -51,16 +47,31 @@ function TeamSettingsForm({ team, orgId, canEdit }: TeamSettingsFormProps) {
   const { toast } = useToast()
 
   const [form, setForm] = useState<FormState>(() => formFromTeam(team))
+  // Snapshot of the values the user saw; changes are computed against it so a
+  // background refetch cannot cause untouched fields to overwrite newer values.
+  const [base, setBase] = useState<TeamResponse>(team)
   const [nameError, setNameError] = useState<string | undefined>()
   const [slugError, setSlugError] = useState<string | undefined>()
 
+  const dailyTokenLimit = parseLimitInput(form.dailyTokenLimit)
+  const monthlyTokenLimit = parseLimitInput(form.monthlyTokenLimit)
+  const requestsPerMinute = parseLimitInput(form.requestsPerMinute)
+  const requestsPerDay = parseLimitInput(form.requestsPerDay)
+
+  const hasLimitError = Boolean(
+    dailyTokenLimit.error ||
+      monthlyTokenLimit.error ||
+      requestsPerMinute.error ||
+      requestsPerDay.error,
+  )
+
   const isDirty =
-    form.name !== team.name ||
-    form.slug !== team.slug ||
-    parseLimit(form.dailyTokenLimit) !== team.daily_token_limit ||
-    parseLimit(form.monthlyTokenLimit) !== team.monthly_token_limit ||
-    parseLimit(form.requestsPerMinute) !== team.requests_per_minute ||
-    parseLimit(form.requestsPerDay) !== team.requests_per_day
+    form.name !== base.name ||
+    form.slug !== base.slug ||
+    dailyTokenLimit.value !== base.daily_token_limit ||
+    monthlyTokenLimit.value !== base.monthly_token_limit ||
+    requestsPerMinute.value !== base.requests_per_minute ||
+    requestsPerDay.value !== base.requests_per_day
 
   function patch(field: keyof FormState) {
     return (e: React.ChangeEvent<HTMLInputElement>) =>
@@ -89,19 +100,23 @@ function TeamSettingsForm({ team, orgId, canEdit }: TeamSettingsFormProps) {
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
-    if (!validate()) return
+    if (!validate() || hasLimitError) return
 
-    updateTeam.mutate(
+    const params: Partial<CreateTeamParams> = {}
+    const name = form.name.trim()
+    const slug = form.slug.trim()
+    if (name !== base.name) params.name = name
+    if (slug !== base.slug) params.slug = slug
+    if (dailyTokenLimit.value !== base.daily_token_limit) params.daily_token_limit = dailyTokenLimit.value
+    if (monthlyTokenLimit.value !== base.monthly_token_limit) params.monthly_token_limit = monthlyTokenLimit.value
+    if (requestsPerMinute.value !== base.requests_per_minute) params.requests_per_minute = requestsPerMinute.value
+    if (requestsPerDay.value !== base.requests_per_day) params.requests_per_day = requestsPerDay.value
+
+    updateTeam.mutate(params,
       {
-        name: form.name.trim(),
-        slug: form.slug.trim(),
-        daily_token_limit: parseLimit(form.dailyTokenLimit),
-        monthly_token_limit: parseLimit(form.monthlyTokenLimit),
-        requests_per_minute: parseLimit(form.requestsPerMinute),
-        requests_per_day: parseLimit(form.requestsPerDay),
-      },
-      {
-        onSuccess: () => {
+        onSuccess: (updated) => {
+          setBase(updated)
+          setForm(formFromTeam(updated))
           toast({ variant: 'success', message: 'Team settings saved' })
         },
         onError: (err) => {
@@ -155,38 +170,42 @@ function TeamSettingsForm({ team, orgId, canEdit }: TeamSettingsFormProps) {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <Input
             label="Daily Token Limit"
-            type="number"
-            min="0"
+            type="text"
+            inputMode="numeric"
             value={form.dailyTokenLimit}
             onChange={patch('dailyTokenLimit')}
             description="0 = unlimited"
+            error={dailyTokenLimit.error}
             disabled={!canEdit || updateTeam.isPending}
           />
           <Input
             label="Monthly Token Limit"
-            type="number"
-            min="0"
+            type="text"
+            inputMode="numeric"
             value={form.monthlyTokenLimit}
             onChange={patch('monthlyTokenLimit')}
             description="0 = unlimited"
+            error={monthlyTokenLimit.error}
             disabled={!canEdit || updateTeam.isPending}
           />
           <Input
             label="Requests / Minute"
-            type="number"
-            min="0"
+            type="text"
+            inputMode="numeric"
             value={form.requestsPerMinute}
             onChange={patch('requestsPerMinute')}
             description="0 = unlimited"
+            error={requestsPerMinute.error}
             disabled={!canEdit || updateTeam.isPending}
           />
           <Input
             label="Requests / Day"
-            type="number"
-            min="0"
+            type="text"
+            inputMode="numeric"
             value={form.requestsPerDay}
             onChange={patch('requestsPerDay')}
             description="0 = unlimited"
+            error={requestsPerDay.error}
             disabled={!canEdit || updateTeam.isPending}
           />
         </div>
@@ -197,7 +216,7 @@ function TeamSettingsForm({ team, orgId, canEdit }: TeamSettingsFormProps) {
           <Button
             type="submit"
             loading={updateTeam.isPending}
-            disabled={!isDirty}
+            disabled={!isDirty || hasLimitError}
           >
             Save Changes
           </Button>

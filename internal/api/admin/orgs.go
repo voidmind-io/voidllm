@@ -113,6 +113,9 @@ func (h *Handler) CreateOrg(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&req); err != nil {
 		return apierror.BadRequest(c, "invalid request body")
 	}
+	if sent, err := rejectNegativeLimits(c, &req.DailyTokenLimit, &req.MonthlyTokenLimit, &req.RequestsPerMinute, &req.RequestsPerDay); sent {
+		return err
+	}
 	if req.Name == "" {
 		return apierror.BadRequest(c, "name is required")
 	}
@@ -305,6 +308,9 @@ func (h *Handler) UpdateOrg(c fiber.Ctx) error {
 	var req updateOrgRequest
 	if err := c.Bind().JSON(&req); err != nil {
 		return apierror.BadRequest(c, "invalid request body")
+	}
+	if sent, err := rejectNegativeLimits(c, req.DailyTokenLimit, req.MonthlyTokenLimit, req.RequestsPerMinute, req.RequestsPerDay); sent {
+		return err
 	}
 	if req.Slug != nil && !slugRegex.MatchString(*req.Slug) {
 		return apierror.BadRequest(c, "slug must be lowercase alphanumeric with hyphens, 2-63 characters")

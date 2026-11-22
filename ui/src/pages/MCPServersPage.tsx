@@ -882,34 +882,15 @@ function getBaseUrl(): string {
   return origin
 }
 
-function generateMCPConfig(alias: string, isCodeMode?: boolean): string {
+type MCPConfigFormat = 'claude-code' | 'cursor'
+
+function generateMCPConfig(alias: string, isCodeMode: boolean, format: MCPConfigFormat): string {
   const base = getBaseUrl()
-  if (isCodeMode) {
-    return JSON.stringify(
-      {
-        mcpServers: {
-          'voidllm-code': {
-            url: `${base}/api/v1/mcp`,
-            headers: { Authorization: 'Bearer <your-api-key>' },
-          },
-        },
-      },
-      null,
-      2,
-    )
-  }
-  return JSON.stringify(
-    {
-      mcpServers: {
-        [alias]: {
-          url: `${base}/api/v1/mcp/${alias}`,
-          headers: { Authorization: 'Bearer <your-api-key>' },
-        },
-      },
-    },
-    null,
-    2,
-  )
+  const name = isCodeMode ? 'voidllm-code' : alias
+  const url = isCodeMode ? `${base}/api/v1/mcp` : `${base}/api/v1/mcp/${alias}`
+  const headers = { Authorization: 'Bearer <your-api-key>' }
+  const entry = format === 'claude-code' ? { type: 'http', url, headers } : { url, headers }
+  return JSON.stringify({ mcpServers: { [name]: entry } }, null, 2)
 }
 
 function IconChevronDown() {
@@ -922,6 +903,7 @@ function IconChevronDown() {
 
 function ServerExpandedRow({ server, canModify, health }: ServerExpandedRowProps) {
   const [configOpen, setConfigOpen] = useState(false)
+  const [configFormat, setConfigFormat] = useState<MCPConfigFormat>('claude-code')
   const { data: tools, isLoading: toolsLoading } = useMCPServerTools(server.id)
   const addEntry = useAddBlocklistEntry()
   const removeEntry = useRemoveBlocklistEntry()
@@ -985,7 +967,7 @@ function ServerExpandedRow({ server, canModify, health }: ServerExpandedRowProps
   }
 
   function handleCopyConfig(isCodeMode?: boolean) {
-    const config = generateMCPConfig(server.alias, isCodeMode)
+    const config = generateMCPConfig(server.alias, isCodeMode === true, configFormat)
     navigator.clipboard.writeText(config).then(() => {
       toast({ variant: 'success', message: 'Copied to clipboard' })
     }).catch(() => {})
@@ -1018,6 +1000,25 @@ function ServerExpandedRow({ server, canModify, health }: ServerExpandedRowProps
             Client Config
           </button>
           <div className="flex items-center gap-1">
+            <div role="tablist" aria-label="Client config format" className="inline-flex rounded-md border border-border p-0.5 mr-1">
+              {([['claude-code', 'Claude Code'], ['cursor', 'Cursor']] as const).map(([value, text]) => (
+                <button
+                  key={value}
+                  type="button"
+                  role="tab"
+                  aria-selected={configFormat === value}
+                  onClick={() => setConfigFormat(value)}
+                  className={cn(
+                    'px-2 py-0.5 rounded text-xs transition-colors',
+                    configFormat === value
+                      ? 'bg-bg-tertiary text-text-primary'
+                      : 'text-text-tertiary hover:text-text-secondary',
+                  )}
+                >
+                  {text}
+                </button>
+              ))}
+            </div>
             {server.alias === 'voidllm' && (
               <button
                 type="button"
@@ -1044,13 +1045,13 @@ function ServerExpandedRow({ server, canModify, health }: ServerExpandedRowProps
           <div className="mt-2 space-y-2">
             <ClientConfigSnippet
               label={null}
-              config={generateMCPConfig(server.alias)}
+              config={generateMCPConfig(server.alias, false, configFormat)}
               onCopy={() => toast({ variant: 'success', message: 'Copied to clipboard' })}
             />
             {server.alias === 'voidllm' && (
               <ClientConfigSnippet
                 label="Code Mode (all tools)"
-                config={generateMCPConfig(server.alias, true)}
+                config={generateMCPConfig(server.alias, true, configFormat)}
                 onCopy={() => toast({ variant: 'success', message: 'Copied to clipboard' })}
               />
             )}

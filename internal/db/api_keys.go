@@ -292,41 +292,119 @@ func (d *DB) UpdateAPIKey(ctx context.Context, id string, params UpdateAPIKeyPar
 	return key, nil
 }
 
-// DeleteAPIKey soft-deletes an active API key by setting deleted_at.
-// It returns ErrNotFound if the key does not exist or is already deleted.
+// sessionAccessTables lists the tables whose rows reference api_keys(id) and
+// must be removed before a session key row can be deleted.
+var sessionAccessTables = []string{"key_model_access", "key_mcp_access"}
 
-// RevokeUserSessions hard-deletes all session keys for a user.
-// Called during login and OIDC callback to ensure only one session exists per
-// user. Session keys are ephemeral — no audit trail needed, hard delete
-// prevents the api_keys table from filling up with dead sessions.
-func (d *DB) RevokeUserSessions(ctx context.Context, userID string) error {
-	p := d.dialect.Placeholder
-	query := "DELETE FROM api_keys WHERE user_id = " + p(1) + " AND key_type = " + p(2)
-
-	_, err := d.sql.ExecContext(ctx, query, userID, "session_key")
+// deleteSessionKeys selects the id and key hash of the session keys matched by
+// where (with args), then deletes their access rows and the keys strictly by
+// that selected id list. A session created concurrently after the SELECT is
+// therefore neither deleted nor missed by the caller's cache eviction. It must
+// run inside a transaction and returns exactly the hashes of the deleted ids.
+func (d *DB) deleteSessionKeys(ctx context.Context, q Querier, where string, args ...any) ([]string, error) {
+	rows, err := q.QueryContext(ctx, "SELECT id, key_hash FROM api_keys WHERE "+where, args...)
 	if err != nil {
-		return fmt.Errorf("revoke user sessions %s: %w", userID, translateError(err))
+		return nil, fmt.Errorf("select session keys: %w", translateError(err))
 	}
-	return nil
+	defer rows.Close()
+	var ids, hashes []string
+	for rows.Next() {
+		var id, hash string
+		if err := rows.Scan(&id, &hash); err != nil {
+			return nil, fmt.Errorf("scan session key: %w", err)
+		}
+		ids = append(ids, id)
+		hashes = append(hashes, hash)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate session keys: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close session keys: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, len(ids))
+	idArgs := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = d.dialect.Placeholder(i + 1)
+		idArgs[i] = id
+	}
+	inList := "(" + strings.Join(placeholders, ", ") + ")"
+
+	for _, table := range sessionAccessTables {
+		if _, err := q.ExecContext(ctx, "DELETE FROM "+table+" WHERE key_id IN "+inList, idArgs...); err != nil {
+			return nil, fmt.Errorf("delete %s: %w", table, translateError(err))
+		}
+	}
+	if _, err := q.ExecContext(ctx, "DELETE FROM api_keys WHERE id IN "+inList, idArgs...); err != nil {
+		return nil, fmt.Errorf("delete session keys: %w", translateError(err))
+	}
+	return hashes, nil
+}
+
+// RevokeSessionKey hard-deletes a single session key by ID together with any
+// model and MCP access rows that reference it, in one transaction. Only rows
+// with key_type session_key are affected, so a non-session key ID is a no-op.
+// It returns the key hashes it deleted (empty when nothing matched), so the
+// caller can evict them from caches. It is idempotent.
+func (d *DB) RevokeSessionKey(ctx context.Context, keyID string) ([]string, error) {
+	p := d.dialect.Placeholder
+	where := "id = " + p(1) + " AND key_type = " + p(2)
+
+	var hashes []string
+	err := d.WithTx(ctx, func(q Querier) error {
+		var err error
+		hashes, err = d.deleteSessionKeys(ctx, q, where, keyID, "session_key")
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("revoke session key %s: %w", keyID, err)
+	}
+	return hashes, nil
+}
+
+// RevokeUserSessions hard-deletes all session keys for a user, including their
+// model and MCP access rows, in one transaction. Called during login and OIDC
+// callback to ensure only one session exists per user. Session keys are
+// ephemeral, so no audit trail is needed and a hard delete keeps the api_keys
+// table from filling up with dead sessions. It returns the deleted key hashes
+// so the caller can evict them from caches.
+func (d *DB) RevokeUserSessions(ctx context.Context, userID string) ([]string, error) {
+	p := d.dialect.Placeholder
+	where := "user_id = " + p(1) + " AND key_type = " + p(2)
+
+	var hashes []string
+	err := d.WithTx(ctx, func(q Querier) error {
+		var err error
+		hashes, err = d.deleteSessionKeys(ctx, q, where, userID, "session_key")
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("revoke user sessions %s: %w", userID, err)
+	}
+	return hashes, nil
 }
 
 // ChangePasswordAndRevokeOtherSessions atomically updates a user's password hash
 // and hard-deletes all session keys for that user except the one identified by
 // exceptKeyID. Both operations run in a single transaction: if either fails the
 // whole operation is rolled back so the DB is never left in a partially-updated
-// state. Returns ErrNotFound if the user does not exist or has been soft-deleted.
-func (d *DB) ChangePasswordAndRevokeOtherSessions(ctx context.Context, userID, newPasswordHash, exceptKeyID string) error {
+// state. It returns the key hashes of the revoked sessions so the caller can
+// evict them from caches, or ErrNotFound if the user does not exist or has been
+// soft-deleted.
+func (d *DB) ChangePasswordAndRevokeOtherSessions(ctx context.Context, userID, newPasswordHash, exceptKeyID string) ([]string, error) {
 	p := d.dialect.Placeholder
 
 	updateQuery := "UPDATE users SET password_hash = " + p(1) +
 		", updated_at = CURRENT_TIMESTAMP" +
 		" WHERE id = " + p(2) + " AND deleted_at IS NULL"
+	where := "user_id = " + p(1) + " AND key_type = " + p(2) + " AND id != " + p(3)
 
-	deleteQuery := "DELETE FROM api_keys WHERE user_id = " + p(1) +
-		" AND key_type = " + p(2) +
-		" AND id != " + p(3)
-
-	return d.WithTx(ctx, func(q Querier) error {
+	var hashes []string
+	err := d.WithTx(ctx, func(q Querier) error {
 		result, err := q.ExecContext(ctx, updateQuery, newPasswordHash, userID)
 		if err != nil {
 			return fmt.Errorf("update password hash: %w", translateError(err))
@@ -338,14 +416,17 @@ func (d *DB) ChangePasswordAndRevokeOtherSessions(ctx context.Context, userID, n
 		if n == 0 {
 			return ErrNotFound
 		}
-
-		if _, err := q.ExecContext(ctx, deleteQuery, userID, "session_key", exceptKeyID); err != nil {
-			return fmt.Errorf("revoke other sessions: %w", translateError(err))
-		}
-		return nil
+		hashes, err = d.deleteSessionKeys(ctx, q, where, userID, "session_key", exceptKeyID)
+		return err
 	})
+	if err != nil {
+		return nil, err
+	}
+	return hashes, nil
 }
 
+// DeleteAPIKey soft-deletes an active API key by setting deleted_at.
+// It returns ErrNotFound if the key does not exist or is already deleted.
 func (d *DB) DeleteAPIKey(ctx context.Context, id string) error {
 	p := d.dialect.Placeholder
 	query := "UPDATE api_keys SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP " +

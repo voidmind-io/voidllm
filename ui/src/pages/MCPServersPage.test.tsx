@@ -403,3 +403,46 @@ describe('EditMCPServerDialog — Protocol Version field', () => {
     ).toBeInTheDocument()
   })
 })
+
+describe('ServerExpandedRow - client config format', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    setupFetchMock([
+      { matcher: (u) => u.includes('/tools'), method: 'GET', response: [] },
+      ...defaultEntries(),
+    ])
+  })
+
+  async function openConfig() {
+    renderMCPServersPage()
+    const nameEl = await screen.findByText('GitHub MCP')
+    const row = nameEl.closest('tr')
+    if (!row) throw new Error('row not found')
+    await userEvent.click(within(row).getByRole('button', { name: /expand row/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /client config/i }))
+  }
+
+  function snippet(): Record<string, Record<string, Record<string, unknown>>> {
+    const pre = document.querySelector('pre')
+    if (!pre) throw new Error('snippet not found')
+    return JSON.parse(pre.textContent ?? '') as Record<string, Record<string, Record<string, unknown>>>
+  }
+
+  it('defaults to Claude Code with type http, url and headers', async () => {
+    await openConfig()
+    const entry = snippet().mcpServers['github-mcp']
+    expect(screen.getByRole('tab', { name: 'Claude Code' })).toHaveAttribute('aria-selected', 'true')
+    expect(entry.type).toBe('http')
+    expect(entry.url).toContain('/api/v1/mcp/github-mcp')
+    expect(entry.headers).toBeDefined()
+  })
+
+  it('switches to Cursor format without type', async () => {
+    await openConfig()
+    await userEvent.click(screen.getByRole('tab', { name: 'Cursor' }))
+    const entry = snippet().mcpServers['github-mcp']
+    expect(entry).not.toHaveProperty('type')
+    expect(entry.url).toContain('/api/v1/mcp/github-mcp')
+    expect(entry.headers).toBeDefined()
+  })
+})

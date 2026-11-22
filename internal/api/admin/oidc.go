@@ -22,8 +22,10 @@ import (
 const (
 	oidcStateCookieName = "voidllm_oidc_state"
 	oidcTokenCookieName = "voidllm_oidc_token"
-	oidcStateBytes      = 32
-	oidcNonceBytes      = 32
+	// oidcExpiresAtCookieName carries the RFC3339 session expiry next to the token cookie.
+	oidcExpiresAtCookieName = "voidllm_oidc_expires_at"
+	oidcStateBytes          = 32
+	oidcNonceBytes          = 32
 )
 
 // generateRandomHex returns a cryptographically random hex-encoded string of
@@ -320,9 +322,11 @@ func (h *Handler) OIDCCallback(c fiber.Ctx) error {
 	}
 
 	// Step 10: Revoke existing sessions.
-	if err := h.DB.RevokeUserSessions(ctx, user.ID); err != nil {
+	if revoked, err := h.DB.RevokeUserSessions(ctx, user.ID); err != nil {
 		h.Log.ErrorContext(ctx, "oidc callback: revoke old sessions", slog.String("error", err.Error()))
 		// Non-fatal: proceed even if cleanup fails.
+	} else {
+		h.evictRevokedSessions(ctx, revoked)
 	}
 
 	// Step 11: Generate a new session key valid for 24 hours.
@@ -406,6 +410,15 @@ func (h *Handler) OIDCCallback(c fiber.Ctx) error {
 		Path:     "/auth/callback",
 		MaxAge:   10,
 		HTTPOnly: false, // frontend JS must read it to store in localStorage
+		SameSite: "Strict",
+		Secure:   secure,
+	})
+	c.Cookie(&fiber.Cookie{
+		Name:     oidcExpiresAtCookieName,
+		Value:    expiresAt.Format(time.RFC3339),
+		Path:     "/auth/callback",
+		MaxAge:   10,
+		HTTPOnly: false,
 		SameSite: "Strict",
 		Secure:   secure,
 	})

@@ -5,7 +5,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { Input } from '../../components/ui/Input'
 import { Button } from '../../components/ui/Button'
 import { Banner } from '../../components/ui/Banner'
-import { LOCAL_STORAGE_KEY } from '../../lib/constants'
+import { storeSession } from '../../lib/session'
 import type { MeResponse } from '../../hooks/useMe'
 
 interface AuthProviders {
@@ -68,7 +68,7 @@ export default function LoginPage() {
       }
 
       const data = (await res.json()) as { token: string; expires_at: string; user: MeResponse }
-      localStorage.setItem(LOCAL_STORAGE_KEY, data.token)
+      storeSession(data.token, data.expires_at)
       queryClient.setQueryData(['me'], data.user)
       navigate('/')
     } catch {

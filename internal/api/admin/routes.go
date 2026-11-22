@@ -35,6 +35,9 @@ func RegisterRoutes(app *fiber.App, handler *Handler, keyCache *cache.Cache[stri
 
 	api := app.Group("/api/v1", apiMiddlewares...)
 
+	// Logout — revokes the calling session key; no-op for other key types.
+	api.Post("/auth/logout", handler.Logout)
+
 	// Current user profile — no role restriction.
 	api.Get("/me", handler.Me)
 	api.Post("/me/password", handler.ChangeOwnPassword)

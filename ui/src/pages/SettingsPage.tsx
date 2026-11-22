@@ -5,6 +5,7 @@ import { useMe } from '../hooks/useMe'
 import { useOrg, useUpdateOrg } from '../hooks/useOrg'
 import type { OrgResponse, UpdateOrgParams } from '../hooks/useOrg'
 import { useToast } from '../hooks/useToast'
+import { parseLimitInput } from '../lib/utils'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -12,11 +13,6 @@ import { useToast } from '../hooks/useToast'
 
 function canEditOrg(role: string | undefined): boolean {
   return role === 'org_admin' || role === 'system_admin'
-}
-
-function parseLimit(value: string): number {
-  const n = parseInt(value, 10)
-  return isNaN(n) || n < 0 ? 0 : n
 }
 
 interface FormState {
@@ -54,16 +50,31 @@ function OrgSettingsForm({ org, readOnly }: OrgSettingsFormProps) {
   const { toast } = useToast()
 
   const [form, setForm] = useState<FormState>(() => formFromOrg(org))
+  // Snapshot of the values the user saw; changes are computed against it so a
+  // background refetch cannot cause untouched fields to overwrite newer values.
+  const [base, setBase] = useState<OrgResponse>(org)
   const [nameError, setNameError] = useState<string | undefined>()
   const [slugError, setSlugError] = useState<string | undefined>()
 
+  const dailyTokenLimit = parseLimitInput(form.dailyTokenLimit)
+  const monthlyTokenLimit = parseLimitInput(form.monthlyTokenLimit)
+  const requestsPerMinute = parseLimitInput(form.requestsPerMinute)
+  const requestsPerDay = parseLimitInput(form.requestsPerDay)
+
+  const hasLimitError = Boolean(
+    dailyTokenLimit.error ||
+      monthlyTokenLimit.error ||
+      requestsPerMinute.error ||
+      requestsPerDay.error,
+  )
+
   const isDirty =
-    form.name !== org.name ||
-    form.slug !== org.slug ||
-    parseLimit(form.dailyTokenLimit) !== org.daily_token_limit ||
-    parseLimit(form.monthlyTokenLimit) !== org.monthly_token_limit ||
-    parseLimit(form.requestsPerMinute) !== org.requests_per_minute ||
-    parseLimit(form.requestsPerDay) !== org.requests_per_day
+    form.name !== base.name ||
+    form.slug !== base.slug ||
+    dailyTokenLimit.value !== base.daily_token_limit ||
+    monthlyTokenLimit.value !== base.monthly_token_limit ||
+    requestsPerMinute.value !== base.requests_per_minute ||
+    requestsPerDay.value !== base.requests_per_day
 
   function patch(field: keyof FormState) {
     return (e: React.ChangeEvent<HTMLInputElement>) =>
@@ -92,19 +103,22 @@ function OrgSettingsForm({ org, readOnly }: OrgSettingsFormProps) {
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
-    if (!validate()) return
+    if (!validate() || hasLimitError) return
 
-    const params: UpdateOrgParams = {
-      name: form.name.trim(),
-      slug: form.slug.trim(),
-      daily_token_limit: parseLimit(form.dailyTokenLimit),
-      monthly_token_limit: parseLimit(form.monthlyTokenLimit),
-      requests_per_minute: parseLimit(form.requestsPerMinute),
-      requests_per_day: parseLimit(form.requestsPerDay),
-    }
+    const params: UpdateOrgParams = {}
+    const name = form.name.trim()
+    const slug = form.slug.trim()
+    if (name !== base.name) params.name = name
+    if (slug !== base.slug) params.slug = slug
+    if (dailyTokenLimit.value !== base.daily_token_limit) params.daily_token_limit = dailyTokenLimit.value
+    if (monthlyTokenLimit.value !== base.monthly_token_limit) params.monthly_token_limit = monthlyTokenLimit.value
+    if (requestsPerMinute.value !== base.requests_per_minute) params.requests_per_minute = requestsPerMinute.value
+    if (requestsPerDay.value !== base.requests_per_day) params.requests_per_day = requestsPerDay.value
 
     updateOrg.mutate(params, {
-      onSuccess: () => {
+      onSuccess: (updated) => {
+        setBase(updated)
+        setForm(formFromOrg(updated))
         toast({ variant: 'success', message: 'Settings saved' })
       },
       onError: (err) => {
@@ -151,38 +165,42 @@ function OrgSettingsForm({ org, readOnly }: OrgSettingsFormProps) {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <Input
             label="Daily Token Limit"
-            type="number"
-            min="0"
+            type="text"
+            inputMode="numeric"
             value={form.dailyTokenLimit}
             onChange={patch('dailyTokenLimit')}
             description="0 = unlimited"
+            error={dailyTokenLimit.error}
             disabled={readOnly || updateOrg.isPending}
           />
           <Input
             label="Monthly Token Limit"
-            type="number"
-            min="0"
+            type="text"
+            inputMode="numeric"
             value={form.monthlyTokenLimit}
             onChange={patch('monthlyTokenLimit')}
             description="0 = unlimited"
+            error={monthlyTokenLimit.error}
             disabled={readOnly || updateOrg.isPending}
           />
           <Input
             label="Requests / Minute"
-            type="number"
-            min="0"
+            type="text"
+            inputMode="numeric"
             value={form.requestsPerMinute}
             onChange={patch('requestsPerMinute')}
             description="0 = unlimited"
+            error={requestsPerMinute.error}
             disabled={readOnly || updateOrg.isPending}
           />
           <Input
             label="Requests / Day"
-            type="number"
-            min="0"
+            type="text"
+            inputMode="numeric"
             value={form.requestsPerDay}
             onChange={patch('requestsPerDay')}
             description="0 = unlimited"
+            error={requestsPerDay.error}
             disabled={readOnly || updateOrg.isPending}
           />
         </div>
@@ -197,7 +215,7 @@ function OrgSettingsForm({ org, readOnly }: OrgSettingsFormProps) {
           <Button
             type="submit"
             loading={updateOrg.isPending}
-            disabled={!isDirty}
+            disabled={!isDirty || hasLimitError}
           >
             Save Changes
           </Button>
