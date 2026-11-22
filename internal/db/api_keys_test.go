@@ -871,3 +871,66 @@ func TestGetUserOrgRole(t *testing.T) {
 		})
 	}
 }
+
+// TestRevokeSessions_DeletesExactlyReturnedKeys verifies that the returned
+// hashes match the deleted rows, and that other users' sessions and the same
+// user's non-session keys survive.
+func TestRevokeSessions_DeletesExactlyReturnedKeys(t *testing.T) {
+	t.Parallel()
+	d := openMigratedDB(t)
+	ctx := context.Background()
+
+	org := mustCreateOrg(t, d, CreateOrgParams{Name: "O", Slug: "revoke-exact-org"})
+	user := mustCreateUser(t, d, CreateUserParams{Email: "revoke-exact@example.com", DisplayName: "U"})
+	other := mustCreateUser(t, d, CreateUserParams{Email: "revoke-exact-other@example.com", DisplayName: "O"})
+
+	mk := func(u *User, keyType, name string) *APIKey {
+		plain := "vl_xx_" + name + strings.Repeat("0", 48-len(name))
+		return mustCreateAPIKey(t, d, CreateAPIKeyParams{
+			KeyHash: keygen.Hash(plain, testHMACSecret), KeyHint: keygen.Hint(plain),
+			KeyType: keyType, Name: name, OrgID: org.ID, UserID: ptr(u.ID), CreatedBy: u.ID,
+		})
+	}
+	s1 := mk(user, "session_key", "sess0001")
+	s2 := mk(user, "session_key", "sess0002")
+	userKey := mk(user, "user_key", "ukey0001")
+	otherSession := mk(other, "session_key", "osess001")
+
+	if err := d.SetKeyModelAccess(ctx, s1.ID, []string{"gpt-4o"}); err != nil {
+		t.Fatalf("SetKeyModelAccess: %v", err)
+	}
+
+	empty, err := d.RevokeUserSessions(ctx, "00000000-0000-0000-0000-000000000000")
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("RevokeUserSessions(unknown user) = %v, %v; want no hashes, nil", empty, err)
+	}
+
+	hashes, err := d.RevokeUserSessions(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("RevokeUserSessions: %v", err)
+	}
+	got := map[string]bool{}
+	for _, h := range hashes {
+		got[h] = true
+	}
+	if len(hashes) != 2 || !got[s1.KeyHash] || !got[s2.KeyHash] {
+		t.Errorf("hashes = %v, want exactly the hashes of the two sessions", hashes)
+	}
+
+	exists := func(id string) bool {
+		var n int
+		if err := d.SQL().QueryRowContext(ctx, "SELECT COUNT(*) FROM api_keys WHERE id = ?", id).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", id, err)
+		}
+		return n == 1
+	}
+	if exists(s1.ID) || exists(s2.ID) {
+		t.Error("revoked sessions still exist")
+	}
+	if !exists(userKey.ID) {
+		t.Error("user key was deleted")
+	}
+	if !exists(otherSession.ID) {
+		t.Error("other user's session was deleted")
+	}
+}

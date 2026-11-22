@@ -296,36 +296,50 @@ func (d *DB) UpdateAPIKey(ctx context.Context, id string, params UpdateAPIKeyPar
 // must be removed before a session key row can be deleted.
 var sessionAccessTables = []string{"key_model_access", "key_mcp_access"}
 
-// deleteSessionKeys selects the key hashes of the session keys matched by
-// where (with args), deletes their access rows and then the keys themselves.
-// It must run inside a transaction and returns the deleted key hashes.
-func deleteSessionKeys(ctx context.Context, q Querier, where string, args ...any) ([]string, error) {
-	rows, err := q.QueryContext(ctx, "SELECT key_hash FROM api_keys WHERE "+where, args...)
+// deleteSessionKeys selects the id and key hash of the session keys matched by
+// where (with args), then deletes their access rows and the keys strictly by
+// that selected id list. A session created concurrently after the SELECT is
+// therefore neither deleted nor missed by the caller's cache eviction. It must
+// run inside a transaction and returns exactly the hashes of the deleted ids.
+func (d *DB) deleteSessionKeys(ctx context.Context, q Querier, where string, args ...any) ([]string, error) {
+	rows, err := q.QueryContext(ctx, "SELECT id, key_hash FROM api_keys WHERE "+where, args...)
 	if err != nil {
-		return nil, fmt.Errorf("select session key hashes: %w", translateError(err))
+		return nil, fmt.Errorf("select session keys: %w", translateError(err))
 	}
 	defer rows.Close()
-	var hashes []string
+	var ids, hashes []string
 	for rows.Next() {
-		var h string
-		if err := rows.Scan(&h); err != nil {
-			return nil, fmt.Errorf("scan session key hash: %w", err)
+		var id, hash string
+		if err := rows.Scan(&id, &hash); err != nil {
+			return nil, fmt.Errorf("scan session key: %w", err)
 		}
-		hashes = append(hashes, h)
+		ids = append(ids, id)
+		hashes = append(hashes, hash)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate session key hashes: %w", err)
+		return nil, fmt.Errorf("iterate session keys: %w", err)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("close session key hashes: %w", err)
+		return nil, fmt.Errorf("close session keys: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
 	}
 
+	placeholders := make([]string, len(ids))
+	idArgs := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = d.dialect.Placeholder(i + 1)
+		idArgs[i] = id
+	}
+	inList := "(" + strings.Join(placeholders, ", ") + ")"
+
 	for _, table := range sessionAccessTables {
-		if _, err := q.ExecContext(ctx, "DELETE FROM "+table+" WHERE key_id IN (SELECT id FROM api_keys WHERE "+where+")", args...); err != nil {
+		if _, err := q.ExecContext(ctx, "DELETE FROM "+table+" WHERE key_id IN "+inList, idArgs...); err != nil {
 			return nil, fmt.Errorf("delete %s: %w", table, translateError(err))
 		}
 	}
-	if _, err := q.ExecContext(ctx, "DELETE FROM api_keys WHERE "+where, args...); err != nil {
+	if _, err := q.ExecContext(ctx, "DELETE FROM api_keys WHERE id IN "+inList, idArgs...); err != nil {
 		return nil, fmt.Errorf("delete session keys: %w", translateError(err))
 	}
 	return hashes, nil
@@ -343,7 +357,7 @@ func (d *DB) RevokeSessionKey(ctx context.Context, keyID string) ([]string, erro
 	var hashes []string
 	err := d.WithTx(ctx, func(q Querier) error {
 		var err error
-		hashes, err = deleteSessionKeys(ctx, q, where, keyID, "session_key")
+		hashes, err = d.deleteSessionKeys(ctx, q, where, keyID, "session_key")
 		return err
 	})
 	if err != nil {
@@ -365,7 +379,7 @@ func (d *DB) RevokeUserSessions(ctx context.Context, userID string) ([]string, e
 	var hashes []string
 	err := d.WithTx(ctx, func(q Querier) error {
 		var err error
-		hashes, err = deleteSessionKeys(ctx, q, where, userID, "session_key")
+		hashes, err = d.deleteSessionKeys(ctx, q, where, userID, "session_key")
 		return err
 	})
 	if err != nil {
@@ -402,7 +416,7 @@ func (d *DB) ChangePasswordAndRevokeOtherSessions(ctx context.Context, userID, n
 		if n == 0 {
 			return ErrNotFound
 		}
-		hashes, err = deleteSessionKeys(ctx, q, where, userID, "session_key", exceptKeyID)
+		hashes, err = d.deleteSessionKeys(ctx, q, where, userID, "session_key", exceptKeyID)
 		return err
 	})
 	if err != nil {
