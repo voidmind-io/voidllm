@@ -133,12 +133,14 @@ func TestSummarizeTeams(t *testing.T) {
 			plain := fmt.Sprintf("vl_tk_summary%04d", n)
 			return mustCreateAPIKey(t, d, CreateAPIKeyParams{
 				KeyHash: keygen.Hash(plain, testHMACSecret), KeyHint: keygen.Hint(plain),
-				KeyType: keygen.KeyTypeTeam, Name: plain, OrgID: org.ID, TeamID: ptr(teamID), CreatedBy: u1.ID,
+				KeyType: keygen.KeyTypeTeam, Name: plain, OrgID: org.ID, TeamID: ptr(teamID), ExpiresAt: exp, CreatedBy: u1.ID,
 			})
 		}
 		mkKey(teams[0].ID, nil)
 		mkKey(teams[0].ID, nil)
 		mkKey(teams[2].ID, nil)
+		mkKey(teams[1].ID, tsIn(-time.Hour))      // expired: excluded
+		mkKey(teams[1].ID, tsIn(30*24*time.Hour)) // future expiry: included
 		gone := mkKey(teams[2].ID, nil)
 		if err := d.DeleteAPIKey(ctx, gone.ID); err != nil {
 			t.Fatalf("DeleteAPIKey: %v", err)
@@ -152,7 +154,7 @@ func TestSummarizeTeams(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SummarizeTeams: %v", err)
 			}
-			want := TeamsSummary{Total: 5, Members: 2, Keys: 3}
+			want := TeamsSummary{Total: 5, Members: 2, Keys: 4}
 			if *got != want {
 				t.Errorf("summary = %+v, want %+v", *got, want)
 			}
