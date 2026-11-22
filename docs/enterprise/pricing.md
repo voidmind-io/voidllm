@@ -23,7 +23,7 @@ Want to try Pro or Enterprise features first? See [30-day trial](#30-day-trial).
 Everything you need to run an LLM proxy in production:
 
 - 1 organization, 3 teams, unlimited users
-- Proxy with streaming + provider adapters (OpenAI, Anthropic, Azure, Ollama, vLLM, custom)
+- Proxy with streaming + provider adapters (OpenAI, Anthropic, Azure, Gemini, Vertex AI, AWS Bedrock, Ollama, vLLM, custom)
 - Full Web UI + Playground
 - RBAC (4 built-in roles)
 - Usage tracking + dashboard

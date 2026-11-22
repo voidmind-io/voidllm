@@ -1,12 +1,12 @@
 ---
 title: "Provider Setup"
-description: "Configure OpenAI, Anthropic, Azure, AWS Bedrock, Ollama, vLLM, and custom providers"
+description: "Configure OpenAI, Anthropic, Azure, Google Gemini, Vertex AI, AWS Bedrock, Ollama, vLLM, and custom providers"
 section: models
 order: 1
 ---
 # Provider Setup
 
-VoidLLM supports 7 providers. Each handles request/response translation differently.
+VoidLLM supports 9 providers: `openai`, `anthropic`, `azure`, `gemini`, `vertex`, `bedrock`, `vllm`, `ollama` and `custom`. Each handles request/response translation differently.
 
 ## OpenAI
 
@@ -329,6 +329,51 @@ The chat health probe sends a Converse request with a single user message and `m
 ### PII anonymization
 
 Bedrock endpoints are public hosts, so when [PII anonymization](../security/pii.md) is enabled they are treated as external providers and requests are pseudonymized by default. The decision is made from the endpoint host without a DNS lookup: named hosts (including PrivateLink `vpce-...` names) count as public, only literal private IP addresses and `localhost` count as private.
+
+## Google Gemini
+
+VoidLLM translates OpenAI chat completion requests into the Gemini `generateContent` API and translates the responses back, including streaming and tool calls. Clients keep using the OpenAI format.
+
+```yaml
+models:
+  - name: gemini-2.0-flash
+    provider: gemini
+    base_url: https://generativelanguage.googleapis.com
+    api_key: ${GEMINI_API_KEY}
+```
+
+- The request goes to `{base_url}/v1beta/models/{name}:generateContent`, or `:streamGenerateContent?alt=sse` for streaming. `name` is the model name Gemini expects.
+- The `api_key` is sent in the `x-goog-api-key` header. The client's own `Authorization` header is not forwarded.
+- `base_url` is required and must start with `http://` or `https://`.
+
+## Google Vertex AI
+
+Vertex AI uses the same translation as Gemini, with a project and region in the URL.
+
+```yaml
+models:
+  - name: gemini-2.0-flash
+    provider: vertex
+    base_url: https://us-central1-aiplatform.googleapis.com
+    gcp_project: my-project
+    gcp_location: us-central1
+    api_key: ${VERTEX_ACCESS_TOKEN}
+```
+
+- The request goes to `{base_url}/v1/projects/{gcp_project}/locations/{gcp_location}/publishers/google/models/{name}:generateContent` (or `:streamGenerateContent?alt=sse`).
+- `gcp_project` and `gcp_location` are required. They are validated at config load, on deployments, and in the Admin API (which also requires them for the connection test, together with the model name).
+- The `api_key` is sent as `Authorization: Bearer`. VoidLLM does not read a service account JSON file and does not use Application Default Credentials: it sends the configured value as is, so it has to be a valid bearer token for Vertex AI. VoidLLM does not refresh it. If the token expires, update the model's key.
+
+## Gemini and Vertex AI behavior
+
+Both providers share one adapter.
+
+- **Endpoints:** chat completions only. Rerank and score requests are rejected with `400 endpoint not supported for this model`. The adapter has no embeddings translation, and health probes and the connection test do not use a models-list or embeddings endpoint for these providers.
+- **Request fields translated:** `messages`, `tools`, `tool_choice`, `temperature`, `top_p`, `max_completion_tokens` (takes precedence over `max_tokens`), `stop`, `n`, and `response_format` of type `json_object`. Request bodies are rebuilt from these fields, so other fields are not forwarded. `response_format` of type `json_schema` is not mapped.
+- **Messages:** system messages become Gemini's system instruction. Message content is sent as text. Content blocks that are not of type `text` are not forwarded.
+- **Tool calls:** OpenAI `tools` become Gemini function declarations, assistant `tool_calls` become function calls, and `tool` messages become function responses. Responses and streams are translated back to OpenAI tool calls. A stream with too many or invalid tool call parts is aborted.
+- **Usage:** token counts come from Gemini's usage metadata. Cached prompt tokens are reported by Gemini as part of the prompt tokens.
+- **Health probe:** the chat probe is a real, billable generateContent request, as with other translating providers.
 
 ## Ollama
 
