@@ -341,9 +341,9 @@ func (h *Handler) ListUsers(c fiber.Ctx) error {
 		summary, err := h.DB.SummarizeUsers(c.Context(), includeDeleted)
 		if err != nil {
 			h.Log.ErrorContext(c.Context(), "summarize users", slog.String("error", err.Error()))
-			return apierror.InternalError(c, "failed to summarize users")
+		} else {
+			resp.Summary = &usersSummaryResponse{Total: summary.Total, SystemAdmins: summary.SystemAdmins, SSO: summary.SSO}
 		}
-		resp.Summary = &usersSummaryResponse{Total: summary.Total, SystemAdmins: summary.SystemAdmins, SSO: summary.SSO}
 	}
 	return c.JSON(resp)
 }

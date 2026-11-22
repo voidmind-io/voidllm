@@ -286,9 +286,9 @@ func (h *Handler) ListTeams(c fiber.Ctx) error {
 			summary, err := h.DB.SummarizeUserTeams(c.Context(), orgID, keyInfo.UserID)
 			if err != nil {
 				h.Log.ErrorContext(c.Context(), "summarize teams for user", slog.String("error", err.Error()))
-				return apierror.InternalError(c, "failed to summarize teams")
+			} else {
+				resp.Summary = teamsSummaryToResponse(summary)
 			}
-			resp.Summary = teamsSummaryToResponse(summary)
 		}
 		return c.JSON(resp)
 	}
@@ -324,9 +324,9 @@ func (h *Handler) ListTeams(c fiber.Ctx) error {
 		summary, err := h.DB.SummarizeTeams(c.Context(), orgID, includeDeleted)
 		if err != nil {
 			h.Log.ErrorContext(c.Context(), "summarize teams", slog.String("error", err.Error()))
-			return apierror.InternalError(c, "failed to summarize teams")
+		} else {
+			resp.Summary = teamsSummaryToResponse(summary)
 		}
-		resp.Summary = teamsSummaryToResponse(summary)
 	}
 	return c.JSON(resp)
 }

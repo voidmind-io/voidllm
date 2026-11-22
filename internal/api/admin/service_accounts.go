@@ -263,9 +263,9 @@ func (h *Handler) ListServiceAccounts(c fiber.Ctx) error {
 		summary, err := h.DB.SummarizeServiceAccounts(c.Context(), orgID, filterCreatedBy, includeDeleted)
 		if err != nil {
 			h.Log.ErrorContext(c.Context(), "summarize service accounts", slog.String("error", err.Error()))
-			return apierror.InternalError(c, "failed to summarize service accounts")
+		} else {
+			resp.Summary = &serviceAccountsSummaryResponse{Total: summary.Total, OrgScoped: summary.OrgScoped, TeamScoped: summary.TeamScoped}
 		}
-		resp.Summary = &serviceAccountsSummaryResponse{Total: summary.Total, OrgScoped: summary.OrgScoped, TeamScoped: summary.TeamScoped}
 	}
 	return c.JSON(resp)
 }

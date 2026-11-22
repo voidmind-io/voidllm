@@ -717,9 +717,9 @@ func (h *Handler) ListAPIKeys(c fiber.Ctx) error {
 		summary, err := h.DB.SummarizeAPIKeys(c.Context(), orgID, filterUserID, filterTeamID, includeDeleted)
 		if err != nil {
 			h.Log.ErrorContext(c.Context(), "summarize api keys", slog.String("error", err.Error()))
-			return apierror.InternalError(c, "failed to summarize api keys")
+		} else {
+			resp.Summary = &apiKeysSummaryResponse{Total: summary.Total, Active: summary.Active, ExpiringSoon: summary.ExpiringSoon}
 		}
-		resp.Summary = &apiKeysSummaryResponse{Total: summary.Total, Active: summary.Active, ExpiringSoon: summary.ExpiringSoon}
 	}
 	return c.JSON(resp)
 }

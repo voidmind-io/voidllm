@@ -226,9 +226,9 @@ func (h *Handler) ListOrgMemberships(c fiber.Ctx) error {
 		summary, err := h.DB.SummarizeOrgMemberships(c.Context(), orgID)
 		if err != nil {
 			h.Log.ErrorContext(c.Context(), "summarize org memberships", slog.String("error", err.Error()))
-			return apierror.InternalError(c, "failed to summarize org memberships")
+		} else {
+			resp.Summary = &orgMembershipsSummaryResponse{Total: summary.Total, Admins: summary.Admins}
 		}
-		resp.Summary = &orgMembershipsSummaryResponse{Total: summary.Total, Admins: summary.Admins}
 	}
 	return c.JSON(resp)
 }

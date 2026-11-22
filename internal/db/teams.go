@@ -489,25 +489,35 @@ type TeamsSummary struct {
 // SummarizeTeams aggregates the teams that ListTeamsWithCounts would return
 // for the same orgID and includeDeleted across all pages.
 func (d *DB) SummarizeTeams(ctx context.Context, orgID string, includeDeleted bool) (*TeamsSummary, error) {
-	q := d.newQueryArgs()
-	query := teamsSummarySelect(q) + teamCountsFrom +
-		" WHERE " + strings.Join(teamScopeConditions(q, orgID, includeDeleted), " AND ")
-	return d.scanTeamsSummary(ctx, "SummarizeTeams", query, q.args)
+	query, args := d.teamsSummaryQuery(func(q *queryArgs) string {
+		return "SELECT t.id FROM teams t WHERE " +
+			strings.Join(teamScopeConditions(q, orgID, includeDeleted), " AND ")
+	})
+	return d.scanTeamsSummary(ctx, "SummarizeTeams", query, args)
 }
 
 // SummarizeUserTeams aggregates the teams that ListUserTeams would return for
 // the same orgID and userID.
 func (d *DB) SummarizeUserTeams(ctx context.Context, orgID, userID string) (*TeamsSummary, error) {
-	q := d.newQueryArgs()
-	query := teamsSummarySelect(q) + teamCountsFrom + userTeamsJoin(q, userID) +
-		" WHERE " + strings.Join(teamScopeConditions(q, orgID, false), " AND ")
-	return d.scanTeamsSummary(ctx, "SummarizeUserTeams", query, q.args)
+	query, args := d.teamsSummaryQuery(func(q *queryArgs) string {
+		return "SELECT t.id FROM teams t" + userTeamsJoin(q, userID) +
+			" WHERE " + strings.Join(teamScopeConditions(q, orgID, false), " AND ")
+	})
+	return d.scanTeamsSummary(ctx, "SummarizeUserTeams", query, args)
 }
 
-// teamsSummarySelect builds the aggregate SELECT list for team summaries.
-func teamsSummarySelect(q *queryArgs) string {
-	return "SELECT COUNT(DISTINCT t.id), COUNT(DISTINCT tm.user_id), " +
-		"COUNT(DISTINCT " + fmt.Sprintf(teamActiveKeyCase, q.bind(FormatTimestamp(time.Now()))) + ")"
+// teamsSummaryQuery builds the summary query from a scoped-teams subquery
+// builder. The subquery is rendered once per aggregate so that members and
+// keys are counted independently, without a members x keys cross product.
+// Placeholders are bound in textual order.
+func (d *DB) teamsSummaryQuery(scoped func(q *queryArgs) string) (string, []any) {
+	q := d.newQueryArgs()
+	query := "SELECT (SELECT COUNT(*) FROM (" + scoped(q) + ") st), " +
+		"(SELECT COUNT(DISTINCT tm.user_id) FROM team_memberships tm WHERE tm.team_id IN (" + scoped(q) + ")), " +
+		"(SELECT COUNT(ak.id) FROM api_keys ak WHERE ak.team_id IN (" + scoped(q) + ")" +
+		" AND ak.deleted_at IS NULL AND (ak.expires_at IS NULL OR ak.expires_at > " +
+		q.bind(FormatTimestamp(time.Now())) + "))"
+	return query, q.args
 }
 
 // userTeamsJoin restricts a team query to teams the given user belongs to.
