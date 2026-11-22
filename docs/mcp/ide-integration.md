@@ -42,6 +42,7 @@ Access VoidLLM's built-in management tools (list models, check health, create ke
 {
   "mcpServers": {
     "voidllm": {
+      "type": "http",
       "url": "https://your-voidllm/api/v1/mcp/voidllm",
       "headers": {
         "Authorization": "Bearer vl_uk_..."
@@ -59,6 +60,7 @@ Access Code Mode tools (list_servers, search_tools, execute_code) for multi-tool
 {
   "mcpServers": {
     "voidllm-code": {
+      "type": "http",
       "url": "https://your-voidllm/api/v1/mcp",
       "headers": {
         "Authorization": "Bearer vl_uk_..."
@@ -76,6 +78,7 @@ Each registered MCP server gets its own endpoint. Connect to a specific server:
 {
   "mcpServers": {
     "aws": {
+      "type": "http",
       "url": "https://your-voidllm/api/v1/mcp/aws",
       "headers": {
         "Authorization": "Bearer vl_uk_..."

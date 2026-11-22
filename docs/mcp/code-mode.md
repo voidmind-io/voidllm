@@ -92,6 +92,7 @@ Point your IDE at `/api/v1/mcp` to get Code Mode tools:
 {
   "mcpServers": {
     "voidllm-code": {
+      "type": "http",
       "url": "https://your-voidllm/api/v1/mcp",
       "headers": {
         "Authorization": "Bearer <your-api-key>"

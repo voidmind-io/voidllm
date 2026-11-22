@@ -38,47 +38,137 @@ VoidLLM does not validate request bodies beyond extracting the `model` field. Th
 
 ## Admin API (`/api/v1/*`)
 
-Management endpoints for organizations, teams, users, keys, models, and MCP servers.
+Management endpoints for organizations, teams, users, keys, models, and MCP servers. Roles are described in [RBAC](../security/rbac.md). Routes below are grouped as registered in `internal/api/admin/routes.go`.
+
+### Current user
+| Method | Endpoint |
+|---|---|
+| `GET` | `/api/v1/me` |
+| `POST` | `/api/v1/me/password` |
+| `GET` | `/api/v1/me/available-models` |
+| `GET` | `/api/v1/usage/me` |
+| `GET` | `/api/v1/dashboard/stats` |
 
 ### Organizations
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/v1/orgs` | List organizations |
-| `POST` | `/api/v1/orgs` | Create organization |
-| `GET` | `/api/v1/orgs/:id` | Get organization |
-| `PATCH` | `/api/v1/orgs/:id` | Update organization |
+| Method | Endpoint |
+|---|---|
+| `POST` | `/api/v1/orgs` |
+| `GET` | `/api/v1/orgs` |
+| `GET` | `/api/v1/orgs/:org_id` |
+| `PATCH` | `/api/v1/orgs/:org_id` |
+| `DELETE` | `/api/v1/orgs/:org_id` |
+
+### Users
+| Method | Endpoint |
+|---|---|
+| `POST` | `/api/v1/users` |
+| `GET` | `/api/v1/users` |
+| `GET` | `/api/v1/users/:user_id` |
+| `PATCH` | `/api/v1/users/:user_id` |
+| `DELETE` | `/api/v1/users/:user_id` |
+
+### Org memberships
+| Method | Endpoint |
+|---|---|
+| `POST` | `/api/v1/orgs/:org_id/members` |
+| `GET` | `/api/v1/orgs/:org_id/members` |
+| `PATCH` | `/api/v1/orgs/:org_id/members/:membership_id` |
+| `DELETE` | `/api/v1/orgs/:org_id/members/:membership_id` |
 
 ### Teams
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/v1/orgs/:org_id/teams` | List teams |
-| `POST` | `/api/v1/orgs/:org_id/teams` | Create team |
-| `GET` | `/api/v1/teams/:id` | Get team |
-| `PATCH` | `/api/v1/teams/:id` | Update team |
-| `DELETE` | `/api/v1/teams/:id` | Delete team |
+| Method | Endpoint |
+|---|---|
+| `POST` | `/api/v1/orgs/:org_id/teams` |
+| `GET` | `/api/v1/orgs/:org_id/teams` |
+| `GET` | `/api/v1/orgs/:org_id/teams/:team_id` |
+| `PATCH` | `/api/v1/orgs/:org_id/teams/:team_id` |
+| `DELETE` | `/api/v1/orgs/:org_id/teams/:team_id` |
 
-### API Keys
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/v1/keys` | List keys |
-| `POST` | `/api/v1/keys` | Create key |
-| `DELETE` | `/api/v1/keys/:id` | Revoke key |
-| `POST` | `/api/v1/keys/:id/rotate` | Rotate key (24h grace) |
+### Team memberships
+| Method | Endpoint |
+|---|---|
+| `POST` | `/api/v1/orgs/:org_id/teams/:team_id/members` |
+| `GET` | `/api/v1/orgs/:org_id/teams/:team_id/members` |
+| `PATCH` | `/api/v1/orgs/:org_id/teams/:team_id/members/:membership_id` |
+| `DELETE` | `/api/v1/orgs/:org_id/teams/:team_id/members/:membership_id` |
 
-### Models
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/v1/models` | List models |
-| `POST` | `/api/v1/models` | Create model |
-| `PATCH` | `/api/v1/models/:id` | Update model |
-| `DELETE` | `/api/v1/models/:id` | Delete model |
-| `POST` | `/api/v1/models/:id/test` | Test upstream connectivity |
+### Service accounts
+| Method | Endpoint |
+|---|---|
+| `POST` | `/api/v1/orgs/:org_id/service-accounts` |
+| `GET` | `/api/v1/orgs/:org_id/service-accounts` |
+| `GET` | `/api/v1/orgs/:org_id/service-accounts/:sa_id` |
+| `PATCH` | `/api/v1/orgs/:org_id/service-accounts/:sa_id` |
+| `DELETE` | `/api/v1/orgs/:org_id/service-accounts/:sa_id` |
+
+### Invites
+| Method | Endpoint |
+|---|---|
+| `POST` | `/api/v1/orgs/:org_id/invites` |
+| `GET` | `/api/v1/orgs/:org_id/invites` |
+| `DELETE` | `/api/v1/orgs/:org_id/invites/:invite_id` |
+
+### API keys
+| Method | Endpoint |
+|---|---|
+| `POST` | `/api/v1/orgs/:org_id/keys` |
+| `GET` | `/api/v1/orgs/:org_id/keys` |
+| `GET` | `/api/v1/orgs/:org_id/keys/:key_id` |
+| `PATCH` | `/api/v1/orgs/:org_id/keys/:key_id` |
+| `DELETE` | `/api/v1/orgs/:org_id/keys/:key_id` |
+| `POST` | `/api/v1/orgs/:org_id/keys/:key_id/rotate` |
+
+### Models (system admin)
+| Method | Endpoint |
+|---|---|
+| `GET` | `/api/v1/models/health` |
+| `POST` | `/api/v1/models/test-connection` |
+| `POST` | `/api/v1/models` |
+| `GET` | `/api/v1/models` |
+| `GET` | `/api/v1/models/:model_id` |
+| `PATCH` | `/api/v1/models/:model_id` |
+| `DELETE` | `/api/v1/models/:model_id` |
+| `PATCH` | `/api/v1/models/:model_id/activate` |
+| `PATCH` | `/api/v1/models/:model_id/deactivate` |
+| `POST` | `/api/v1/models/:model_id/deployments` |
+| `GET` | `/api/v1/models/:model_id/deployments` |
+| `PATCH` | `/api/v1/models/:model_id/deployments/:deployment_id` |
+| `DELETE` | `/api/v1/models/:model_id/deployments/:deployment_id` |
+
+### Model access
+| Method | Endpoint |
+|---|---|
+| `GET` | `/api/v1/orgs/:org_id/model-access` |
+| `PUT` | `/api/v1/orgs/:org_id/model-access` |
+| `GET` | `/api/v1/orgs/:org_id/teams/:team_id/model-access` |
+| `PUT` | `/api/v1/orgs/:org_id/teams/:team_id/model-access` |
+| `GET` | `/api/v1/orgs/:org_id/keys/:key_id/model-access` |
+| `PUT` | `/api/v1/orgs/:org_id/keys/:key_id/model-access` |
+
+### Model aliases
+| Method | Endpoint |
+|---|---|
+| `POST` | `/api/v1/orgs/:org_id/model-aliases` |
+| `GET` | `/api/v1/orgs/:org_id/model-aliases` |
+| `DELETE` | `/api/v1/orgs/:org_id/model-aliases/:alias_id` |
+| `POST` | `/api/v1/orgs/:org_id/teams/:team_id/model-aliases` |
+| `GET` | `/api/v1/orgs/:org_id/teams/:team_id/model-aliases` |
+| `DELETE` | `/api/v1/orgs/:org_id/teams/:team_id/model-aliases/:alias_id` |
 
 ### Usage
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/v1/orgs/:org_id/usage` | Org usage stats |
-| `GET` | `/api/v1/usage/me` | Current user's usage |
+| Method | Endpoint |
+|---|---|
+| `GET` | `/api/v1/usage` |
+| `GET` | `/api/v1/orgs/:org_id/usage` |
+| `GET` | `/api/v1/mcp-usage` |
+| `GET` | `/api/v1/orgs/:org_id/mcp-usage` |
+
+### Audit logs
+| Method | Endpoint |
+|---|---|
+| `GET` | `/api/v1/audit-logs` |
+
+MCP server management (`/mcp-servers`, `/orgs/:org_id/mcp-servers`, MCP access routes), SSO and license routes are also registered in `internal/api/admin/routes.go` and are not listed here yet.
 
 ### MCP
 | Method | Endpoint | Description |

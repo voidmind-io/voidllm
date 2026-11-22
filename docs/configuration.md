@@ -420,7 +420,7 @@ settings:
 
 ```yaml
 cache:
-  key_ttl: 30s              # How often to refresh the key cache from DB
+  key_ttl: 30s              # How often to refresh the key cache from DB (org/team limit changes apply after this)
   model_ttl: 60s            # Model access cache refresh
   alias_ttl: 60s            # Alias cache refresh
 ```

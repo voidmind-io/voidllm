@@ -93,6 +93,7 @@ Add to your MCP config:
 {
   "mcpServers": {
     "voidllm": {
+      "type": "http",
       "url": "http://localhost:8080/api/v1/mcp/voidllm",
       "headers": {
         "Authorization": "Bearer vl_uk_..."

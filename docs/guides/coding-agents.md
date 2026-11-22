@@ -180,7 +180,7 @@ These are the responses from the local test. The numbers are small on purpose.
 - A key whose `daily_token_limit` is used up: `429` with `token_limit_exceeded`, message `token budget exceeded`.
 - A key with no limit of its own, in a team whose `daily_token_limit` is used up: the same `429 token_limit_exceeded`.
 
-Changes to a team's limits are not instant. In the test, the first request after lowering the team limit still passed, and the next ones after the cache refresh were rejected. The refresh interval is `cache.key_ttl` (default 30s, see the [configuration reference](../configuration.md)). Changes to a key's limits took effect on the next request.
+Limit changes on a key apply on the next request. Changes to org or team limits apply after the key cache refresh (`cache.key_ttl`, default 30s, see the [configuration reference](../configuration.md)). With Redis configured, the update publishes a cache invalidation instead. In the test, the first request after lowering a team limit still passed, and the following ones were rejected.
 
 Budgets are in tokens and requests, not currency. Cost figures in the usage views are estimates from the model prices you configure.
 
