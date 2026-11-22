@@ -76,13 +76,12 @@ import (
 // own — see waitForLoggedStatusCode, which polls the DB directly instead of
 // relying on a single explicit ul.Stop() at a moment the test can't
 // otherwise pin down (handleStreamingResponse's SendStreamWriter goroutine
-// keeps running after Handle itself has already returned — Handle's own
-// top-level trackDone defer fires as soon as SendStreamWriter is registered,
-// well before the goroutine's body finishes, since the sync.Once inside
-// trackDone makes the goroutine's later, matching defer a no-op — so neither
-// the client receiving a response nor the request round-trip completing
-// proves the goroutine, and therefore its breaker recording and usage
-// logging, has actually finished). The returned *usage.Logger is stopped via
+// keeps running after Handle itself has already returned — after a
+// successful stream install the writer goroutine owns the shutdown tracking
+// release and fires it only once the stream has ended, while Handle's own
+// defer skips it — so neither the client receiving a response nor the
+// request round-trip completing proves the goroutine, and therefore its
+// breaker recording and usage logging, has actually finished). The returned *usage.Logger is stopped via
 // t.Cleanup.
 func newTerminationTestHandler(t *testing.T, reg *Registry) (*ProxyHandler, *usage.Logger, *db.DB) {
 	t.Helper()

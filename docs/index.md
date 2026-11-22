@@ -24,7 +24,7 @@ Privacy-first LLM proxy and AI gateway. Self-hosted, single binary, sub-500us ov
 
 ## Guides
 
-- [Coding Agents for Teams](guides/coding-agents.md) - one key per developer, budgets per team, which tools work through the proxy
+- [Coding Agents for Teams](guides/coding-agents.md) - one key per developer, budgets per team, Claude Code and Codex CLI through the proxy
 
 ## Models
 

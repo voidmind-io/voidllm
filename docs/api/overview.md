@@ -16,6 +16,8 @@ All requests require an API key in the `Authorization` header:
 Authorization: Bearer vl_uk_...
 ```
 
+On the proxy routes (`/v1/*`) the key can instead be sent in an `x-api-key` header, which is what Anthropic SDKs send by default. `x-api-key` is only read when the request has no `Authorization` header at all; an `Authorization` header, even an empty one, always takes precedence. The Admin API accepts only `Authorization: Bearer`.
+
 Key types: `vl_uk_` (user), `vl_tk_` (team), `vl_sa_` (service account), `vl_sk_` (session).
 
 ## Proxy API (`/v1/*`)
@@ -33,8 +35,53 @@ The proxy forwards requests to upstream LLM providers. Any OpenAI-compatible end
 | `POST /v1/audio/transcriptions` | Audio transcription |
 | `POST /v1/audio/speech` | Text to speech |
 | `GET /v1/models` | List available models |
+| `POST /v1/messages` | Anthropic Messages API, native passthrough (streaming supported). `provider: anthropic` only, see [Native endpoints](#native-endpoints) |
+| `POST /v1/messages/count_tokens` | Anthropic token counting, native passthrough. `provider: anthropic` only |
+| `POST /v1/responses` | OpenAI Responses API, native passthrough (streaming supported). `provider: openai`, `custom`, `vllm` or `ollama` only |
 
 Before forwarding, VoidLLM checks that the request body is within the size limit (`server.proxy.max_request_body`, default 20 MB) and parses it to read the `model` field, which is required. It then applies rate and token limits and resolves the model. It does not validate the rest of the body. The upstream provider handles that, except where an adapter translates the request for the provider. Paths other than those listed above are rejected with `400 unsupported API endpoint`.
+
+### Native endpoints
+
+`/v1/messages`, `/v1/messages/count_tokens` and `/v1/responses` are forwarded in their own wire format, without translation. They are meant for clients that speak these APIs natively, such as Claude Code and Codex CLI (see [Coding Agents for Teams](../guides/coding-agents.md)).
+
+| Endpoint | Supported providers | Upstream URL |
+|---|---|---|
+| `POST /v1/messages`, `POST /v1/messages/count_tokens` | `anthropic` | `{base_url}/v1/messages`, `{base_url}/v1/messages/count_tokens` |
+| `POST /v1/responses` | `openai`, `custom`, `vllm`, `ollama` | `{base_url}/responses` |
+
+- **Other providers:** a request for a model whose provider does not support the endpoint is rejected with `400 endpoint not supported for this model`. For a model with several deployments, only deployments with a supporting provider are used, and fallback models without one are skipped.
+- **Methods and sub-resources:** only `POST` is accepted. Other methods and sub-resources such as `GET` or `DELETE /v1/responses/{id}` are rejected with `400 unsupported API endpoint` before any limit is charged.
+- **Request body:** forwarded as sent, except that the `model` field is rewritten when an alias was used and `/v1/responses` gets a `store: false` default (see below).
+- **Headers:** `anthropic-version` (form `YYYY-MM-DD`, otherwise `2023-06-01` is sent) and `anthropic-beta` are forwarded on the Messages endpoints, `OpenAI-Beta` on `/v1/responses`. Beta headers are forwarded only when they are a comma-separated list of lowercase tokens without spaces, at most 512 bytes, and dropped otherwise. The upstream key from the model config is sent as `x-api-key` (Messages) or `Authorization: Bearer` (Responses). Upstream `Request-Id` and `anthropic-ratelimit-*` response headers are passed back to the client.
+- **Limits:** rate limits, token budgets and model access apply exactly as on `/v1/chat/completions`.
+
+#### `/v1/responses` is stateless
+
+VoidLLM does not proxy the server-side state of the Responses API:
+
+- When the request has no `store` field, VoidLLM sets `store: false`, so the upstream does not persist the response. A `store` value sent by the client is kept.
+- A request with a non-null `previous_response_id` or `conversation`, or with `background: true`, is rejected with `400 unsupported_parameter`. Send the full context in `input` instead.
+- `GET /v1/responses/{id}` and `DELETE /v1/responses/{id}` are not supported (`400 unsupported API endpoint`).
+
+#### Usage and cost
+
+Usage is recorded the same way as for chat completions: prompt and completion tokens, cache read and cache write tokens (Messages) or cached input tokens (Responses), the estimated cost from the model's pricing, duration and, for streams, TTFT. If a client disconnects during a stream, VoidLLM keeps reading the upstream stream for up to 30 seconds without forwarding it, so the final token counts are still recorded and charged.
+
+`/v1/messages/count_tokens` creates no usage record. It has no cost and does not use up token budget, but it counts against request rate limits, and a key whose budget is exhausted is rejected there too.
+
+No prompt or response content is stored, logged or persisted on these endpoints, the same as on all others.
+
+#### PII filtering on native endpoints
+
+[PII anonymization](../security/pii.md) only understands the chat completions format, so native requests are never anonymized. Instead, when PII anonymization is enabled, a native request is only sent to deployments for which anonymization does not apply (for example a private destination by default, or one with `pii_filter: false`). If none of the model's deployments qualify, the request is rejected with `400 not available while PII filtering is enabled for this model`. Nothing is forwarded in that case.
+
+#### Errors on native endpoints
+
+- **`/v1/messages` and `/v1/messages/count_tokens`:** errors created by VoidLLM (authentication, limits, unknown model, unsupported endpoint and so on) use the Anthropic error envelope, so Anthropic SDKs can parse them: `{"type":"error","error":{"type":"rate_limit_error","message":"token budget exceeded"}}`. The `error.type` follows the status code: `authentication_error` (401), `permission_error` (403), `not_found_error` (404), `request_too_large` (413), `rate_limit_error` (429), `overloaded_error` (503), `invalid_request_error` (other 4xx), `api_error` (5xx).
+- **`/v1/responses`:** VoidLLM errors use the standard envelope described under [Error Responses](#error-responses).
+- **Upstream errors** are passed to the client unchanged, with the upstream status code.
+- **Streams:** if a stream breaks off, VoidLLM ends it with an `error` event in the format of the endpoint (Anthropic or Responses).
 
 ## Admin API (`/api/v1/*`)
 
@@ -224,7 +271,7 @@ A static copy of the spec is also available in the repository: [swagger.yaml](ht
 
 ## Error Responses
 
-All errors follow a consistent format:
+All errors follow a consistent format, except VoidLLM errors on `/v1/messages` and `/v1/messages/count_tokens`, which use the Anthropic envelope (see [Errors on native endpoints](#errors-on-native-endpoints)):
 
 ```json
 {
@@ -239,6 +286,7 @@ All errors follow a consistent format:
 | Status | Code | Meaning |
 |---|---|---|
 | 400 | `bad_request` | Invalid request body or parameters |
+| 400 | `unsupported_parameter` | `previous_response_id`, `conversation` or `background: true` on `/v1/responses` |
 | 401 | `unauthorized` | Missing or invalid API key |
 | 403 | `forbidden` | Insufficient permissions |
 | 404 | `not_found` | Resource not found |
@@ -249,3 +297,11 @@ All errors follow a consistent format:
 | 429 | `rate_limit_exceeded` | Request rate limit exceeded |
 | 429 | `token_limit_exceeded` | Daily or monthly token budget exceeded |
 | 502 | `upstream_unavailable` | LLM provider unreachable |
+
+### Limit rejections
+
+A `429` caused by a VoidLLM limit carries a `Retry-After` header with the number of seconds until the limit resets (with Redis-backed request rate limits, the window length as an upper bound). For a token budget that is the next midnight UTC (daily) or the 1st of the next month UTC (monthly). A token budget rejection also sets `x-should-retry: false`, because retrying before the reset cannot succeed. On `/v1/responses` its error additionally has `"type": "insufficient_quota"`, which OpenAI clients such as Codex CLI treat as final:
+
+```json
+{"error":{"type":"insufficient_quota","code":"token_limit_exceeded","message":"token budget exceeded","request_id":"..."}}
+```

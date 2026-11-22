@@ -8,9 +8,19 @@ order: 1
 
 VoidLLM supports 9 providers: `openai`, `anthropic`, `azure`, `gemini`, `vertex`, `bedrock`, `vllm`, `ollama` and `custom`. Each handles request/response translation differently.
 
+Every provider serves the OpenAI-compatible endpoints such as `/v1/chat/completions`. The [native endpoints](../api/overview.md#native-endpoints), which are forwarded without translation, depend on the provider:
+
+| Provider | `/v1/messages`, `/v1/messages/count_tokens` | `/v1/responses` |
+|---|---|---|
+| `anthropic` | Yes | No |
+| `openai`, `custom`, `vllm`, `ollama` | No | Yes, if the upstream implements `/responses` |
+| `azure`, `gemini`, `vertex`, `bedrock` | No | No |
+
+A native request for a model whose provider is not supported is rejected with `400 endpoint not supported for this model`.
+
 ## OpenAI
 
-Direct passthrough - no translation needed.
+Direct passthrough - no translation needed. `POST /v1/responses` is forwarded to `{base_url}/responses`, which is what Codex CLI uses (see [Coding Agents for Teams](../guides/coding-agents.md#codex-cli)).
 
 ```yaml
 models:
@@ -33,7 +43,7 @@ models:
     api_key: ${ANTHROPIC_KEY}
 ```
 
-Note: Claude Code talks directly to Anthropic's API for LLM access - you can't route its LLM requests through VoidLLM. But you can add VoidLLM as an [MCP server](../mcp/ide-integration.md) in Claude Code to manage your proxy and access external tools.
+Anthropic models also serve the native Messages API: `POST /v1/messages` and `POST /v1/messages/count_tokens` are forwarded unchanged to `{base_url}/v1/messages` (so `base_url` has no `/v1` suffix). This is what Claude Code uses, see [Coding Agents for Teams](../guides/coding-agents.md#claude-code). You can also add VoidLLM to Claude Code as an [MCP server](../mcp/ide-integration.md).
 
 ## Azure OpenAI
 
@@ -387,7 +397,7 @@ models:
     aliases: [local]
 ```
 
-No API key needed for local Ollama.
+No API key needed for local Ollama. `POST /v1/responses` is forwarded to `{base_url}/responses`; it works if your Ollama version implements that endpoint.
 
 ## vLLM
 
@@ -401,7 +411,7 @@ models:
     aliases: [large]
 ```
 
-No API key needed - vLLM doesn't have built-in auth. Use network policies to restrict access to the vLLM endpoint.
+No API key needed - vLLM doesn't have built-in auth. Use network policies to restrict access to the vLLM endpoint. `POST /v1/responses` is forwarded to `{base_url}/responses`; it works if your vLLM version implements that endpoint.
 
 ## Custom (any OpenAI-compatible endpoint)
 
@@ -415,7 +425,7 @@ models:
     api_key: ${MY_KEY}
 ```
 
-This works with any service that implements `/v1/chat/completions` in OpenAI format: Together AI, Fireworks, Groq, Replicate, local inference servers, etc.
+This works with any service that implements `/v1/chat/completions` in OpenAI format: Together AI, Fireworks, Groq, Replicate, local inference servers, etc. `POST /v1/responses` is forwarded to `{base_url}/responses` if the service implements it.
 
 ## Model Types
 

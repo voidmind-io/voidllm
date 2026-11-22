@@ -171,6 +171,8 @@ models:
     pii_filter: false     # WARNING: sends PII in clear text to this upstream
 ```
 
+The native endpoints (`/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`) are never anonymized, because the PII walkers only understand the chat completions format. When PII anonymization is enabled, a native request is only sent to deployments for which anonymization does not apply under the rules above. If there is none, it is rejected with `400` and nothing is forwarded. See [Native endpoints](../api/overview.md#pii-filtering-on-native-endpoints).
+
 ## Operational notes
 
 - **Models may notice pseudonyms.** A pseudonym is an odd-looking token. Models sometimes comment on it, refuse to repeat it, or handle it awkwardly. Expect some quality impact on text that is heavily pseudonymized.

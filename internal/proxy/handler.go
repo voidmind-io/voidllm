@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"path"
 	"strconv"
@@ -243,12 +244,30 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 	// Reject new requests immediately during graceful drain so the load
 	// balancer can route them elsewhere before in-flight requests finish.
 	if p.ShutdownState != nil && p.ShutdownState.Draining() {
-		return apierror.Send(c, fiber.StatusServiceUnavailable,
+		return apierror.SendProxy(c, fiber.StatusServiceUnavailable,
 			"service_unavailable", "server is shutting down")
 	}
 
+	// format is derived once from the path. Native endpoints accept POST only,
+	// and sub-resources such as GET /v1/responses/{id} are not proxied. Both
+	// are rejected before any limit is charged or upstream is contacted.
+	upstreamPath := path.Clean(strings.TrimPrefix(c.Path(), "/v1/"))
+	format := formatForPath(upstreamPath)
+	if (format.native() && c.Method() != fiber.MethodPost) || isUnsupportedNativeSubpath(upstreamPath) {
+		return apierror.SendProxy(c, fiber.StatusBadRequest,
+			"bad_request", "unsupported API endpoint")
+	}
+
 	trackDone := p.initShutdownTracking()
-	defer trackDone()
+	// The streaming path hands trackDone to the stream writer, which releases
+	// it when the stream (and any native disconnect drain) has finished.
+	// Every other path releases it here when Handle returns.
+	streamOwnsTracking := false
+	defer func() {
+		if !streamOwnsTracking {
+			trackDone()
+		}
+	}()
 
 	maxReqBody, maxRespBody, maxStreamDur := p.resolveEffectiveLimits()
 
@@ -258,6 +277,11 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			return nil
 		}
 		return err
+	}
+
+	if format == formatResponses && hasStatefulResponsesParam(body) {
+		return apierror.SendProxy(c, fiber.StatusBadRequest, "unsupported_parameter",
+			"previous_response_id, conversation and background are not supported")
 	}
 
 	keyInfo := auth.KeyInfoFromCtx(c)
@@ -297,6 +321,23 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 	// the request.
 	requestedModelName := model.Name
 
+	// Native endpoints are forwarded without adapter translation and without
+	// PII scanning. Narrow the model to the deployments that can serve the
+	// endpoint; a model with none is a clean client error, never an upstream
+	// call.
+	if format.native() {
+		usable, block := p.nativeUsableModel(model, format)
+		switch block {
+		case nativeProviderBlocked:
+			return apierror.SendProxy(c, fiber.StatusBadRequest,
+				"bad_request", "endpoint not supported for this model")
+		case nativePIIBlocked:
+			return apierror.SendProxy(c, fiber.StatusBadRequest,
+				"bad_request", "not available while PII filtering is enabled for this model")
+		}
+		model = usable
+	}
+
 	// visited tracks the canonical names of all models attempted in this
 	// request's fallback chain so that runtime cycles are detected and broken.
 	visited := make(map[string]bool)
@@ -324,7 +365,7 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 	// when the engine is enabled and anonymization cannot be guaranteed.
 	var piiFilter *pii.Filter
 	var anonBody []byte // anonymized body; nil when PII engine is disabled
-	if p.PIIEngine != nil {
+	if p.PIIEngine != nil && !format.native() {
 		// OrgID is always non-empty for authenticated requests because the auth
 		// middleware (internal/auth) validates the API key and rejects requests
 		// with no matching key. The only path with a nil keyInfo is test code or
@@ -342,40 +383,16 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		if anonErr != nil {
 			// Fail-closed: reject the request rather than risk sending PII
 			// to an external provider on any hop in the fallback chain.
-			return apierror.Send(c, fiber.StatusUnprocessableEntity,
+			return apierror.SendProxy(c, fiber.StatusUnprocessableEntity,
 				"pii_policy", "request rejected by PII policy")
 		}
 	}
 
 	// shouldAnonymize reports whether PII anonymization must be applied for the
-	// given deployment. The decision follows this priority order:
-	//
-	//  1. dep.PIIFilter != nil  → use *dep.PIIFilter (explicit per-deployment)
-	//  2. model.PIIFilter != nil → use *model.PIIFilter (explicit per-model)
-	//  3. default               → anonymize when the destination is NOT private
-	//                             (!dep.destPrivate), pass through when private
-	//
-	// An explicit pii_filter: true on a private destination forces anonymization;
-	// an explicit pii_filter: false on a public destination suppresses it (trusted
-	// public endpoint). The default (nil flag) uses the network-based heuristic
-	// so that self-hosted models on loopback/private IPs are never anonymized by
-	// default, while cloud-provider endpoints are always anonymized by default.
-	//
-	// The model captured here is the ORIGINAL resolved model (before any fallback
-	// hop replaces currentModel). Within a single hop, currentModel is passed into
-	// tryModel which passes it as the model arg; the closure below captures the
-	// outer currentModel by reference, so it always reflects the model for the
-	// current hop. This is correct: each hop's shouldAnonymize reads the model
-	// for that hop, not the original requested model.
-	shouldAnonymize := func(dep Deployment, m Model) bool {
-		if dep.PIIFilter != nil {
-			return *dep.PIIFilter
-		}
-		if m.PIIFilter != nil {
-			return *m.PIIFilter
-		}
-		return !dep.destPrivate
-	}
+	// given deployment; see piiAppliesTo for the decision order. The model
+	// captured here is the model of the hop being attempted: each hop's call
+	// reads the model for that hop, not the original requested model.
+	shouldAnonymize := piiAppliesTo
 
 	// pickBody returns the body that should be sent to a given deployment.
 	// It delegates to shouldAnonymize and selects the anonymized body when
@@ -445,7 +462,7 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 			break
 		}
 
-		next, hasFallback := p.Registry.FallbackFor(currentModel.Name, visited)
+		next, hasFallback := p.nextFallback(currentModel.Name, visited, format, keyInfo)
 		if !hasFallback {
 			// No fallback model configured — keep resp as-is so it can be
 			// forwarded to the client (even if it is a 5xx).
@@ -537,14 +554,18 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 	// All candidates (and fallback chain) exhausted without a usable response.
 	if resp == nil {
 		if lastErr != nil {
-			if errors.Is(lastErr, errBedrockCredentials) {
-				return apierror.Send(c, fiber.StatusBadGateway, "upstream_unavailable", bedrockCredentialsMessage)
+			if errors.Is(lastErr, errNativeIncompatible) {
+				return apierror.SendProxy(c, fiber.StatusBadRequest,
+					"bad_request", "endpoint not supported for this model")
 			}
-			return apierror.Send(c, fiber.StatusBadGateway, "upstream_unavailable", "upstream provider is unavailable")
+			if errors.Is(lastErr, errBedrockCredentials) {
+				return apierror.SendProxy(c, fiber.StatusBadGateway, "upstream_unavailable", bedrockCredentialsMessage)
+			}
+			return apierror.SendProxy(c, fiber.StatusBadGateway, "upstream_unavailable", "upstream provider is unavailable")
 		}
 		// Every candidate was blocked by its circuit breaker.
 		metrics.CircuitBreakerRejectionsTotal.WithLabelValues(currentModel.Name).Inc()
-		return apierror.Send(c, fiber.StatusServiceUnavailable,
+		return apierror.SendProxy(c, fiber.StatusServiceUnavailable,
 			"circuit_open", "upstream temporarily unavailable")
 	}
 
@@ -560,8 +581,13 @@ func (p *ProxyHandler) Handle(c fiber.Ctx) error {
 		if p.CircuitBreakers != nil && !isRateLimited(resp.StatusCode) {
 			breaker = p.CircuitBreakers.Get(deploymentKey(currentModel.Name, usedDep.Name))
 		}
-		return p.handleStreamingResponse(c, resp, cancelUpstream, currentModel,
+		err := p.handleStreamingResponse(c, resp, cancelUpstream, currentModel,
 			keyInfo, adapter, usedDep, startTime, requestID, requestedModelName, effectiveStreamDur, maxRespBody, trackDone, breaker, piiFilter)
+		// SendStreamWriter starts the writer goroutine synchronously inside
+		// fasthttp's SetBodyStreamWriter (NewStreamReader), so once it has
+		// been installed the writer always runs and releases trackDone.
+		streamOwnsTracking = err == nil
+		return err
 	}
 
 	defer cancelUpstream()
@@ -725,6 +751,16 @@ func (p *ProxyHandler) tryModel(
 				metrics.RoutingRetriesTotal.WithLabelValues(model.Name, model.Strategy).Inc()
 				continue
 			}
+			if errors.Is(buildErr, errNativeIncompatible) {
+				// The deployment's provider cannot serve this native endpoint.
+				// Nothing was sent: skip it like an unavailable candidate; the
+				// deferred release settles any breaker reservation.
+				lastErr = buildErr
+				req = nil
+				cancelUpstream = nil
+				currentAdapter = nil
+				continue
+			}
 			return nil, nil, nil, Deployment{}, nil, 0, buildErr
 		}
 
@@ -850,7 +886,13 @@ func (p *ProxyHandler) tryModel(
 			}
 			p.Cooldowns.Mark(depKey, retryAfterOrDefault(currentResp))
 		} else if breaker != nil && !isStreamingResponse(currentResp, currentAdapter) {
-			if currentResp.StatusCode >= 500 {
+			if path.Clean(strings.TrimPrefix(c.Path(), "/v1/")) == messagesCountTokensPath {
+				// count_tokens is a cheap side endpoint that does not exercise
+				// generation: its outcome says nothing reliable about the
+				// deployment's health, so it neither resets accumulated
+				// failures (success) nor trips the breaker (failure).
+				breaker.RecordNeutral()
+			} else if currentResp.StatusCode >= 500 {
 				breaker.RecordFailure()
 			} else {
 				breaker.RecordSuccess()
@@ -941,7 +983,7 @@ func (p *ProxyHandler) readAndValidateBody(c fiber.Ctx, maxRequestBody int) ([]b
 	body := c.Body()
 
 	if len(body) > maxRequestBody {
-		if err := apierror.Send(c, fiber.StatusRequestEntityTooLarge,
+		if err := apierror.SendProxy(c, fiber.StatusRequestEntityTooLarge,
 			"request_too_large", "request body exceeds size limit"); err != nil {
 			return nil, requestEnvelope{}, err
 		}
@@ -950,7 +992,7 @@ func (p *ProxyHandler) readAndValidateBody(c fiber.Ctx, maxRequestBody int) ([]b
 
 	var envelope requestEnvelope
 	if err := jsonx.Unmarshal(body, &envelope); err != nil || envelope.Model == "" {
-		if err := apierror.Send(c, fiber.StatusBadRequest, "bad_request", "model field is required"); err != nil {
+		if err := apierror.SendProxy(c, fiber.StatusBadRequest, "bad_request", "model field is required"); err != nil {
 			return nil, requestEnvelope{}, err
 		}
 		return nil, requestEnvelope{}, errResponseSent
@@ -1009,7 +1051,8 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 				slog.String("key_id", keyInfo.ID),
 				slog.String("org_id", keyInfo.OrgID),
 			)
-			if err := apierror.Send(c, fiber.StatusTooManyRequests, "rate_limit_exceeded", "rate limit exceeded"); err != nil {
+			setRetryAfter(c, err)
+			if err := apierror.SendProxy(c, fiber.StatusTooManyRequests, "rate_limit_exceeded", "rate limit exceeded"); err != nil {
 				return err
 			}
 			return errResponseSent
@@ -1023,7 +1066,11 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 				slog.String("key_id", keyInfo.ID),
 				slog.String("org_id", keyInfo.OrgID),
 			)
-			if err := apierror.Send(c, fiber.StatusTooManyRequests, "token_limit_exceeded", "token budget exceeded"); err != nil {
+			// A budget only resets at a window boundary: tell clients not to
+			// retry-loop (x-should-retry) and when the budget frees up.
+			setRetryAfter(c, err)
+			c.Set("x-should-retry", "false")
+			if err := apierror.SendProxyQuota(c, fiber.StatusTooManyRequests, "token_limit_exceeded", "token budget exceeded"); err != nil {
 				return err
 			}
 			return errResponseSent
@@ -1031,6 +1078,21 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 	}
 
 	return nil
+}
+
+// setRetryAfter sets the Retry-After header (whole seconds, at least 1) from
+// the reset delay carried by a ratelimit.LimitError. It is a no-op when err
+// carries none.
+func setRetryAfter(c fiber.Ctx, err error) {
+	d, ok := ratelimit.RetryAfterFromError(err)
+	if !ok {
+		return
+	}
+	secs := int64(math.Ceil(d.Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	c.Set("Retry-After", strconv.FormatInt(secs, 10))
 }
 
 // resolveModel performs scoped alias resolution followed by registry lookup and
@@ -1047,7 +1109,7 @@ func (p *ProxyHandler) resolveModel(c fiber.Ctx, keyInfo *auth.KeyInfo, modelNam
 	model, err := p.Registry.Resolve(modelName)
 	if err != nil {
 		if errors.Is(err, ErrModelNotFound) {
-			if err := apierror.Send(c, fiber.StatusNotFound, "model_not_found",
+			if err := apierror.SendProxy(c, fiber.StatusNotFound, "model_not_found",
 				"the requested model was not found"); err != nil {
 				return Model{}, err
 			}
@@ -1057,7 +1119,7 @@ func (p *ProxyHandler) resolveModel(c fiber.Ctx, keyInfo *auth.KeyInfo, modelNam
 			slog.String("model", modelName),
 			slog.String("error", err.Error()),
 		)
-		if err := apierror.Send(c, fiber.StatusInternalServerError, "internal_error", "failed to resolve model"); err != nil {
+		if err := apierror.SendProxy(c, fiber.StatusInternalServerError, "internal_error", "failed to resolve model"); err != nil {
 			return Model{}, err
 		}
 		return Model{}, errResponseSent
@@ -1065,7 +1127,7 @@ func (p *ProxyHandler) resolveModel(c fiber.Ctx, keyInfo *auth.KeyInfo, modelNam
 
 	if p.AccessCache != nil && keyInfo != nil {
 		if !p.AccessCache.Check(keyInfo.OrgID, keyInfo.TeamID, keyInfo.ID, model.Name) {
-			if err := apierror.Send(c, fiber.StatusForbidden, "model_access_denied", "model access denied"); err != nil {
+			if err := apierror.SendProxy(c, fiber.StatusForbidden, "model_access_denied", "model access denied"); err != nil {
 				return Model{}, err
 			}
 			return Model{}, errResponseSent
@@ -1085,20 +1147,31 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 	upstreamPath := path.Clean(strings.TrimPrefix(c.Path(), "/v1/"))
 
 	if !isAllowedPath(upstreamPath) {
-		if err := apierror.Send(c, fiber.StatusBadRequest,
+		if err := apierror.SendProxy(c, fiber.StatusBadRequest,
 			"bad_request", "unsupported API endpoint"); err != nil {
 			return nil, nil, nil, err
 		}
 		return nil, nil, nil, errResponseSent
 	}
 
-	adapter := GetAdapter(model.Provider)
+	format := formatForPath(upstreamPath)
+
+	// Native endpoints are forwarded as-is: only providers that speak the wire
+	// format natively qualify, and no adapter translation ever applies.
+	var adapter Adapter
+	if format.native() {
+		if !providerSupportsFormat(model.Provider, format) {
+			return nil, nil, nil, errNativeIncompatible
+		}
+	} else {
+		adapter = GetAdapter(model.Provider)
+	}
 
 	// Rerank and score have no translation for the Anthropic and Gemini/Vertex
 	// adapters, which only understand chat requests. Reject them here instead of
 	// forwarding a malformed chat request upstream.
 	if adapter != nil && !isAzureAdapter(adapter) && (upstreamPath == "rerank" || upstreamPath == "score") {
-		if err := apierror.Send(c, fiber.StatusBadRequest,
+		if err := apierror.SendProxy(c, fiber.StatusBadRequest,
 			"bad_request", "endpoint not supported for this model"); err != nil {
 			return nil, nil, nil, err
 		}
@@ -1110,7 +1183,7 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 		p.Log.LogAttrs(c.Context(), slog.LevelError, "invalid bedrock configuration",
 			slog.String("model", model.Name),
 		)
-		if err := apierror.Send(c, fiber.StatusInternalServerError, "internal_error", "invalid bedrock configuration"); err != nil {
+		if err := apierror.SendProxy(c, fiber.StatusInternalServerError, "internal_error", "invalid bedrock configuration"); err != nil {
 			return nil, nil, nil, err
 		}
 		return nil, nil, nil, errResponseSent
@@ -1118,7 +1191,7 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 
 	// Determine if body needs mutation.
 	needsModelReplace := envelope.Model != model.Name
-	needsStreamOpts := envelope.Stream && (adapter == nil || isAzureAdapter(adapter))
+	needsStreamOpts := envelope.Stream && !format.native() && (adapter == nil || isAzureAdapter(adapter))
 
 	var modifiedBody []byte
 	if needsModelReplace || needsStreamOpts {
@@ -1129,6 +1202,10 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 		// made because c.Body() is backed by fasthttp's arena which is recycled
 		// after Handle returns.
 		modifiedBody = append([]byte(nil), body...)
+	}
+
+	if format == formatResponses {
+		modifiedBody = defaultResponsesStore(modifiedBody)
 	}
 
 	if adapter != nil {
@@ -1149,7 +1226,7 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 			if errors.As(transformErr, &clientErr) {
 				message = clientErr.Error()
 			}
-			if err := apierror.Send(c, fiber.StatusBadRequest, "bad_request", message); err != nil {
+			if err := apierror.SendProxy(c, fiber.StatusBadRequest, "bad_request", message); err != nil {
 				return nil, nil, nil, err
 			}
 			return nil, nil, nil, errResponseSent
@@ -1157,7 +1234,9 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 	}
 
 	var upstreamURL string
-	if adapter != nil {
+	if format.native() {
+		upstreamURL = nativeUpstreamURL(model.BaseURL, upstreamPath, format)
+	} else if adapter != nil {
 		upstreamURL = adapter.TransformURL(model.BaseURL, upstreamPath, model)
 	} else {
 		upstreamURL = strings.TrimRight(model.BaseURL, "/") + "/" + upstreamPath
@@ -1213,13 +1292,17 @@ func (p *ProxyHandler) buildUpstreamRequest(c fiber.Ctx, model Model, body []byt
 			slog.String("url", upstreamURL),
 			slog.String("error", err.Error()),
 		)
-		if err := apierror.Send(c, fiber.StatusInternalServerError, "internal_error", "failed to build upstream request"); err != nil {
+		if err := apierror.SendProxy(c, fiber.StatusInternalServerError, "internal_error", "failed to build upstream request"); err != nil {
 			return nil, nil, nil, err
 		}
 		return nil, nil, nil, errResponseSent
 	}
 
 	setUpstreamHeaders(req, c, model)
+
+	if format.native() {
+		setNativeHeaders(req, c, model, format)
+	}
 
 	if adapter != nil {
 		adapter.SetHeaders(req, model)
@@ -1326,13 +1409,15 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 	// upstreamPath is captured for the same reason: c.Path() must not be read
 	// inside the closure.
 	upstreamPath := path.Clean(strings.TrimPrefix(c.Path(), "/v1/"))
+	format := formatForPath(upstreamPath)
 
 	// upstreamCancel, resp.Body.Close, and the drain tracking call are all
 	// handled inside the closure. SendStreamWriter's goroutine outlives
 	// Handle's return, so none of them must be deferred at Handle scope —
 	// that would fire before the goroutine has finished reading the body.
-	// trackDone is safe to pass directly: sync.Once ensures it fires exactly
-	// once whether the top-level defer or this goroutine runs first.
+	// The writer goroutine owns trackDone once installed: fasthttp's
+	// NewStreamReader starts it immediately and it always runs to completion,
+	// so Handle skips its own release after a successful install.
 	return c.SendStreamWriter(func(w *bufio.Writer) {
 		metrics.ActiveStreams.Inc()
 		defer metrics.ActiveStreams.Dec()
@@ -1362,6 +1447,12 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 		defer streamTimer.Stop()
 
 		extractor := &streamUsageExtractor{}
+		// nat observes native Messages/Responses streams: usage and the
+		// format-specific terminal event. It is nil for every other format.
+		var nat *nativeStream
+		if format.native() {
+			nat = &nativeStream{format: format}
+		}
 		scanner := bufio.NewScanner(body)
 		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024) // up to 4MB per SSE line
 
@@ -1394,6 +1485,8 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 		// that the record accurately reflects the stream was not successful, while
 		// still capturing the partial token counts that the upstream consumed.
 		streamIncomplete := false
+		// nativeOK is true when a native stream ended on its clean terminal event.
+		nativeOK := false
 
 		if needsContentRestore {
 			// Incremental PII restore path (Stage 0b).
@@ -1668,6 +1761,9 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 			rawEventOpen := false
 			rawEventDataLines := 0
 			rawEventHasDoneLine := false
+			// nativeKind is the terminal classification of a native stream once
+			// its terminal event has been fully written to the client.
+			nativeKind := termNone
 
 		plainScanLoop:
 			for scanner.Scan() {
@@ -1763,7 +1859,11 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 							rawEventHasDoneLine = true
 						}
 					}
-					extractor.observe(line)
+					if nat != nil {
+						nat.observe(line)
+					} else {
+						extractor.observe(line)
+					}
 				}
 
 				if _, err := w.Write(line); err != nil {
@@ -1781,6 +1881,15 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 
 				if len(line) == 0 {
 					isTerminalEvent := rawEventOpen && rawEventDataLines == 1 && rawEventHasDoneLine
+					if nat != nil {
+						// Native streams end on their own terminal event; a
+						// trailing [DONE] is neither required nor meaningful.
+						kind := nat.endEvent()
+						isTerminalEvent = rawEventOpen && kind != termNone
+						if isTerminalEvent {
+							nativeKind = kind
+						}
+					}
 					rawEventOpen = false
 					rawEventDataLines = 0
 					rawEventHasDoneLine = false
@@ -1800,9 +1909,41 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 					clientDisconnected = true
 				} else if err := w.Flush(); err != nil {
 					clientDisconnected = true
+				} else if nat != nil {
+					if kind := nat.endEvent(); kind != termNone {
+						nativeKind = kind
+						terminalSeen = true
+					}
 				} else if rawEventDataLines == 1 && rawEventHasDoneLine {
 					terminalSeen = true
 				}
+			}
+
+			// The client hung up mid-stream on a native endpoint: keep reading the
+			// upstream without writing, so the usage that arrives with the
+			// terminal event is still captured and charged. The read is bounded by
+			// nativeDisconnectDrain; the stream timer above bounds it by the
+			// remaining stream deadline.
+			if clientDisconnected && nat != nil && !terminalSeen {
+				// Free a half-open probe slot now rather than after the drain.
+				// A client disconnect is a neutral outcome; clearing breaker
+				// keeps the switch below from recording a second one.
+				if breaker != nil {
+					breaker.RecordNeutral()
+					breaker = nil
+				}
+				drainTimer := time.AfterFunc(nativeDisconnectDrain, cancelUpstream)
+				for scanner.Scan() {
+					line := scanner.Bytes()
+					if len(line) == 0 {
+						if nat.endEvent() != termNone {
+							break
+						}
+						continue
+					}
+					nat.observe(line)
+				}
+				drainTimer.Stop()
 			}
 
 			// scanErr is logged unconditionally for observability whenever
@@ -1860,7 +2001,7 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				// Framing invariant: upstream blank separators are forwarded, and
 				// an event still open at EOF/error is explicitly closed above. The
 				// abort event therefore always starts at a fresh SSE event boundary.
-				if writeStreamAbortEvent(w, "stream_incomplete") {
+				if writeFormatAbortEvent(w, format, "stream_incomplete") {
 					streamIncomplete = true
 				} else {
 					// The client turned out to already be gone by the time we
@@ -1885,8 +2026,22 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				}
 			}
 
+			// A native stream that ended on an upstream-reported failure or an
+			// incomplete response was delivered to the client verbatim, so no abort
+			// event is added, but the usage event must not claim success.
+			if terminalSeen && (nativeKind == termFailed || nativeKind == termIncomplete) {
+				streamIncomplete = true
+			}
+			nativeOK = terminalSeen && nativeKind == termOK
+
 			if breaker != nil && !plainAborted {
 				switch {
+				case terminalSeen && nativeKind == termFailed:
+					breaker.RecordFailure()
+				case terminalSeen && nativeKind == termIncomplete:
+					// The upstream answered normally but stopped early (for
+					// example at its output token limit): not an upstream fault.
+					breaker.RecordNeutral()
 				case clientDisconnected:
 					// Client hung up — neither success nor failure on the
 					// upstream side, but the reservation Allow() took for
@@ -1906,13 +2061,15 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 
 		if p.UsageLogger != nil {
 			var streamUI UsageInfo
-			if adapter != nil {
+			if nat != nil {
+				streamUI = nat.usage()
+			} else if adapter != nil {
 				streamUI = adapter.StreamUsage()
 			}
 			// Fall back to the extractor when the adapter reports zero tokens.
 			// AzureAdapter.StreamUsage always returns zero because Azure uses
 			// the OpenAI SSE format and the extractor handles usage directly.
-			if streamUI.PromptTokens == 0 && streamUI.CompletionTokens == 0 {
+			if nat == nil && streamUI.PromptTokens == 0 && streamUI.CompletionTokens == 0 {
 				streamUI = extractor.lastUsage
 			}
 			if rep, ok := adapter.(usageAnomalyReporter); ok {
@@ -1929,6 +2086,9 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 				}
 			}
 			streamUI = normalizeRerankScoreUsage(upstreamPath, streamUI)
+			if nativeOK && streamUI == (UsageInfo{}) {
+				p.warnNoNativeUsage(model.Name, requestID, format)
+			}
 			durationMS := int(time.Since(startTime).Milliseconds())
 			// Use the upstream HTTP status for successful, complete streams. For
 			// aborted or truncated streams (no clean [DONE]) log StatusBadGateway
@@ -1953,12 +2113,15 @@ func (p *ProxyHandler) handleStreamingResponse(c fiber.Ctx, resp *http.Response,
 // it may differ from model.Name when a fallback was activated.
 // filter may be nil when PII anonymization is disabled.
 func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, model Model, keyInfo *auth.KeyInfo, adapter Adapter, usedDep Deployment, startTime time.Time, requestID string, requestedModelName string, maxResponseBody int, filter *pii.Filter) error {
+	upstreamPath := path.Clean(strings.TrimPrefix(c.Path(), "/v1/"))
+	format := formatForPath(upstreamPath)
+
 	// Content-Length pre-check: fast-reject optimization to avoid allocating
 	// memory for obviously oversized responses. Not the security boundary —
 	// io.LimitReader on the next line handles chunked/unknown-length responses.
 	if resp.ContentLength > 0 && resp.ContentLength > int64(maxResponseBody) {
 		_ = resp.Body.Close() // body unread; error irrelevant on early reject
-		return apierror.Send(c, fiber.StatusBadGateway,
+		return apierror.SendProxy(c, fiber.StatusBadGateway,
 			"upstream_response_too_large", "upstream response exceeds size limit")
 	}
 
@@ -1971,12 +2134,12 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 		p.Log.LogAttrs(c.Context(), slog.LevelWarn, "failed to read upstream response",
 			slog.String("error", err.Error()),
 		)
-		return apierror.Send(c, fiber.StatusBadGateway,
+		return apierror.SendProxy(c, fiber.StatusBadGateway,
 			"upstream_unavailable", "failed to read upstream response")
 	}
 
 	if len(responseBody) > maxResponseBody {
-		return apierror.Send(c, fiber.StatusBadGateway,
+		return apierror.SendProxy(c, fiber.StatusBadGateway,
 			"upstream_response_too_large", "upstream response exceeds size limit")
 	}
 
@@ -2011,7 +2174,7 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 			RequestID: apierror.RequestIDFromCtx(c),
 		}})
 		if mapErr != nil {
-			return apierror.Send(c, fiber.StatusBadGateway, "upstream_error", "failed to map upstream error")
+			return apierror.SendProxy(c, fiber.StatusBadGateway, "upstream_error", "failed to map upstream error")
 		}
 		c.Set("Content-Type", "application/json")
 		finalBody = mapped
@@ -2023,7 +2186,7 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "adapter transform response failed",
 				slog.String("error", transformErr.Error()),
 			)
-			return apierror.Send(c, fiber.StatusBadGateway, "upstream_error", "failed to transform response from provider")
+			return apierror.SendProxy(c, fiber.StatusBadGateway, "upstream_error", "failed to transform response from provider")
 		}
 		usageBody = finalBody // post-transform = OpenAI-shaped
 	} else {
@@ -2047,8 +2210,19 @@ func (p *ProxyHandler) handleBufferedResponse(c fiber.Ctx, resp *http.Response, 
 		return err
 	}
 
-	if p.UsageLogger != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		ui := normalizeRerankScoreUsage(path.Clean(strings.TrimPrefix(c.Path(), "/v1/")), extractUsage(usageBody))
+	// count_tokens performs no generation: it produces no usage event, so no
+	// cost is recorded and no token budget is charged. The request itself was
+	// already counted by the rate limiter.
+	if p.UsageLogger != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && upstreamPath != messagesCountTokensPath {
+		var ui UsageInfo
+		if format.native() {
+			ui = usageFromNativeBody(format, usageBody)
+			if ui == (UsageInfo{}) {
+				p.warnNoNativeUsage(model.Name, requestID, format)
+			}
+		} else {
+			ui = normalizeRerankScoreUsage(upstreamPath, extractUsage(usageBody))
+		}
 		durationMS := int(time.Since(startTime).Milliseconds())
 		// For non-streaming responses TTFT equals total duration: the entire
 		// response body is the first (and only) "token delivery".
@@ -2464,7 +2638,8 @@ func isAzureAdapter(a Adapter) bool {
 // only for paths that have legitimate sub-routes (images/, audio/, models/).
 func isAllowedPath(p string) bool {
 	switch p {
-	case "chat/completions", "completions", "embeddings", "models", "rerank", "score":
+	case "chat/completions", "completions", "embeddings", "models", "rerank", "score",
+		"messages", messagesCountTokensPath, "responses":
 		return true
 	}
 	return strings.HasPrefix(p, "images/") ||

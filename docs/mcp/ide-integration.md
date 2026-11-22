@@ -10,7 +10,7 @@ Connect AI coding assistants to VoidLLM - as an LLM proxy, an MCP server, or bot
 
 ## As LLM Proxy
 
-VoidLLM exposes an OpenAI-compatible `/v1` endpoint. A tool that lets you set a custom OpenAI base URL and API key can use it.
+VoidLLM exposes an OpenAI-compatible `/v1` endpoint. A tool that lets you set a custom OpenAI base URL and API key can use it. VoidLLM also serves the Anthropic Messages API and the OpenAI Responses API natively, which is what Claude Code and Codex CLI use.
 
 ### Cursor and Windsurf
 
@@ -23,7 +23,11 @@ API Key: vl_uk_...
 
 ### Claude Code
 
-Claude Code uses the Anthropic API format, not OpenAI. It cannot use VoidLLM as an LLM proxy directly. But it works as an MCP server (see below).
+Claude Code uses the Anthropic Messages API, which VoidLLM serves natively at `/v1/messages` for models with `provider: anthropic`. Set `ANTHROPIC_BASE_URL` to the VoidLLM root (without `/v1`) and `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` to a VoidLLM key. See [Coding Agents for Teams](../guides/coding-agents.md#claude-code). It also works as an MCP server (see below).
+
+### Codex CLI
+
+Codex CLI uses the OpenAI Responses API, which VoidLLM serves at `/v1/responses` for models with `provider: openai`, `custom`, `vllm` or `ollama`. Configure a custom model provider with `wire_api = "responses"`, see [Coding Agents for Teams](../guides/coding-agents.md#codex-cli).
 
 ## As MCP Server
 

@@ -82,7 +82,8 @@ func (r *RedisChecker) CheckRate(s Scopes, l ScopeLimits) error {
 			continue // fail open
 		}
 		if !allowed {
-			return ErrRateLimitExceeded
+			// The window length is a conservative upper bound on the reset time.
+			return &LimitError{Err: ErrRateLimitExceeded, RetryAfter: c.window}
 		}
 	}
 

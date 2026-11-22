@@ -100,19 +100,29 @@ type KeyInfo struct {
 	UserRequestsPerDay int
 }
 
-// Middleware returns a Fiber handler that authenticates requests via Bearer token.
-// It extracts the token, computes HMAC-SHA256 with hmacSecret, looks up the hash
-// in keyCache, checks expiration, and stores the KeyInfo in the request context.
+// Middleware returns a Fiber handler that authenticates requests via Bearer token
+// or, on /v1/* proxy routes without any Authorization header (present but
+// empty counts as present), the x-api-key header. It computes
+// HMAC-SHA256 of the token with hmacSecret, looks up the hash in keyCache,
+// checks expiration, and stores the KeyInfo in the request context.
 func Middleware(keyCache *cache.Cache[string, KeyInfo], hmacSecret []byte) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		auth := c.Get("Authorization")
-		token := extractBearerToken(auth)
+		// x-api-key (the Anthropic SDK default) is accepted on the proxy routes
+		// (/v1/*) only, and only when the request carries no Authorization
+		// header at all: any Authorization header, whatever its scheme or
+		// value (even empty), takes precedence and is never combined with x-api-key. The admin API stays
+		// Bearer-only.
+		authz := c.Get("Authorization")
+		token := extractBearerToken(authz)
+		if c.Request().Header.Peek("Authorization") == nil && strings.HasPrefix(c.Path(), "/v1/") {
+			token = strings.TrimSpace(c.Get("x-api-key"))
+		}
 		if token == "" {
-			return apierror.Unauthorized(c, "missing authorization header")
+			return apierror.SendProxy(c, fiber.StatusUnauthorized, "unauthorized", "missing authorization header")
 		}
 
 		if _, err := keygen.ValidatePrefix(token); err != nil {
-			return apierror.Unauthorized(c, "invalid API key format")
+			return apierror.SendProxy(c, fiber.StatusUnauthorized, "unauthorized", "invalid API key format")
 		}
 
 		// Hash is used as a cache map key. Map lookup is not constant-time, but
@@ -121,12 +131,12 @@ func Middleware(keyCache *cache.Cache[string, KeyInfo], hmacSecret []byte) fiber
 		hash := keygen.Hash(token, hmacSecret)
 		keyInfo, ok := keyCache.Get(hash)
 		if !ok {
-			return apierror.Unauthorized(c, "invalid API key")
+			return apierror.SendProxy(c, fiber.StatusUnauthorized, "unauthorized", "invalid API key")
 		}
 
 		if keyInfo.ExpiresAt != nil && time.Now().After(*keyInfo.ExpiresAt) {
 			keyCache.Delete(hash)
-			return apierror.Unauthorized(c, "invalid API key")
+			return apierror.SendProxy(c, fiber.StatusUnauthorized, "unauthorized", "invalid API key")
 		}
 
 		keyInfo.Hash = hash
@@ -138,8 +148,8 @@ func Middleware(keyCache *cache.Cache[string, KeyInfo], hmacSecret []byte) fiber
 // extractBearerToken parses a Bearer token from an Authorization header value.
 // Returns the token string, or empty string if the header is absent or malformed.
 func extractBearerToken(header string) string {
-	token, ok := strings.CutPrefix(header, "Bearer ")
-	if !ok {
+	scheme, token, ok := strings.Cut(header, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
 		return ""
 	}
 	token = strings.TrimSpace(token)

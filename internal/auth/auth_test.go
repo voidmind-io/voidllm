@@ -74,7 +74,7 @@ func TestExtractBearerToken(t *testing.T) {
 		{
 			name:   "bearer lowercase",
 			header: "bearer vl_uk_abc",
-			want:   "",
+			want:   "vl_uk_abc",
 		},
 		{
 			name:   "bearer no space",
