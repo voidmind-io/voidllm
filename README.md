@@ -257,6 +257,7 @@ This connects your IDE (Claude Code, Cursor, Windsurf) to the Code Mode endpoint
 | MCP Gateway | [Overview](docs/mcp/overview.md) - [Servers](docs/mcp/servers.md) - [Code Mode](docs/mcp/code-mode.md) - [IDE Setup](docs/mcp/ide-integration.md) |
 | RBAC | [Roles and permissions](docs/security/rbac.md) |
 | Privacy | [Zero-knowledge architecture](docs/security/privacy.md) |
+| Supply chain | [Image signatures, SBOM, provenance](docs/security/supply-chain.md) |
 | API Reference | [Endpoints and error codes](docs/api/overview.md) |
 | Enterprise | [License](docs/enterprise/license.md) - [SSO](docs/enterprise/sso.md) - [Audit](docs/enterprise/audit.md) - [OTel](docs/enterprise/otel.md) - [Pricing](docs/enterprise/pricing.md) |
 | Troubleshooting | [Common issues](docs/troubleshooting.md) |
