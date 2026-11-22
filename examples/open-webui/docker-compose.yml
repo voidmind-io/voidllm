@@ -1,0 +1,69 @@
+# VoidLLM + Open WebUI + Ollama
+#
+# Traffic flow: Open WebUI -> VoidLLM (/v1, team key) -> Ollama (OpenAI-compatible /v1)
+#
+# Ollama has no published port and sits on its own network ("backend") that
+# Open WebUI is not attached to. The only way to reach it is through VoidLLM,
+# so every request is authenticated, limited and counted per team.
+#
+# See README.md in this directory for the step-by-step setup.
+
+services:
+  ollama:
+    image: ollama/ollama:0.40.17
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - backend
+    restart: unless-stopped
+
+  voidllm:
+    image: ghcr.io/voidmind-io/voidllm:0.0.31
+    depends_on:
+      - ollama
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./voidllm.yaml:/etc/voidllm/voidllm.yaml:ro
+      - voidllm_data:/data
+    environment:
+      - VOIDLLM_ADMIN_KEY=${VOIDLLM_ADMIN_KEY}
+      - VOIDLLM_ENCRYPTION_KEY=${VOIDLLM_ENCRYPTION_KEY:?set VOIDLLM_ENCRYPTION_KEY in .env}
+    networks:
+      - backend
+      - frontend
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.13.4
+    depends_on:
+      - voidllm
+    ports:
+      - "3000:8080"
+    volumes:
+      - open_webui_data:/app/backend/data
+    environment:
+      # Talk to VoidLLM only, never to Ollama directly.
+      - ENABLE_OLLAMA_API=false
+      - ENABLE_OPENAI_API=true
+      - OPENAI_API_BASE_URL=http://voidllm:8080/v1
+      # A VoidLLM team key (vl_tk_...). Create it first, see README.md.
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Session signing key. Without it Open WebUI generates one outside the
+      # data volume, and every container recreate logs all users out.
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:?set WEBUI_SECRET_KEY in .env}
+    networks:
+      - frontend
+    restart: unless-stopped
+
+networks:
+  # Ollama + VoidLLM. Not "internal: true" because Ollama needs internet
+  # access to pull models.
+  backend:
+  # VoidLLM + Open WebUI.
+  frontend:
+
+volumes:
+  ollama_data:
+  voidllm_data:
+  open_webui_data:

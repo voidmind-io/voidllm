@@ -252,6 +252,7 @@ This connects your IDE (Claude Code, Cursor, Windsurf) to the Code Mode endpoint
 | Configuration | [All YAML settings](docs/configuration.md) |
 | Docker | [Docker deployment](docs/deployment/docker.md) |
 | Kubernetes | [Helm chart](docs/deployment/kubernetes.md) |
+| Open WebUI | [Open WebUI + Ollama recipe](docs/deployment/open-webui.md) |
 | Providers | [OpenAI, Anthropic, Azure, AWS Bedrock, Ollama, vLLM](docs/models/providers.md) |
 | Load Balancing | [Strategies, failover, circuit breakers](docs/models/load-balancing.md) |
 | MCP Gateway | [Overview](docs/mcp/overview.md) - [Servers](docs/mcp/servers.md) - [Code Mode](docs/mcp/code-mode.md) - [IDE Setup](docs/mcp/ide-integration.md) |
