@@ -22,9 +22,13 @@ Privacy-first LLM proxy and AI gateway. Self-hosted, single binary, sub-500us ov
 - [Database](deployment/database.md) - SQLite, PostgreSQL, migration
 - [Open WebUI](deployment/open-webui.md) - Open WebUI + Ollama behind VoidLLM, per-team keys and budgets
 
+## Guides
+
+- [Coding Agents for Teams](guides/coding-agents.md) - one key per developer, budgets per team, which tools work through the proxy
+
 ## Models
 
-- [Provider Setup](models/providers.md) - OpenAI, Anthropic, Azure, AWS Bedrock, Ollama, vLLM, custom
+- [Provider Setup](models/providers.md) - OpenAI, Anthropic, Azure, Gemini, Vertex AI, AWS Bedrock, Ollama, vLLM, custom
 - [Load Balancing](models/load-balancing.md) - strategies, failover, circuit breakers
 - [Aliases](models/aliases.md) - logical names for models (per org/team)
 
@@ -41,6 +45,7 @@ Privacy-first LLM proxy and AI gateway. Self-hosted, single binary, sub-500us ov
 - [Privacy](security/privacy.md) - zero-knowledge architecture, GDPR
 - [PII Anonymization](security/pii.md) - opt-in identifier pseudonymization (early/beta)
 - [Hardening](security/hardening.md) - security checklist, TLS, network policies
+- [Supply Chain](security/supply-chain.md) - image signatures, SBOM, provenance, disclosure
 
 ## Enterprise
 

@@ -41,6 +41,8 @@ limit anywhere in the hierarchy wins:
 - Key allows 1,000 tokens/day
 - Result: the key can use 1,000 tokens/day
 
+Limit changes on a key apply on the next request. Changes to org or team limits apply after the periodic key cache refresh (`cache.key_ttl`, default 30s), also when Redis is configured.
+
 If a level has no limit set (0), it is treated as unlimited and the next
 level's limit applies. If no limits are set anywhere, usage is unlimited.
 

@@ -38,6 +38,10 @@ The following are out of scope:
 - Denial of service via legitimate high traffic
 - Social engineering
 
+## Supply Chain
+
+Release images are signed with cosign (keyless). See [Supply Chain Security](docs/security/supply-chain.md) for verification steps, SBOM and provenance, and the list of published advisories.
+
 ## Security Design Principles
 
 VoidLLM follows these security principles by design:

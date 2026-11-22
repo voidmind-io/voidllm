@@ -12,7 +12,7 @@
 
 **A privacy-first LLM proxy and AI gateway for teams that take control seriously.**
 
-VoidLLM is a self-hosted LLM proxy that sits between your applications and LLM providers - OpenAI, Anthropic, Azure, AWS Bedrock, Ollama, vLLM, or any custom endpoint. It gives you organization-wide access control, API key management, usage tracking, rate limiting, and multi-deployment load balancing. One Go binary, sub-2ms proxy overhead, zero knowledge of your prompts.
+VoidLLM is a self-hosted LLM proxy that sits between your applications and LLM providers - OpenAI, Anthropic, Azure, Google Gemini, Vertex AI, AWS Bedrock, Ollama, vLLM, or any custom endpoint. It gives you organization-wide access control, API key management, usage tracking, rate limiting, and multi-deployment load balancing. One Go binary, sub-2ms proxy overhead, zero knowledge of your prompts.
 
 ![VoidLLM Dashboard](docs/screenshots/VoidLLM-Dashboard.jpg)
 
@@ -47,7 +47,7 @@ flowchart LR
     App[Your app / SDK] -->|OpenAI-compatible| Proxy[VoidLLM proxy]
     Proxy --> Gate[API key + RBAC<br/>rate limits + budgets]
     Gate --> Router[Model alias + load balancing]
-    Router --> Providers[OpenAI / Anthropic / Azure / Bedrock<br/>Ollama / vLLM / custom]
+    Router --> Providers[OpenAI / Anthropic / Azure / Gemini / Vertex AI<br/>Bedrock / Ollama / vLLM / custom]
     Proxy -. metadata only .-> DB[(SQLite / PostgreSQL)]
 ```
 
@@ -131,7 +131,7 @@ Any OpenAI-compatible SDK works out of the box - just change the base URL to you
 | Feature | Details |
 |---|---|
 | OpenAI-compatible proxy | `/v1/chat/completions`, embeddings, rerank, score, images, audio, streaming |
-| Multi-provider routing | OpenAI, Anthropic, Azure, Ollama, vLLM, any custom endpoint |
+| Multi-provider routing | OpenAI, Anthropic, Azure, Gemini, Vertex AI, AWS Bedrock, Ollama, vLLM, any custom endpoint |
 | Load balancing | Round-robin, least-latency, weighted, priority across deployments |
 | Automatic failover | Retry on 5xx/timeout, circuit breakers, health-aware routing |
 | Web UI | Dashboard, playground, API keys, teams, models, usage, settings |
@@ -232,7 +232,7 @@ Admins can block specific tools from Code Mode via the per-tool blocklist API an
 }
 ```
 
-This connects your IDE (Claude Code, Cursor, Windsurf) to the Code Mode endpoint. Management tools (list_models, get_usage, etc.) are available at `/api/v1/mcp/voidllm`. External MCP servers at `/api/v1/mcp/:alias`.
+This is the Claude Code format (it needs `"type": "http"`). Cursor uses the same entry without `type`; see [IDE Integration](docs/mcp/ide-integration.md) for each client. The snippet connects your client to the Code Mode endpoint. Management tools (list_models, get_usage, etc.) are available at `/api/v1/mcp/voidllm`. External MCP servers at `/api/v1/mcp/:alias`.
 
 ### Known Limitations
 
@@ -252,12 +252,17 @@ This connects your IDE (Claude Code, Cursor, Windsurf) to the Code Mode endpoint
 | Configuration | [All YAML settings](docs/configuration.md) |
 | Docker | [Docker deployment](docs/deployment/docker.md) |
 | Kubernetes | [Helm chart](docs/deployment/kubernetes.md) |
+<<<<<<< HEAD
 | Open WebUI | [Open WebUI + Ollama recipe](docs/deployment/open-webui.md) |
 | Providers | [OpenAI, Anthropic, Azure, AWS Bedrock, Ollama, vLLM](docs/models/providers.md) |
+=======
+| Providers | [OpenAI, Anthropic, Azure, Gemini, Vertex AI, AWS Bedrock, Ollama, vLLM](docs/models/providers.md) |
+>>>>>>> origin/main
 | Load Balancing | [Strategies, failover, circuit breakers](docs/models/load-balancing.md) |
 | MCP Gateway | [Overview](docs/mcp/overview.md) - [Servers](docs/mcp/servers.md) - [Code Mode](docs/mcp/code-mode.md) - [IDE Setup](docs/mcp/ide-integration.md) |
 | RBAC | [Roles and permissions](docs/security/rbac.md) |
 | Privacy | [Zero-knowledge architecture](docs/security/privacy.md) |
+| Supply chain | [Image signatures, SBOM, provenance](docs/security/supply-chain.md) |
 | API Reference | [Endpoints and error codes](docs/api/overview.md) |
 | Enterprise | [License](docs/enterprise/license.md) - [SSO](docs/enterprise/sso.md) - [Audit](docs/enterprise/audit.md) - [OTel](docs/enterprise/otel.md) - [Pricing](docs/enterprise/pricing.md) |
 | Troubleshooting | [Common issues](docs/troubleshooting.md) |
@@ -311,7 +316,7 @@ settings:
       enabled: true
 ```
 
-Supported providers: `openai` · `anthropic` · `azure` · `bedrock` · `vllm` · `ollama` · `custom`
+Supported providers: `openai` · `anthropic` · `azure` · `gemini` · `vertex` · `bedrock` · `vllm` · `ollama` · `custom`
 
 Environment variables are interpolated with `${VAR}` syntax. Secrets never hardcoded.
 

@@ -80,11 +80,12 @@ VoidLLM resolves `default` to whatever model you configured with that alias, for
 
 ### Cursor / Windsurf (LLM Proxy)
 
-Change the base URL to your VoidLLM instance:
+Not verified. We have not tested Cursor or Windsurf against VoidLLM, and the current Cursor docs do not describe a custom base URL. If your version has a custom OpenAI base URL setting, the values would be:
 ```
 Base URL: http://localhost:8080/v1
 API Key: vl_uk_...
 ```
+See [IDE Integration](mcp/ide-integration.md).
 
 ### Claude Code (MCP Server)
 
@@ -93,6 +94,7 @@ Add to your MCP config:
 {
   "mcpServers": {
     "voidllm": {
+      "type": "http",
       "url": "http://localhost:8080/api/v1/mcp/voidllm",
       "headers": {
         "Authorization": "Bearer vl_uk_..."
