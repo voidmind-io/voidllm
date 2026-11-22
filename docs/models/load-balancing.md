@@ -108,8 +108,23 @@ This works for:
 - Same model across regions (Azure East + West)
 - Same model across providers (Azure + OpenAI direct)
 
-This does **not** work for mixing different LLMs (e.g., GPT-4o + Llama 70B) because vLLM wouldn't recognize "gpt-4o" as a valid model name. Cross-model failover chains are on the Enterprise roadmap.
+This does **not** work for mixing different LLMs (e.g., GPT-4o + Llama 70B) because vLLM wouldn't recognize "gpt-4o" as a valid model name. To fall back from one model to a different one, use a `fallback:` chain (see below).
+
+## Cross-Model Fallback Chains (Enterprise)
+
+Failover between the deployments of one model is a Community feature. A `fallback:` chain, which retries a request on a different model when the primary model is unavailable, needs an Enterprise license:
+
+```yaml
+models:
+  - name: gpt-4o
+    provider: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_KEY}
+    fallback: claude-sonnet
+```
+
+`fallback` names another model (or alias) to retry on. The chain depth is limited by `settings.fallback_max_depth` (default 3, range 1 to 10). Without a license that includes fallback chains, VoidLLM strips the `fallback` setting from every model at load time, logs a warning, and keeps proxying without it. The license is checked again on registry reload, so activating a license takes effect without a restart.
 
 ## Community Feature
 
-Load balancing, failover, circuit breakers, and health probing are all included in the free Community tier.
+Load balancing, per-model deployment failover, circuit breakers, and health probing are all included in the free Community tier. Only cross-model `fallback:` chains require Enterprise.
