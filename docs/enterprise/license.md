@@ -10,7 +10,7 @@ VoidLLM Enterprise features are gated by a license key - a signed JWT (Ed25519).
 
 ## Obtain a License
 
-Purchase a Pro or Enterprise subscription at [voidllm.ai](https://voidllm.ai/#pricing). You'll receive a license key - a signed JWT that encodes your plan, features, and limits.
+Purchase a Pro or Enterprise subscription at [voidllm.ai](https://voidllm.ai/#pricing). You'll receive a license key - a signed JWT that encodes your plan, features, and limits. Prices: Pro €99/month, Enterprise €399/month, Enterprise Plus from about €1,000/month billed annually (contact us). To evaluate first, see [30-day trial](#30-day-trial).
 
 ## Activate
 
@@ -70,9 +70,21 @@ voidllm license verify < license.jwt
 | OpenTelemetry | | | Yes |
 | Multi-instance (Redis) | | | Yes |
 
-## Founding Member
+## 30-day trial
 
-A one-time $999 payment for lifetime Enterprise access - all current and future features, no recurring fees. Includes Product Advisory Board membership and direct founder access. [Learn more](https://voidllm.ai/#pricing).
+Try the paid features for 30 days, free and without payment data.
+
+**How to request:** as a system admin open System -> License in the UI and fill in the trial form, or go to [voidllm.ai/trial](https://voidllm.ai/trial). The key is emailed to you. Paste it into System -> License to activate it; no restart is needed.
+
+**What is sent:** nothing leaves your instance until you submit the form. The request contains your email, an optional company name, your consent choices, the instance ID, and the product version. No prompts, responses, or usage data are included, and no payment data is collected.
+
+**What happens after 30 days:** the key stops working. An hourly check switches the running instance back to Community mode, and the License page shows that the license has expired. If audit logs, SSO, or OpenTelemetry were enabled at startup, they stay active until you restart VoidLLM, and the page tells you so. The proxy keeps running throughout.
+
+**Heartbeat:** activating a key in the UI also starts the daily license heartbeat, so you do not need to restart for it.
+
+## Past offers
+
+Founding Member licenses (a one-time payment for lifetime Enterprise access) are no longer offered. Existing Founding Member licenses keep working.
 
 ## Graceful Degradation
 

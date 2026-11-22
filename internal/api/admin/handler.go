@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -56,8 +57,20 @@ type Handler struct {
 	Redis             *voidredis.Client        // nil when Redis is not configured
 	AuditLogger       *audit.Logger            // nil when audit logging is disabled
 	License           *license.Holder          // thread-safe license holder; Load() never returns nil
-	FallbackMaxDepth  int                      // from config; 0 = fallback disabled; exposed via GET /license
-	Log               *slog.Logger
+	// LicenseExpiry reports whether the running process saw its license expire.
+	// Nil is treated as "not expired".
+	LicenseExpiry *license.ExpiryState
+	// LicenseHeartbeat starts the license heartbeat when a key is activated at
+	// runtime. Nil disables that behavior (for example in dev mode).
+	LicenseHeartbeat *license.HeartbeatManager
+	// trialBaseURL overrides the license server base URL for trial requests.
+	// Empty means license.DefaultServerURL. Set only by tests.
+	trialBaseURL string
+	// trialClient overrides the HTTP client used for trial requests. Nil means
+	// the package default (10s timeout, no redirects). Set only by tests.
+	trialClient      *http.Client
+	FallbackMaxDepth int // from config; 0 = fallback disabled; exposed via GET /license
+	Log              *slog.Logger
 	// AWSSigner signs Bedrock IAM test-connection probes. Nil makes such
 	// probes report that credentials are unavailable.
 	AWSSigner proxy.BedrockSigner

@@ -74,10 +74,27 @@ type enterpriseLicense struct {
 	maxOrgs     int
 	maxTeams    int
 	customerID  string
+	trial       bool
+	id          string
 }
 
-func (l *enterpriseLicense) Edition() Edition     { return EditionEnterprise }
+// Edition reports the enterprise tier while the license is valid. An expired
+// enterprise license behaves like community for every live check.
+func (l *enterpriseLicense) Edition() Edition {
+	if !l.Valid() {
+		return EditionCommunity
+	}
+	return EditionEnterprise
+}
+
 func (l *enterpriseLicense) ExpiresAt() time.Time { return l.expiresAt }
+
+// ID returns the license's unique token ID (the JWT "jti" claim), or an empty
+// string when the token has none.
+func (l *enterpriseLicense) ID() string { return l.id }
+
+// Trial reports whether the license was issued as a time-limited trial.
+func (l *enterpriseLicense) Trial() bool { return l.trial }
 
 func (l *enterpriseLicense) Valid() bool {
 	if l.expiresAt.IsZero() {
@@ -86,19 +103,43 @@ func (l *enterpriseLicense) Valid() bool {
 	return time.Now().UTC().Before(l.expiresAt)
 }
 
+// HasFeature reports whether the feature is enabled. An expired license
+// grants no features, even if the process has not restarted since expiry.
 func (l *enterpriseLicense) HasFeature(feature string) bool {
+	if !l.Valid() {
+		return false
+	}
 	_, ok := l.features[feature]
 	return ok
 }
 
+// Features returns the enabled feature names, or an empty slice once the
+// license has expired.
 func (l *enterpriseLicense) Features() []string {
+	if !l.Valid() {
+		return []string{}
+	}
 	out := make([]string, len(l.featureList))
 	copy(out, l.featureList)
 	return out
 }
 
-func (l *enterpriseLicense) MaxOrgs() int       { return l.maxOrgs }
-func (l *enterpriseLicense) MaxTeams() int      { return l.maxTeams }
+// MaxOrgs returns the organization limit, or the community limit once expired.
+func (l *enterpriseLicense) MaxOrgs() int {
+	if !l.Valid() {
+		return CommunityMaxOrgs
+	}
+	return l.maxOrgs
+}
+
+// MaxTeams returns the team limit, or the community limit once expired.
+func (l *enterpriseLicense) MaxTeams() int {
+	if !l.Valid() {
+		return CommunityMaxTeams
+	}
+	return l.maxTeams
+}
+
 func (l *enterpriseLicense) CustomerID() string { return l.customerID }
 
 // devLicense is granted when VOIDLLM_ENTERPRISE_DEV is set. It enables all
@@ -126,3 +167,10 @@ func (devLicense) Features() []string {
 func (devLicense) MaxOrgs() int       { return -1 }
 func (devLicense) MaxTeams() int      { return -1 }
 func (devLicense) CustomerID() string { return "" }
+
+// IsTrial reports whether lic is a time-limited trial license, identified by
+// the "trial" claim in the license JWT.
+func IsTrial(lic License) bool {
+	t, ok := lic.(interface{ Trial() bool })
+	return ok && t.Trial()
+}
