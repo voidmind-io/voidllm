@@ -10,19 +10,12 @@ Connect AI coding assistants to VoidLLM - as an LLM proxy, an MCP server, or bot
 
 ## As LLM Proxy
 
-VoidLLM exposes an OpenAI-compatible `/v1` endpoint. Any tool that lets you set a custom OpenAI base URL works.
+VoidLLM exposes an OpenAI-compatible `/v1` endpoint. A tool that lets you set a custom OpenAI base URL and API key can use it.
 
-### Cursor
+### Cursor and Windsurf
 
-Settings -> Models -> OpenAI API Base:
-```
-https://your-voidllm/v1
-```
-API Key: `vl_uk_...`
+Not verified. We have not tested either tool against VoidLLM. The current Cursor docs describe adding your own OpenAI, Anthropic, Google, Azure and AWS Bedrock keys and do not describe a custom base URL; they also say requests made with your own key are routed through Cursor's servers. Windsurf's documentation has moved to the Devin docs and we could not confirm a custom provider setting there. If your version has a custom OpenAI base URL setting, the values would be:
 
-### Windsurf
-
-Settings -> Custom Provider:
 ```
 Base URL: https://your-voidllm/v1
 API Key: vl_uk_...
@@ -30,13 +23,21 @@ API Key: vl_uk_...
 
 ### Claude Code
 
-Claude Code uses the Anthropic API format, not OpenAI. It cannot use VoidLLM as an LLM proxy directly. But it works great as an MCP server (see below).
+Claude Code uses the Anthropic API format, not OpenAI. It cannot use VoidLLM as an LLM proxy directly. But it works as an MCP server (see below).
 
 ## As MCP Server
 
-### Management Tools
+VoidLLM serves MCP over Streamable HTTP. Each client has its own config format, so the snippets below differ. The endpoints are:
 
-Access VoidLLM's built-in management tools (list models, check health, create keys, etc.):
+| Endpoint | Gives you |
+|---|---|
+| `/api/v1/mcp/voidllm` | Built-in management tools (list models, check health, create keys, etc.) |
+| `/api/v1/mcp` | Code Mode tools (`list_servers`, `search_tools`, `execute_code`), when Code Mode is enabled |
+| `/api/v1/mcp/<alias>` | One registered MCP server |
+
+### Claude Code
+
+Claude Code requires `"type": "http"` for a remote server. An entry with a `url` and no `type` is skipped. Put this in a project `.mcp.json`, or add it with `claude mcp add --transport http`:
 
 ```json
 {
@@ -52,16 +53,17 @@ Access VoidLLM's built-in management tools (list models, check health, create ke
 }
 ```
 
-### Code Mode
+See the [Claude Code MCP docs](https://code.claude.com/docs/en/mcp.md).
 
-Access Code Mode tools (list_servers, search_tools, execute_code) for multi-tool orchestration:
+### Cursor
+
+Cursor reads `url` and `headers` from `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global), see the [Cursor MCP docs](https://cursor.com/help/customization/mcp.md):
 
 ```json
 {
   "mcpServers": {
-    "voidllm-code": {
-      "type": "http",
-      "url": "https://your-voidllm/api/v1/mcp",
+    "voidllm": {
+      "url": "https://your-voidllm/api/v1/mcp/voidllm",
       "headers": {
         "Authorization": "Bearer vl_uk_..."
       }
@@ -70,37 +72,27 @@ Access Code Mode tools (list_servers, search_tools, execute_code) for multi-tool
 }
 ```
 
-### External MCP Servers
+### Windsurf
 
-Each registered MCP server gets its own endpoint. Connect to a specific server:
+Not verified. Windsurf's MCP documentation has moved to the Devin docs, which describe a different config location (`.devin/mcp_config.json`) and do not show a remote server entry we could confirm. Check the current Windsurf or Devin documentation for the remote server format, and use the URL and `Authorization` header from the examples above.
 
-```json
-{
-  "mcpServers": {
-    "aws": {
-      "type": "http",
-      "url": "https://your-voidllm/api/v1/mcp/aws",
-      "headers": {
-        "Authorization": "Bearer vl_uk_..."
-      }
-    }
-  }
-}
-```
+### Other endpoints
+
+Use the same entry with a different URL. For Code Mode use `https://your-voidllm/api/v1/mcp` (name the server `voidllm-code`), and for a registered server `https://your-voidllm/api/v1/mcp/aws` (replace `aws` with its alias).
 
 The advantage: VoidLLM handles upstream auth, enforces access control, and logs every tool call. Your IDE only needs one credential - your VoidLLM API key.
 
 ## Copy from UI
 
-The MCP Servers page has a copy button on every server that generates the exact JSON config for your IDE. Click the chevron on any server row to see it.
+The MCP Servers page has a copy button on every server. Click the chevron on any server row to see it. The generated JSON has `url` and `headers`, which is the Cursor format. For Claude Code add `"type": "http"` to the entry.
 
 ## Config File Locations
 
 | IDE | Config file |
 |---|---|
-| Claude Code | `~/.claude/mcp.json` or project `.mcp.json` |
-| Cursor | Cursor Settings -> MCP |
-| Windsurf | Windsurf Settings -> MCP |
+| Claude Code | project `.mcp.json`, or `~/.claude.json` through `claude mcp add --scope user` |
+| Cursor | `.cursor/mcp.json` or `~/.cursor/mcp.json` |
+| Windsurf | Not verified, see above |
 
 ## Troubleshooting
 

@@ -10,9 +10,9 @@ How to run AI coding tools for a team through VoidLLM: one key per developer, on
 
 ## What works today
 
-VoidLLM serves the OpenAI-compatible API (`/v1/chat/completions` and the other endpoints listed in the [API reference](../api/overview.md)). It does not serve the Anthropic Messages API (`/v1/messages`) or the OpenAI Responses API (`/v1/responses`). Requests to those paths are rejected with `400 unsupported API endpoint`.
+VoidLLM serves the OpenAI-compatible API (`/v1/chat/completions` and the other endpoints listed in the [API reference](../api/overview.md)). It does not serve the Anthropic Messages API (`/v1/messages`) or the OpenAI Responses API (`/v1/responses`). Requests to those paths are rejected with `400 unsupported API endpoint`. That check comes after authentication, the body size and `model` field checks, rate and token limits, and model resolution, so a request with a bad key, no `model`, an over-limit key or an unknown model gets that error instead.
 
-That decides which tools can use it as their LLM endpoint. This table only lists what was run against a local VoidLLM build, not what should work in theory:
+That decides which tools can use it as their LLM endpoint. This table only lists what was run on 2026-11-22 against a local VoidLLM build of `main` at commit `a8a93d9`, not what should work in theory:
 
 | Client | Version | Result |
 |---|---|---|
@@ -43,7 +43,7 @@ Access is organized as organization, team, user and key:
 - Each team has its own limits.
 - CI jobs use a service account with a `vl_sa_` key, so no pipeline runs on a person's key.
 
-Limits (tokens per day and month, requests per minute and per day) can be set on the org, the team, the user's org membership and the key. Every level is checked on each request, and the most restrictive one wins. `0` means unlimited at that level. See [RBAC](../security/rbac.md) for the details.
+Limits (tokens per day and month, requests per minute and per day) can be set on the org, the team, the user's org membership and the key. Every level is checked on each request, once the request has passed authentication and body validation, and the most restrictive one wins. `0` means unlimited at that level. See [RBAC](../security/rbac.md) for the details.
 
 ## Setup
 
@@ -174,21 +174,21 @@ Many tools read these two variables, others have the same two fields in their se
 
 ## What the limits look like in practice
 
-These are the responses from the local test. The numbers are small on purpose.
+These are the responses seen in the local test (commit `a8a93d9`, 2026-11-22). The numbers were small on purpose.
 
 - A key with `requests_per_minute` exhausted: `429` with `rate_limit_exceeded`.
 - A key whose `daily_token_limit` is used up: `429` with `token_limit_exceeded`, message `token budget exceeded`.
 - A key with no limit of its own, in a team whose `daily_token_limit` is used up: the same `429 token_limit_exceeded`.
 
-Limit changes on a key apply on the next request. Changes to org or team limits apply after the key cache refresh (`cache.key_ttl`, default 30s, see the [configuration reference](../configuration.md)). With Redis configured, the update publishes a cache invalidation instead. In the test, the first request after lowering a team limit still passed, and the following ones were rejected.
+Limit changes on a key apply on the next request. Changes to org or team limits apply after the periodic key cache refresh (`cache.key_ttl`, default 30s, see the [configuration reference](../configuration.md)), also when Redis is configured. In the test, the first request after lowering a team limit still passed, and the following ones were rejected.
 
 Budgets are in tokens and requests, not currency. Cost figures in the usage views are estimates from the model prices you configure.
 
 ## Which headers reach the provider
 
-VoidLLM does not pass client headers through. For the requests it forwards, it copies only `Content-Type`, `Accept`, `Accept-Language` and `X-Request-ID` from the client. The client's `Authorization` header is replaced with the upstream key from the model config, and `User-Agent` is set to `VoidLLM/0.1`.
+VoidLLM does not pass client headers through. For the requests it forwards, it copies only four allowlisted headers from the client: `Content-Type`, `Accept`, `Accept-Language` and `X-Request-ID`. The client's `Authorization` header is not forwarded. The provider's own authentication is set from the model config, and `User-Agent` is set to `VoidLLM/0.1`. The request body is held in memory and may be rewritten (model alias to model name), translated for providers such as Anthropic, or anonymized if you enable [PII anonymization](../security/pii.md). It is never written to disk.
 
-For models with `provider: anthropic`, the request goes to `/v1/messages` with the upstream key in `x-api-key` and `anthropic-version: 2023-06-01`. A client-supplied `anthropic-version` or `anthropic-beta` header is not forwarded. We confirmed this against a local test upstream: the upstream saw `anthropic-version: 2023-06-01`, the copied `X-Request-ID`, and no `anthropic-beta` or custom headers.
+For models with `provider: anthropic`, the request goes to `/v1/messages` with the upstream key in `x-api-key` and `anthropic-version: 2023-06-01`. A client-supplied `anthropic-version` or `anthropic-beta` header is not forwarded. This is what the code does. We also checked it against a local test upstream at commit `a8a93d9`: the upstream saw `anthropic-version: 2023-06-01`, the copied `X-Request-ID`, and no `anthropic-beta` or custom headers.
 
 This is one more reason Claude Code cannot go through VoidLLM today: Anthropic's guide says a gateway must forward `anthropic-beta` unchanged.
 
@@ -223,13 +223,13 @@ Current Claude Code requires a `type` on remote servers, a `url` entry without i
 }
 ```
 
-Each developer sets `VOIDLLM_API_KEY` to their own key, so the key never goes into the repository. Claude Code asks the developer to approve a project-scoped server the first time. The format and `${VAR}` expansion are described in the [Claude Code MCP docs](https://code.claude.com/docs/en/mcp.md). Tested with Claude Code 2.1.330: `claude mcp list` reports the server as connected.
+Each developer sets `VOIDLLM_API_KEY` to their own key, so the key never goes into the repository. Claude Code asks the developer to approve a project-scoped server the first time. The format and `${VAR}` expansion are described in the [Claude Code MCP docs](https://code.claude.com/docs/en/mcp.md). With Claude Code 2.1.330, `claude mcp list` reported the server as connected against a local build at commit `a8a93d9`.
 
 If you manage Claude Code machines centrally, [managed settings](https://code.claude.com/docs/en/managed-settings.md) and `managed-mcp.json` are the documented way to distribute configuration. We have not tested a managed rollout with VoidLLM.
 
 ## Privacy
 
-VoidLLM does not store prompts or responses. It reads the `model` field to route the request and streams everything else through memory. What it keeps is usage metadata: who, when, which model, token counts, duration. That metadata can be personal data when it is tied to a named developer, so tell your team what is recorded. The architecture is designed to support GDPR compliance, see [Privacy](../security/privacy.md).
+VoidLLM does not store prompts or responses. It reads the `model` field to route the request and streams the rest through memory, applying only the in-memory rewriting described above. What it keeps is usage metadata: who, when, which model, token counts, duration. That metadata can be personal data when it is tied to a named developer, so tell your team what is recorded. The architecture is designed to support GDPR compliance, see [Privacy](../security/privacy.md).
 
 Note that the provider still sees the prompts. Your agreement with OpenAI, Anthropic or whoever you route to applies to that content.
 

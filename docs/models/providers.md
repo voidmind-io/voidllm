@@ -336,7 +336,7 @@ VoidLLM translates OpenAI chat completion requests into the Gemini `generateCont
 
 ```yaml
 models:
-  - name: gemini-2.0-flash
+  - name: gemini-3.8-flash
     provider: gemini
     base_url: https://generativelanguage.googleapis.com
     api_key: ${GEMINI_API_KEY}
@@ -352,7 +352,7 @@ Vertex AI uses the same translation as Gemini, with a project and region in the 
 
 ```yaml
 models:
-  - name: gemini-2.0-flash
+  - name: gemini-3.8-flash
     provider: vertex
     base_url: https://us-central1-aiplatform.googleapis.com
     gcp_project: my-project
@@ -366,9 +366,9 @@ models:
 
 ## Gemini and Vertex AI behavior
 
-Both providers share one adapter.
+`gemini` and `vertex` share one adapter (`GeminiAdapter`), so everything below applies to both. Model IDs change often, check Google's model lists ([Gemini API](https://ai.google.dev/gemini-api/docs/models), [Vertex AI](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/models)) for what is currently served. `gemini-3.8-flash` is listed in both at the time of writing.
 
-- **Endpoints:** chat completions only. Rerank and score requests are rejected with `400 endpoint not supported for this model`. The adapter has no embeddings translation, and health probes and the connection test do not use a models-list or embeddings endpoint for these providers.
+- **Endpoints:** chat completions is the supported translation. The `stream` field of the request selects the upstream endpoint (`generateContent` or `streamGenerateContent?alt=sse`). Rerank and score requests are rejected with `400 endpoint not supported for this model`. The adapter has no embeddings translation, and health probes and the connection test do not use a models-list or embeddings endpoint for these providers.
 - **Request fields translated:** `messages`, `tools`, `tool_choice`, `temperature`, `top_p`, `max_completion_tokens` (takes precedence over `max_tokens`), `stop`, `n`, and `response_format` of type `json_object`. Request bodies are rebuilt from these fields, so other fields are not forwarded. `response_format` of type `json_schema` is not mapped.
 - **Messages:** system messages become Gemini's system instruction. Message content is sent as text. Content blocks that are not of type `text` are not forwarded.
 - **Tool calls:** OpenAI `tools` become Gemini function declarations, assistant `tool_calls` become function calls, and `tool` messages become function responses. Responses and streams are translated back to OpenAI tool calls. A stream with too many or invalid tool call parts is aborted.

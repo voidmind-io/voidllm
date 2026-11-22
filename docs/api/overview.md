@@ -27,14 +27,14 @@ The proxy forwards requests to upstream LLM providers. Any OpenAI-compatible end
 | `POST /v1/chat/completions` | Chat completions (streaming supported) |
 | `POST /v1/completions` | Text completions |
 | `POST /v1/embeddings` | Text embeddings |
-| `POST /v1/rerank` | Document reranking (OpenAI-compatible backends such as vLLM; not available for Anthropic, Gemini or Vertex models) |
-| `POST /v1/score` | Text pair scoring (OpenAI-compatible backends such as vLLM; not available for Anthropic, Gemini or Vertex models) |
+| `POST /v1/rerank` | Document reranking (OpenAI-compatible backends such as vLLM; not available for Anthropic, Gemini, Vertex or Bedrock models) |
+| `POST /v1/score` | Text pair scoring (OpenAI-compatible backends such as vLLM; not available for Anthropic, Gemini, Vertex or Bedrock models) |
 | `POST /v1/images/generations` | Image generation |
 | `POST /v1/audio/transcriptions` | Audio transcription |
 | `POST /v1/audio/speech` | Text to speech |
 | `GET /v1/models` | List available models |
 
-VoidLLM does not validate request bodies beyond extracting the `model` field. The upstream provider handles validation.
+Before forwarding, VoidLLM checks that the request body is within the size limit (`server.proxy.max_request_body`, default 20 MB) and parses it to read the `model` field, which is required. It then applies rate and token limits and resolves the model. It does not validate the rest of the body. The upstream provider handles that, except where an adapter translates the request for the provider. Paths other than those listed above are rejected with `400 unsupported API endpoint`.
 
 ## Admin API (`/api/v1/*`)
 
@@ -118,7 +118,10 @@ Management endpoints for organizations, teams, users, keys, models, and MCP serv
 | `DELETE` | `/api/v1/orgs/:org_id/keys/:key_id` |
 | `POST` | `/api/v1/orgs/:org_id/keys/:key_id/rotate` |
 
-### Models (system admin)
+### Models
+
+`GET /api/v1/models/health` is open to any authenticated member. The other model routes require a system admin.
+
 | Method | Endpoint |
 |---|---|
 | `GET` | `/api/v1/models/health` |
@@ -168,21 +171,46 @@ Management endpoints for organizations, teams, users, keys, models, and MCP serv
 |---|---|
 | `GET` | `/api/v1/audit-logs` |
 
-MCP server management (`/mcp-servers`, `/orgs/:org_id/mcp-servers`, MCP access routes), SSO and license routes are also registered in `internal/api/admin/routes.go` and are not listed here yet.
+### Other routes
+
+These are registered in `internal/api/admin/routes.go` and are not in the [OpenAPI spec](swagger.yaml) yet:
+
+- MCP server management: `/api/v1/mcp-servers`, `/api/v1/orgs/:org_id/mcp-servers`, `/api/v1/orgs/:org_id/teams/:team_id/mcp-servers`, and per-server routes under `/api/v1/mcp-servers/:server_id` (activate, test, blocklist, tools, refresh).
+- MCP access control: `mcp-access` under the org, team and key paths, and `/api/v1/orgs/:org_id/available-mcp-servers`.
+- Org SSO: `/api/v1/orgs/:org_id/sso` and `/sso/test`, plus `GET /api/v1/settings/sso` for the global configuration.
+- License: `GET /api/v1/license`, `PUT /api/v1/settings/license`, `POST /api/v1/license/trial`.
+- `GET /api/v1/system/update-check` for the cached update status, open to any authenticated key.
+
+### Public routes
+
+These need no API key:
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/v1/auth/login` | Log in with email and password |
+| `GET` | `/api/v1/auth/providers` | Discover available login providers |
+| `GET` | `/api/v1/invites/peek` | Look up an invite |
+| `POST` | `/api/v1/invites/redeem` | Redeem an invite |
+| `GET` | `/api/v1/auth/oidc/login` | Start OIDC login, only registered when an SSO provider is configured |
+| `GET` | `/api/v1/auth/oidc/callback` | OIDC callback, only registered when an SSO provider is configured |
 
 ### MCP
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/api/v1/mcp/voidllm` | Built-in MCP tools |
 | `POST` | `/api/v1/mcp/:alias` | Proxy to external MCP server |
-| `POST` | `/api/v1/mcp` | Code Mode tools |
+| `GET` | `/api/v1/mcp/:alias` | Server-sent event stream for the same endpoint |
+| `POST` | `/api/v1/mcp` | Code Mode tools, only registered when Code Mode is enabled |
+| `GET` | `/api/v1/mcp` | Server-sent event stream for Code Mode, only registered when Code Mode is enabled |
+
+MCP requests are subject to an Origin check.
 
 ## Health Endpoints
 
 | Endpoint | Auth | Description |
 |---|---|---|
 | `GET /healthz` | No | Liveness probe (always 200) |
-| `GET /readyz` | No | Readiness probe (503 during drain) |
+| `GET /readyz` | No | Readiness probe, pings the database. Returns 503 while draining or when the database is unavailable |
 | `GET /metrics` | No | Prometheus metrics |
 
 ## Swagger UI
@@ -215,5 +243,9 @@ All errors follow a consistent format:
 | 403 | `forbidden` | Insufficient permissions |
 | 404 | `not_found` | Resource not found |
 | 409 | `conflict` | Resource already exists |
-| 429 | `rate_limit_exceeded` | Rate limit or token budget exceeded |
+| 403 | `model_access_denied` | The key may not use this model |
+| 404 | `model_not_found` | The requested model does not exist (proxy API) |
+| 413 | `request_too_large` | Request body exceeds the size limit (proxy API) |
+| 429 | `rate_limit_exceeded` | Request rate limit exceeded |
+| 429 | `token_limit_exceeded` | Daily or monthly token budget exceeded |
 | 502 | `upstream_unavailable` | LLM provider unreachable |

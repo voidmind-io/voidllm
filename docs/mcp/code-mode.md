@@ -86,7 +86,7 @@ The bottleneck is always the upstream MCP server response time, not the sandbox.
 
 ## IDE Setup
 
-Point your IDE at `/api/v1/mcp` to get Code Mode tools:
+Point your MCP client at `/api/v1/mcp` to get Code Mode tools. Claude Code format shown (it needs `"type": "http"`); Cursor uses the same entry without `type`, see [IDE Integration](ide-integration.md) for each client's format:
 
 ```json
 {

@@ -228,7 +228,9 @@ GET  /api/v1/orgs/:id/teams/:id/mcp-servers  — List team + org + global server
 
 JSON-RPC 2.0 over Streamable HTTP (MCP spec version `2025-03-26`). Supports both `application/json` and `text/event-stream` response formats. Authentication via standard VoidLLM Bearer token.
 
-### IDE Setup (Claude Code / Cursor)
+### IDE Setup (Claude Code)
+
+These snippets use the Claude Code format, which needs `"type": "http"`. Cursor uses the same entries without `type`. See [IDE Integration](mcp/ide-integration.md) for each client.
 
 Built-in VoidLLM tools:
 ```json
@@ -420,7 +422,7 @@ settings:
 
 ```yaml
 cache:
-  key_ttl: 30s              # How often to refresh the key cache from DB (org/team limit changes apply after this)
+  key_ttl: 30s              # How often to refresh the key cache from DB (org/team limit changes apply after this, also with Redis)
   model_ttl: 60s            # Model access cache refresh
   alias_ttl: 60s            # Alias cache refresh
 ```

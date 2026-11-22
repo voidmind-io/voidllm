@@ -232,7 +232,7 @@ Admins can block specific tools from Code Mode via the per-tool blocklist API an
 }
 ```
 
-This connects your IDE (Claude Code, Cursor, Windsurf) to the Code Mode endpoint. Management tools (list_models, get_usage, etc.) are available at `/api/v1/mcp/voidllm`. External MCP servers at `/api/v1/mcp/:alias`.
+This is the Claude Code format (it needs `"type": "http"`). Cursor uses the same entry without `type`; see [IDE Integration](docs/mcp/ide-integration.md) for each client. The snippet connects your client to the Code Mode endpoint. Management tools (list_models, get_usage, etc.) are available at `/api/v1/mcp/voidllm`. External MCP servers at `/api/v1/mcp/:alias`.
 
 ### Known Limitations
 
