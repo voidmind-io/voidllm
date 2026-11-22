@@ -825,6 +825,8 @@ func Load(path string) (*Config, bool, error) {
 		return nil, false, fmt.Errorf("config: unmarshal yaml: %w", err)
 	}
 
+	applyEnvFallbacks(&cfg)
+	warnIgnoredDatabaseEnv(&cfg)
 	cfg.setDefaults()
 
 	// If license_file is set and the inline license key is empty, read the
@@ -867,14 +869,56 @@ func findConfigFile() (string, error) {
 	return "", fmt.Errorf("no config file found; set VOIDLLM_CONFIG or place voidllm.yaml in the current directory")
 }
 
+// applyEnvFallbacks fills the admin key, encryption key and license from
+// VOIDLLM_ADMIN_KEY, VOIDLLM_ENCRYPTION_KEY and VOIDLLM_LICENSE, but only for
+// fields that are still empty, so values set in the YAML file always win. The
+// license variable is ignored when settings.license_file is set. Every field
+// that is filled from the environment is logged by setting name (never by
+// value). Database DSN and driver are deliberately not covered: an ambient
+// variable must not silently switch a YAML deployment to another database.
+func applyEnvFallbacks(cfg *Config) {
+	fill := func(dst *string, env, setting string) {
+		if *dst != "" {
+			return
+		}
+		if v := os.Getenv(env); v != "" {
+			*dst = v
+			slog.Info("config: setting filled from environment",
+				slog.String("setting", setting),
+				slog.String("env", env),
+			)
+		}
+	}
+	fill(&cfg.Settings.AdminKey, "VOIDLLM_ADMIN_KEY", "settings.admin_key")
+	fill(&cfg.Settings.EncryptionKey, "VOIDLLM_ENCRYPTION_KEY", "settings.encryption_key")
+	if cfg.Settings.LicenseFile == "" {
+		fill(&cfg.Settings.License, "VOIDLLM_LICENSE", "settings.license")
+	}
+}
+
+// warnIgnoredDatabaseEnv logs a warning when the YAML leaves the database DSN
+// or driver empty while the matching VOIDLLM_DATABASE_* variable is set. The
+// variables are deliberately not applied with a config file; the warning tells
+// the operator how to opt in. Values are never logged.
+func warnIgnoredDatabaseEnv(cfg *Config) {
+	ignored := func(configured, env, setting string) {
+		if configured == "" && os.Getenv(env) != "" {
+			slog.Warn("config: environment variable ignored when a config file is used; reference it in the YAML instead",
+				slog.String("env", env),
+				slog.String("hint", setting+": ${"+env+"}"),
+			)
+		}
+	}
+	ignored(cfg.Database.DSN, "VOIDLLM_DATABASE_DSN", "database.dsn")
+	ignored(cfg.Database.Driver, "VOIDLLM_DATABASE_DRIVER", "database.driver")
+}
+
 // loadDefaults returns a Config populated entirely from environment
 // variables and built-in defaults. It is used when no configuration
 // file is found.
 func loadDefaults() (*Config, error) {
 	var cfg Config
-	cfg.Settings.AdminKey = os.Getenv("VOIDLLM_ADMIN_KEY")
-	cfg.Settings.EncryptionKey = os.Getenv("VOIDLLM_ENCRYPTION_KEY")
-	cfg.Settings.License = os.Getenv("VOIDLLM_LICENSE")
+	applyEnvFallbacks(&cfg)
 	cfg.Database.DSN = os.Getenv("VOIDLLM_DATABASE_DSN")
 	cfg.Database.Driver = os.Getenv("VOIDLLM_DATABASE_DRIVER")
 	cfg.setDefaults()

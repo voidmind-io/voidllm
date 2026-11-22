@@ -3,7 +3,8 @@ import { NavLink, Link } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { useMe } from '../../hooks/useMe'
 import { useLicense } from '../../hooks/useLicense'
-import { LOCAL_STORAGE_KEY } from '../../lib/constants'
+import { clearSession } from '../../lib/session'
+import { logoutRequest } from '../../api/auth'
 
 function formatRole(role?: string): string {
   if (!role) return '...'
@@ -359,9 +360,11 @@ export function Sidebar() {
           </Link>
           <button
             onClick={() => {
-              localStorage.removeItem(LOCAL_STORAGE_KEY)
-              queryClient.clear()
-              window.location.href = '/login'
+              void logoutRequest().finally(() => {
+                clearSession()
+                queryClient.clear()
+                window.location.href = '/login'
+              })
             }}
             className="flex-1 py-1.5 bg-transparent border border-white/10 rounded-md text-xs text-text-secondary cursor-pointer transition-colors duration-200 hover:border-error hover:text-error"
           >

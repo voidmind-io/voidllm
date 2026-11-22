@@ -398,3 +398,29 @@ func (h *Handler) refreshMCPAccessCache(ctx context.Context, scope MCPAccessRefr
 		h.Log.ErrorContext(ctx, "refresh mcp access cache", slog.String("error", err.Error()))
 	}
 }
+
+// negativeLimitField returns the JSON name of the first negative limit among
+// the given values, or "" when none is negative. Nil pointers (unchanged
+// fields in update requests) are skipped.
+func negativeLimitField(daily, monthly *int64, perMinute, perDay *int) string {
+	switch {
+	case daily != nil && *daily < 0:
+		return "daily_token_limit"
+	case monthly != nil && *monthly < 0:
+		return "monthly_token_limit"
+	case perMinute != nil && *perMinute < 0:
+		return "requests_per_minute"
+	case perDay != nil && *perDay < 0:
+		return "requests_per_day"
+	}
+	return ""
+}
+
+// rejectNegativeLimits sends a 400 naming the offending field when any limit
+// is negative. The bool result reports whether a response was sent.
+func rejectNegativeLimits(c fiber.Ctx, daily, monthly *int64, perMinute, perDay *int) (bool, error) {
+	if name := negativeLimitField(daily, monthly, perMinute, perDay); name != "" {
+		return true, apierror.BadRequest(c, name+" must be >= 0")
+	}
+	return false, nil
+}

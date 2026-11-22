@@ -1,5 +1,7 @@
+import { useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClientProvider } from '@tanstack/react-query'
+import { queryClient } from './lib/queryClient'
 import LoginPage from './pages/auth/LoginPage'
 import CallbackPage from './pages/auth/CallbackPage'
 import AcceptInvitePage from './pages/AcceptInvitePage'
@@ -40,15 +42,7 @@ import { ToastProvider } from './hooks/useToast'
 import { Shell } from './components/layout/Shell'
 import { PageHeader } from './components/ui/PageHeader'
 import { LOCAL_STORAGE_KEY } from './lib/constants'
-
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      retry: 1,
-      staleTime: 30_000,
-    },
-  },
-})
+import { clearSession, isSessionExpired, msUntilSessionExpiry } from './lib/session'
 
 function PlaceholderPage({ title, description }: { title: string; description?: string }) {
   return (
@@ -61,9 +55,28 @@ function PlaceholderPage({ title, description }: { title: string; description?: 
   )
 }
 
-function RequireAuth() {
+export function RequireAuth() {
   const token = localStorage.getItem(LOCAL_STORAGE_KEY)
-  if (!token) return <Navigate to="/login" replace />
+  const [expired, setExpired] = useState(() => isSessionExpired())
+
+  useEffect(() => {
+    if (!token) return
+    let timer: number | undefined
+    const check = () => {
+      if (isSessionExpired()) {
+        clearSession()
+        queryClient.clear()
+        setExpired(true)
+        return
+      }
+      const delay = msUntilSessionExpiry()
+      if (delay !== null) timer = window.setTimeout(check, delay)
+    }
+    check()
+    return () => window.clearTimeout(timer)
+  }, [token])
+
+  if (!token || expired) return <Navigate to="/login" replace />
   return <Shell />
 }
 

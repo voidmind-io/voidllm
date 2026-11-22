@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
+	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 	"github.com/voidmind-io/voidllm/pkg/keygen"
 )
 
@@ -167,9 +169,11 @@ func (h *Handler) Login(c fiber.Ctx) error {
 	}
 
 	// Revoke previous session keys for this user so only one session exists.
-	if err := h.DB.RevokeUserSessions(ctx, userID); err != nil {
+	if revoked, err := h.DB.RevokeUserSessions(ctx, userID); err != nil {
 		h.Log.ErrorContext(ctx, "login: revoke old sessions", slog.String("error", err.Error()))
 		// Non-fatal: proceed with login even if cleanup fails.
+	} else {
+		h.evictRevokedSessions(ctx, revoked)
 	}
 
 	key, err := keygen.Generate(keygen.KeyTypeSession)
@@ -317,6 +321,85 @@ type changeOwnPasswordRequest struct {
 	NewPassword     string `json:"new_password"`
 }
 
+// publishKeyInvalidation tells peer nodes over Redis to drop the given key
+// hash from their caches. It is a no-op when Redis is not configured, and a
+// publish failure is logged rather than returned.
+func (h *Handler) publishKeyInvalidation(ctx context.Context, keyHash string) {
+	if h.Redis == nil {
+		return
+	}
+	if err := h.Redis.PublishInvalidation(ctx, voidredis.ChannelKeys, keyHash); err != nil {
+		h.Log.LogAttrs(ctx, slog.LevelWarn, "redis: publish key invalidation failed",
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// evictRevokedSessions removes the given key hashes from the local key cache
+// and publishes each one on Redis so peer nodes drop them too. Callers pass
+// the hashes returned by the DB revocation methods, so sessions that were only
+// cached on another node are covered.
+func (h *Handler) evictRevokedSessions(ctx context.Context, keyHashes []string) {
+	for _, keyHash := range keyHashes {
+		h.KeyCache.Delete(keyHash)
+		h.publishKeyInvalidation(ctx, keyHash)
+	}
+}
+
+// Logout handles POST /api/v1/auth/logout. When the calling key is a session
+// key it is deleted from the database and evicted from the key cache, so the
+// token is rejected immediately. Any other key type (user, team, service
+// account) is left untouched and the call still succeeds, which lets clients
+// call logout unconditionally.
+//
+// @Summary      Log out
+// @Description  Revokes the calling session key. For non-session API keys this is a no-op that still returns 204.
+// @Tags         auth
+// @Success      204  "No Content"
+// @Failure      401  {object}  swaggerErrorResponse
+// @Failure      500  {object}  swaggerErrorResponse
+// @Security     BearerAuth
+// @Router       /auth/logout [post]
+func (h *Handler) Logout(c fiber.Ctx) error {
+	keyInfo := auth.KeyInfoFromCtx(c)
+	if keyInfo == nil {
+		return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "missing authentication")
+	}
+	if keyInfo.KeyType != keygen.KeyTypeSession {
+		return c.SendStatus(fiber.StatusNoContent)
+	}
+
+	ctx := c.Context()
+	hashes, err := h.DB.RevokeSessionKey(ctx, keyInfo.ID)
+	if err != nil {
+		h.Log.ErrorContext(ctx, "logout: revoke session key", slog.String("error", err.Error()))
+		return apierror.InternalError(c, "failed to log out")
+	}
+	if len(hashes) == 0 {
+		// The row is already gone; still drop the presented token from the cache.
+		hashes = []string{keyInfo.Hash}
+	}
+	h.evictRevokedSessions(ctx, hashes)
+
+	if h.AuditLogger != nil {
+		h.AuditLogger.Log(audit.Event{
+			Timestamp:    time.Now().UTC(),
+			OrgID:        keyInfo.OrgID,
+			ActorID:      keyInfo.UserID,
+			ActorType:    "user",
+			ActorKeyID:   keyInfo.ID,
+			Action:       "logout",
+			ResourceType: "session",
+			ResourceID:   keyInfo.ID,
+			IPAddress:    c.IP(),
+			StatusCode:   fiber.StatusNoContent,
+			RequestID:    apierror.RequestIDFromCtx(c),
+		})
+	}
+
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
 // ChangeOwnPassword handles POST /api/v1/me/password. It verifies the caller's
 // current password, then replaces it with the new one and invalidates all other
 // active sessions for the user. The current session remains valid.
@@ -402,7 +485,8 @@ func (h *Handler) ChangeOwnPassword(c fiber.Ctx) error {
 	// Update the password hash and revoke all other sessions atomically.
 	// If either operation fails the transaction rolls back, leaving the DB
 	// consistent: neither the password nor the session list is partially updated.
-	if err := h.DB.ChangePasswordAndRevokeOtherSessions(ctx, keyInfo.UserID, newHashStr, keyInfo.ID); err != nil {
+	revoked, err := h.DB.ChangePasswordAndRevokeOtherSessions(ctx, keyInfo.UserID, newHashStr, keyInfo.ID)
+	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.Send(c, fiber.StatusUnauthorized, "unauthorized", "user not found")
 		}
@@ -410,24 +494,9 @@ func (h *Handler) ChangeOwnPassword(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update password")
 	}
 
-	// Evict the user's other session keys from the in-memory key cache so that
-	// revoked sessions are rejected immediately without waiting for the next
-	// periodic cache refresh. Only session keys are evicted: the DB revocation
-	// above deletes only session_key rows, so long-lived user, team and service
-	// account keys carrying this UserID must stay authenticated.
-	// Collect hashes first — Range holds a read lock, so Delete (write lock)
-	// must not be called inside the Range closure.
-	var toEvict []string
-	currentKeyID := keyInfo.ID
-	h.KeyCache.Range(func(keyHash string, ki auth.KeyInfo) bool {
-		if ki.UserID == keyInfo.UserID && ki.KeyType == keygen.KeyTypeSession && ki.ID != currentKeyID {
-			toEvict = append(toEvict, keyHash)
-		}
-		return true
-	})
-	for _, keyHash := range toEvict {
-		h.KeyCache.Delete(keyHash)
-	}
+	// Evict exactly the sessions the DB revoked, locally and on peers, so they
+	// are rejected immediately even if they were only cached on another node.
+	h.evictRevokedSessions(ctx, revoked)
 
 	if h.AuditLogger != nil {
 		h.AuditLogger.Log(audit.Event{
