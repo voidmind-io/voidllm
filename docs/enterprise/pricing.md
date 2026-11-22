@@ -23,12 +23,12 @@ Want to try Pro or Enterprise features first? See [30-day trial](#30-day-trial).
 Everything you need to run an LLM proxy in production:
 
 - 1 organization, 3 teams, unlimited users
-- Proxy with streaming + provider adapters (OpenAI, Anthropic, Azure, Ollama, vLLM, custom)
+- Proxy with streaming + provider adapters (OpenAI, Anthropic, Azure, Gemini, Vertex AI, AWS Bedrock, Ollama, vLLM, custom)
 - Full Web UI + Playground
 - RBAC (4 built-in roles)
 - Usage tracking + dashboard
 - Rate limiting + token budgets
-- Load balancing (4 strategies) + automatic failover
+- Load balancing (4 strategies) + automatic failover between deployments of a model
 - Circuit breakers + per-model timeouts
 - MCP gateway + Code Mode
 - Prometheus metrics
@@ -53,6 +53,8 @@ Everything in Pro, plus:
 - SSO / OIDC (any provider) - [Setup guide](sso.md)
 - Per-org SSO configuration
 - Audit logs (API + UI) - [Setup guide](audit.md)
+- Cross-model fallback chains (`fallback:`) - [Load balancing](../models/load-balancing.md)
+- Custom roles
 - OpenTelemetry tracing - [Setup guide](otel.md)
 - Multi-instance support (Redis)
 - Dedicated Slack support (24h)
