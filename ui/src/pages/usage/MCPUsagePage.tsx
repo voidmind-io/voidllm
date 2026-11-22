@@ -190,17 +190,19 @@ function MCPUsageContent() {
   const isSystemAdmin = me?.is_system_admin === true
 
   const canViewOrgUsage = isOrgAdmin(me)
+  const crossOrgActive = crossOrg && isSystemAdmin
+  const orgScopeEnabled = canViewOrgUsage && !crossOrgActive
 
-  const orgUsage = useMCPUsage(orgId, range, groupBy, { enabled: canViewOrgUsage })
-  const crossOrgUsage = useCrossOrgMCPUsage({ range, groupBy }, crossOrg && isSystemAdmin)
+  const orgUsage = useMCPUsage(orgId, range, groupBy, { enabled: orgScopeEnabled })
+  const crossOrgUsage = useCrossOrgMCPUsage({ range, groupBy }, crossOrgActive)
 
-  const activeResult = crossOrg && isSystemAdmin ? crossOrgUsage : orgUsage
+  const activeResult = crossOrgActive ? crossOrgUsage : orgUsage
 
   const { data: usage, isLoading } = activeResult
 
   // Daily trend data - only when groupBy is not already 'day'/'hour'
   const needsDailyTrend = groupBy !== 'day' && groupBy !== 'hour'
-  const dailyUsage = useMCPUsage(orgId, range, 'day', { enabled: canViewOrgUsage && needsDailyTrend })
+  const dailyUsage = useMCPUsage(orgId, range, 'day', { enabled: orgScopeEnabled && needsDailyTrend })
   const trendData = needsDailyTrend ? dailyUsage.data?.data : usage?.data
 
   const handleCrossOrgToggle = (next: boolean) => {
@@ -244,14 +246,14 @@ function MCPUsageContent() {
   const isDataLoading = isLoading && (crossOrg ? isSystemAdmin : !!orgId)
 
   // Get top 10 by tool groupBy - use a separate query when current groupBy isn't 'tool'
-  const toolGroupUsage = useMCPUsage(orgId, range, 'tool', { enabled: canViewOrgUsage && groupBy !== 'tool' })
+  const toolGroupUsage = useMCPUsage(orgId, range, 'tool', { enabled: orgScopeEnabled && groupBy !== 'tool' })
   const topTools = useMemo(() => {
     const source = groupBy === 'tool' ? sortedData : (toolGroupUsage.data?.data ?? [])
     return [...source].sort((a, b) => b.total_calls - a.total_calls).slice(0, 10)
   }, [groupBy, sortedData, toolGroupUsage.data])
 
   // For server groupBy - use a separate query when current groupBy isn't 'server'
-  const serverGroupUsage = useMCPUsage(orgId, range, 'server', { enabled: canViewOrgUsage && groupBy !== 'server' })
+  const serverGroupUsage = useMCPUsage(orgId, range, 'server', { enabled: orgScopeEnabled && groupBy !== 'server' })
   const topServers = useMemo(() => {
     const source = groupBy === 'server' ? sortedData : (serverGroupUsage.data?.data ?? [])
     return [...source].sort((a, b) => b.total_calls - a.total_calls).slice(0, 10)

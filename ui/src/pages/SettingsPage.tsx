@@ -6,15 +6,12 @@ import { useMe } from '../hooks/useMe'
 import { useOrg, useUpdateOrg } from '../hooks/useOrg'
 import type { OrgResponse, UpdateOrgParams } from '../hooks/useOrg'
 import { useToast } from '../hooks/useToast'
+import { isOrgAdmin } from '../lib/roles'
 import { parseLimitInput } from '../lib/utils'
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function canEditOrg(role: string | undefined): boolean {
-  return role === 'org_admin' || role === 'system_admin'
-}
 
 interface FormState {
   name: string
@@ -233,11 +230,11 @@ function OrgSettingsForm({ org, readOnly }: OrgSettingsFormProps) {
 
 interface OrgSettingsCardProps {
   orgId: string
-  readOnly: boolean
+  isAdmin: boolean
 }
 
-function OrgSettingsCard({ orgId, readOnly }: OrgSettingsCardProps) {
-  const { data: org, isLoading, error } = useOrg(orgId)
+function OrgSettingsCard({ orgId, isAdmin }: OrgSettingsCardProps) {
+  const { data: org, isLoading, error } = useOrg(orgId, { enabled: isAdmin })
 
   return (
     <div className="rounded-lg border border-border bg-bg-secondary">
@@ -245,7 +242,13 @@ function OrgSettingsCard({ orgId, readOnly }: OrgSettingsCardProps) {
         <h2 className="text-sm font-semibold text-text-primary">Organization</h2>
       </div>
 
-      {error ? (
+      {!isAdmin ? (
+        <div className="p-6">
+          <p className="text-sm text-text-tertiary">
+            Only organization admins can view organization settings.
+          </p>
+        </div>
+      ) : error ? (
         <div className="p-6">
           <p className="text-sm text-text-tertiary">
             {error instanceof ApiError && error.status === 403
@@ -268,7 +271,7 @@ function OrgSettingsCard({ orgId, readOnly }: OrgSettingsCardProps) {
           </div>
         </div>
       ) : (
-        <OrgSettingsForm key={org.id} org={org} readOnly={readOnly} />
+        <OrgSettingsForm key={org.id} org={org} readOnly={false} />
       )}
     </div>
   )
@@ -281,11 +284,11 @@ function OrgSettingsCard({ orgId, readOnly }: OrgSettingsCardProps) {
 export default function SettingsPage() {
   const { data: me } = useMe()
   const orgId = me?.org_id ?? ''
-  const readOnly = !canEditOrg(me?.role)
+  const isAdmin = isOrgAdmin(me)
 
   return (
     <div className="max-w-2xl space-y-6">
-      {orgId && <OrgSettingsCard orgId={orgId} readOnly={readOnly} />}
+      {orgId && <OrgSettingsCard orgId={orgId} isAdmin={isAdmin} />}
     </div>
   )
 }

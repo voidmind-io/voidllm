@@ -248,21 +248,25 @@ export default function AuditLogPage() {
   function handleRangeChange(newRange: TimeRange) {
     setRange(newRange)
     setCursors([''])
+    setPageWindow(null)
   }
 
   function handleResourceTypeChange(value: string) {
     setResourceType(value)
     setCursors([''])
+    setPageWindow(null)
   }
 
   function handleActionChange(value: string) {
     setAction(value)
     setCursors([''])
+    setPageWindow(null)
   }
 
   function handlePageSizeChange(value: string) {
     setPageSize(Number(value))
     setCursors([''])
+    setPageWindow(null)
   }
 
   const isDataLoading = isLoading && !!orgId

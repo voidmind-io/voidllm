@@ -68,5 +68,6 @@ export function useAuditLog(params: AuditLogParams) {
     },
     enabled: !!orgId,
     staleTime: cursor ? 30_000 : 0,
+    refetchInterval: cursor ? false : 60_000,
   })
 }

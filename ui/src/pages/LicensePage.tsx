@@ -555,8 +555,9 @@ export default function LicensePage() {
       {license != null && <LicenseStatusBanners license={license} />}
 
       {/* Stat row */}
-      {license != null && (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        {license != null && (
+          <>
           <StatCard
             label="Plan"
             value={planLabel(license.edition)}
@@ -575,14 +576,15 @@ export default function LicensePage() {
             icon={<IconCalendar />}
             iconColor="blue"
           />
+          </>
+        )}
           <StatCard
             label="Version"
             value={updateInfo?.current_version ?? '-'}
             icon={<IconTag />}
             iconColor="yellow"
           />
-        </div>
-      )}
+      </div>
 
       <div className="flex gap-6 items-start">
         {/* Left panel — Current Plan (40%) */}

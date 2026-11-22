@@ -191,16 +191,18 @@ export default function LLMUsagePage() {
   const canViewOrgUsage = isOrgAdmin(me)
   const meLoaded = me !== undefined
 
-  const orgUsage = useUsage(orgId, range, groupBy, { enabled: canViewOrgUsage })
-  const myUsage = useMyUsage(range, groupBy, { enabled: meLoaded && !canViewOrgUsage })
-  const crossOrgUsage = useCrossOrgUsage({ range, groupBy }, isSystemAdmin && crossOrg)
+  const crossOrgActive = crossOrg && isSystemAdmin
 
-  const activeResult = crossOrg && isSystemAdmin ? crossOrgUsage : canViewOrgUsage ? orgUsage : myUsage
+  const orgUsage = useUsage(orgId, range, groupBy, { enabled: canViewOrgUsage && !crossOrgActive })
+  const myUsage = useMyUsage(range, groupBy, { enabled: meLoaded && !canViewOrgUsage && !crossOrgActive })
+  const crossOrgUsage = useCrossOrgUsage({ range, groupBy }, crossOrgActive)
+
+  const activeResult = crossOrgActive ? crossOrgUsage : canViewOrgUsage ? orgUsage : myUsage
 
   const { data: usage, isLoading } = activeResult
 
   // Daily trend data - only when groupBy is not already 'day'/'hour', and not cross-org
-  const needsDailyTrend = !crossOrg && groupBy !== 'day' && groupBy !== 'hour'
+  const needsDailyTrend = !crossOrgActive && groupBy !== 'day' && groupBy !== 'hour'
   const dailyOrgUsage = useUsage(orgId, range, 'day', { enabled: canViewOrgUsage && needsDailyTrend })
   const dailyMyUsage = useMyUsage(range, 'day', { enabled: meLoaded && !canViewOrgUsage && needsDailyTrend })
   const dailyUsage = canViewOrgUsage ? dailyOrgUsage : dailyMyUsage

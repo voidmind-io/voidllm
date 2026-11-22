@@ -24,6 +24,32 @@ describe('apiClient errors', () => {
   })
 })
 
+describe('apiClient 401', () => {
+  it('throws a non-retryable ApiError(401) and clears the session', async () => {
+    vi.stubGlobal('location', { href: '/dash' })
+    localStorage.setItem('voidllm_session', 'vl_sk_x')
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: false,
+        status: 401,
+        statusText: 'Unauthorized',
+        json: () => Promise.resolve({}),
+      })),
+    )
+    const err = await apiClient('/x').catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).status).toBe(401)
+    expect((err as ApiError).message).toBe('Session expired')
+    expect(window.location.href).toBe('/login')
+    const retry = queryClient.getDefaultOptions().queries?.retry as (
+      count: number,
+      error: unknown,
+    ) => boolean
+    expect(retry(0, err)).toBe(false)
+  })
+})
+
 describe('queryClient retry policy', () => {
   const retry = queryClient.getDefaultOptions().queries?.retry as (
     count: number,

@@ -18,6 +18,7 @@ import type { UsageDataPoint } from '../hooks/useTopModels'
 import { useUsage, useMyUsage } from '../hooks/useUsage'
 import type { UsageRange } from '../lib/timeRange'
 import { useOrg } from '../hooks/useOrg'
+import { isOrgAdmin } from '../lib/roles'
 import { useModelHealth } from '../hooks/useModelHealth'
 import type { ModelHealthInfo } from '../hooks/useModelHealth'
 import { useUpdateCheck } from '../hooks/useUpdateCheck'
@@ -79,9 +80,17 @@ function ProgressBar({ label, used, limit }: { label: string; used: number; limi
 // BudgetSection
 // ---------------------------------------------------------------------------
 
-function BudgetSection({ orgId, tokens24h }: { orgId: string; tokens24h: number }) {
-  const { data: org } = useOrg(orgId)
-  if (!org || org.daily_token_limit <= 0) return null
+function BudgetSection({
+  orgId,
+  tokens24h,
+  isAdmin,
+}: {
+  orgId: string
+  tokens24h: number
+  isAdmin: boolean
+}) {
+  const { data: org } = useOrg(orgId, { enabled: isAdmin })
+  if (!isAdmin || !org || org.daily_token_limit <= 0) return null
   return (
     <div className="bg-bg-secondary rounded-xl border border-border p-6">
       <h2 className="text-lg font-semibold text-text-primary mb-6">Token Budget</h2>
@@ -319,7 +328,7 @@ export default function DashboardPage() {
     setShowUpdateDialog(false)
   }
 
-  const canViewOrgUsage = me?.role === 'system_admin' || me?.role === 'org_admin'
+  const canViewOrgUsage = isOrgAdmin(me)
   const orgId = me?.org_id ?? ''
 
   const { data: topModels, isLoading: modelsLoading } = useTopModels(
@@ -495,7 +504,11 @@ export default function DashboardPage() {
 
         {/* Token budget section */}
         {me?.org_id != null && !statsLoading && (
-          <BudgetSection orgId={me.org_id} tokens24h={stats?.tokens_24h ?? 0} />
+          <BudgetSection
+            orgId={me.org_id}
+            tokens24h={stats?.tokens_24h ?? 0}
+            isAdmin={canViewOrgUsage}
+          />
         )}
 
         {/* Requests over time */}

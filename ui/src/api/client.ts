@@ -28,7 +28,7 @@ const apiClient = async <T>(endpoint: string, options?: RequestInit): Promise<T>
     clearSession()
     queryClient.clear()
     window.location.href = '/login'
-    throw new Error('Session expired')
+    throw new ApiError(401, 'Session expired')
   }
 
   if (!res.ok) {

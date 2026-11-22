@@ -71,6 +71,7 @@ export function useCreateAPIKey(orgId: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['api-keys', orgId] })
       queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['service-accounts', orgId] })
       queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] })
     },
   })
@@ -84,6 +85,7 @@ export function useDeleteAPIKey(orgId: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['api-keys', orgId] })
       queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['service-accounts', orgId] })
       queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] })
     },
   })
@@ -100,6 +102,7 @@ export function useUpdateAPIKey(orgId: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['api-keys', orgId] })
       queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['service-accounts', orgId] })
       queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] })
     },
   })
@@ -113,6 +116,7 @@ export function useRotateAPIKey(orgId: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['api-keys', orgId] })
       queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['service-accounts', orgId] })
       queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] })
     },
   })
