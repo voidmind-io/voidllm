@@ -844,8 +844,16 @@ func TestHeartbeatManager_ActivatedTriggersSoon(t *testing.T) {
 	m.Ensure(context.Background(), "key-A")
 	waitForKey(t, sent, "key-A")
 	// The first beat recorded a fresh dedup timestamp; B must still go out.
-	if last, _ := db.GetSetting(context.Background(), "heartbeat_last_sent"); last == "" {
-		t.Fatal("dedup marker not set after first heartbeat")
+	// The server records the key before the client writes the marker, so poll.
+	markerDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if last, _ := db.GetSetting(context.Background(), "heartbeat_last_sent"); last != "" {
+			break
+		}
+		if time.Now().After(markerDeadline) {
+			t.Fatal("dedup marker not set after first heartbeat")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if err := holder.Activate(testEnterprise("B", false, time.Hour), "key-B", nil); err != nil {
 		t.Fatal(err)
