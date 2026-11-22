@@ -410,15 +410,17 @@ func (h *Handler) ChangeOwnPassword(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update password")
 	}
 
-	// Evict all other session entries for this user from the in-memory key cache
-	// so that revoked sessions are rejected immediately without waiting for the
-	// next periodic cache refresh.
+	// Evict the user's other session keys from the in-memory key cache so that
+	// revoked sessions are rejected immediately without waiting for the next
+	// periodic cache refresh. Only session keys are evicted: the DB revocation
+	// above deletes only session_key rows, so long-lived user, team and service
+	// account keys carrying this UserID must stay authenticated.
 	// Collect hashes first — Range holds a read lock, so Delete (write lock)
 	// must not be called inside the Range closure.
 	var toEvict []string
 	currentKeyID := keyInfo.ID
 	h.KeyCache.Range(func(keyHash string, ki auth.KeyInfo) bool {
-		if ki.UserID == keyInfo.UserID && ki.ID != currentKeyID {
+		if ki.UserID == keyInfo.UserID && ki.KeyType == keygen.KeyTypeSession && ki.ID != currentKeyID {
 			toEvict = append(toEvict, keyHash)
 		}
 		return true
