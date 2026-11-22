@@ -12,8 +12,15 @@ export interface ServiceAccountResponse {
   key_count: number
 }
 
+export interface ServiceAccountsSummary {
+  total: number
+  org_scoped: number
+  team_scoped: number
+}
+
 interface PaginatedServiceAccounts {
   data: ServiceAccountResponse[]
+  summary?: ServiceAccountsSummary
   has_more: boolean
   next_cursor?: string
 }
@@ -23,11 +30,13 @@ export interface CreateServiceAccountParams {
   team_id?: string
 }
 
-export function useServiceAccounts(orgId: string, cursor?: string) {
+export function useServiceAccounts(orgId: string, cursor?: string, opts?: { summary?: boolean }) {
+  const summary = opts?.summary ?? false
   const params = new URLSearchParams({ limit: '20' })
   if (cursor) params.set('cursor', cursor)
+  if (summary) params.set('summary', 'true')
   return useQuery({
-    queryKey: ['service-accounts', orgId, cursor],
+    queryKey: ['service-accounts', orgId, cursor, summary],
     queryFn: () =>
       apiClient<PaginatedServiceAccounts>(`/orgs/${orgId}/service-accounts?${params}`),
     enabled: !!orgId,

@@ -43,6 +43,8 @@ export function useAddTeamMember(orgId: string, teamId: string) {
       ),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['team-members', orgId, teamId] })
+      queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] })
     },
   })
 }
@@ -57,6 +59,8 @@ export function useRemoveTeamMember(orgId: string, teamId: string) {
       ),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['team-members', orgId, teamId] })
+      queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] })
     },
   })
 }
@@ -74,6 +78,8 @@ export function useUpdateTeamMember(orgId: string, teamId: string) {
       ),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['team-members', orgId, teamId] })
+      queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] })
     },
   })
 }

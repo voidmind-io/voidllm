@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { QueryClientProvider } from '@tanstack/react-query'
 import { queryClient } from './lib/queryClient'
+import { useMe } from './hooks/useMe'
+import { isOrgAdmin } from './lib/roles'
 import LoginPage from './pages/auth/LoginPage'
 import CallbackPage from './pages/auth/CallbackPage'
 import AcceptInvitePage from './pages/AcceptInvitePage'
@@ -80,6 +82,13 @@ export function RequireAuth() {
   return <Shell />
 }
 
+/** Sends org admins to the user list and everyone else to the settings tab. */
+function OrgIndexRedirect() {
+  const { data: me } = useMe()
+  if (!me) return null
+  return <Navigate to={isOrgAdmin(me) ? 'users' : 'settings'} replace />
+}
+
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
@@ -102,7 +111,7 @@ export default function App() {
                 <Route path="settings" element={<TeamSettingsTab />} />
               </Route>
               <Route path="org" element={<OrganizationPage />}>
-                <Route index element={<Navigate to="users" replace />} />
+                <Route index element={<OrgIndexRedirect />} />
                 <Route path="settings" element={<SettingsPage />} />
                 <Route path="users" element={<OrgUsersPage />} />
                 <Route path="models" element={<ModelsAccessTab />} />

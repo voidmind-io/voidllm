@@ -15,7 +15,8 @@ import { useDashboardStats } from '../hooks/useDashboardStats'
 import type { BudgetWarning } from '../hooks/useDashboardStats'
 import { useTopModels } from '../hooks/useTopModels'
 import type { UsageDataPoint } from '../hooks/useTopModels'
-import { useUsage } from '../hooks/useUsage'
+import { useUsage, useMyUsage } from '../hooks/useUsage'
+import type { UsageRange } from '../lib/timeRange'
 import { useOrg } from '../hooks/useOrg'
 import { useModelHealth } from '../hooks/useModelHealth'
 import type { ModelHealthInfo } from '../hooks/useModelHealth'
@@ -28,13 +29,9 @@ import { formatTokens, formatCost, formatNumber } from '../lib/utils'
 
 type TimeRange = '24h' | '7d' | '30d'
 
-function getTimeRange(range: TimeRange): { from: string; to: string } {
-  const to = new Date()
-  const from = new Date()
-  if (range === '24h') from.setHours(from.getHours() - 24)
-  else if (range === '7d') from.setDate(from.getDate() - 7)
-  else from.setDate(from.getDate() - 30)
-  return { from: from.toISOString(), to: to.toISOString() }
+/** Dashboard ranges use calendar arithmetic (setHours/setDate) when resolved. */
+function toUsageRange(range: TimeRange): UsageRange {
+  return `${range}-cal`
 }
 
 // ---------------------------------------------------------------------------
@@ -338,22 +335,26 @@ export default function DashboardPage() {
   )
 
   // Time-series data for the area chart
-  const { from, to } = useMemo(() => getTimeRange(timeRange), [timeRange])
-  const { from: from24h } = useMemo(() => getTimeRange('24h'), [])
+  const usageRange = toUsageRange(timeRange)
 
-  const { data: usageSeries, isLoading: seriesLoading } = useUsage(
+  const { data: orgUsageSeries, isLoading: orgSeriesLoading } = useUsage(
     orgId,
-    from,
-    to,
+    usageRange,
     'day',
+    { enabled: canViewOrgUsage },
   )
+  const { data: myUsageSeries, isLoading: mySeriesLoading } = useMyUsage(usageRange, 'day', {
+    enabled: me !== undefined && !canViewOrgUsage,
+  })
+  const usageSeries = canViewOrgUsage ? orgUsageSeries : myUsageSeries
+  const seriesLoading = canViewOrgUsage ? orgSeriesLoading : mySeriesLoading
 
-  // Team usage (admin only)
+  // Team usage (admin only), always a true last-24h window
   const { data: teamUsage, isLoading: teamUsageLoading } = useUsage(
     orgId,
-    from24h,
-    to,
+    '24h-cal',
     'team',
+    { enabled: canViewOrgUsage },
   )
 
   const scope = stats?.scope ?? 'user'

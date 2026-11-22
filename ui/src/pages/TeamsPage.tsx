@@ -219,12 +219,13 @@ export default function TeamsPage() {
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [deleteTeamId, setDeleteTeamId] = useState<string | null>(null)
 
-  const { data: teams, isLoading } = useTeams(orgId, cursor)
+  const { data: teams, isLoading } = useTeams(orgId, cursor, { summary: true })
   const deleteTeam = useDeleteTeam(orgId)
   const { toast } = useToast()
 
-  const totalMembers = (teams?.data ?? []).reduce((sum, t) => sum + t.member_count, 0)
-  const totalKeys = (teams?.data ?? []).reduce((sum, t) => sum + t.key_count, 0)
+  const totalTeams = teams?.summary?.total ?? '-'
+  const totalMembers = teams?.summary?.members ?? '-'
+  const totalKeys = teams?.summary?.keys ?? '-'
 
   const columns: Column<TeamResponse>[] = [
     {
@@ -322,7 +323,7 @@ export default function TeamsPage() {
       <div className="grid grid-cols-3 gap-4 mb-6">
         <StatCard
           label="Total Teams"
-          value={teams?.data?.length ?? 0}
+          value={totalTeams}
           icon={<IconTeam />}
           iconColor="purple"
         />

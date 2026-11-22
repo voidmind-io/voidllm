@@ -23,13 +23,13 @@ function row(overrides: Record<string, unknown>) {
   }
 }
 
-function stubFetch(data: unknown[]) {
+function stubFetch(data: unknown[], role = 'org_admin') {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === 'string' ? input : input.toString()
       const body = url.includes('/api/v1/me')
-        ? { id: 'u1', email: 'a@b.c', display_name: 'A', role: 'org_admin', org_id: 'org-1', is_system_admin: false }
+        ? { id: 'u1', email: 'a@b.c', display_name: 'A', role, org_id: 'org-1', is_system_admin: false }
         : { org_id: 'org-1', from: '', to: '', group_by: 'model', data }
       return { ok: true, status: 200, json: () => Promise.resolve(body) }
     }),
@@ -87,5 +87,26 @@ describe('LLMUsagePage cache columns', () => {
     const keys = headers.map((h) => h.key)
     expect(keys).toContain('cached_read_tokens')
     expect(keys).toContain('cache_write_tokens')
+  })
+})
+
+describe('LLMUsagePage role-aware data', () => {
+  it('uses /usage/me and never the org endpoint for members', async () => {
+    stubFetch([row({})], 'member')
+    renderPage()
+    expect(await screen.findByText('Your usage')).toBeInTheDocument()
+    await screen.findAllByText('gpt-4o')
+    const urls = vi.mocked(fetch).mock.calls.map((c) => String(c[0]))
+    expect(urls.some((u) => u.includes('/usage/me'))).toBe(true)
+    expect(urls.some((u) => /\/orgs\/org-1\/usage/.test(u))).toBe(false)
+  })
+
+  it('uses the org endpoint for org admins', async () => {
+    stubFetch([row({})], 'org_admin')
+    renderPage()
+    await screen.findAllByText('gpt-4o')
+    const urls = vi.mocked(fetch).mock.calls.map((c) => String(c[0]))
+    expect(urls.some((u) => /\/orgs\/org-1\/usage/.test(u))).toBe(true)
+    expect(urls.some((u) => u.includes('/usage/me'))).toBe(false)
   })
 })

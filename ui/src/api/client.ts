@@ -2,6 +2,17 @@ import { LOCAL_STORAGE_KEY } from '../lib/constants'
 import { clearSession } from '../lib/session'
 import { queryClient } from '../lib/queryClient'
 
+/** Error thrown for non-OK API responses, carrying the HTTP status. */
+export class ApiError extends Error {
+  status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
 const apiClient = async <T>(endpoint: string, options?: RequestInit): Promise<T> => {
   const key = localStorage.getItem(LOCAL_STORAGE_KEY) ?? ''
   const res = await fetch(`/api/v1${endpoint}`, {
@@ -22,7 +33,8 @@ const apiClient = async <T>(endpoint: string, options?: RequestInit): Promise<T>
 
   if (!res.ok) {
     const error = await res.json().catch(() => ({ error: { message: res.statusText } }))
-    throw new Error(
+    throw new ApiError(
+      res.status,
       (error as { error?: { message?: string } })?.error?.message ?? 'Unknown error',
     )
   }

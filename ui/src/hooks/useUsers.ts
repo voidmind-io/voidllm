@@ -22,8 +22,15 @@ export interface CreateUserParams {
   role?: string
 }
 
+export interface UsersSummary {
+  total: number
+  system_admins: number
+  sso: number
+}
+
 export interface PaginatedUsers {
   data: UserResponse[]
+  summary?: UsersSummary
   has_more: boolean
   next_cursor?: string
 }
@@ -37,13 +44,14 @@ export function useUser(userId: string) {
   })
 }
 
-export function useUsers(cursor?: string) {
+export function useUsers(cursor?: string, opts?: { summary?: boolean }) {
+  const summary = opts?.summary ?? false
+  const params = new URLSearchParams({ limit: '20' })
+  if (cursor) params.set('cursor', cursor)
+  if (summary) params.set('summary', 'true')
   return useQuery({
-    queryKey: ['users-list', cursor],
-    queryFn: () =>
-      apiClient<PaginatedUsers>(
-        `/users?limit=20${cursor ? `&cursor=${cursor}` : ''}`,
-      ),
+    queryKey: ['users-list', cursor, summary],
+    queryFn: () => apiClient<PaginatedUsers>(`/users?${params}`),
   })
 }
 

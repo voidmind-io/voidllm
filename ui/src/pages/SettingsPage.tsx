@@ -1,4 +1,5 @@
 import React, { useState } from 'react'
+import { ApiError } from '../api/client'
 import { Input } from '../components/ui/Input'
 import { Button } from '../components/ui/Button'
 import { useMe } from '../hooks/useMe'
@@ -236,7 +237,7 @@ interface OrgSettingsCardProps {
 }
 
 function OrgSettingsCard({ orgId, readOnly }: OrgSettingsCardProps) {
-  const { data: org, isLoading } = useOrg(orgId)
+  const { data: org, isLoading, error } = useOrg(orgId)
 
   return (
     <div className="rounded-lg border border-border bg-bg-secondary">
@@ -244,7 +245,15 @@ function OrgSettingsCard({ orgId, readOnly }: OrgSettingsCardProps) {
         <h2 className="text-sm font-semibold text-text-primary">Organization</h2>
       </div>
 
-      {isLoading || !org ? (
+      {error ? (
+        <div className="p-6">
+          <p className="text-sm text-text-tertiary">
+            {error instanceof ApiError && error.status === 403
+              ? 'Only organization admins can view organization settings.'
+              : 'Failed to load organization settings.'}
+          </p>
+        </div>
+      ) : isLoading || !org ? (
         <div className="p-6 space-y-4">
           <div className="h-4 w-32 rounded bg-bg-tertiary animate-pulse" />
           <div className="h-9 w-full rounded bg-bg-tertiary animate-pulse" />

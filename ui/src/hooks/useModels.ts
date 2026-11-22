@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query'
 import apiClient from '../api/client'
 
 export interface DeploymentResponse {
@@ -135,6 +135,12 @@ export interface UpdateModelParams {
   pii_filter?: boolean | null
 }
 
+function invalidateModelQueries(queryClient: QueryClient): void {
+  for (const key of ['models', 'available-models', 'model-health', 'model-access', 'team-model-access']) {
+    queryClient.invalidateQueries({ queryKey: [key] })
+  }
+}
+
 export function useModels(cursor?: string) {
   const params = new URLSearchParams({ limit: '50', include_inactive: 'true' })
   if (cursor) params.set('cursor', cursor)
@@ -153,7 +159,7 @@ export function useCreateModel() {
         body: JSON.stringify(params),
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['models'] })
+      invalidateModelQueries(queryClient)
     },
   })
 }
@@ -164,7 +170,7 @@ export function useDeleteModel() {
     mutationFn: (modelId: string) =>
       apiClient<void>(`/models/${modelId}`, { method: 'DELETE' }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['models'] })
+      invalidateModelQueries(queryClient)
     },
   })
 }
@@ -178,7 +184,7 @@ export function useUpdateModel() {
         body: JSON.stringify(params),
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['models'] })
+      invalidateModelQueries(queryClient)
     },
   })
 }
@@ -191,7 +197,7 @@ export function useToggleModel() {
         method: 'PATCH',
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['models'] })
+      invalidateModelQueries(queryClient)
     },
   })
 }
@@ -205,7 +211,7 @@ export function useCreateDeployment() {
         body: JSON.stringify(params),
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['models'] })
+      invalidateModelQueries(queryClient)
     },
   })
 }
@@ -219,7 +225,7 @@ export function useUpdateDeployment() {
         body: JSON.stringify(params),
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['models'] })
+      invalidateModelQueries(queryClient)
     },
   })
 }
@@ -232,7 +238,7 @@ export function useDeleteDeployment() {
         method: 'DELETE',
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['models'] })
+      invalidateModelQueries(queryClient)
     },
   })
 }

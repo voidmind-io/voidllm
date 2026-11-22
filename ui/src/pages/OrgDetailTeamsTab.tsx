@@ -155,13 +155,13 @@ export default function OrgDetailTeamsTab() {
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [deleteTeamId, setDeleteTeamId] = useState<string | null>(null)
 
-  const { data: teams, isLoading } = useTeams(orgId, cursor)
+  const { data: teams, isLoading } = useTeams(orgId, cursor, { summary: true })
   const deleteTeam = useDeleteTeam(orgId)
   const { toast } = useToast()
 
   const teamList = teams?.data ?? []
-  const totalTeams = teamList.length
-  const totalMembers = teamList.reduce((sum, t) => sum + (t.member_count ?? 0), 0)
+  const totalTeams = teams?.summary?.total ?? '-'
+  const totalMembers = teams?.summary?.members ?? '-'
 
   const columns: Column<TeamResponse>[] = [
     {

@@ -11,6 +11,16 @@ const originalLocation = window.location
 function mockFetch(logout: () => Promise<Response>) {
   const fn = vi.fn(async (url: string) => {
     if (url.endsWith('/auth/logout')) return logout()
+    if (url.endsWith('/system/update-check')) {
+      return new Response(
+        JSON.stringify({
+          current_version: '0.0.27',
+          needs_update: true,
+          release_url: 'https://example.com/r',
+        }),
+        { status: 200 },
+      )
+    }
     if (url.endsWith('/license')) {
       return new Response(JSON.stringify({ plan: 'free', features: [] }), { status: 200 })
     }
@@ -68,5 +78,21 @@ describe('Sidebar logout', () => {
     await waitFor(() => expect(window.location.href).toBe('/login'))
     expect(localStorage.getItem(LOCAL_STORAGE_KEY)).toBeNull()
     expect(localStorage.getItem(SESSION_EXPIRY_KEY)).toBeNull()
+  })
+})
+
+describe('Sidebar version', () => {
+  it('shows the current version but no update link for non-admins', async () => {
+    mockFetch(async () => new Response(null, { status: 204 }))
+    renderSidebar()
+    expect(await screen.findByText('VoidLLM 0.0.27')).toBeInTheDocument()
+    expect(screen.queryByText('Update available')).not.toBeInTheDocument()
+  })
+
+  it('hides cost reports for members', async () => {
+    mockFetch(async () => new Response(null, { status: 204 }))
+    renderSidebar()
+    await screen.findByText('VoidLLM 0.0.27')
+    expect(screen.queryByText('Cost Reports')).not.toBeInTheDocument()
   })
 })

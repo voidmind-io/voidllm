@@ -1,5 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import apiClient from '../api/client'
+import { resolveRange } from '../lib/timeRange'
+import type { UsageRange } from '../lib/timeRange'
 
 export interface UsageDataPoint {
   group_key: string
@@ -23,29 +25,64 @@ export interface UsageResponse {
   data: UsageDataPoint[]
 }
 
-export function useUsage(orgId: string, from: string, to: string, groupBy: string) {
+/** Options shared by the usage query hooks. */
+export interface UsageQueryOptions {
+  enabled?: boolean
+  refetchInterval?: number | false
+}
+
+const DEFAULT_REFETCH_MS = 60_000
+
+export function useUsage(
+  orgId: string,
+  range: UsageRange,
+  groupBy: string,
+  opts?: UsageQueryOptions,
+) {
   return useQuery({
-    queryKey: ['usage', orgId, from, to, groupBy],
-    queryFn: () =>
-      apiClient<UsageResponse>(
+    queryKey: ['usage', orgId, range, groupBy],
+    queryFn: () => {
+      const { from, to } = resolveRange(range)
+      return apiClient<UsageResponse>(
         `/orgs/${orgId}/usage?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&group_by=${groupBy}`,
-      ),
-    enabled: !!orgId && !!from && !!to,
+      )
+    },
+    enabled: !!orgId && (opts?.enabled ?? true),
     staleTime: 60_000,
+    refetchInterval: opts?.refetchInterval ?? DEFAULT_REFETCH_MS,
+  })
+}
+
+/** Usage of the calling user only (GET /usage/me). Available to every role. */
+export function useMyUsage(range: UsageRange, groupBy: string, opts?: UsageQueryOptions) {
+  return useQuery({
+    queryKey: ['my-usage', range, groupBy],
+    queryFn: () => {
+      const { from, to } = resolveRange(range)
+      const query = new URLSearchParams({ from, to, group_by: groupBy })
+      return apiClient<UsageResponse>(`/usage/me?${query.toString()}`)
+    },
+    enabled: opts?.enabled ?? true,
+    staleTime: 60_000,
+    refetchInterval: opts?.refetchInterval ?? DEFAULT_REFETCH_MS,
   })
 }
 
 export function useCrossOrgUsage(
-  params: { from: string; to: string; groupBy: string },
+  params: { range: UsageRange; groupBy: string },
   enabled: boolean,
 ) {
-  const { from, to, groupBy } = params
-  const query = new URLSearchParams({ from, to, group_by: groupBy })
+  const { range, groupBy } = params
 
   return useQuery({
-    queryKey: ['cross-org-usage', from, to, groupBy],
-    queryFn: () => apiClient<UsageResponse>(`/usage?${query.toString()}`),
-    enabled: enabled && !!from && !!to,
+    queryKey: ['cross-org-usage', range, groupBy],
+    queryFn: () => {
+      const { from, to } = resolveRange(range)
+      const query = new URLSearchParams({ from, to, group_by: groupBy })
+      return apiClient<UsageResponse>(`/usage?${query.toString()}`)
+    },
+    enabled,
     staleTime: 60_000,
+    refetchInterval: DEFAULT_REFETCH_MS,
   })
 }

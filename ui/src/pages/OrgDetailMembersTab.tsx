@@ -43,10 +43,6 @@ function roleLabel(role: string): string {
   return labels[role] ?? role
 }
 
-function isAdminRole(role: string): boolean {
-  return role === 'org_admin' || role === 'system_admin'
-}
-
 // ---------------------------------------------------------------------------
 // UserCell
 // ---------------------------------------------------------------------------
@@ -246,13 +242,13 @@ export default function OrgDetailMembersTab() {
   const [showInviteDialog, setShowInviteDialog] = useState(false)
   const [deleteMembershipId, setDeleteMembershipId] = useState<string | null>(null)
 
-  const { data: members, isLoading } = useOrgMembers(orgId, cursor)
+  const { data: members, isLoading } = useOrgMembers(orgId, cursor, { summary: true })
   const deleteMember = useDeleteOrgMember(orgId)
   const { toast } = useToast()
 
   const memberList = members?.data ?? []
-  const totalMembers = memberList.length
-  const adminCount = memberList.filter((m) => isAdminRole(m.role)).length
+  const totalMembers = members?.summary?.total ?? '-'
+  const adminCount = members?.summary?.admins ?? '-'
 
   const columns: Column<OrgMembershipResponse>[] = [
     {

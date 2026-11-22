@@ -3,6 +3,7 @@ import { NavLink, Link } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { useMe } from '../../hooks/useMe'
 import { useLicense } from '../../hooks/useLicense'
+import { useUpdateCheck } from '../../hooks/useUpdateCheck'
 import { clearSession } from '../../lib/session'
 import { logoutRequest } from '../../api/auth'
 
@@ -210,7 +211,7 @@ function buildNavigation(hasFeature: (f: string) => boolean): NavGroup[] {
       label: 'Analytics',
       items: [
         { label: 'Usage', path: '/usage', icon: <IconBarChart /> },
-        { label: 'Cost Reports', path: '/cost-reports', icon: <IconDollar />, locked: !hasFeature('cost_reports') },
+        { label: 'Cost Reports', path: '/cost-reports', icon: <IconDollar />, minRole: 'org_admin', locked: !hasFeature('cost_reports') },
       ],
     },
     {
@@ -262,6 +263,7 @@ function LockIcon() {
 export function Sidebar() {
   const { data } = useMe()
   const { data: license } = useLicense()
+  const { data: updateInfo } = useUpdateCheck()
   const queryClient = useQueryClient()
 
   const userRole = data?.role ?? 'member'
@@ -351,6 +353,21 @@ export function Sidebar() {
           </Link>
           <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-semibold text-accent uppercase">{formatRole(data?.role)}</span>
         </div>
+        {updateInfo?.current_version && (
+          <div className="flex items-center justify-between mb-2 text-[11px] text-text-tertiary">
+            <span>VoidLLM {updateInfo.current_version}</span>
+            {data?.is_system_admin && updateInfo.needs_update && updateInfo.release_url && (
+              <a
+                href={updateInfo.release_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-accent hover:underline no-underline"
+              >
+                Update available
+              </a>
+            )}
+          </div>
+        )}
         <div className="flex gap-2">
           <Link
             to="/profile"

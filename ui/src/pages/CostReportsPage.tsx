@@ -9,6 +9,8 @@ import { useMe } from '../hooks/useMe'
 import { useLicense } from '../hooks/useLicense'
 import { useUsage } from '../hooks/useUsage'
 import type { UsageDataPoint } from '../hooks/useUsage'
+import { AdminOnlyNotice } from '../components/ui/AdminOnlyNotice'
+import { isOrgAdmin } from '../lib/roles'
 import { formatNumber, formatCost } from '../lib/utils'
 import { exportData } from '../lib/export'
 import { cacheHitRate, formatHitRate, sumSavings } from '../lib/cache'
@@ -37,12 +39,6 @@ const RANGE_DAYS: Record<TimeRange, number> = {
   '7d': 7,
   '30d': 30,
   '90d': 90,
-}
-
-function getTimeRange(range: TimeRange): { from: string; to: string } {
-  const now = new Date()
-  const from = new Date(now.getTime() - RANGE_DAYS[range] * 86_400_000)
-  return { from: from.toISOString(), to: now.toISOString() }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,17 +243,15 @@ const dayColumns: Column<DayCostRow>[] = [
 // CostReportsPage
 // ---------------------------------------------------------------------------
 
-export default function CostReportsPage() {
+function CostReportsContent() {
   const [range, setRange] = useState<TimeRange>('30d')
   const { data: me } = useMe()
   const { data: license } = useLicense()
   const orgId = me?.org_id ?? ''
 
   const featureEnabled = !license || license.features.includes('cost_reports')
-  const { from, to } = useMemo(() => getTimeRange(range), [range])
-
-  const { data: modelUsage, isLoading: modelLoading } = useUsage(orgId, from, to, 'model')
-  const { data: dayUsage, isLoading: dayLoading } = useUsage(orgId, from, to, 'day')
+  const { data: modelUsage, isLoading: modelLoading } = useUsage(orgId, range, 'model')
+  const { data: dayUsage, isLoading: dayLoading } = useUsage(orgId, range, 'day')
 
   // Compute totals and model rows
   const { totalCost, modelRows, avgCostPerDay, topModel, cacheSavings } = useMemo(() => {
@@ -422,4 +416,17 @@ export default function CostReportsPage() {
       </div>
     </>
   )
+}
+
+export default function CostReportsPage() {
+  const { data: me } = useMe()
+  if (me && !isOrgAdmin(me)) {
+    return (
+      <>
+        <PageHeader title="Cost Reports" />
+        <AdminOnlyNotice message="Only organization admins can view cost reports." />
+      </>
+    )
+  }
+  return <CostReportsContent />
 }

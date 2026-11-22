@@ -14,8 +14,14 @@ export interface OrgMembershipResponse {
   created_at: string
 }
 
+export interface OrgMembersSummary {
+  total: number
+  admins: number
+}
+
 interface PaginatedOrgMemberships {
   data: OrgMembershipResponse[]
+  summary?: OrgMembersSummary
   has_more: boolean
   next_cursor?: string
 }
@@ -33,11 +39,13 @@ export interface UpdateOrgMemberParams {
   requests_per_day?: number
 }
 
-export function useOrgMembers(orgId: string, cursor?: string) {
+export function useOrgMembers(orgId: string, cursor?: string, opts?: { summary?: boolean }) {
+  const summary = opts?.summary ?? false
   const params = new URLSearchParams({ limit: '20' })
   if (cursor) params.set('cursor', cursor)
+  if (summary) params.set('summary', 'true')
   return useQuery({
-    queryKey: ['org-members', orgId, cursor],
+    queryKey: ['org-members', orgId, cursor, summary],
     queryFn: () =>
       apiClient<PaginatedOrgMemberships>(`/orgs/${orgId}/members?${params}`),
     enabled: !!orgId,
@@ -78,6 +86,8 @@ export function useUpdateOrgMember(orgId: string) {
       ),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['org-members', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['team-members'] })
+      queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
     },
   })
 }
@@ -92,6 +102,8 @@ export function useDeleteOrgMember(orgId: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['org-members', orgId] })
       queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] })
+      queryClient.invalidateQueries({ queryKey: ['team-members'] })
+      queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
     },
   })
 }

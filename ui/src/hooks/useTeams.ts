@@ -16,8 +16,15 @@ export interface TeamResponse {
   updated_at: string
 }
 
+export interface TeamsSummary {
+  total: number
+  members: number
+  keys: number
+}
+
 interface PaginatedTeams {
   data: TeamResponse[]
+  summary?: TeamsSummary
   has_more: boolean
   next_cursor?: string
 }
@@ -54,11 +61,13 @@ export function useUpdateTeam(orgId: string, teamId: string) {
   })
 }
 
-export function useTeams(orgId: string, cursor?: string) {
+export function useTeams(orgId: string, cursor?: string, opts?: { summary?: boolean }) {
+  const summary = opts?.summary ?? false
   const params = new URLSearchParams({ limit: '20' })
   if (cursor) params.set('cursor', cursor)
+  if (summary) params.set('summary', 'true')
   return useQuery({
-    queryKey: ['teams', orgId, cursor],
+    queryKey: ['teams', orgId, cursor, summary],
     queryFn: () => apiClient<PaginatedTeams>(`/orgs/${orgId}/teams?${params}`),
     enabled: !!orgId,
   })

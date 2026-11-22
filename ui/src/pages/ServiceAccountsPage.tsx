@@ -425,13 +425,14 @@ export default function ServiceAccountsPage() {
   const [deleteId, setDeleteId] = useState<string | null>(null)
   const [editSa, setEditSa] = useState<ServiceAccountResponse | null>(null)
 
-  const { data: serviceAccounts, isLoading } = useServiceAccounts(orgId, cursor)
+  const { data: serviceAccounts, isLoading } = useServiceAccounts(orgId, cursor, { summary: true })
   const deleteServiceAccount = useDeleteServiceAccount(orgId)
   const { toast } = useToast()
 
   const allSAs = serviceAccounts?.data ?? []
-  const orgScopedCount = allSAs.filter((sa) => !sa.team_id).length
-  const teamScopedCount = allSAs.filter((sa) => !!sa.team_id).length
+  const totalSAs = serviceAccounts?.summary?.total ?? '-'
+  const orgScopedCount = serviceAccounts?.summary?.org_scoped ?? '-'
+  const teamScopedCount = serviceAccounts?.summary?.team_scoped ?? '-'
 
   const columns: Column<ServiceAccountResponse>[] = [
     {
@@ -527,7 +528,7 @@ export default function ServiceAccountsPage() {
       <div className="grid grid-cols-3 gap-4 mb-6">
         <StatCard
           label="Total Service Accounts"
-          value={allSAs.length}
+          value={totalSAs}
           icon={<IconBot />}
           iconColor="purple"
         />

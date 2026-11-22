@@ -393,3 +393,38 @@ describe('OrgUsersPage — EditLimitsDialog', () => {
     expect(capturedBodies.has('PATCH:/api/v1/orgs/org-1/members/mem-2')).toBe(false)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Tests: stat cards use backend summary
+// ---------------------------------------------------------------------------
+
+describe('OrgUsersPage - summary stat cards', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('shows summary totals, requests summary=true and has no Active card', async () => {
+    const entries = defaultEntries(MOCK_ME_ADMIN, [MEMBER_UNLIMITED])
+    entries[1] = {
+      matcher: (u) => u.includes('/api/v1/orgs/org-1/members'),
+      method: 'GET',
+      response: { data: [MEMBER_UNLIMITED], has_more: false, summary: { total: 42, admins: 7 } },
+    }
+    setupFetchMock(entries)
+    renderOrgUsersPage()
+
+    const total = await screen.findByRole('group', { name: 'Total Members' })
+    await waitFor(() => expect(total).toHaveTextContent('42'))
+    expect(screen.getByRole('group', { name: 'Admins' })).toHaveTextContent('7')
+    expect(screen.queryByRole('group', { name: 'Active' })).not.toBeInTheDocument()
+    const urls = vi.mocked(fetch).mock.calls.map((c) => String(c[0]))
+    expect(urls.some((u) => u.includes('/members') && u.includes('summary=true'))).toBe(true)
+  })
+
+  it('shows a hyphen when the summary is absent', async () => {
+    setupFetchMock(defaultEntries(MOCK_ME_ADMIN, [MEMBER_UNLIMITED]))
+    renderOrgUsersPage()
+    await screen.findByText('Alice')
+    expect(screen.getByRole('group', { name: 'Total Members' })).toHaveTextContent('-')
+  })
+})
