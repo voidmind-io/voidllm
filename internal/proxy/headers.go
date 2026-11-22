@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
@@ -62,7 +63,8 @@ func setUpstreamHeaders(req *http.Request, c fiber.Ctx, model Model) {
 // copyResponseHeaders copies allowlisted upstream response headers onto the
 // Fiber response context. Hop-by-hop headers and implementation-detail headers
 // such as Server and X-Powered-By are never forwarded. X-RateLimit-* headers
-// from the upstream are forwarded verbatim so clients can observe rate limits.
+// and Anthropic-RateLimit-* headers from the upstream are forwarded verbatim so
+// clients can observe rate limits.
 func copyResponseHeaders(c fiber.Ctx, resp *http.Response) {
 	for _, h := range allowedResponseHeaders {
 		if v := resp.Header.Get(h); v != "" {
@@ -70,14 +72,89 @@ func copyResponseHeaders(c fiber.Ctx, resp *http.Response) {
 		}
 	}
 
+	// Anthropic correlation and rate-limit headers carry no secrets and let
+	// native Messages clients observe their upstream quota.
+	if v := resp.Header.Get("Request-Id"); v != "" {
+		c.Set("Request-Id", v)
+	}
+
 	for key, values := range resp.Header {
 		if hopByHopHeaders[key] {
 			continue
 		}
-		if strings.HasPrefix(key, "X-Ratelimit") || strings.HasPrefix(key, "X-RateLimit") {
+		if strings.HasPrefix(key, "X-Ratelimit") || strings.HasPrefix(key, "X-RateLimit") ||
+			strings.HasPrefix(key, "Anthropic-Ratelimit-") {
 			for _, v := range values {
 				c.Set(key, v)
 			}
+		}
+	}
+}
+
+// maxBetaHeaderLen caps the total length of a forwarded anthropic-beta or
+// OpenAI-Beta header value.
+const maxBetaHeaderLen = 512
+
+// defaultAnthropicVersion is the anthropic-version sent upstream when the
+// client supplies none or an invalid one.
+const defaultAnthropicVersion = "2023-06-01"
+
+var (
+	// anthropicVersionRe matches the date-shaped anthropic-version header value.
+	anthropicVersionRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	// anthropicBetaTokenRe matches one anthropic-beta feature token.
+	anthropicBetaTokenRe = regexp.MustCompile(`^[a-z0-9-]+$`)
+	// openAIBetaTokenRe matches one OpenAI-Beta token. It additionally allows
+	// "_", "." and "=" because OpenAI beta flags have the form name=version.
+	openAIBetaTokenRe = regexp.MustCompile(`^[a-z0-9._=-]+$`)
+)
+
+// validAnthropicVersion returns v when it is a date-shaped anthropic-version
+// value and the default version otherwise.
+func validAnthropicVersion(v string) string {
+	if anthropicVersionRe.MatchString(v) {
+		return v
+	}
+	return defaultAnthropicVersion
+}
+
+// validBetaList reports whether v is a comma-separated list of tokens that all
+// match tokenRe, at most maxBetaHeaderLen bytes long in total. Whitespace
+// around tokens is rejected so the value can be forwarded verbatim. An empty
+// value is not valid.
+func validBetaList(v string, tokenRe *regexp.Regexp) bool {
+	if v == "" || len(v) > maxBetaHeaderLen {
+		return false
+	}
+	for _, tok := range strings.Split(v, ",") {
+		if !tokenRe.MatchString(tok) {
+			return false
+		}
+	}
+	return true
+}
+
+// setNativeHeaders applies the headers of a native (non-translated) endpoint on
+// top of the base upstream headers set by setUpstreamHeaders. For the Messages
+// format the Bearer Authorization is replaced by x-api-key from the model
+// configuration and anthropic-version / anthropic-beta are forwarded after
+// validation. For the Responses format OpenAI-Beta is forwarded after
+// validation. Invalid beta values are dropped silently.
+func setNativeHeaders(req *http.Request, c fiber.Ctx, model Model, format apiFormat) {
+	switch format {
+	case formatMessages:
+		req.Header.Del("Authorization")
+		if model.APIKey != "" {
+			req.Header.Set("x-api-key", model.APIKey)
+		}
+		req.Header.Set("anthropic-version", validAnthropicVersion(c.Get("anthropic-version")))
+		if v := c.Get("anthropic-beta"); validBetaList(v, anthropicBetaTokenRe) {
+			req.Header.Set("anthropic-beta", v)
+		}
+		req.Header.Set("Content-Type", "application/json")
+	case formatResponses:
+		if v := c.Get("OpenAI-Beta"); validBetaList(v, openAIBetaTokenRe) {
+			req.Header.Set("OpenAI-Beta", v)
 		}
 	}
 }

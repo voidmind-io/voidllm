@@ -100,19 +100,24 @@ type KeyInfo struct {
 	UserRequestsPerDay int
 }
 
-// Middleware returns a Fiber handler that authenticates requests via Bearer token.
-// It extracts the token, computes HMAC-SHA256 with hmacSecret, looks up the hash
-// in keyCache, checks expiration, and stores the KeyInfo in the request context.
+// Middleware returns a Fiber handler that authenticates requests via Bearer token
+// or, when no Bearer token is present, the x-api-key header. It computes
+// HMAC-SHA256 of the token with hmacSecret, looks up the hash in keyCache,
+// checks expiration, and stores the KeyInfo in the request context.
 func Middleware(keyCache *cache.Cache[string, KeyInfo], hmacSecret []byte) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		auth := c.Get("Authorization")
-		token := extractBearerToken(auth)
+		// A Bearer token wins; the x-api-key header (the Anthropic SDK default)
+		// is only consulted when no Bearer token is present.
+		token := extractBearerToken(c.Get("Authorization"))
 		if token == "" {
-			return apierror.Unauthorized(c, "missing authorization header")
+			token = strings.TrimSpace(c.Get("x-api-key"))
+		}
+		if token == "" {
+			return apierror.SendProxy(c, fiber.StatusUnauthorized, "unauthorized", "missing authorization header")
 		}
 
 		if _, err := keygen.ValidatePrefix(token); err != nil {
-			return apierror.Unauthorized(c, "invalid API key format")
+			return apierror.SendProxy(c, fiber.StatusUnauthorized, "unauthorized", "invalid API key format")
 		}
 
 		// Hash is used as a cache map key. Map lookup is not constant-time, but
@@ -121,12 +126,12 @@ func Middleware(keyCache *cache.Cache[string, KeyInfo], hmacSecret []byte) fiber
 		hash := keygen.Hash(token, hmacSecret)
 		keyInfo, ok := keyCache.Get(hash)
 		if !ok {
-			return apierror.Unauthorized(c, "invalid API key")
+			return apierror.SendProxy(c, fiber.StatusUnauthorized, "unauthorized", "invalid API key")
 		}
 
 		if keyInfo.ExpiresAt != nil && time.Now().After(*keyInfo.ExpiresAt) {
 			keyCache.Delete(hash)
-			return apierror.Unauthorized(c, "invalid API key")
+			return apierror.SendProxy(c, fiber.StatusUnauthorized, "unauthorized", "invalid API key")
 		}
 
 		keyInfo.Hash = hash
