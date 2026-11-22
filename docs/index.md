@@ -21,6 +21,10 @@ Privacy-first LLM proxy and AI gateway. Self-hosted, single binary, sub-500us ov
 - [Reverse Proxy](deployment/reverse-proxy.md) - Nginx, Caddy, Traefik
 - [Database](deployment/database.md) - SQLite, PostgreSQL, migration
 
+## Guides
+
+- [Coding Agents for Teams](guides/coding-agents.md) - one key per developer, budgets per team, which tools work through the proxy
+
 ## Models
 
 - [Provider Setup](models/providers.md) - OpenAI, Anthropic, Azure, AWS Bedrock, Ollama, vLLM, custom
