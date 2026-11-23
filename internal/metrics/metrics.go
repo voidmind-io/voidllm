@@ -74,6 +74,16 @@ var RateLimitRejectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Total requests rejected by rate limiting.",
 }, []string{"scope"})
 
+// BudgetBackendErrorsTotal counts failures of the shared (Redis) budget
+// counter backend, partitioned by operation: "check" for a failed budget read
+// (the check falls back to the local counters), "flush" for a failed counter
+// increment, "seed" for a failed rehydration from the database, and
+// "queue_full" for an increment dropped because the write queue was full.
+var BudgetBackendErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "voidllm_budget_backend_errors_total",
+	Help: "Total errors of the shared budget counter backend.",
+}, []string{"op"})
+
 // CircuitBreakerRejectionsTotal counts requests rejected because the circuit
 // breaker for a model is in the open state, partitioned by model name.
 var CircuitBreakerRejectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{

@@ -23,24 +23,25 @@ type rollupKey struct {
 // database in batches. It is safe for concurrent use. The zero value is not
 // usable; construct via NewLogger.
 type Logger struct {
-	events       chan Event
-	database     *db.DB
-	log          *slog.Logger
-	batchSize    int
-	interval     time.Duration
-	dropOnFull   bool
-	done         chan struct{}
-	stopped      chan struct{}           // closed by run() when it exits
-	tokenCounter *ratelimit.TokenCounter // nil disables in-memory token counting
+	events     chan Event
+	database   *db.DB
+	log        *slog.Logger
+	batchSize  int
+	interval   time.Duration
+	dropOnFull bool
+	done       chan struct{}
+	stopped    chan struct{}           // closed by run() when it exits
+	budget     ratelimit.BudgetCounter // nil disables budget counting
 }
 
 // NewLogger constructs a Logger wired to the given database connection.
 // cfg controls the channel buffer size, flush interval, and drop-on-full
 // behaviour. log is used to report flush errors without propagating them.
-// tokenCounter, when non-nil, is incremented immediately in Log() before the
-// event is enqueued so that CheckTokens sees up-to-date counts without waiting
-// for the async DB flush.
-func NewLogger(database *db.DB, cfg config.UsageConfig, log *slog.Logger, tokenCounter *ratelimit.TokenCounter) *Logger {
+// budget, when non-nil, is incremented immediately in Log() before the event
+// is enqueued so that budget checks see up-to-date counts without waiting for
+// the async DB flush. Pass a nil interface, not a nil pointer of a concrete
+// counter type, to disable budget counting.
+func NewLogger(database *db.DB, cfg config.UsageConfig, log *slog.Logger, budget ratelimit.BudgetCounter) *Logger {
 	bufferSize := cfg.BufferSize
 	if bufferSize <= 0 {
 		bufferSize = 1000
@@ -51,15 +52,15 @@ func NewLogger(database *db.DB, cfg config.UsageConfig, log *slog.Logger, tokenC
 	}
 
 	return &Logger{
-		events:       make(chan Event, bufferSize),
-		database:     database,
-		log:          log,
-		batchSize:    bufferSize,
-		interval:     interval,
-		dropOnFull:   cfg.ShouldDropOnFull(),
-		done:         make(chan struct{}),
-		stopped:      make(chan struct{}),
-		tokenCounter: tokenCounter,
+		events:     make(chan Event, bufferSize),
+		database:   database,
+		log:        log,
+		batchSize:  bufferSize,
+		interval:   interval,
+		dropOnFull: cfg.ShouldDropOnFull(),
+		done:       make(chan struct{}),
+		stopped:    make(chan struct{}),
+		budget:     budget,
 	}
 }
 
@@ -83,8 +84,8 @@ func (l *Logger) BufferLen() int {
 	return len(l.events)
 }
 
-// Log enqueues an event for async persistence. When a TokenCounter is wired it
-// is incremented immediately — before the channel send — so that in-flight
+// Log enqueues an event for async persistence. When a BudgetCounter is wired
+// it is incremented immediately — before the channel send — so that in-flight
 // token budget checks see the most current totals without waiting for the DB
 // flush. When the internal buffer is full and dropOnFull is true, the event is
 // silently dropped rather than blocking the caller. This ensures the proxy hot
@@ -99,15 +100,16 @@ func (l *Logger) Log(event Event) {
 		event.CreatedAt = time.Now().UTC()
 	}
 
-	// Increment the in-memory token counter immediately so that subsequent
-	// CheckTokens calls reflect this request even before it reaches the DB.
-	if l.tokenCounter != nil && event.TotalTokens > 0 {
-		l.tokenCounter.Add(ratelimit.Scopes{
+	// Increment the budget counter immediately so that subsequent budget
+	// checks reflect this request even before it reaches the DB. Only tokens
+	// are counted; cost is not part of live budget accounting yet.
+	if l.budget != nil && event.TotalTokens > 0 {
+		l.budget.Add(context.Background(), ratelimit.Scopes{
 			KeyID:  event.KeyID,
 			UserID: event.UserID,
 			TeamID: event.TeamID,
 			OrgID:  event.OrgID,
-		}, int64(event.TotalTokens))
+		}, ratelimit.Usage{Tokens: int64(event.TotalTokens)})
 	}
 
 	if l.dropOnFull {

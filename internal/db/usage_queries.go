@@ -371,11 +371,14 @@ func (d *DB) GetCrossOrgUsageAggregates(ctx context.Context, from, to time.Time,
 }
 
 // QueryUsageSeed implements ratelimit.UsageSeeder. It returns rows of
-// (key_id, team_id, org_id, user_id, total_tokens) for all usage events
-// recorded on or after since. The returned *sql.Rows must be closed by the
-// caller.
+// (key_id, team_id, org_id, user_id, total_tokens, cost_estimate) for all
+// usage events recorded on or after since. team_id and user_id are returned
+// as empty strings when NULL; cost_estimate is returned in major currency
+// units as a float, 0 when NULL (no pricing configured). The returned
+// *sql.Rows must be closed by the caller.
 func (d *DB) QueryUsageSeed(ctx context.Context, since time.Time) (*sql.Rows, error) {
-	query := "SELECT key_id, COALESCE(team_id, ''), org_id, COALESCE(user_id, ''), total_tokens " +
+	query := "SELECT key_id, COALESCE(team_id, ''), org_id, COALESCE(user_id, ''), total_tokens, " +
+		"COALESCE(cost_estimate, 0) " +
 		"FROM usage_events WHERE created_at >= " + d.dialect.Placeholder(1)
 	rows, err := d.sql.QueryContext(ctx, query, FormatTimestamp(since))
 	if err != nil {

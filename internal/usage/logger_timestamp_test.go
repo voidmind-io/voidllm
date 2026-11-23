@@ -78,7 +78,7 @@ func TestLogger_StoredCreatedAtEqualsEventTime(t *testing.T) {
 // is logged and flushed to a real database with an explicit CreatedAt set to
 // today (a date chosen relative to the actual time.Now() so the test is not
 // sensitive to when it happens to run, including near a calendar boundary),
-// then a brand new TokenCounter — standing in for a freshly restarted
+// then a brand new budget counter — standing in for a freshly restarted
 // process — is seeded from that same database. The daily counter must
 // already reflect the persisted event's tokens.
 func TestLogger_TokenCounterSeed_CountsTodayEventAfterRestart(t *testing.T) {
@@ -100,9 +100,9 @@ func TestLogger_TokenCounterSeed_CountsTodayEventAfterRestart(t *testing.T) {
 	l.Log(ev)
 	stopAndWait(t, l, d, 1)
 
-	// Simulate a process restart: a brand new TokenCounter with no in-memory
+	// Simulate a process restart: a brand new budget counter with no in-memory
 	// state, seeded fresh from the database Logger just wrote to.
-	restarted := ratelimit.NewTokenCounter()
+	restarted := ratelimit.NewMemoryBudgetCounter()
 	if err := restarted.Seed(context.Background(), dbUsageSeeder{d}); err != nil {
 		t.Fatalf("Seed() error = %v, want nil", err)
 	}
@@ -111,16 +111,16 @@ func TestLogger_TokenCounterSeed_CountsTodayEventAfterRestart(t *testing.T) {
 	limits := ratelimit.ScopeLimits{
 		Key: ratelimit.Limits{DailyTokenLimit: 500},
 	}
-	if err := restarted.CheckTokens(scopes, limits); err == nil {
-		t.Error("CheckTokens() after Seed() = nil, want ErrTokenBudgetExceeded (500 tokens already spent today, budget is 500)")
+	if err := checkTokens(restarted, scopes, limits); err == nil {
+		t.Error("Check() after Seed() = nil, want ErrTokenBudgetExceeded (500 tokens already spent today, budget is 500)")
 	}
 
 	// A budget just above the already-spent total must still have headroom,
 	// confirming the counter counts exactly the persisted total rather than
 	// e.g. treating every key as perpetually over budget.
 	roomyLimits := ratelimit.ScopeLimits{Key: ratelimit.Limits{DailyTokenLimit: 1000}}
-	if err := restarted.CheckTokens(scopes, roomyLimits); err != nil {
-		t.Errorf("CheckTokens() with headroom after Seed() = %v, want nil", err)
+	if err := checkTokens(restarted, scopes, roomyLimits); err != nil {
+		t.Errorf("Check() with headroom after Seed() = %v, want nil", err)
 	}
 }
 

@@ -14,6 +14,17 @@ type LimitError struct {
 	Err error
 	// RetryAfter is how long until the exceeded window resets.
 	RetryAfter time.Duration
+	// Metric names what ran out ("tokens" or "cost"). It is set for budget
+	// errors only and is meant for logs and metrics, never for clients.
+	Metric string
+	// Scope names the kind of scope whose budget determines RetryAfter
+	// ("key", "user", "team" or "org"). Set for budget errors only; for logs
+	// and metrics, never for clients.
+	Scope string
+	// Window names the window that determines RetryAfter ("daily" or
+	// "monthly"). Set for budget errors only; for logs and metrics, never for
+	// clients.
+	Window string
 }
 
 // Error returns the wrapped sentinel's message.
