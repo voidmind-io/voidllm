@@ -53,6 +53,8 @@ func setupReloaderApp(t *testing.T, dsn string, withReloader bool) (*fiber.App, 
 	}
 	if withReloader {
 		handler.KeyReloader = auth.NewReloader(database, keyCache, log)
+		// Registered after the database cleanup, so it runs before it.
+		t.Cleanup(handler.KeyReloader.Stop)
 	}
 
 	app := fiber.New()
@@ -317,6 +319,191 @@ func TestUpdateTeam_LimitChangeRoleMatrix(t *testing.T) {
 			}
 			if tc.wantStatus == fiber.StatusForbidden && after.Name != "Team" {
 				t.Errorf("rejected request still changed the name to %q", after.Name)
+			}
+		})
+	}
+}
+
+// TestUpdateTeam_TeamAdminNeverWritesLimits covers the interleaving in which
+// an org admin changes a team's limits between the moment a team admin's
+// PATCH reads the team and the moment it writes: the team admin re-sends the
+// limits it saw, which pass the "unchanged" check against the stale read, and
+// must still not be written.
+func TestUpdateTeam_TeamAdminNeverWritesLimits(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	_, database, _ := setupReloaderApp(t, "file:TestTeamAdminNeverWritesLimits?mode=memory&cache=private", false)
+	org := mustCreateOrg(t, database, "Stale Org", "stale-limits-org")
+	team, err := database.CreateTeam(ctx, db.CreateTeamParams{
+		OrgID: org.ID, Name: "Team", Slug: "stale-limits-team",
+		DailyTokenLimit: 100, MonthlyTokenLimit: 2000, RequestsPerMinute: 10, RequestsPerDay: 50,
+	})
+	if err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
+
+	// The team admin's request: a rename that re-sends the limits it loaded.
+	name := "Renamed"
+	daily, monthly := int64(100), int64(2000)
+	rpm, rpd := 10, 50
+	req := admin.TeamUpdateRequest{
+		Name: &name, DailyTokenLimit: &daily, MonthlyTokenLimit: &monthly,
+		RequestsPerMinute: &rpm, RequestsPerDay: &rpd,
+	}
+
+	// The handler reads the team (still the old limits) ...
+	read, err := database.GetTeam(ctx, team.ID)
+	if err != nil {
+		t.Fatalf("GetTeam: %v", err)
+	}
+	// ... then an org admin lowers every limit ...
+	newDaily, newMonthly := int64(5), int64(50)
+	newRPM, newRPD := 1, 2
+	if _, err := database.UpdateTeam(ctx, team.ID, db.UpdateTeamParams{
+		DailyTokenLimit: &newDaily, MonthlyTokenLimit: &newMonthly,
+		RequestsPerMinute: &newRPM, RequestsPerDay: &newRPD,
+	}); err != nil {
+		t.Fatalf("org admin UpdateTeam: %v", err)
+	}
+	// ... and only now does the team admin's write happen.
+	params, allowed := admin.TeamUpdateParams(auth.RoleTeamAdmin, read, req)
+	if !allowed {
+		t.Fatal("re-sending the limits that were read was rejected, want allowed")
+	}
+	if params.DailyTokenLimit != nil || params.MonthlyTokenLimit != nil ||
+		params.RequestsPerMinute != nil || params.RequestsPerDay != nil {
+		t.Errorf("team admin write carries limit fields: %+v", params)
+	}
+	if params.Name == nil || *params.Name != name {
+		t.Errorf("team admin write lost the rename: %+v", params)
+	}
+	if _, err := database.UpdateTeam(ctx, team.ID, params); err != nil {
+		t.Fatalf("team admin UpdateTeam: %v", err)
+	}
+
+	after, err := database.GetTeam(ctx, team.ID)
+	if err != nil {
+		t.Fatalf("GetTeam: %v", err)
+	}
+	if after.Name != name {
+		t.Errorf("name = %q, want %q", after.Name, name)
+	}
+	if after.DailyTokenLimit != newDaily || after.MonthlyTokenLimit != newMonthly ||
+		after.RequestsPerMinute != newRPM || after.RequestsPerDay != newRPD {
+		t.Errorf("limits after the team admin's write = %d/%d/%d/%d, want the org admin's %d/%d/%d/%d",
+			after.DailyTokenLimit, after.MonthlyTokenLimit, after.RequestsPerMinute, after.RequestsPerDay,
+			newDaily, newMonthly, newRPM, newRPD)
+	}
+
+	// Org admins and above do write limits; a team admin changing one is refused.
+	for _, role := range []string{auth.RoleOrgAdmin, auth.RoleSystemAdmin} {
+		p, ok := admin.TeamUpdateParams(role, read, req)
+		if !ok || p.DailyTokenLimit == nil || p.MonthlyTokenLimit == nil || p.RequestsPerMinute == nil || p.RequestsPerDay == nil {
+			t.Errorf("%s: allowed=%v params=%+v, want all limit fields written", role, ok, p)
+		}
+	}
+	changed := int64(999)
+	if _, ok := admin.TeamUpdateParams(auth.RoleTeamAdmin, read, admin.TeamUpdateRequest{DailyTokenLimit: &changed}); ok {
+		t.Error("team admin changing a limit was allowed")
+	}
+}
+
+// TestUpdateTeam_TeamAdminStaleLimitsOverHTTP sends a team admin PATCH whose
+// limits were current when the client loaded the team but have since been
+// changed by an org admin. The stored limits must stay the org admin's.
+func TestUpdateTeam_TeamAdminStaleLimitsOverHTTP(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	app, database, keyCache := setupReloaderApp(t, "file:TestTeamAdminStaleLimitsHTTP?mode=memory&cache=private", true)
+	org := mustCreateOrg(t, database, "Stale Org", "stale-http-org")
+	team, err := database.CreateTeam(ctx, db.CreateTeamParams{
+		OrgID: org.ID, Name: "Team", Slug: "stale-http-team",
+		DailyTokenLimit: 100, MonthlyTokenLimit: 2000, RequestsPerMinute: 10, RequestsPerDay: 50,
+	})
+	if err != nil {
+		t.Fatalf("CreateTeam: %v", err)
+	}
+	caller := mustCreateCacheTestUser(t, database, "stale-http-caller@example.com")
+	if _, err := database.CreateTeamMembership(ctx, db.CreateTeamMembershipParams{
+		TeamID: team.ID, UserID: caller.ID, Role: auth.RoleTeamAdmin,
+	}); err != nil {
+		t.Fatalf("CreateTeamMembership: %v", err)
+	}
+	key := addTestKeyWithTeam(t, keyCache, auth.RoleTeamAdmin, org.ID, team.ID, caller.ID)
+
+	// The org admin lowers the daily limit after the team admin loaded the team.
+	lowered := int64(5)
+	if _, err := database.UpdateTeam(ctx, team.ID, db.UpdateTeamParams{DailyTokenLimit: &lowered}); err != nil {
+		t.Fatalf("org admin UpdateTeam: %v", err)
+	}
+
+	status := doJSON(t, app, "PATCH", teamItemURL(org.ID, team.ID), key, map[string]any{
+		"name": "Renamed", "daily_token_limit": 100, "monthly_token_limit": 2000,
+		"requests_per_minute": 10, "requests_per_day": 50,
+	})
+	if status != fiber.StatusForbidden {
+		t.Errorf("status = %d, want 403 (the re-sent daily limit no longer matches)", status)
+	}
+	after, err := database.GetTeam(ctx, team.ID)
+	if err != nil {
+		t.Fatalf("GetTeam: %v", err)
+	}
+	if after.DailyTokenLimit != lowered {
+		t.Errorf("stored daily limit = %d, want the org admin's %d", after.DailyTokenLimit, lowered)
+	}
+	if after.Name != "Team" {
+		t.Errorf("name = %q, want unchanged", after.Name)
+	}
+}
+
+func TestDeleteOrg_RemovesOrgKeysFromCache(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range reloaderModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
+			suffix := strings.ReplaceAll(mode.name, " ", "-")
+			dsn := fmt.Sprintf("file:TestDeleteOrgCache_%s?mode=memory&cache=private", strings.ReplaceAll(mode.name, " ", "_"))
+			app, database, keyCache := setupReloaderApp(t, dsn, mode.withReloader)
+
+			home := mustCreateOrg(t, database, "Home Org", "home-org-"+suffix)
+			doomed := mustCreateOrg(t, database, "Doomed Org", "doomed-org-"+suffix)
+			team := mustCreateTeam(t, database, doomed.ID, "Team", "doomed-team-"+suffix)
+			member := mustCreateCacheTestUser(t, database, "doomed-member-"+suffix+"@example.com")
+			if _, err := database.CreateOrgMembership(context.Background(), db.CreateOrgMembershipParams{
+				OrgID: doomed.ID, UserID: member.ID, Role: auth.RoleMember,
+			}); err != nil {
+				t.Fatalf("CreateOrgMembership: %v", err)
+			}
+			userHash := mustCreateStoredKey(t, database, db.CreateAPIKeyParams{
+				KeyType: keygen.KeyTypeUser, Name: "doomed user key", OrgID: doomed.ID, UserID: &member.ID, CreatedBy: member.ID,
+			})
+			teamHash := mustCreateStoredKey(t, database, db.CreateAPIKeyParams{
+				KeyType: keygen.KeyTypeTeam, Name: "doomed team key", OrgID: doomed.ID, TeamID: &team.ID, CreatedBy: member.ID,
+			})
+			// Loads the cache from the database, including the keys above.
+			adminKey := mustCreateSystemAdminCallerKey(t, database, keyCache, home.ID)
+			adminHash := keygen.Hash(adminKey, testHMACSecret)
+			for name, hash := range map[string]string{"user key": userHash, "team key": teamHash, "caller key": adminHash} {
+				if _, ok := keyCache.Get(hash); !ok {
+					t.Fatalf("precondition: %s not cached", name)
+				}
+			}
+
+			if got := doJSON(t, app, "DELETE", "/api/v1/orgs/"+doomed.ID, adminKey, nil); got != fiber.StatusNoContent {
+				t.Fatalf("DELETE status = %d, want 204", got)
+			}
+
+			if _, ok := keyCache.Get(userHash); ok {
+				t.Error("user key of the deleted org is still cached")
+			}
+			if _, ok := keyCache.Get(teamHash); ok {
+				t.Error("team key of the deleted org is still cached")
+			}
+			if _, ok := keyCache.Get(adminHash); !ok {
+				t.Error("key of another org was dropped by the org deletion")
 			}
 		})
 	}

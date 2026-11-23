@@ -341,6 +341,25 @@ func changesTeamLimits(current *db.Team, req *updateTeamRequest) bool {
 		(req.RequestsPerDay != nil && *req.RequestsPerDay != current.RequestsPerDay)
 }
 
+// teamUpdateParams turns req into the fields to write for a caller with
+// callerRole. It returns false when the caller is below org admin and req
+// changes a limit relative to current.
+//
+// For callers below org admin the limit fields are never written, even when
+// req re-sends the values in current: current was read before the write, so
+// writing it back could overwrite a limit an org admin changed in between.
+func teamUpdateParams(callerRole string, current *db.Team, req *updateTeamRequest) (db.UpdateTeamParams, bool) {
+	params := db.UpdateTeamParams{Name: req.Name, Slug: req.Slug}
+	if !auth.HasRole(callerRole, auth.RoleOrgAdmin) {
+		return params, !changesTeamLimits(current, req)
+	}
+	params.DailyTokenLimit = req.DailyTokenLimit
+	params.MonthlyTokenLimit = req.MonthlyTokenLimit
+	params.RequestsPerMinute = req.RequestsPerMinute
+	params.RequestsPerDay = req.RequestsPerDay
+	return params, true
+}
+
 // UpdateTeam handles PATCH /api/v1/orgs/:org_id/teams/:team_id.
 // System admins, org admins of the target org, and team admins who belong to
 // the team may update it, but changing any limit field requires org admin or
@@ -380,18 +399,12 @@ func (h *Handler) UpdateTeam(c fiber.Ctx) error {
 	if req.Slug != nil && !slugRegex.MatchString(*req.Slug) {
 		return apierror.BadRequest(c, "slug must be lowercase alphanumeric with hyphens, 2-63 characters")
 	}
-	if !auth.HasRole(keyInfo.Role, auth.RoleOrgAdmin) && changesTeamLimits(existing, &req) {
+	params, allowed := teamUpdateParams(keyInfo.Role, existing, &req)
+	if !allowed {
 		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "only org admins may change team limits")
 	}
 
-	if _, err := h.DB.UpdateTeam(c.Context(), existing.ID, db.UpdateTeamParams{
-		Name:              req.Name,
-		Slug:              req.Slug,
-		DailyTokenLimit:   req.DailyTokenLimit,
-		MonthlyTokenLimit: req.MonthlyTokenLimit,
-		RequestsPerMinute: req.RequestsPerMinute,
-		RequestsPerDay:    req.RequestsPerDay,
-	}); err != nil {
+	if _, err := h.DB.UpdateTeam(c.Context(), existing.ID, params); err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "team not found")
 		}
