@@ -103,6 +103,9 @@ func TestBackfillUsageHourly_Postgres(t *testing.T) {
 	insertBackfillEvent(t, d, backfillEvent{id: "x1", key: "k1", model: "m", created: "2026-03-20 09:00:00", tokens: 3})
 	insertBackfillEvent(t, d, backfillEvent{id: "x2", key: "k1", model: "m", created: "2026-03-20T09:00:00.123456Z", tokens: 3})
 	insertBackfillEvent(t, d, backfillEvent{id: "x3", key: "k1", model: "m", created: "garbage", tokens: 3})
+	// Calendar-invalid values that sort before every real event.
+	insertBackfillEvent(t, d, backfillEvent{id: "x4", key: "k1", model: "m", created: "2026-01-01T00:99:00Z", tokens: 3})
+	insertBackfillEvent(t, d, backfillEvent{id: "x5", key: "k1", model: "m", created: "2025-02-29T10:00:00Z", tokens: 3})
 
 	rows, ran, err := d.BackfillUsageHourlyOnce(ctx, start)
 	if err != nil || !ran {
@@ -194,8 +197,8 @@ func TestBackfillUsageHourly_ResumesMonthByMonth(t *testing.T) {
 	if _, ran, err := d.BackfillUsageHourlyOnce(ctx, start); err == nil || !ran {
 		t.Fatalf("first run: ran=%v err=%v, want failure", ran, err)
 	}
-	if got := backfillMarker(t, d); got != `{"done_until":"2026-01"}` {
-		t.Fatalf("marker after failure = %q, want done_until 2026-01", got)
+	if got := backfillMarker(t, d); got != `{"cutoff":"2026-04-10T09:00:00Z","done_until":"2026-01"}` {
+		t.Fatalf("marker after failure = %q, want cutoff and done_until 2026-01", got)
 	}
 	if n := countBuckets(t, d, "bucket_hour LIKE '2026-01%'"); n != 1 {
 		t.Errorf("january buckets = %d, want 1", n)
@@ -221,6 +224,28 @@ func TestBackfillUsageHourly_ResumesMonthByMonth(t *testing.T) {
 	}
 	if got := backfillMarker(t, d); got != usageHourlyBackfillDone {
 		t.Errorf("marker = %q, want done", got)
+	}
+}
+
+func TestBackfillUsageHourly_CutoffIsEarliestLiveBucket(t *testing.T) {
+	d := openBackfillPostgres(t)
+	ctx := context.Background()
+	start := time.Date(2026, 3, 20, 14, 30, 0, 0, time.UTC)
+
+	for i, h := range []string{"09", "10", "11", "12"} {
+		insertBackfillEvent(t, d, backfillEvent{id: "e" + h, key: "k1", model: "m", created: "2026-03-20T" + h + ":10:00Z", tokens: i + 1})
+	}
+	// A live replica started writing at hour 11 (other key).
+	if err := d.UpsertUsageHourly(ctx, HourlyRollup{OrgID: "org-bf", KeyID: "k3", ModelName: "m", BucketHour: "2026-03-20T11:00:00Z", RequestCount: 1, TotalTokens: 1}); err != nil {
+		t.Fatalf("seed bucket: %v", err)
+	}
+
+	rows, ran, err := d.BackfillUsageHourlyOnce(ctx, start)
+	if err != nil || !ran || rows != 2 {
+		t.Fatalf("rows=%d ran=%v err=%v, want 2 (hours 9 and 10)", rows, ran, err)
+	}
+	if n := countBuckets(t, d, "key_id = 'k1' AND bucket_hour >= '2026-03-20T11:00:00Z'"); n != 0 {
+		t.Errorf("buckets at/after first live hour = %d, want 0", n)
 	}
 }
 

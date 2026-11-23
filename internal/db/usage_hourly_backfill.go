@@ -23,11 +23,20 @@ const usageHourlyBackfillDone = "done"
 // only one instance runs the backfill at a time.
 const usageHourlyBackfillLockKey int64 = 0x766f6964686272
 
-// canonicalTimestampRegex matches exactly the canonical TimestampLayout shape.
-const canonicalTimestampRegex = `^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$`
+// usageHourlyBackfillUnlockTimeout bounds the advisory unlock call.
+const usageHourlyBackfillUnlockTimeout = 5 * time.Second
+
+// canonicalTimestampRegex matches the canonical TimestampLayout shape with
+// in-range fields, including days per month (Feb 29 in non-leap years still
+// matches and is skipped when parsing).
+const canonicalTimestampRegex = `^[0-9]{4}-((0[13578]|1[02])-(0[1-9]|[12][0-9]|3[01])|(0[469]|11)-(0[1-9]|[12][0-9]|30)|02-(0[1-9]|1[0-9]|2[0-9]))T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$`
 
 type usageHourlyBackfillProgress struct {
-	DoneUntil string `json:"done_until"`
+	// Cutoff is the exclusive upper bound of the run (canonical timestamp),
+	// fixed on the first attempt so a resume never recomputes it from buckets
+	// the backfill itself created.
+	Cutoff    string `json:"cutoff,omitempty"`
+	DoneUntil string `json:"done_until,omitempty"`
 }
 
 // BackfillUsageHourlyOnce rebuilds missing usage_hourly buckets from
@@ -35,11 +44,15 @@ type usageHourlyBackfillProgress struct {
 // the upsert defect the backfill repairs, so there the marker is set and the
 // call returns immediately.
 //
-// Only hours strictly before the hour containing processStart are backfilled.
-// A freshly started process holds no buffered events from before its start, so
-// the live usage logger never upserts those buckets and the backfill cannot
-// race with it. The start hour itself may therefore stay partial: buckets the
-// logger already created there are kept (ON CONFLICT DO NOTHING).
+// Only hours strictly before the cutoff are backfilled, where cutoff is the
+// earlier of the hour containing processStart and the hour of the earliest
+// existing usage_hourly bucket. A freshly started process holds no buffered
+// events from before its start, and the table was empty on PostgreSQL before
+// the upsert fix, so the earliest bucket marks when fixed loggers (including
+// other replicas of a rolling deploy) started writing. No live upsert can
+// therefore interleave with the backfill. The first live hour may stay
+// partial: buckets the logger already created there are kept (ON CONFLICT DO
+// NOTHING). The cutoff is persisted on the first attempt and reused on resume.
 //
 // The work is done month by month from the oldest event to the newest, and the
 // last finished month is persisted in the settings marker, so an interrupted
@@ -76,7 +89,9 @@ func (d *DB) BackfillUsageHourlyOnce(ctx context.Context, processStart time.Time
 		return 0, false, nil
 	}
 	defer func() {
-		if _, uerr := conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", usageHourlyBackfillLockKey); uerr != nil {
+		uctx, ucancel := context.WithTimeout(context.Background(), usageHourlyBackfillUnlockTimeout)
+		defer ucancel()
+		if _, uerr := conn.ExecContext(uctx, "SELECT pg_advisory_unlock($1)", usageHourlyBackfillLockKey); uerr != nil {
 			// The lock is session-scoped: discard the connection so it cannot
 			// return to the pool still holding the lock.
 			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
@@ -98,7 +113,18 @@ func (d *DB) BackfillUsageHourlyOnce(ctx context.Context, processStart time.Time
 		}
 	}
 
-	rows, err = d.backfillMonths(ctx, conn, processStart, progress)
+	if progress.Cutoff == "" {
+		cutoff, err := d.backfillCutoff(ctx, conn, processStart)
+		if err != nil {
+			return 0, true, err
+		}
+		progress.Cutoff = FormatTimestamp(cutoff)
+		if err := d.saveBackfillProgress(ctx, conn, progress); err != nil {
+			return 0, true, err
+		}
+	}
+
+	rows, err = d.backfillMonths(ctx, conn, progress)
 	if err != nil {
 		return rows, true, err
 	}
@@ -108,26 +134,68 @@ func (d *DB) BackfillUsageHourlyOnce(ctx context.Context, processStart time.Time
 	return rows, true, nil
 }
 
+// backfillCutoff returns the earlier of the hour containing processStart and
+// the hour of the earliest existing usage_hourly bucket.
+func (d *DB) backfillCutoff(ctx context.Context, conn *sql.Conn, processStart time.Time) (time.Time, error) {
+	cutoff := processStart.UTC().Truncate(time.Hour)
+	var earliest sql.NullString
+	if err := conn.QueryRowContext(ctx, "SELECT MIN(bucket_hour) FROM usage_hourly").Scan(&earliest); err != nil {
+		return time.Time{}, fmt.Errorf("backfill usage hourly: find earliest bucket: %w", err)
+	}
+	if earliest.Valid {
+		if t, err := time.Parse(TimestampLayout, earliest.String); err == nil && t.Before(cutoff) {
+			cutoff = t.UTC().Truncate(time.Hour)
+		}
+	}
+	return cutoff, nil
+}
+
+func (d *DB) saveBackfillProgress(ctx context.Context, conn *sql.Conn, p usageHourlyBackfillProgress) error {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return fmt.Errorf("backfill usage hourly: encode progress: %w", err)
+	}
+	return d.writeBackfillMarker(ctx, conn, string(b))
+}
+
+// firstValidEvent returns the oldest parseable canonical created_at before
+// cutoff, skipping calendar-invalid values. ok is false when there is none.
+func (d *DB) firstValidEvent(ctx context.Context, conn *sql.Conn, cutoff time.Time) (time.Time, bool, error) {
+	p := d.dialect.Placeholder
+	lower := ""
+	for {
+		var oldest sql.NullString
+		err := conn.QueryRowContext(ctx,
+			"SELECT MIN(created_at) FROM usage_events WHERE created_at ~ '"+canonicalTimestampRegex+"' AND created_at > "+p(1)+" AND created_at < "+p(2),
+			lower, FormatTimestamp(cutoff)).Scan(&oldest)
+		if err != nil {
+			return time.Time{}, false, fmt.Errorf("backfill usage hourly: find oldest event: %w", err)
+		}
+		if !oldest.Valid {
+			return time.Time{}, false, nil
+		}
+		if t, perr := time.Parse(TimestampLayout, oldest.String); perr == nil {
+			return t, true, nil
+		}
+		lower = oldest.String
+	}
+}
+
 // backfillMonths processes every month from the first one not yet recorded in
 // progress up to the month containing the cutoff, persisting progress after
 // each fully processed month.
-func (d *DB) backfillMonths(ctx context.Context, conn *sql.Conn, processStart time.Time, progress usageHourlyBackfillProgress) (int64, error) {
-	cutoff := processStart.UTC().Truncate(time.Hour)
-	p := d.dialect.Placeholder
+func (d *DB) backfillMonths(ctx context.Context, conn *sql.Conn, progress usageHourlyBackfillProgress) (int64, error) {
+	cutoff, err := time.Parse(TimestampLayout, progress.Cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("backfill usage hourly: parse cutoff %q: %w", progress.Cutoff, err)
+	}
 
-	var oldest sql.NullString
-	err := conn.QueryRowContext(ctx,
-		"SELECT MIN(created_at) FROM usage_events WHERE created_at ~ '"+canonicalTimestampRegex+"' AND created_at < "+p(1),
-		FormatTimestamp(cutoff)).Scan(&oldest)
+	first, ok, err := d.firstValidEvent(ctx, conn, cutoff)
 	if err != nil {
-		return 0, fmt.Errorf("backfill usage hourly: find oldest event: %w", err)
+		return 0, err
 	}
-	if !oldest.Valid {
+	if !ok {
 		return 0, nil
-	}
-	first, err := time.Parse(TimestampLayout, oldest.String)
-	if err != nil {
-		return 0, fmt.Errorf("backfill usage hourly: parse oldest event: %w", err)
 	}
 	month := time.Date(first.Year(), first.Month(), 1, 0, 0, 0, 0, time.UTC)
 	if progress.DoneUntil != "" {
@@ -153,11 +221,8 @@ func (d *DB) backfillMonths(ctx context.Context, conn *sql.Conn, processStart ti
 		}
 		total += n
 		if complete {
-			b, err := json.Marshal(usageHourlyBackfillProgress{DoneUntil: month.Format("2006-01")})
-			if err != nil {
-				return total, fmt.Errorf("backfill usage hourly: encode progress: %w", err)
-			}
-			if err := d.writeBackfillMarker(ctx, conn, string(b)); err != nil {
+			progress.DoneUntil = month.Format("2006-01")
+			if err := d.saveBackfillProgress(ctx, conn, progress); err != nil {
 				return total, err
 			}
 		}
