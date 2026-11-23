@@ -1,5 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import apiClient from '../api/client'
+import { resolveRange } from '../lib/timeRange'
+import type { UsageRange } from '../lib/timeRange'
 
 export interface MCPUsageDataPoint {
   group_key: string
@@ -20,29 +22,43 @@ export interface MCPUsageResponse {
   data: MCPUsageDataPoint[]
 }
 
-export function useMCPUsage(orgId: string, from: string, to: string, groupBy: string) {
+const DEFAULT_REFETCH_MS = 60_000
+
+export function useMCPUsage(
+  orgId: string,
+  range: UsageRange,
+  groupBy: string,
+  opts?: { enabled?: boolean },
+) {
   return useQuery({
-    queryKey: ['mcp-usage', orgId, from, to, groupBy],
-    queryFn: () =>
-      apiClient<MCPUsageResponse>(
+    queryKey: ['mcp-usage', orgId, range, groupBy],
+    queryFn: () => {
+      const { from, to } = resolveRange(range)
+      return apiClient<MCPUsageResponse>(
         `/orgs/${orgId}/mcp-usage?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&group_by=${encodeURIComponent(groupBy)}`,
-      ),
-    enabled: !!orgId && !!from && !!to,
+      )
+    },
+    enabled: !!orgId && (opts?.enabled ?? true),
     staleTime: 60_000,
+    refetchInterval: DEFAULT_REFETCH_MS,
   })
 }
 
 export function useCrossOrgMCPUsage(
-  params: { from: string; to: string; groupBy: string },
+  params: { range: UsageRange; groupBy: string },
   enabled: boolean,
 ) {
-  const { from, to, groupBy } = params
-  const query = new URLSearchParams({ from, to, group_by: groupBy })
+  const { range, groupBy } = params
 
   return useQuery({
-    queryKey: ['cross-org-mcp-usage', from, to, groupBy],
-    queryFn: () => apiClient<MCPUsageResponse>(`/mcp-usage?${query.toString()}`),
-    enabled: enabled && !!from && !!to,
+    queryKey: ['cross-org-mcp-usage', range, groupBy],
+    queryFn: () => {
+      const { from, to } = resolveRange(range)
+      const query = new URLSearchParams({ from, to, group_by: groupBy })
+      return apiClient<MCPUsageResponse>(`/mcp-usage?${query.toString()}`)
+    },
+    enabled,
     staleTime: 60_000,
+    refetchInterval: DEFAULT_REFETCH_MS,
   })
 }

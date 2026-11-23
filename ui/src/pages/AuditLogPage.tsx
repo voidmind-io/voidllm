@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { shortenId } from '../lib/utils'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Table } from '../components/ui/Table'
@@ -12,7 +12,7 @@ import { UpgradePrompt } from '../components/ui/UpgradePrompt'
 import { useMe } from '../hooks/useMe'
 import { useLicense } from '../hooks/useLicense'
 import { useAuditLog } from '../hooks/useAuditLog'
-import type { AuditEvent } from '../hooks/useAuditLog'
+import type { AuditEvent, AuditWindow } from '../hooks/useAuditLog'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -25,18 +25,6 @@ const RANGE_LABELS: Record<TimeRange, string> = {
   '24h': 'Last 24h',
   '7d': 'Last 7d',
   '30d': 'Last 30d',
-}
-
-const RANGE_HOURS: Record<TimeRange, number> = {
-  '24h': 24,
-  '7d': 168,
-  '30d': 720,
-}
-
-function getTimeRange(range: TimeRange): { from: string; to: string } {
-  const now = new Date()
-  const from = new Date(now.getTime() - RANGE_HOURS[range] * 3_600_000)
-  return { from: from.toISOString(), to: now.toISOString() }
 }
 
 const RESOURCE_TYPE_OPTIONS = [
@@ -215,21 +203,22 @@ export default function AuditLogPage() {
   // cursor returned by the previous page response.
   const [cursors, setCursors] = useState<string[]>([''])
   const currentCursor = cursors[cursors.length - 1]
+  // Window used for page 1, kept while paging forward so all pages share it.
+  const [pageWindow, setPageWindow] = useState<AuditWindow | null>(null)
 
   const { data: me } = useMe()
   const { data: license } = useLicense()
   const orgId = me?.org_id ?? ''
 
-  const { from, to } = useMemo(() => getTimeRange(range), [range])
-
   const { data, isLoading } = useAuditLog({
     orgId,
     resourceType,
     action,
-    from,
-    to,
+    range,
+    frozenWindow: pageWindow,
     limit: pageSize,
     cursor: currentCursor,
+    enabled: !!license && license.features.includes('audit_logs'),
   })
 
   if (license && !license.features.includes('audit_logs')) {
@@ -248,6 +237,7 @@ export default function AuditLogPage() {
 
   function handleNext() {
     if (data?.cursor) {
+      if (cursors.length === 1) setPageWindow(data.window)
       setCursors((prev) => [...prev, data.cursor!])
     }
   }
@@ -259,21 +249,25 @@ export default function AuditLogPage() {
   function handleRangeChange(newRange: TimeRange) {
     setRange(newRange)
     setCursors([''])
+    setPageWindow(null)
   }
 
   function handleResourceTypeChange(value: string) {
     setResourceType(value)
     setCursors([''])
+    setPageWindow(null)
   }
 
   function handleActionChange(value: string) {
     setAction(value)
     setCursors([''])
+    setPageWindow(null)
   }
 
   function handlePageSizeChange(value: string) {
     setPageSize(Number(value))
     setCursors([''])
+    setPageWindow(null)
   }
 
   const isDataLoading = isLoading && !!orgId

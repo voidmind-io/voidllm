@@ -253,7 +253,7 @@ export default function SystemUsersPage() {
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [deleteUserId, setDeleteUserId] = useState<string | null>(null)
 
-  const { data: users, isLoading } = useUsers(cursor)
+  const { data: users, isLoading } = useUsers(cursor, { summary: true })
   const deleteUser = useDeleteUser()
   const { toast } = useToast()
 
@@ -262,8 +262,9 @@ export default function SystemUsersPage() {
   }
 
   const allUsers = users?.data ?? []
-  const adminCount = allUsers.filter((u) => u.is_system_admin).length
-  const ssoCount = allUsers.filter((u) => u.auth_provider === 'oidc').length
+  const totalUsers = users?.summary?.total ?? '-'
+  const adminCount = users?.summary?.system_admins ?? '-'
+  const ssoCount = users?.summary?.sso ?? '-'
 
   const columns: Column<UserResponse>[] = [
     {
@@ -343,19 +344,19 @@ export default function SystemUsersPage() {
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
         <StatCard
           label="Total Users"
-          value={isLoading ? '—' : allUsers.length}
+          value={totalUsers}
           icon={<IconUsers />}
           iconColor="purple"
         />
         <StatCard
           label="System Admins"
-          value={isLoading ? '—' : adminCount}
+          value={adminCount}
           icon={<IconShield />}
           iconColor="blue"
         />
         <StatCard
           label="SSO Users"
-          value={isLoading ? '—' : ssoCount}
+          value={ssoCount}
           icon={<IconCloud />}
           iconColor="green"
         />

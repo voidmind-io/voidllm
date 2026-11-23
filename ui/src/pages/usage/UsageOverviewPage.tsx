@@ -3,21 +3,10 @@ import { Link } from 'react-router-dom'
 import { StatCard } from '../../components/ui/StatCard'
 import { AreaChart } from '../../components/ui/charts'
 import { useMe } from '../../hooks/useMe'
-import { useUsage } from '../../hooks/useUsage'
+import { useUsage, useMyUsage } from '../../hooks/useUsage'
 import { useMCPUsage } from '../../hooks/useMCPUsage'
+import { isOrgAdmin } from '../../lib/roles'
 import { formatNumber, formatTokens, formatCost } from '../../lib/utils'
-
-function getLast7Days(): { from: string; to: string } {
-  const now = new Date()
-  const from = new Date(now.getTime() - 7 * 24 * 3_600_000)
-  return { from: from.toISOString(), to: now.toISOString() }
-}
-
-function getLast24h(): { from: string; to: string } {
-  const now = new Date()
-  const from = new Date(now.getTime() - 24 * 3_600_000)
-  return { from: from.toISOString(), to: now.toISOString() }
-}
 
 // ---------------------------------------------------------------------------
 // Icons
@@ -91,16 +80,20 @@ export default function UsageOverviewPage() {
   const { data: me } = useMe()
   const orgId = me?.org_id ?? ''
 
-  const { from: from24h, to: to24h } = useMemo(() => getLast24h(), [])
-  const { from: from7d, to: to7d } = useMemo(() => getLast7Days(), [])
+  const canViewOrgUsage = isOrgAdmin(me)
+  const meLoaded = me !== undefined
 
-  // LLM: 24h totals + 7d daily trend
-  const llmTotals = useUsage(orgId, from24h, to24h, 'model')
-  const llmTrend = useUsage(orgId, from7d, to7d, 'day')
+  // LLM: 24h totals + 7d daily trend (org-wide for admins, own usage otherwise)
+  const orgLlmTotals = useUsage(orgId, '24h', 'model', { enabled: canViewOrgUsage })
+  const orgLlmTrend = useUsage(orgId, '7d', 'day', { enabled: canViewOrgUsage })
+  const myLlmTotals = useMyUsage('24h', 'model', { enabled: meLoaded && !canViewOrgUsage })
+  const myLlmTrend = useMyUsage('7d', 'day', { enabled: meLoaded && !canViewOrgUsage })
+  const llmTotals = canViewOrgUsage ? orgLlmTotals : myLlmTotals
+  const llmTrend = canViewOrgUsage ? orgLlmTrend : myLlmTrend
 
-  // MCP: 24h totals + 7d daily trend
-  const mcpTotals = useMCPUsage(orgId, from24h, to24h, 'server')
-  const mcpTrend = useMCPUsage(orgId, from7d, to7d, 'day')
+  // MCP: 24h totals + 7d daily trend (org admins only)
+  const mcpTotals = useMCPUsage(orgId, '24h', 'server', { enabled: canViewOrgUsage })
+  const mcpTrend = useMCPUsage(orgId, '7d', 'day', { enabled: canViewOrgUsage })
 
   const llmSummary = useMemo(() => {
     if (!llmTotals.data?.data) return { requests: 0, tokens: 0, cost: 0 }
@@ -129,11 +122,18 @@ export default function UsageOverviewPage() {
   const mcpSuccessRate = mcpSummary.calls > 0 ? (mcpSummary.success / mcpSummary.calls) * 100 : 0
   const mcpAvgDuration = mcpSummary.calls > 0 ? mcpSummary.totalDurationMs / mcpSummary.calls : 0
 
-  const llmLoading = llmTotals.isLoading && !!orgId
+  const llmLoading = !meLoaded || (llmTotals.isLoading && (canViewOrgUsage ? !!orgId : true))
   const mcpLoading = mcpTotals.isLoading && !!orgId
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {meLoaded && !canViewOrgUsage && (
+        <div className="lg:col-span-2">
+          <h2 className="text-base font-semibold text-text-primary">Your usage</h2>
+          <p className="text-sm text-text-tertiary">Requests made with your own keys</p>
+        </div>
+      )}
+
       {/* LLM panel */}
       <div className="bg-bg-secondary rounded-xl border border-border p-6 flex flex-col gap-4">
         <div className="flex items-center justify-between">
@@ -185,6 +185,7 @@ export default function UsageOverviewPage() {
       </div>
 
       {/* MCP panel */}
+      {canViewOrgUsage && (
       <div className="bg-bg-secondary rounded-xl border border-border p-6 flex flex-col gap-4">
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-semibold text-text-primary">MCP Usage</h3>
@@ -234,6 +235,7 @@ export default function UsageOverviewPage() {
           />
         </div>
       </div>
+      )}
     </div>
   )
 }

@@ -53,6 +53,17 @@ type paginatedOrgMembershipsResponse struct {
 	Data    []orgMembershipResponse `json:"data"`
 	HasMore bool                    `json:"has_more"`
 	Cursor  string                  `json:"next_cursor,omitempty"`
+	// Summary is present only when the request has summary=true.
+	Summary *orgMembershipsSummaryResponse `json:"summary,omitempty"`
+}
+
+// orgMembershipsSummaryResponse holds aggregate figures over every membership
+// of the org, independent of pagination.
+type orgMembershipsSummaryResponse struct {
+	// Total is the number of memberships in the org.
+	Total int `json:"total"`
+	// Admins is the number of memberships with an admin role (org_admin or system_admin).
+	Admins int `json:"admins"`
 }
 
 // orgMembershipToResponse converts a db.OrgMembership to its API wire representation.
@@ -170,6 +181,7 @@ func (h *Handler) CreateOrgMembership(c fiber.Ctx) error {
 // @Param        org_id  path      string  true   "Organization ID"
 // @Param        limit   query     int     false  "Page size (default 20, max 100)"
 // @Param        cursor  query     string  false  "Pagination cursor (UUIDv7 of the last seen membership)"
+// @Param        summary query     bool    false  "Include aggregate counts over all memberships"
 // @Success      200     {object}  paginatedOrgMembershipsResponse
 // @Failure      400     {object}  swaggerErrorResponse
 // @Failure      401     {object}  swaggerErrorResponse
@@ -209,6 +221,14 @@ func (h *Handler) ListOrgMemberships(c fiber.Ctx) error {
 	}
 	if hasMore && len(memberships) > 0 {
 		resp.Cursor = memberships[len(memberships)-1].ID
+	}
+	if wantsSummary(c) {
+		summary, err := h.DB.SummarizeOrgMemberships(c.Context(), orgID)
+		if err != nil {
+			h.Log.ErrorContext(c.Context(), "summarize org memberships", slog.String("error", err.Error()))
+		} else {
+			resp.Summary = &orgMembershipsSummaryResponse{Total: summary.Total, Admins: summary.Admins}
+		}
 	}
 	return c.JSON(resp)
 }

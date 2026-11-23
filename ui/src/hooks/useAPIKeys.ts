@@ -22,8 +22,15 @@ export interface APIKeyResponse {
   updated_at: string
 }
 
+export interface KeysSummary {
+  total: number
+  active: number
+  expiring_soon: number
+}
+
 export interface PaginatedKeys {
   data: APIKeyResponse[]
+  summary?: KeysSummary
   has_more: boolean
   next_cursor?: string
 }
@@ -41,11 +48,13 @@ export interface CreateAPIKeyParams {
   requests_per_day?: number
 }
 
-export function useAPIKeys(orgId: string, cursor?: string) {
+export function useAPIKeys(orgId: string, cursor?: string, opts?: { summary?: boolean }) {
+  const summary = opts?.summary ?? false
   const params = new URLSearchParams({ limit: '20' })
   if (cursor) params.set('cursor', cursor)
+  if (summary) params.set('summary', 'true')
   return useQuery({
-    queryKey: ['api-keys', orgId, cursor],
+    queryKey: ['api-keys', orgId, cursor, summary],
     queryFn: () => apiClient<PaginatedKeys>(`/orgs/${orgId}/keys?${params}`),
     enabled: !!orgId,
   })
@@ -61,6 +70,8 @@ export function useCreateAPIKey(orgId: string) {
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['api-keys', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['service-accounts', orgId] })
       queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] })
     },
   })
@@ -73,6 +84,8 @@ export function useDeleteAPIKey(orgId: string) {
       apiClient<void>(`/orgs/${orgId}/keys/${keyId}`, { method: 'DELETE' }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['api-keys', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['service-accounts', orgId] })
       queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] })
     },
   })
@@ -86,7 +99,12 @@ export function useUpdateAPIKey(orgId: string) {
         method: 'PATCH',
         body: JSON.stringify(params),
       }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['api-keys', orgId] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['api-keys', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['service-accounts', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] })
+    },
   })
 }
 
@@ -95,6 +113,11 @@ export function useRotateAPIKey(orgId: string) {
   return useMutation({
     mutationFn: (keyId: string) =>
       apiClient<APIKeyResponse>(`/orgs/${orgId}/keys/${keyId}/rotate`, { method: 'POST' }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['api-keys', orgId] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['api-keys', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['teams', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['service-accounts', orgId] })
+      queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] })
+    },
   })
 }

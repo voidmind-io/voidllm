@@ -8,24 +8,13 @@ import { AreaChart, DonutChart, HorizontalBar } from '../../components/ui/charts
 import { useMe } from '../../hooks/useMe'
 import { useMCPUsage, useCrossOrgMCPUsage } from '../../hooks/useMCPUsage'
 import type { MCPUsageDataPoint } from '../../hooks/useMCPUsage'
+import { AdminOnlyNotice } from '../../components/ui/AdminOnlyNotice'
+import { isOrgAdmin } from '../../lib/roles'
 import { formatNumber, shortenId } from '../../lib/utils'
 import { exportData } from '../../lib/export'
 
 const TIME_RANGES = ['24h', '7d', '30d', '90d'] as const
 type TimeRange = (typeof TIME_RANGES)[number]
-
-const RANGE_HOURS: Record<TimeRange, number> = {
-  '24h': 24,
-  '7d': 168,
-  '30d': 720,
-  '90d': 2160,
-}
-
-function getTimeRange(range: TimeRange): { from: string; to: string } {
-  const now = new Date()
-  const from = new Date(now.getTime() - RANGE_HOURS[range] * 3_600_000)
-  return { from: from.toISOString(), to: now.toISOString() }
-}
 
 const BASE_GROUP_BY_OPTIONS = [
   { value: 'server', label: 'Server' },
@@ -191,7 +180,7 @@ function DownloadIcon() {
 // MCPUsagePage
 // ---------------------------------------------------------------------------
 
-export default function MCPUsagePage() {
+function MCPUsageContent() {
   const [range, setRange] = useState<TimeRange>('24h')
   const [groupBy, setGroupBy] = useState('server')
   const [crossOrg, setCrossOrg] = useState(false)
@@ -200,18 +189,20 @@ export default function MCPUsagePage() {
   const orgId = me?.org_id ?? ''
   const isSystemAdmin = me?.is_system_admin === true
 
-  const { from, to } = useMemo(() => getTimeRange(range), [range])
+  const canViewOrgUsage = isOrgAdmin(me)
+  const crossOrgActive = crossOrg && isSystemAdmin
+  const orgScopeEnabled = canViewOrgUsage && !crossOrgActive
 
-  const orgUsage = useMCPUsage(orgId, from, to, groupBy)
-  const crossOrgUsage = useCrossOrgMCPUsage({ from, to, groupBy }, crossOrg && isSystemAdmin)
+  const orgUsage = useMCPUsage(orgId, range, groupBy, { enabled: orgScopeEnabled })
+  const crossOrgUsage = useCrossOrgMCPUsage({ range, groupBy }, crossOrgActive)
 
-  const activeResult = crossOrg && isSystemAdmin ? crossOrgUsage : orgUsage
+  const activeResult = crossOrgActive ? crossOrgUsage : orgUsage
 
   const { data: usage, isLoading } = activeResult
 
   // Daily trend data - only when groupBy is not already 'day'/'hour'
   const needsDailyTrend = groupBy !== 'day' && groupBy !== 'hour'
-  const dailyUsage = useMCPUsage(orgId, from, to, 'day')
+  const dailyUsage = useMCPUsage(orgId, range, 'day', { enabled: orgScopeEnabled && needsDailyTrend })
   const trendData = needsDailyTrend ? dailyUsage.data?.data : usage?.data
 
   const handleCrossOrgToggle = (next: boolean) => {
@@ -255,14 +246,14 @@ export default function MCPUsagePage() {
   const isDataLoading = isLoading && (crossOrg ? isSystemAdmin : !!orgId)
 
   // Get top 10 by tool groupBy - use a separate query when current groupBy isn't 'tool'
-  const toolGroupUsage = useMCPUsage(orgId, from, to, 'tool')
+  const toolGroupUsage = useMCPUsage(orgId, range, 'tool', { enabled: orgScopeEnabled && groupBy !== 'tool' })
   const topTools = useMemo(() => {
     const source = groupBy === 'tool' ? sortedData : (toolGroupUsage.data?.data ?? [])
     return [...source].sort((a, b) => b.total_calls - a.total_calls).slice(0, 10)
   }, [groupBy, sortedData, toolGroupUsage.data])
 
   // For server groupBy - use a separate query when current groupBy isn't 'server'
-  const serverGroupUsage = useMCPUsage(orgId, from, to, 'server')
+  const serverGroupUsage = useMCPUsage(orgId, range, 'server', { enabled: orgScopeEnabled && groupBy !== 'server' })
   const topServers = useMemo(() => {
     const source = groupBy === 'server' ? sortedData : (serverGroupUsage.data?.data ?? [])
     return [...source].sort((a, b) => b.total_calls - a.total_calls).slice(0, 10)
@@ -468,3 +459,11 @@ export default function MCPUsagePage() {
   )
 }
 
+
+export default function MCPUsagePage() {
+  const { data: me } = useMe()
+  if (me && !isOrgAdmin(me)) {
+    return <AdminOnlyNotice message="Only organization admins can view MCP usage." />
+  }
+  return <MCPUsageContent />
+}

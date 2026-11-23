@@ -269,3 +269,32 @@ describe('LicensePage banners and pricing', () => {
     expect(screen.queryByText(/\$299|\$799/)).not.toBeInTheDocument()
   })
 })
+
+describe('LicensePage version stat', () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals()
+    localStorage.clear()
+  })
+
+  it('renders the Version stat even when the license request fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.endsWith('/api/v1/me')) {
+        return { ok: true, status: 200, statusText: 'ok', json: () => Promise.resolve(ME_ADMIN) }
+      }
+      if (url.endsWith('/api/v1/system/update-check')) {
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'ok',
+          json: () => Promise.resolve({ current_version: '1.2.3' }),
+        }
+      }
+      return { ok: false, status: 500, statusText: 'err', json: () => Promise.resolve({}) }
+    }))
+    renderPage()
+    expect(await screen.findByText('Version')).toBeInTheDocument()
+    expect(await screen.findByText('1.2.3')).toBeInTheDocument()
+    expect(screen.queryByText('Plan')).not.toBeInTheDocument()
+  })
+})

@@ -10,6 +10,7 @@ import { StatCard } from '../components/ui/StatCard'
 import { useMe } from '../hooks/useMe'
 import { useLicense, useActivateLicense, useRequestTrial } from '../hooks/useLicense'
 import type { LicenseInfo } from '../hooks/useLicense'
+import { useUpdateCheck } from '../hooks/useUpdateCheck'
 import { useToast } from '../hooks/useToast'
 import { formatDate } from '../lib/utils'
 
@@ -512,6 +513,7 @@ function LoadingSkeleton() {
 export default function LicensePage() {
   const { data: me } = useMe()
   const { data: license, isLoading } = useLicense()
+  const { data: updateInfo } = useUpdateCheck()
   const [licenseKey, setLicenseKey] = useState('')
   const [activateError, setActivateError] = useState<string | null>(null)
   const activateLicense = useActivateLicense()
@@ -553,8 +555,9 @@ export default function LicensePage() {
       {license != null && <LicenseStatusBanners license={license} />}
 
       {/* Stat row */}
-      {license != null && (
-        <div className="grid grid-cols-3 gap-4 mb-6">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        {license != null && (
+          <>
           <StatCard
             label="Plan"
             value={planLabel(license.edition)}
@@ -573,8 +576,15 @@ export default function LicensePage() {
             icon={<IconCalendar />}
             iconColor="blue"
           />
-        </div>
-      )}
+          </>
+        )}
+          <StatCard
+            label="Version"
+            value={updateInfo?.current_version ?? '-'}
+            icon={<IconTag />}
+            iconColor="yellow"
+          />
+      </div>
 
       <div className="flex gap-6 items-start">
         {/* Left panel — Current Plan (40%) */}

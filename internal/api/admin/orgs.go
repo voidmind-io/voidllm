@@ -62,6 +62,19 @@ type paginatedOrgsResponse struct {
 	Data    []orgResponse `json:"data"`
 	HasMore bool          `json:"has_more"`
 	Cursor  string        `json:"next_cursor,omitempty"`
+	// Summary is present only when the request has summary=true.
+	Summary *orgsSummaryResponse `json:"summary,omitempty"`
+}
+
+// orgsSummaryResponse holds aggregate figures over every organization the
+// caller can list, independent of pagination.
+type orgsSummaryResponse struct {
+	// Total is the number of organizations in scope.
+	Total int `json:"total"`
+	// Members is the sum of the member counts of the organizations in scope.
+	Members int `json:"members"`
+	// Teams is the sum of the active team counts of the organizations in scope.
+	Teams int `json:"teams"`
 }
 
 // orgToResponse converts a db.OrgWithCounts to its API wire representation,
@@ -218,6 +231,7 @@ func (h *Handler) GetOrg(c fiber.Ctx) error {
 // @Param        limit            query     int     false  "Page size (default 20, max 100)"
 // @Param        cursor           query     string  false  "Pagination cursor (UUIDv7 of the last seen org)"
 // @Param        include_deleted  query     bool    false  "Include soft-deleted orgs (system admin only)"
+// @Param        summary          query     bool    false  "Include aggregate counts over the whole visible scope"
 // @Success      200              {object}  paginatedOrgsResponse
 // @Failure      400              {object}  swaggerErrorResponse
 // @Failure      401              {object}  swaggerErrorResponse
@@ -241,12 +255,20 @@ func (h *Handler) ListOrgs(c fiber.Ctx) error {
 		org, err := h.DB.GetOrgWithCounts(c.Context(), keyInfo.OrgID)
 		if err != nil {
 			if errors.Is(err, db.ErrNotFound) {
-				return c.JSON(paginatedOrgsResponse{Data: []orgResponse{}})
+				resp := paginatedOrgsResponse{Data: []orgResponse{}}
+				if wantsSummary(c) {
+					resp.Summary = &orgsSummaryResponse{}
+				}
+				return c.JSON(resp)
 			}
 			h.Log.ErrorContext(c.Context(), "list orgs", slog.String("error", err.Error()))
 			return apierror.InternalError(c, "failed to list organizations")
 		}
-		return c.JSON(paginatedOrgsResponse{Data: []orgResponse{orgToResponse(org)}})
+		resp := paginatedOrgsResponse{Data: []orgResponse{orgToResponse(org)}}
+		if wantsSummary(c) {
+			resp.Summary = &orgsSummaryResponse{Total: 1, Members: org.MemberCount, Teams: org.TeamCount}
+		}
+		return c.JSON(resp)
 	}
 
 	orgs, err := h.DB.ListOrgsWithCounts(c.Context(), p.Cursor, p.Limit+1, includeDeleted)
@@ -269,6 +291,14 @@ func (h *Handler) ListOrgs(c fiber.Ctx) error {
 	}
 	if hasMore && len(orgs) > 0 {
 		resp.Cursor = orgs[len(orgs)-1].ID
+	}
+	if wantsSummary(c) {
+		summary, err := h.DB.SummarizeOrgs(c.Context(), includeDeleted)
+		if err != nil {
+			h.Log.ErrorContext(c.Context(), "summarize orgs", slog.String("error", err.Error()))
+		} else {
+			resp.Summary = &orgsSummaryResponse{Total: summary.Total, Members: summary.Members, Teams: summary.Teams}
+		}
 	}
 	return c.JSON(resp)
 }

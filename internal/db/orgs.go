@@ -367,28 +367,19 @@ func scanOrgWithCounts(rows interface {
 // number of records returned. includeDeleted controls whether soft-deleted
 // organizations are included.
 func (d *DB) ListOrgsWithCounts(ctx context.Context, cursor string, limit int, includeDeleted bool) ([]OrgWithCounts, error) {
-	p := d.dialect.Placeholder
-	argN := 1
-	var conditions []string
-	var args []any
-
-	if !includeDeleted {
-		conditions = append(conditions, "o.deleted_at IS NULL")
-	}
+	q := d.newQueryArgs()
+	conditions := orgScopeConditions(includeDeleted)
 	if cursor != "" {
-		conditions = append(conditions, "o.id > "+p(argN))
-		args = append(args, cursor)
-		argN++
+		conditions = append(conditions, "o.id > "+q.bind(cursor))
 	}
 
 	query := orgWithCountsBase
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
-	query += " ORDER BY o.id ASC LIMIT " + p(argN)
-	args = append(args, limit)
+	query += " ORDER BY o.id ASC LIMIT " + q.bind(limit)
 
-	rows, err := d.sql.QueryContext(ctx, query, args...)
+	rows, err := d.sql.QueryContext(ctx, query, q.args...)
 	if err != nil {
 		return nil, fmt.Errorf("ListOrgsWithCounts query: %w", err)
 	}
@@ -424,4 +415,46 @@ func (d *DB) GetOrgWithCounts(ctx context.Context, id string) (*OrgWithCounts, e
 		return nil, fmt.Errorf("GetOrgWithCounts %s: %w", id, translateError(err))
 	}
 	return o, nil
+}
+
+// orgScopeConditions returns the WHERE conditions that decide which
+// organizations a system admin list call sees. It is shared by
+// ListOrgsWithCounts and SummarizeOrgs so the list and its summary can never diverge.
+func orgScopeConditions(includeDeleted bool) []string {
+	var conditions []string
+	if !includeDeleted {
+		conditions = append(conditions, "o.deleted_at IS NULL")
+	}
+	return conditions
+}
+
+// OrgsSummary holds aggregate figures over a whole organization list scope.
+type OrgsSummary struct {
+	// Total is the number of organizations in scope.
+	Total int
+	// Members is the sum of the member counts of the organizations in scope,
+	// counted the same way as OrgWithCounts.MemberCount.
+	Members int
+	// Teams is the sum of the active team counts of the organizations in scope,
+	// counted the same way as OrgWithCounts.TeamCount.
+	Teams int
+}
+
+// SummarizeOrgs aggregates the organizations that ListOrgsWithCounts would
+// return for the same includeDeleted value across all pages.
+func (d *DB) SummarizeOrgs(ctx context.Context, includeDeleted bool) (*OrgsSummary, error) {
+	scope := "SELECT o.id FROM organizations o"
+	if conditions := orgScopeConditions(includeDeleted); len(conditions) > 0 {
+		scope += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query := "WITH scoped AS (" + scope + ") SELECT " +
+		"(SELECT COUNT(*) FROM scoped), " +
+		"(SELECT COUNT(*) FROM org_memberships WHERE org_id IN (SELECT id FROM scoped)), " +
+		"(SELECT COUNT(*) FROM teams WHERE deleted_at IS NULL AND org_id IN (SELECT id FROM scoped))"
+
+	var s OrgsSummary
+	if err := d.sql.QueryRowContext(ctx, query).Scan(&s.Total, &s.Members, &s.Teams); err != nil {
+		return nil, fmt.Errorf("SummarizeOrgs: %w", err)
+	}
+	return &s, nil
 }

@@ -15,8 +15,10 @@ import { useDashboardStats } from '../hooks/useDashboardStats'
 import type { BudgetWarning } from '../hooks/useDashboardStats'
 import { useTopModels } from '../hooks/useTopModels'
 import type { UsageDataPoint } from '../hooks/useTopModels'
-import { useUsage } from '../hooks/useUsage'
+import { useUsage, useMyUsage } from '../hooks/useUsage'
+import type { UsageRange } from '../lib/timeRange'
 import { useOrg } from '../hooks/useOrg'
+import { isOrgAdmin } from '../lib/roles'
 import { useModelHealth } from '../hooks/useModelHealth'
 import type { ModelHealthInfo } from '../hooks/useModelHealth'
 import { useUpdateCheck } from '../hooks/useUpdateCheck'
@@ -28,13 +30,9 @@ import { formatTokens, formatCost, formatNumber } from '../lib/utils'
 
 type TimeRange = '24h' | '7d' | '30d'
 
-function getTimeRange(range: TimeRange): { from: string; to: string } {
-  const to = new Date()
-  const from = new Date()
-  if (range === '24h') from.setHours(from.getHours() - 24)
-  else if (range === '7d') from.setDate(from.getDate() - 7)
-  else from.setDate(from.getDate() - 30)
-  return { from: from.toISOString(), to: to.toISOString() }
+/** Dashboard ranges use calendar arithmetic (setHours/setDate) when resolved. */
+function toUsageRange(range: TimeRange): UsageRange {
+  return `${range}-cal`
 }
 
 // ---------------------------------------------------------------------------
@@ -82,9 +80,17 @@ function ProgressBar({ label, used, limit }: { label: string; used: number; limi
 // BudgetSection
 // ---------------------------------------------------------------------------
 
-function BudgetSection({ orgId, tokens24h }: { orgId: string; tokens24h: number }) {
-  const { data: org } = useOrg(orgId)
-  if (!org || org.daily_token_limit <= 0) return null
+function BudgetSection({
+  orgId,
+  tokens24h,
+  isAdmin,
+}: {
+  orgId: string
+  tokens24h: number
+  isAdmin: boolean
+}) {
+  const { data: org } = useOrg(orgId, { enabled: isAdmin })
+  if (!isAdmin || !org || org.daily_token_limit <= 0) return null
   return (
     <div className="bg-bg-secondary rounded-xl border border-border p-6">
       <h2 className="text-lg font-semibold text-text-primary mb-6">Token Budget</h2>
@@ -322,7 +328,7 @@ export default function DashboardPage() {
     setShowUpdateDialog(false)
   }
 
-  const canViewOrgUsage = me?.role === 'system_admin' || me?.role === 'org_admin'
+  const canViewOrgUsage = isOrgAdmin(me)
   const orgId = me?.org_id ?? ''
 
   const { data: topModels, isLoading: modelsLoading } = useTopModels(
@@ -338,22 +344,26 @@ export default function DashboardPage() {
   )
 
   // Time-series data for the area chart
-  const { from, to } = useMemo(() => getTimeRange(timeRange), [timeRange])
-  const { from: from24h } = useMemo(() => getTimeRange('24h'), [])
+  const usageRange = toUsageRange(timeRange)
 
-  const { data: usageSeries, isLoading: seriesLoading } = useUsage(
+  const { data: orgUsageSeries, isLoading: orgSeriesLoading } = useUsage(
     orgId,
-    from,
-    to,
+    usageRange,
     'day',
+    { enabled: canViewOrgUsage },
   )
+  const { data: myUsageSeries, isLoading: mySeriesLoading } = useMyUsage(usageRange, 'day', {
+    enabled: me !== undefined && !canViewOrgUsage,
+  })
+  const usageSeries = canViewOrgUsage ? orgUsageSeries : myUsageSeries
+  const seriesLoading = canViewOrgUsage ? orgSeriesLoading : mySeriesLoading
 
-  // Team usage (admin only)
+  // Team usage (admin only), always a true last-24h window
   const { data: teamUsage, isLoading: teamUsageLoading } = useUsage(
     orgId,
-    from24h,
-    to,
+    '24h-cal',
     'team',
+    { enabled: canViewOrgUsage },
   )
 
   const scope = stats?.scope ?? 'user'
@@ -494,7 +504,11 @@ export default function DashboardPage() {
 
         {/* Token budget section */}
         {me?.org_id != null && !statsLoading && (
-          <BudgetSection orgId={me.org_id} tokens24h={stats?.tokens_24h ?? 0} />
+          <BudgetSection
+            orgId={me.org_id}
+            tokens24h={stats?.tokens_24h ?? 0}
+            isAdmin={canViewOrgUsage}
+          />
         )}
 
         {/* Requests over time */}

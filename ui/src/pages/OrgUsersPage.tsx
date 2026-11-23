@@ -45,10 +45,6 @@ function roleLabel(role: string): string {
   return labels[role] ?? role
 }
 
-function isAdminRole(role: string): boolean {
-  return role === 'org_admin' || role === 'system_admin'
-}
-
 // ---------------------------------------------------------------------------
 // Limit helpers
 // ---------------------------------------------------------------------------
@@ -427,7 +423,7 @@ export default function OrgUsersPage() {
   } | null>(null)
   const [editLimitsMember, setEditLimitsMember] = useState<OrgMembershipResponse | null>(null)
 
-  const { data: members, isLoading } = useOrgMembers(orgId, cursor)
+  const { data: members, isLoading } = useOrgMembers(orgId, cursor, { summary: true })
   const deleteMember = useDeleteOrgMember(orgId)
   const updateMember = useUpdateOrgMember(orgId)
   const { toast } = useToast()
@@ -443,8 +439,8 @@ export default function OrgUsersPage() {
   }
 
   const memberList = members?.data ?? []
-  const totalMembers = memberList.length
-  const adminCount = memberList.filter((m) => isAdminRole(m.role)).length
+  const totalMembers = members?.summary?.total ?? '-'
+  const adminCount = members?.summary?.admins ?? '-'
 
   const columns: Column<OrgMembershipResponse>[] = [
     {
@@ -597,7 +593,7 @@ export default function OrgUsersPage() {
       </div>
 
       {/* Stat cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
         <StatCard
           label="Total Members"
           value={totalMembers}
@@ -636,27 +632,6 @@ export default function OrgUsersPage() {
                 strokeLinecap="round"
                 strokeLinejoin="round"
                 d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285Z"
-              />
-            </svg>
-          }
-        />
-        <StatCard
-          label="Active"
-          value={totalMembers}
-          iconColor="green"
-          icon={
-            <svg
-              className="w-4 h-4"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={1.75}
-              viewBox="0 0 24 24"
-              aria-hidden="true"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"
               />
             </svg>
           }

@@ -6,27 +6,15 @@ import { Button } from '../../components/ui/Button'
 import { Select } from '../../components/ui/Select'
 import { AreaChart, DonutChart, HorizontalBar } from '../../components/ui/charts'
 import { useMe } from '../../hooks/useMe'
-import { useUsage, useCrossOrgUsage } from '../../hooks/useUsage'
+import { useUsage, useMyUsage, useCrossOrgUsage } from '../../hooks/useUsage'
 import type { UsageDataPoint } from '../../hooks/useUsage'
 import { formatNumber, formatTokens, formatCost, shortenId } from '../../lib/utils'
 import { exportData } from '../../lib/export'
+import { isOrgAdmin } from '../../lib/roles'
 import { cacheHitRate, formatHitRate } from '../../lib/cache'
 
 const TIME_RANGES = ['24h', '7d', '30d', '90d'] as const
 type TimeRange = (typeof TIME_RANGES)[number]
-
-const RANGE_HOURS: Record<TimeRange, number> = {
-  '24h': 24,
-  '7d': 168,
-  '30d': 720,
-  '90d': 2160,
-}
-
-function getTimeRange(range: TimeRange): { from: string; to: string } {
-  const now = new Date()
-  const from = new Date(now.getTime() - RANGE_HOURS[range] * 3_600_000)
-  return { from: from.toISOString(), to: now.toISOString() }
-}
 
 const BASE_GROUP_BY_OPTIONS = [
   { value: 'model', label: 'Model' },
@@ -200,19 +188,24 @@ export default function LLMUsagePage() {
   const { data: me } = useMe()
   const orgId = me?.org_id ?? ''
   const isSystemAdmin = me?.is_system_admin === true
+  const canViewOrgUsage = isOrgAdmin(me)
+  const meLoaded = me !== undefined
 
-  const { from, to } = useMemo(() => getTimeRange(range), [range])
+  const crossOrgActive = crossOrg && isSystemAdmin
 
-  const orgUsage = useUsage(orgId, from, to, groupBy)
-  const crossOrgUsage = useCrossOrgData({ from, to, groupBy, enabled: isSystemAdmin })
+  const orgUsage = useUsage(orgId, range, groupBy, { enabled: canViewOrgUsage && !crossOrgActive })
+  const myUsage = useMyUsage(range, groupBy, { enabled: meLoaded && !canViewOrgUsage && !crossOrgActive })
+  const crossOrgUsage = useCrossOrgUsage({ range, groupBy }, crossOrgActive)
 
-  const activeResult = crossOrg && isSystemAdmin ? crossOrgUsage : orgUsage
+  const activeResult = crossOrgActive ? crossOrgUsage : canViewOrgUsage ? orgUsage : myUsage
 
   const { data: usage, isLoading } = activeResult
 
   // Daily trend data - only when groupBy is not already 'day'/'hour', and not cross-org
-  const needsDailyTrend = !crossOrg && groupBy !== 'day' && groupBy !== 'hour'
-  const dailyUsage = useUsage(orgId, from, to, 'day')
+  const needsDailyTrend = !crossOrgActive && groupBy !== 'day' && groupBy !== 'hour'
+  const dailyOrgUsage = useUsage(orgId, range, 'day', { enabled: canViewOrgUsage && needsDailyTrend })
+  const dailyMyUsage = useMyUsage(range, 'day', { enabled: meLoaded && !canViewOrgUsage && needsDailyTrend })
+  const dailyUsage = canViewOrgUsage ? dailyOrgUsage : dailyMyUsage
   // Use main data directly when groupBy is already day or hour
   const trendData = needsDailyTrend ? dailyUsage.data?.data : usage?.data
 
@@ -262,7 +255,7 @@ export default function LLMUsagePage() {
 
   const columns = useMemo(() => buildColumns(groupBy), [groupBy])
 
-  const isDataLoading = isLoading && (crossOrg ? isSystemAdmin : !!orgId)
+  const isDataLoading = !meLoaded || (isLoading && (crossOrg ? isSystemAdmin : canViewOrgUsage ? !!orgId : true))
 
   const totalPrompt = totals.prompt
   const totalCompletion = totals.completion
@@ -272,6 +265,13 @@ export default function LLMUsagePage() {
 
   return (
     <>
+      {meLoaded && !canViewOrgUsage && (
+        <div className="mb-6">
+          <h2 className="text-base font-semibold text-text-primary">Your usage</h2>
+          <p className="text-sm text-text-tertiary">Requests made with your own keys</p>
+        </div>
+      )}
+
       {/* Top controls: scope toggle + time range pills */}
       <div className="flex items-center gap-4 mb-6 flex-wrap">
         {isSystemAdmin && (
@@ -455,19 +455,4 @@ export default function LLMUsagePage() {
       </div>
     </>
   )
-}
-
-// ---------------------------------------------------------------------------
-// CrossOrgData helper - kept local to avoid leaking the type
-// ---------------------------------------------------------------------------
-
-interface CrossOrgDataProps {
-  from: string
-  to: string
-  groupBy: string
-  enabled: boolean
-}
-
-function useCrossOrgData({ from, to, groupBy, enabled }: CrossOrgDataProps) {
-  return useCrossOrgUsage({ from, to, groupBy }, enabled)
 }

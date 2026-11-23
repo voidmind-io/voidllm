@@ -264,6 +264,12 @@ type paginationParams struct {
 	Cursor string
 }
 
+// wantsSummary reports whether the request opted in to the optional summary
+// object on a list response via the query parameter summary=true.
+func wantsSummary(c fiber.Ctx) bool {
+	return c.Query("summary") == "true"
+}
+
 // parsePagination extracts and clamps pagination query parameters from the request.
 // limit defaults to 20 and is clamped to [1, 100].
 // cursor is a raw UUIDv7 string used as a keyset pagination lower bound.

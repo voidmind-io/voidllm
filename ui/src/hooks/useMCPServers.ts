@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query'
 import apiClient from '../api/client'
 
 export interface MCPServerResponse {
@@ -79,6 +79,12 @@ export interface TestMCPServerResponse {
   error?: string
 }
 
+export function invalidateMCPServerQueries(queryClient: QueryClient): void {
+  for (const key of ['mcp-servers', 'available-mcp-servers', 'mcp-access', 'mcp-server-health']) {
+    queryClient.invalidateQueries({ queryKey: [key] })
+  }
+}
+
 export function useMCPServers() {
   return useQuery({
     queryKey: ['mcp-servers'],
@@ -103,7 +109,7 @@ export function useUpdateMCPServer() {
         body: JSON.stringify(params),
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['mcp-servers'] })
+      invalidateMCPServerQueries(queryClient)
     },
   })
 }
@@ -114,7 +120,7 @@ export function useDeleteMCPServer() {
     mutationFn: (serverId: string) =>
       apiClient<void>(`/mcp-servers/${serverId}`, { method: 'DELETE' }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['mcp-servers'] })
+      invalidateMCPServerQueries(queryClient)
     },
   })
 }
@@ -127,7 +133,7 @@ export function useToggleMCPServer() {
         method: 'PATCH',
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['mcp-servers'] })
+      invalidateMCPServerQueries(queryClient)
     },
   })
 }

@@ -20,6 +20,7 @@ import {
   useRemoveBlocklistEntry,
   useRefreshMCPServerTools,
   useMCPServerTools,
+  invalidateMCPServerQueries,
 } from '../hooks/useMCPServers'
 import type { MCPServerResponse, CreateMCPServerParams, UpdateMCPServerParams } from '../hooks/useMCPServers'
 import { useMCPServerHealth } from '../hooks/useMCPServerHealth'
@@ -401,7 +402,7 @@ function CreateMCPServerDialog({
       body: JSON.stringify(params),
     })
       .then(() => {
-        queryClient.invalidateQueries({ queryKey: ['mcp-servers'] })
+        invalidateMCPServerQueries(queryClient)
         toast({ variant: 'success', message: 'MCP server added' })
         handleClose()
       })

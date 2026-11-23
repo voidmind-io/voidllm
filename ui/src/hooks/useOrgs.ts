@@ -16,8 +16,15 @@ export interface OrgListItem {
   updated_at: string
 }
 
+export interface OrgsSummary {
+  total: number
+  members: number
+  teams: number
+}
+
 interface PaginatedOrgs {
   data: OrgListItem[]
+  summary?: OrgsSummary
   has_more: boolean
   next_cursor?: string
 }
@@ -27,13 +34,14 @@ export interface CreateOrgParams {
   slug: string
 }
 
-export function useOrgs(cursor?: string) {
+export function useOrgs(cursor?: string, opts?: { summary?: boolean }) {
+  const summary = opts?.summary ?? false
+  const params = new URLSearchParams({ limit: '20' })
+  if (cursor) params.set('cursor', cursor)
+  if (summary) params.set('summary', 'true')
   return useQuery({
-    queryKey: ['orgs', cursor],
-    queryFn: () =>
-      apiClient<PaginatedOrgs>(
-        `/orgs?limit=20${cursor ? `&cursor=${cursor}` : ''}`,
-      ),
+    queryKey: ['orgs', cursor, summary],
+    queryFn: () => apiClient<PaginatedOrgs>(`/orgs?${params}`),
   })
 }
 

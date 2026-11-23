@@ -113,27 +113,17 @@ func (d *DB) GetOrgMembership(ctx context.Context, id string) (*OrgMembership, e
 // ascending. cursor is an exclusive lower bound on ID for keyset pagination; pass ""
 // to start from the beginning. limit controls the maximum number of records returned.
 func (d *DB) ListOrgMemberships(ctx context.Context, orgID string, cursor string, limit int) ([]OrgMembership, error) {
-	p := d.dialect.Placeholder
-	argN := 1
-	var conditions []string
-	var args []any
-
-	conditions = append(conditions, "org_id = "+p(argN))
-	args = append(args, orgID)
-	argN++
-
+	q := d.newQueryArgs()
+	conditions := orgMembershipScopeConditions(q, orgID)
 	if cursor != "" {
-		conditions = append(conditions, "id > "+p(argN))
-		args = append(args, cursor)
-		argN++
+		conditions = append(conditions, "id > "+q.bind(cursor))
 	}
 
 	query := "SELECT " + orgMembershipSelectColumns + " FROM org_memberships" +
 		" WHERE " + strings.Join(conditions, " AND ") +
-		" ORDER BY id ASC LIMIT " + p(argN)
-	args = append(args, limit)
+		" ORDER BY id ASC LIMIT " + q.bind(limit)
 
-	rows, err := d.sql.QueryContext(ctx, query, args...)
+	rows, err := d.sql.QueryContext(ctx, query, q.args...)
 	if err != nil {
 		return nil, fmt.Errorf("ListOrgMemberships query: %w", err)
 	}
@@ -264,4 +254,34 @@ func scanOrgMembership(row *sql.Row) (*OrgMembership, error) {
 		return nil, err
 	}
 	return &m, nil
+}
+
+// orgMembershipScopeConditions returns the WHERE conditions that decide which
+// memberships a list call sees. It is shared by ListOrgMemberships and
+// SummarizeOrgMemberships so the list and its summary can never diverge.
+func orgMembershipScopeConditions(q *queryArgs, orgID string) []string {
+	return []string{"org_id = " + q.bind(orgID)}
+}
+
+// OrgMembershipsSummary holds aggregate figures over all memberships of an org.
+type OrgMembershipsSummary struct {
+	// Total is the number of memberships in the org.
+	Total int
+	// Admins is the number of memberships with an admin role (org_admin or system_admin).
+	Admins int
+}
+
+// SummarizeOrgMemberships aggregates the memberships that ListOrgMemberships
+// would return for the same orgID across all pages.
+func (d *DB) SummarizeOrgMemberships(ctx context.Context, orgID string) (*OrgMembershipsSummary, error) {
+	q := d.newQueryArgs()
+	query := "SELECT COUNT(*), " +
+		"COALESCE(SUM(CASE WHEN role IN ('org_admin', 'system_admin') THEN 1 ELSE 0 END), 0)" +
+		" FROM org_memberships WHERE " + strings.Join(orgMembershipScopeConditions(q, orgID), " AND ")
+
+	var s OrgMembershipsSummary
+	if err := d.sql.QueryRowContext(ctx, query, q.args...).Scan(&s.Total, &s.Admins); err != nil {
+		return nil, fmt.Errorf("SummarizeOrgMemberships: %w", err)
+	}
+	return &s, nil
 }

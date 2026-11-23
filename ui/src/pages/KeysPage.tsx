@@ -20,6 +20,7 @@ import type { APIKeyResponse, CreateAPIKeyParams } from '../hooks/useAPIKeys'
 import { useTeams } from '../hooks/useTeams'
 import { useServiceAccounts } from '../hooks/useServiceAccounts'
 import { useToast } from '../hooks/useToast'
+import { canEditKey, canRotateKey, canRevokeKey } from '../lib/keyPermissions'
 import { parseLimitInput } from '../lib/utils'
 import apiClient from '../api/client'
 
@@ -890,29 +891,16 @@ export default function KeysPage() {
     return () => setCreatedKey(null)
   }, [])
 
-  const { data: keys, isLoading } = useAPIKeys(orgId, cursor)
+  const { data: keys, isLoading } = useAPIKeys(orgId, cursor, { summary: true })
   const deleteKey = useDeleteAPIKey(orgId)
   const rotateKey = useRotateAPIKey(orgId)
   const { toast } = useToast()
 
   const allKeys = useMemo(() => keys?.data ?? [], [keys?.data])
 
-  const [totalKeys, activeKeys, expiringSoon] = useMemo(() => {
-    // eslint-disable-next-line react-hooks/purity -- Date comparison is intentionally impure
-    const now = Date.now()
-    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000
-    const total = allKeys.length
-    const active = allKeys.filter((k) => {
-      if (!k.expires_at) return true
-      return new Date(k.expires_at).getTime() > now
-    }).length
-    const expiring = allKeys.filter((k) => {
-      if (!k.expires_at) return false
-      const exp = new Date(k.expires_at).getTime()
-      return exp > now && exp - now <= sevenDaysMs
-    }).length
-    return [total, active, expiring] as const
-  }, [allKeys])
+  const totalKeys = keys?.summary?.total ?? '-'
+  const activeKeys = keys?.summary?.active ?? '-'
+  const expiringSoon = keys?.summary?.expiring_soon ?? '-'
 
   const columns: Column<APIKeyResponse>[] = [
     {
@@ -960,36 +948,42 @@ export default function KeysPage() {
         if (row.key_type === 'session_key') return null
         return (
           <div className="flex items-center justify-end gap-0.5">
-            <Button
-              variant="ghost"
-              size="sm"
-              className="!px-1.5"
-              title="Edit key"
-              onClick={() => setEditKey(row)}
-              disabled={deleteKey.isPending || rotateKey.isPending}
-            >
-              <IconPencil className="h-4 w-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="!px-1.5"
-              title="Rotate key"
-              onClick={() => setRotateKeyId(row.id)}
-              disabled={deleteKey.isPending || rotateKey.isPending}
-            >
-              <IconRefresh className="h-4 w-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="!px-1.5 text-error hover:text-error"
-              title="Revoke key"
-              onClick={() => setRevokeKeyId(row.id)}
-              disabled={deleteKey.isPending || rotateKey.isPending}
-            >
-              <IconTrash className="h-4 w-4" />
-            </Button>
+            {canEditKey(me, row) && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="!px-1.5"
+                title="Edit key"
+                onClick={() => setEditKey(row)}
+                disabled={deleteKey.isPending || rotateKey.isPending}
+              >
+                <IconPencil className="h-4 w-4" />
+              </Button>
+            )}
+            {canRotateKey(me, row) && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="!px-1.5"
+                title="Rotate key"
+                onClick={() => setRotateKeyId(row.id)}
+                disabled={deleteKey.isPending || rotateKey.isPending}
+              >
+                <IconRefresh className="h-4 w-4" />
+              </Button>
+            )}
+            {canRevokeKey(me, row) && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="!px-1.5 text-error hover:text-error"
+                title="Revoke key"
+                onClick={() => setRevokeKeyId(row.id)}
+                disabled={deleteKey.isPending || rotateKey.isPending}
+              >
+                <IconTrash className="h-4 w-4" />
+              </Button>
+            )}
           </div>
         )
       },
