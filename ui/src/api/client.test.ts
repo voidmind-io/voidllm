@@ -26,7 +26,7 @@ describe('apiClient errors', () => {
 
 describe('apiClient 401', () => {
   it('throws a non-retryable ApiError(401) and clears the session', async () => {
-    vi.stubGlobal('location', { href: '/dash', pathname: '/dash', search: '?a=1' })
+    vi.stubGlobal('location', { href: '/dash', pathname: '/dash', search: '?a=1', hash: '#h' })
     localStorage.setItem('voidllm_session', 'vl_sk_x')
     vi.stubGlobal(
       'fetch',
@@ -41,7 +41,7 @@ describe('apiClient 401', () => {
     expect(err).toBeInstanceOf(ApiError)
     expect((err as ApiError).status).toBe(401)
     expect((err as ApiError).message).toBe('Session expired')
-    expect(window.location.href).toBe('/login?next=%2Fdash%3Fa%3D1')
+    expect(window.location.href).toBe('/login?next=%2Fdash%3Fa%3D1%23h')
     const retry = queryClient.getDefaultOptions().queries?.retry as (
       count: number,
       error: unknown,
@@ -85,6 +85,24 @@ describe('apiClient timeout and cancellation', () => {
 
   it('throws ApiError(0) when the timeout elapses', async () => {
     vi.stubGlobal('fetch', hangingFetch())
+    const err = await apiClient('/x', { timeoutMs: 10 }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).status).toBe(0)
+    expect((err as ApiError).message).toBe('Request timed out')
+  })
+
+  it('throws ApiError(0) when the body stalls after headers arrive', async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason))
+          }),
+      }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
     const err = await apiClient('/x', { timeoutMs: 10 }).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(ApiError)
     expect((err as ApiError).status).toBe(0)

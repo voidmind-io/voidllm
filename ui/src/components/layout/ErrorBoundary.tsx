@@ -40,6 +40,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
           </Button>
           <Link
             to="/"
+            onClick={() => this.setState({ hasError: false })}
             className="text-sm text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent rounded-sm"
           >
             Go to dashboard

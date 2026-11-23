@@ -20,13 +20,14 @@ export function safeNextPath(raw: string | null | undefined): string {
     return '/'
   }
   if (url.origin !== window.location.origin) return '/'
-  if (url.pathname.startsWith('/login') || url.pathname.startsWith('/auth/')) return '/'
+  const lowerPath = url.pathname.toLowerCase()
+  if (lowerPath.startsWith('/login') || lowerPath.startsWith('/auth/')) return '/'
   return raw
 }
 
 /** Builds the login URL carrying the current location as the return target. */
 export function loginUrlWithNext(): string {
-  const { pathname, search } = window.location
+  const { pathname, search, hash } = window.location
   if (pathname.startsWith('/login')) return '/login'
-  return `/login?next=${encodeURIComponent(pathname + search)}`
+  return `/login?next=${encodeURIComponent(pathname + search + hash)}`
 }

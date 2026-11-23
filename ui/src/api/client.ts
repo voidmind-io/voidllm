@@ -31,6 +31,11 @@ const apiClient = async <T>(endpoint: string, options?: ApiClientOptions): Promi
   const signal =
     signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
 
+  const wrapAbort = (err: unknown): unknown =>
+    callerSignal?.aborted !== true && timeoutSignal?.aborted === true
+      ? new ApiError(0, 'Request timed out')
+      : err
+
   let res: Response
   try {
     res = await fetch(`/api/v1${endpoint}`, {
@@ -43,10 +48,7 @@ const apiClient = async <T>(endpoint: string, options?: ApiClientOptions): Promi
       },
     })
   } catch (err) {
-    if (callerSignal?.aborted !== true && timeoutSignal?.aborted === true) {
-      throw new ApiError(0, 'Request timed out')
-    }
-    throw err
+    throw wrapAbort(err)
   }
 
   if (res.status === 401) {
@@ -57,7 +59,13 @@ const apiClient = async <T>(endpoint: string, options?: ApiClientOptions): Promi
   }
 
   if (!res.ok) {
-    const error = await res.json().catch(() => ({ error: { message: res.statusText } }))
+    let error: unknown
+    try {
+      error = await res.json()
+    } catch (err) {
+      if (wrapAbort(err) !== err) throw wrapAbort(err)
+      error = { error: { message: res.statusText } }
+    }
     throw new ApiError(
       res.status,
       (error as { error?: { message?: string } })?.error?.message ?? 'Unknown error',
@@ -69,7 +77,11 @@ const apiClient = async <T>(endpoint: string, options?: ApiClientOptions): Promi
     return undefined as T
   }
 
-  return res.json() as Promise<T>
+  try {
+    return (await res.json()) as T
+  } catch (err) {
+    throw wrapAbort(err)
+  }
 }
 
 export default apiClient

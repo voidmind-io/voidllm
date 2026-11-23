@@ -70,6 +70,16 @@ describe('LoginPage return path', () => {
     await waitFor(() => expect(sessionStorage.getItem('voidllm_next')).toBe('/keys'))
   })
 
+  it('keeps an earlier stored next when SSO is clicked without a next param', async () => {
+    vi.stubGlobal('fetch', mockFetch())
+    sessionStorage.setItem('voidllm_next', '/keys')
+    renderLogin('/login?error=sso_error')
+    const button = await screen.findByRole('button', { name: 'Sign in with SSO' })
+    button.closest('a')?.addEventListener('click', (e) => e.preventDefault())
+    await userEvent.click(button)
+    expect(sessionStorage.getItem('voidllm_next')).toBe('/keys')
+  })
+
   it('shows messages for new SSO error codes', () => {
     vi.stubGlobal('fetch', mockFetch())
     renderLogin('/login?error=invalid_state')

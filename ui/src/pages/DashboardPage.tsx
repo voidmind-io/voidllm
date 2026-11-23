@@ -386,6 +386,7 @@ export default function DashboardPage() {
   const topModelsBars = useMemo(() => {
     if (!topModels?.data) return []
     return topModels.data.slice(0, 6).map((m) => ({
+      id: m.group_key,
       label: m.group_label || m.group_key,
       value: m.total_tokens,
       detail: `${formatTokens(m.total_tokens)} Tokens`,
@@ -408,6 +409,7 @@ export default function DashboardPage() {
   const teamBars = useMemo(() => {
     if (!teamUsage?.data) return []
     return teamUsage.data.slice(0, 6).map((t) => ({
+      id: t.group_key,
       label: t.group_label || t.group_key,
       value: t.total_requests,
       detail: `${formatNumber(t.total_requests)} Req`,

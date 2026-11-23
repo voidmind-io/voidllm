@@ -56,11 +56,20 @@ const EXPIRY_WARNING_MS = 5 * 60 * 1000
 /** Largest delay setTimeout accepts. */
 const MAX_TIMEOUT_MS = 2_147_483_647
 
+/** Expiry timestamp the warning toast was already shown for, and that toast's id. */
+let warnedExpiry: number | null = null
+let warningToastId: string | null = null
+
+function formatMinutes(ms: number): string {
+  const minutes = Math.max(1, Math.ceil(ms / 60_000))
+  return minutes === 1 ? '1 minute' : `${minutes} minutes`
+}
+
 export function RequireAuth() {
   const token = localStorage.getItem(LOCAL_STORAGE_KEY)
   const [expired, setExpired] = useState(() => isSessionExpired())
   const location = useLocation()
-  const { toast } = useToast()
+  const { toast, dismiss } = useToast()
 
   useEffect(() => {
     if (!token) return
@@ -88,21 +97,30 @@ export function RequireAuth() {
       const remaining = expiry - Date.now()
       if (remaining <= 0) return
       if (remaining <= EXPIRY_WARNING_MS) {
-        toast({
+        if (warnedExpiry === expiry) return
+        warnedExpiry = expiry
+        warningToastId = toast({
           variant: 'info',
           duration: 0,
-          message: 'Your session ends in 5 minutes. Save your work and sign in again.',
+          message: `Your session ends in ${formatMinutes(remaining)}. Save your work and sign in again.`,
         })
         return
       }
       timer = window.setTimeout(schedule, Math.min(remaining - EXPIRY_WARNING_MS, MAX_TIMEOUT_MS))
     }
     schedule()
-    return () => window.clearTimeout(timer)
-  }, [token, toast])
+    return () => {
+      window.clearTimeout(timer)
+      if (warningToastId !== null && (!localStorage.getItem(LOCAL_STORAGE_KEY) || isSessionExpired())) {
+        dismiss(warningToastId)
+        warningToastId = null
+        warnedExpiry = null
+      }
+    }
+  }, [token, toast, dismiss])
 
   if (!token || expired) {
-    const next = location.pathname + location.search
+    const next = location.pathname + location.search + location.hash
     const target =
       location.pathname.startsWith('/login') || next === '/'
         ? '/login'

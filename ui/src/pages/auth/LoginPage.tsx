@@ -137,9 +137,10 @@ export default function LoginPage() {
             <a
               href="/api/v1/auth/oidc/login"
               className="block w-full"
-              onClick={() =>
-                sessionStorage.setItem(NEXT_PATH_KEY, safeNextPath(searchParams.get('next')))
-              }
+              onClick={() => {
+                const next = safeNextPath(searchParams.get('next'))
+                if (next !== '/') sessionStorage.setItem(NEXT_PATH_KEY, next)
+              }}
             >
               <Button variant="secondary" fullWidth size="lg" type="button">
                 Sign in with SSO

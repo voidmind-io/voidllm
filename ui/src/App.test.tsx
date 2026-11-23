@@ -1,5 +1,6 @@
 import { act, render, screen } from '@testing-library/react'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
+import { StrictMode } from 'react'
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { RequireAuth } from './App'
 import { LOCAL_STORAGE_KEY, SESSION_EXPIRY_KEY } from './lib/constants'
@@ -76,10 +77,17 @@ describe('RequireAuth session expiry', () => {
     renderGuard('/keys')
     expect(screen.getByText('login page ?next=%2Fkeys')).toBeInTheDocument()
   })
+
+  it('preserves the hash in next', () => {
+    localStorage.setItem(LOCAL_STORAGE_KEY, 'vl_sk_x')
+    localStorage.setItem(SESSION_EXPIRY_KEY, '2020-01-01T00:00:00Z')
+    renderGuard('/keys?a=1#sec')
+    expect(screen.getByText('login page ?next=%2Fkeys%3Fa%3D1%23sec')).toBeInTheDocument()
+  })
 })
 
 describe('RequireAuth expiry warning', () => {
-  const WARNING = /Your session ends in 5 minutes/
+  const WARNING = /Your session ends in \d+ minutes?\./
 
   it('warns 5 minutes before expiry and cleans up on unmount', () => {
     vi.useFakeTimers()
@@ -98,6 +106,52 @@ describe('RequireAuth expiry warning', () => {
     localStorage.setItem(SESSION_EXPIRY_KEY, new Date(Date.now() + 2 * 60_000).toISOString())
     renderGuard()
     expect(screen.getByText(WARNING)).toBeInTheDocument()
+  })
+
+  it('shows the actual remaining minutes', () => {
+    localStorage.setItem(LOCAL_STORAGE_KEY, 'vl_sk_x')
+    localStorage.setItem(SESSION_EXPIRY_KEY, new Date(Date.now() + 2 * 60_000 - 5_000).toISOString())
+    renderGuard()
+    expect(screen.getByText(/Your session ends in 2 minutes\./)).toBeInTheDocument()
+  })
+
+  it('uses the singular for the last minute', () => {
+    localStorage.setItem(LOCAL_STORAGE_KEY, 'vl_sk_x')
+    localStorage.setItem(SESSION_EXPIRY_KEY, new Date(Date.now() + 30_000).toISOString())
+    renderGuard()
+    expect(screen.getByText(/Your session ends in 1 minute\./)).toBeInTheDocument()
+  })
+
+  it('dismisses the warning when the session expires', () => {
+    vi.useFakeTimers()
+    localStorage.setItem(LOCAL_STORAGE_KEY, 'vl_sk_x')
+    localStorage.setItem(SESSION_EXPIRY_KEY, new Date(Date.now() + 2 * 60_000).toISOString())
+    renderGuard()
+    expect(screen.getByText(WARNING)).toBeInTheDocument()
+    act(() => {
+      vi.advanceTimersByTime(3 * 60_000)
+    })
+    expect(screen.getByText(/login page/)).toBeInTheDocument()
+    expect(screen.queryByText(WARNING)).not.toBeInTheDocument()
+  })
+
+  it('shows the warning once under StrictMode', () => {
+    localStorage.setItem(LOCAL_STORAGE_KEY, 'vl_sk_x')
+    localStorage.setItem(SESSION_EXPIRY_KEY, new Date(Date.now() + 4 * 60_000 + 1_234).toISOString())
+    render(
+      <StrictMode>
+        <ToastProvider>
+          <MemoryRouter>
+            <Routes>
+              <Route element={<RequireAuth />}>
+                <Route index element={<div>home</div>} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </ToastProvider>
+      </StrictMode>,
+    )
+    expect(screen.getAllByText(WARNING)).toHaveLength(1)
   })
 
   it('does not warn without a known expiry', () => {
