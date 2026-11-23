@@ -33,6 +33,7 @@ export function Toggle({ checked, onChange, label, size = 'md', disabled, classN
       type="button"
       role="switch"
       aria-checked={checked}
+      aria-label={label}
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={trackClasses}

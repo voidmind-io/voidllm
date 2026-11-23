@@ -19,7 +19,7 @@ interface ModelHealthResponse {
 export function useModelHealth() {
   return useQuery({
     queryKey: ['model-health'],
-    queryFn: () => apiClient<ModelHealthResponse>('/models/health'),
+    queryFn: ({ signal }) => apiClient<ModelHealthResponse>('/models/health', { signal }),
     refetchInterval: 15_000, // refresh every 15s for near-realtime health
   })
 }

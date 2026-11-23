@@ -207,7 +207,7 @@ export default function PlaygroundPage() {
 
   const { data: modelsData } = useQuery({
     queryKey: ['available-models'],
-    queryFn: () => apiClient<AvailableModelsResponse>('/me/available-models'),
+    queryFn: ({ signal }) => apiClient<AvailableModelsResponse>('/me/available-models', { signal }),
     staleTime: 0,
     refetchOnMount: 'always',
   })
@@ -567,6 +567,7 @@ export default function PlaygroundPage() {
                 <div className="flex items-center justify-between">
                   <ConfigLabel>Stream response</ConfigLabel>
                   <Toggle
+                    aria-label="Stream response"
                     checked={streaming}
                     onChange={setStreaming}
                     size="sm"

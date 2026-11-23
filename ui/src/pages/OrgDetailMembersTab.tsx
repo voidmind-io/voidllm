@@ -282,6 +282,7 @@ export default function OrgDetailMembersTab() {
             className="!px-1.5 text-text-tertiary hover:text-error"
             disabled={deleteMember.isPending}
             title="Remove member"
+            aria-label="Remove member"
           >
             <svg
               className="w-4 h-4"

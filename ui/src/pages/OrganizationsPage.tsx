@@ -204,6 +204,7 @@ export default function OrganizationsPage() {
           className="!px-1.5 text-text-tertiary hover:text-error"
           disabled={deleteOrg.isPending}
           title="Delete organization"
+          aria-label="Delete organization"
         >
           <svg
             className="w-4 h-4"

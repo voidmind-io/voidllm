@@ -32,10 +32,10 @@ export function useMCPUsage(
 ) {
   return useQuery({
     queryKey: ['mcp-usage', orgId, range, groupBy],
-    queryFn: () => {
+    queryFn: ({ signal }) => {
       const { from, to } = resolveRange(range)
       return apiClient<MCPUsageResponse>(
-        `/orgs/${orgId}/mcp-usage?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&group_by=${encodeURIComponent(groupBy)}`,
+        `/orgs/${orgId}/mcp-usage?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&group_by=${encodeURIComponent(groupBy)}`, { signal },
       )
     },
     enabled: !!orgId && (opts?.enabled ?? true),
@@ -52,10 +52,10 @@ export function useCrossOrgMCPUsage(
 
   return useQuery({
     queryKey: ['cross-org-mcp-usage', range, groupBy],
-    queryFn: () => {
+    queryFn: ({ signal }) => {
       const { from, to } = resolveRange(range)
       const query = new URLSearchParams({ from, to, group_by: groupBy })
-      return apiClient<MCPUsageResponse>(`/mcp-usage?${query.toString()}`)
+      return apiClient<MCPUsageResponse>(`/mcp-usage?${query.toString()}`, { signal })
     },
     enabled,
     staleTime: 60_000,

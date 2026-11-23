@@ -88,14 +88,14 @@ export function invalidateMCPServerQueries(queryClient: QueryClient): void {
 export function useMCPServers() {
   return useQuery({
     queryKey: ['mcp-servers'],
-    queryFn: () => apiClient<MCPServerResponse[]>('/mcp-servers'),
+    queryFn: ({ signal }) => apiClient<MCPServerResponse[]>('/mcp-servers', { signal }),
   })
 }
 
 export function useOrgMCPServers(orgId: string) {
   return useQuery({
     queryKey: ['mcp-servers', 'org', orgId],
-    queryFn: () => apiClient<MCPServerResponse[]>(`/orgs/${orgId}/mcp-servers`),
+    queryFn: ({ signal }) => apiClient<MCPServerResponse[]>(`/orgs/${orgId}/mcp-servers`, { signal }),
     enabled: !!orgId,
   })
 }
@@ -148,7 +148,7 @@ export function useTestMCPServer() {
 export function useMCPServerBlocklist(serverId: string) {
   return useQuery<ToolBlocklistEntry[]>({
     queryKey: ['mcp-server-blocklist', serverId],
-    queryFn: () => apiClient<ToolBlocklistEntry[]>(`/mcp-servers/${serverId}/blocklist`),
+    queryFn: ({ signal }) => apiClient<ToolBlocklistEntry[]>(`/mcp-servers/${serverId}/blocklist`, { signal }),
     enabled: !!serverId,
   })
 }
@@ -203,7 +203,7 @@ export interface MCPToolResponse {
 export function useMCPServerTools(serverId: string) {
   return useQuery<MCPToolResponse[]>({
     queryKey: ['mcp-server-tools', serverId],
-    queryFn: () => apiClient<MCPToolResponse[]>(`/mcp-servers/${serverId}/tools`),
+    queryFn: ({ signal }) => apiClient<MCPToolResponse[]>(`/mcp-servers/${serverId}/tools`, { signal }),
     enabled: !!serverId,
   })
 }

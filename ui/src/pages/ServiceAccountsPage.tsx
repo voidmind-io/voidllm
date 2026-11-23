@@ -23,6 +23,7 @@ import type {
 import { useTeams } from '../hooks/useTeams'
 import { useToast } from '../hooks/useToast'
 import { formatDate } from '../lib/utils'
+import { isOrgAdmin as hasOrgAdminRole } from '../lib/roles'
 
 // ---------------------------------------------------------------------------
 // Icons
@@ -173,7 +174,7 @@ function CreateServiceAccountDialog({ open, onClose, orgId }: CreateServiceAccou
   const [teamError, setTeamError] = useState<string | undefined>()
 
   const { data: me } = useMe()
-  const isOrgAdmin = me?.role === 'org_admin' || me?.is_system_admin === true
+  const isOrgAdmin = hasOrgAdminRole(me)
 
   const createServiceAccount = useCreateServiceAccount(orgId)
   const { data: teams } = useTeams(orgId)
@@ -477,6 +478,7 @@ export default function ServiceAccountsPage() {
             disabled={deleteServiceAccount.isPending}
             className="!px-1.5"
             title="Edit"
+            aria-label="Edit"
           >
             <IconPencil />
           </Button>
@@ -487,6 +489,7 @@ export default function ServiceAccountsPage() {
             className="!px-1.5 text-error hover:text-error"
             disabled={deleteServiceAccount.isPending}
             title="Delete"
+            aria-label="Delete"
           >
             <IconTrash />
           </Button>

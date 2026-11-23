@@ -41,10 +41,10 @@ export function useUsage(
 ) {
   return useQuery({
     queryKey: ['usage', orgId, range, groupBy],
-    queryFn: () => {
+    queryFn: ({ signal }) => {
       const { from, to } = resolveRange(range)
       return apiClient<UsageResponse>(
-        `/orgs/${orgId}/usage?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&group_by=${groupBy}`,
+        `/orgs/${orgId}/usage?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&group_by=${groupBy}`, { signal },
       )
     },
     enabled: !!orgId && (opts?.enabled ?? true),
@@ -57,10 +57,10 @@ export function useUsage(
 export function useMyUsage(range: UsageRange, groupBy: string, opts?: UsageQueryOptions) {
   return useQuery({
     queryKey: ['my-usage', range, groupBy],
-    queryFn: () => {
+    queryFn: ({ signal }) => {
       const { from, to } = resolveRange(range)
       const query = new URLSearchParams({ from, to, group_by: groupBy })
-      return apiClient<UsageResponse>(`/usage/me?${query.toString()}`)
+      return apiClient<UsageResponse>(`/usage/me?${query.toString()}`, { signal })
     },
     enabled: opts?.enabled ?? true,
     staleTime: 60_000,
@@ -76,10 +76,10 @@ export function useCrossOrgUsage(
 
   return useQuery({
     queryKey: ['cross-org-usage', range, groupBy],
-    queryFn: () => {
+    queryFn: ({ signal }) => {
       const { from, to } = resolveRange(range)
       const query = new URLSearchParams({ from, to, group_by: groupBy })
-      return apiClient<UsageResponse>(`/usage?${query.toString()}`)
+      return apiClient<UsageResponse>(`/usage?${query.toString()}`, { signal })
     },
     enabled,
     staleTime: 60_000,

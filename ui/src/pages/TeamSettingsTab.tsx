@@ -7,6 +7,7 @@ import { useTeam, useUpdateTeam } from '../hooks/useTeams'
 import type { CreateTeamParams, TeamResponse } from '../hooks/useTeams'
 import { useToast } from '../hooks/useToast'
 import { parseLimitInput } from '../lib/utils'
+import { isOrgAdmin as hasOrgAdminRole } from '../lib/roles'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -276,9 +277,7 @@ export default function TeamSettingsTab() {
   const { data: me } = useMe()
   const orgId = me?.org_id ?? ''
   const canEdit =
-    me?.role === 'org_admin' ||
-    me?.role === 'system_admin' ||
-    me?.role === 'team_admin'
+    hasOrgAdminRole(me) || me?.role === 'team_admin'
 
   return <TeamSettingsCard orgId={orgId} teamId={teamId} canEdit={canEdit} />
 }

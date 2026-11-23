@@ -41,7 +41,7 @@ export interface CreateTeamParams {
 export function useTeam(orgId: string, teamId: string) {
   return useQuery({
     queryKey: ['teams', orgId, 'detail', teamId],
-    queryFn: () => apiClient<TeamResponse>(`/orgs/${orgId}/teams/${teamId}`),
+    queryFn: ({ signal }) => apiClient<TeamResponse>(`/orgs/${orgId}/teams/${teamId}`, { signal }),
     enabled: !!orgId && !!teamId,
   })
 }
@@ -68,7 +68,7 @@ export function useTeams(orgId: string, cursor?: string, opts?: { summary?: bool
   if (summary) params.set('summary', 'true')
   return useQuery({
     queryKey: ['teams', orgId, cursor, summary],
-    queryFn: () => apiClient<PaginatedTeams>(`/orgs/${orgId}/teams?${params}`),
+    queryFn: ({ signal }) => apiClient<PaginatedTeams>(`/orgs/${orgId}/teams?${params}`, { signal }),
     enabled: !!orgId,
   })
 }

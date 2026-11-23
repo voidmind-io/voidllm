@@ -369,6 +369,7 @@ function SSOForm({ orgId, initial, hasExistingConfig, onDelete }: SSOFormProps) 
               </p>
             </div>
             <Toggle
+              aria-label="Enable SSO"
               checked={form.enabled}
               onChange={patch('enabled')}
               disabled={isPending}
@@ -499,6 +500,7 @@ function SSOForm({ orgId, initial, hasExistingConfig, onDelete }: SSOFormProps) 
               </p>
             </div>
             <Toggle
+              aria-label="Auto-provision users"
               checked={form.autoProvision}
               onChange={patch('autoProvision')}
               disabled={isPending}
@@ -528,6 +530,7 @@ function SSOForm({ orgId, initial, hasExistingConfig, onDelete }: SSOFormProps) 
               </p>
             </div>
             <Toggle
+              aria-label="Group sync"
               checked={form.groupSync}
               onChange={patch('groupSync')}
               disabled={isPending}

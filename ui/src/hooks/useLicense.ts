@@ -31,7 +31,7 @@ export interface RequestTrialResponse {
 export function useLicense() {
   return useQuery({
     queryKey: ['license'],
-    queryFn: () => apiClient<LicenseInfo>('/license'),
+    queryFn: ({ signal }) => apiClient<LicenseInfo>('/license', { signal }),
     staleTime: 5 * 60 * 1000, // 5 min — license doesn't change often
   })
 }

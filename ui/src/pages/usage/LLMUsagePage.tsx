@@ -255,7 +255,7 @@ export default function LLMUsagePage() {
 
   const columns = useMemo(() => buildColumns(groupBy), [groupBy])
 
-  const isDataLoading = !meLoaded || (isLoading && (crossOrg ? isSystemAdmin : canViewOrgUsage ? !!orgId : true))
+  const isDataLoading = !meLoaded || (isLoading && (crossOrgActive ? isSystemAdmin : canViewOrgUsage ? !!orgId : true))
 
   const totalPrompt = totals.prompt
   const totalCompletion = totals.completion

@@ -27,7 +27,7 @@ export interface DashboardStats {
 export function useDashboardStats() {
   return useQuery({
     queryKey: ['dashboard-stats'],
-    queryFn: () => apiClient<DashboardStats>('/dashboard/stats'),
+    queryFn: ({ signal }) => apiClient<DashboardStats>('/dashboard/stats', { signal }),
     refetchInterval: 60_000,
     refetchIntervalInBackground: false,
   })

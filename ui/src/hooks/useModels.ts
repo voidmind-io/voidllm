@@ -146,7 +146,7 @@ export function useModels(cursor?: string) {
   if (cursor) params.set('cursor', cursor)
   return useQuery({
     queryKey: ['models', cursor],
-    queryFn: () => apiClient<PaginatedModels>(`/models?${params}`),
+    queryFn: ({ signal }) => apiClient<PaginatedModels>(`/models?${params}`, { signal }),
   })
 }
 

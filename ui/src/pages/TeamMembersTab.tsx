@@ -22,6 +22,7 @@ import type { TeamMembershipResponse } from '../hooks/useTeamMembers'
 import type { OrgMembershipResponse } from '../hooks/useOrgMembers'
 import { useToast } from '../hooks/useToast'
 import apiClient from '../api/client'
+import { isOrgAdmin as hasOrgAdminRole } from '../lib/roles'
 
 // ---------------------------------------------------------------------------
 // Role constants
@@ -122,14 +123,14 @@ interface MemberOption {
 function useOrgMemberOptions(orgId: string, existingMemberIds: Set<string>) {
   return useQuery({
     queryKey: ['org-member-options', orgId],
-    queryFn: async (): Promise<MemberOption[]> => {
+    queryFn: async ({ signal }): Promise<MemberOption[]> => {
       const membersRes = await apiClient<{ data: OrgMembershipResponse[] }>(
-        `/orgs/${orgId}/members?limit=200`,
+        `/orgs/${orgId}/members?limit=200`, { signal },
       )
       const users = await Promise.all(
         membersRes.data.map(async (m) => {
           try {
-            const user = await apiClient<UserResponse>(`/users/${m.user_id}`)
+            const user = await apiClient<UserResponse>(`/users/${m.user_id}`, { signal })
             return {
               userId: m.user_id,
               label: user.display_name,
@@ -259,9 +260,7 @@ export default function TeamMembersTab() {
   const { data: me } = useMe()
   const orgId = me?.org_id ?? ''
   const canManage =
-    me?.role === 'org_admin' ||
-    me?.role === 'system_admin' ||
-    me?.role === 'team_admin'
+    hasOrgAdminRole(me) || me?.role === 'team_admin'
 
   const [cursor, setCursor] = useState<string | undefined>()
   const [prevCursors, setPrevCursors] = useState<string[]>([])
@@ -321,7 +320,7 @@ export default function TeamMembersTab() {
         // Team admins can't remove themselves (would lose management access).
         // Org admins and system admins can remove themselves safely.
         const isSelf = row.user_id === me?.id
-        const isHigherAdmin = me?.role === 'org_admin' || me?.role === 'system_admin'
+        const isHigherAdmin = hasOrgAdminRole(me)
         if (isSelf && !isHigherAdmin) return null
         return (
           <Button
@@ -331,6 +330,7 @@ export default function TeamMembersTab() {
             className="!px-1.5 text-text-tertiary hover:text-error"
             disabled={removeMember.isPending}
             title="Remove member"
+            aria-label="Remove member"
           >
             <svg
               className="w-4 h-4"

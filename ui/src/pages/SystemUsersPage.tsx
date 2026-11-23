@@ -304,6 +304,7 @@ export default function SystemUsersPage() {
             onClick={() => setDeleteUserId(row.id)}
             disabled={deleteUser.isPending}
             title="Delete user"
+            aria-label="Delete user"
             className="p-1.5 rounded-md text-text-tertiary hover:text-error hover:bg-error/10 transition-colors disabled:opacity-40"
           >
             <IconTrash />

@@ -4,9 +4,9 @@ import apiClient from '../api/client'
 export function useTeamModelAccess(orgId: string, teamId: string) {
   return useQuery({
     queryKey: ['team-model-access', orgId, teamId],
-    queryFn: () =>
+    queryFn: ({ signal }) =>
       apiClient<{ models: string[] }>(
-        `/orgs/${orgId}/teams/${teamId}/model-access`,
+        `/orgs/${orgId}/teams/${teamId}/model-access`, { signal },
       ),
     enabled: !!orgId && !!teamId,
   })

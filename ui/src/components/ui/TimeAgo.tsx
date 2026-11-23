@@ -1,5 +1,6 @@
 import React from 'react'
 import { cn, formatDate } from '../../lib/utils'
+import { useNow } from '../../hooks/useNow'
 
 export interface TimeAgoProps extends React.HTMLAttributes<HTMLTimeElement> {
   date: string
@@ -55,6 +56,7 @@ export function relativeTime(iso: string): string {
  * Provides a full date tooltip on hover via the title attribute.
  */
 export function TimeAgo({ date, fallback = 'never', className, ...rest }: TimeAgoProps) {
+  useNow()
   if (!date) {
     return (
       <time className={cn('text-sm text-text-tertiary', className)} {...rest}>

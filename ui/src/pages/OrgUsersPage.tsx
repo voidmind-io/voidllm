@@ -21,6 +21,7 @@ import { useUser } from '../hooks/useUsers'
 import { useCreateInvite } from '../hooks/useInvites'
 import { useToast } from '../hooks/useToast'
 import { parseLimitInput } from '../lib/utils'
+import { isOrgAdmin as hasOrgAdminRole } from '../lib/roles'
 
 // ---------------------------------------------------------------------------
 // Role constants
@@ -428,7 +429,7 @@ export default function OrgUsersPage() {
   const updateMember = useUpdateOrgMember(orgId)
   const { toast } = useToast()
 
-  const isAdmin = me?.role === 'org_admin' || me?.role === 'system_admin' || me?.is_system_admin === true
+  const isAdmin = hasOrgAdminRole(me)
 
   if (me && !isAdmin) {
     return (
@@ -499,6 +500,7 @@ export default function OrgUsersPage() {
                 className="!px-1.5 text-text-tertiary hover:text-text-primary"
                 disabled={updateMember.isPending}
                 title="Edit limits"
+                aria-label="Edit limits"
               >
                 <svg
                   className="w-4 h-4"
@@ -524,6 +526,7 @@ export default function OrgUsersPage() {
                 className="!px-1.5 text-text-tertiary hover:text-error"
                 disabled={deleteMember.isPending}
                 title="Remove user"
+                aria-label="Remove user"
               >
                 <svg
                   className="w-4 h-4"

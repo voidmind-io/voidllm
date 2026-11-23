@@ -10,8 +10,8 @@ export interface AvailableMCPServer {
 export function useAvailableGlobalMCPServers(orgId: string) {
   return useQuery({
     queryKey: ['available-mcp-servers', orgId],
-    queryFn: () =>
-      apiClient<AvailableMCPServer[]>(`/orgs/${orgId}/available-mcp-servers`),
+    queryFn: ({ signal }) =>
+      apiClient<AvailableMCPServer[]>(`/orgs/${orgId}/available-mcp-servers`, { signal }),
     enabled: !!orgId,
   })
 }
@@ -19,8 +19,8 @@ export function useAvailableGlobalMCPServers(orgId: string) {
 export function useOrgMCPAccess(orgId: string) {
   return useQuery({
     queryKey: ['mcp-access', 'org', orgId],
-    queryFn: () =>
-      apiClient<{ servers: string[] }>(`/orgs/${orgId}/mcp-access`),
+    queryFn: ({ signal }) =>
+      apiClient<{ servers: string[] }>(`/orgs/${orgId}/mcp-access`, { signal }),
     enabled: !!orgId,
   })
 }
@@ -44,9 +44,9 @@ export function useSetOrgMCPAccess(orgId: string) {
 export function useTeamMCPAccess(orgId: string, teamId: string) {
   return useQuery({
     queryKey: ['mcp-access', 'team', orgId, teamId],
-    queryFn: () =>
+    queryFn: ({ signal }) =>
       apiClient<{ servers: string[] }>(
-        `/orgs/${orgId}/teams/${teamId}/mcp-access`,
+        `/orgs/${orgId}/teams/${teamId}/mcp-access`, { signal },
       ),
     enabled: !!orgId && !!teamId,
   })

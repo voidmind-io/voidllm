@@ -6,6 +6,7 @@ import { Input } from '../../components/ui/Input'
 import { Button } from '../../components/ui/Button'
 import { Banner } from '../../components/ui/Banner'
 import { storeSession } from '../../lib/session'
+import { NEXT_PATH_KEY, safeNextPath } from '../../lib/nextPath'
 import type { MeResponse } from '../../hooks/useMe'
 
 interface AuthProviders {
@@ -17,6 +18,13 @@ const SSO_ERROR_MESSAGES: Record<string, string> = {
   not_provisioned: 'Your account has not been provisioned. Please contact your administrator.',
   domain_not_allowed: 'Your email domain is not authorized for SSO login.',
   sso_error: 'SSO authentication failed. Please try again.',
+  invalid_state: 'Your SSO sign-in expired or was interrupted. Please try again.',
+  missing_code: 'SSO sign-in did not complete. Please try again.',
+  exchange_failed: 'SSO sign-in could not be completed. Please try again.',
+  lookup_failed: 'SSO sign-in could not verify your account. Please try again.',
+  provision_failed: 'Your account could not be set up. Please contact your administrator.',
+  invalid_email: 'Your SSO account has no valid email address.',
+  auth_failed: 'SSO authentication failed. Please try again.',
 }
 
 export default function LoginPage() {
@@ -70,7 +78,7 @@ export default function LoginPage() {
       const data = (await res.json()) as { token: string; expires_at: string; user: MeResponse }
       storeSession(data.token, data.expires_at)
       queryClient.setQueryData(['me'], data.user)
-      navigate('/')
+      navigate(safeNextPath(searchParams.get('next')), { replace: true })
     } catch {
       setError('Unable to reach the server. Check your connection.')
     } finally {
@@ -126,7 +134,13 @@ export default function LoginPage() {
               <div className="flex-1 h-px bg-white/10" />
             </div>
 
-            <a href="/api/v1/auth/oidc/login" className="block w-full">
+            <a
+              href="/api/v1/auth/oidc/login"
+              className="block w-full"
+              onClick={() =>
+                sessionStorage.setItem(NEXT_PATH_KEY, safeNextPath(searchParams.get('next')))
+              }
+            >
               <Button variant="secondary" fullWidth size="lg" type="button">
                 Sign in with SSO
               </Button>

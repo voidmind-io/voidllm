@@ -46,8 +46,8 @@ export function useOrgMembers(orgId: string, cursor?: string, opts?: { summary?:
   if (summary) params.set('summary', 'true')
   return useQuery({
     queryKey: ['org-members', orgId, cursor, summary],
-    queryFn: () =>
-      apiClient<PaginatedOrgMemberships>(`/orgs/${orgId}/members?${params}`),
+    queryFn: ({ signal }) =>
+      apiClient<PaginatedOrgMemberships>(`/orgs/${orgId}/members?${params}`, { signal }),
     enabled: !!orgId,
   })
 }

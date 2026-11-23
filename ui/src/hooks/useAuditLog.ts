@@ -57,7 +57,7 @@ export function useAuditLog(params: AuditLogParams) {
     queryKey: pinned
       ? ['audit-log', orgId, resourceType, action, 'window', pinned.from, pinned.to, limit, cursor]
       : ['audit-log', orgId, resourceType, action, range, limit, cursor],
-    queryFn: async (): Promise<AuditLogPage> => {
+    queryFn: async ({ signal }): Promise<AuditLogPage> => {
       const window = pinned ?? resolveRange(range)
       const query = new URLSearchParams({ org_id: orgId, limit: String(limit) })
       if (cursor) query.set('cursor', cursor)
@@ -65,7 +65,7 @@ export function useAuditLog(params: AuditLogParams) {
       if (action) query.set('action', action)
       query.set('from', window.from)
       query.set('to', window.to)
-      const res = await apiClient<AuditLogResponse>(`/audit-logs?${query.toString()}`)
+      const res = await apiClient<AuditLogResponse>(`/audit-logs?${query.toString()}`, { signal })
       return { ...res, window }
     },
     enabled: enabled && !!orgId,

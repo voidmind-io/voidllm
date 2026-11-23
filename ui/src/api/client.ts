@@ -1,6 +1,9 @@
 import { LOCAL_STORAGE_KEY } from '../lib/constants'
 import { clearSession } from '../lib/session'
 import { queryClient } from '../lib/queryClient'
+import { loginUrlWithNext } from '../lib/nextPath'
+
+const DEFAULT_TIMEOUT_MS = 15_000
 
 /** Error thrown for non-OK API responses, carrying the HTTP status. */
 export class ApiError extends Error {
@@ -13,21 +16,43 @@ export class ApiError extends Error {
   }
 }
 
-const apiClient = async <T>(endpoint: string, options?: RequestInit): Promise<T> => {
+/** Request options; timeoutMs defaults to 15s, null disables the timeout. */
+export type ApiClientOptions = RequestInit & { timeoutMs?: number | null }
+
+const apiClient = async <T>(endpoint: string, options?: ApiClientOptions): Promise<T> => {
+  const { timeoutMs, signal: callerSignal, ...init } = options ?? {}
   const key = localStorage.getItem(LOCAL_STORAGE_KEY) ?? ''
-  const res = await fetch(`/api/v1${endpoint}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${key}`,
-      ...options?.headers,
-    },
-  })
+
+  const timeoutSignal =
+    timeoutMs === null ? null : AbortSignal.timeout(timeoutMs ?? DEFAULT_TIMEOUT_MS)
+  const signals: AbortSignal[] = []
+  if (callerSignal) signals.push(callerSignal)
+  if (timeoutSignal) signals.push(timeoutSignal)
+  const signal =
+    signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
+
+  let res: Response
+  try {
+    res = await fetch(`/api/v1${endpoint}`, {
+      ...init,
+      signal,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key}`,
+        ...init.headers,
+      },
+    })
+  } catch (err) {
+    if (callerSignal?.aborted !== true && timeoutSignal?.aborted === true) {
+      throw new ApiError(0, 'Request timed out')
+    }
+    throw err
+  }
 
   if (res.status === 401) {
     clearSession()
     queryClient.clear()
-    window.location.href = '/login'
+    window.location.href = loginUrlWithNext()
     throw new ApiError(401, 'Session expired')
   }
 

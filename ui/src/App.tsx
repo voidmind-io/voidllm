@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { QueryClientProvider } from '@tanstack/react-query'
 import { queryClient } from './lib/queryClient'
 import { useMe } from './hooks/useMe'
@@ -38,28 +38,29 @@ import CostReportsPage from './pages/CostReportsPage'
 import ProfilePage from './pages/ProfilePage'
 import AuditLogPage from './pages/AuditLogPage'
 import PlaygroundPage from './pages/PlaygroundPage'
+import NotFoundPage from './pages/NotFoundPage'
 import SystemUsersPage from './pages/SystemUsersPage'
 import MCPServersPage from './pages/MCPServersPage'
-import { ToastProvider } from './hooks/useToast'
+import { ToastProvider, useToast } from './hooks/useToast'
 import { Shell } from './components/layout/Shell'
-import { PageHeader } from './components/ui/PageHeader'
 import { LOCAL_STORAGE_KEY } from './lib/constants'
-import { clearSession, isSessionExpired, msUntilSessionExpiry } from './lib/session'
+import {
+  clearSession,
+  getSessionExpiryMs,
+  isSessionExpired,
+  msUntilSessionExpiry,
+} from './lib/session'
 
-function PlaceholderPage({ title, description }: { title: string; description?: string }) {
-  return (
-    <>
-      <PageHeader title={title} description={description} />
-      <div className="rounded-lg border border-border bg-bg-secondary p-12 text-center">
-        <p className="text-sm text-text-tertiary">Coming soon</p>
-      </div>
-    </>
-  )
-}
+/** How long before expiry the user is warned. */
+const EXPIRY_WARNING_MS = 5 * 60 * 1000
+/** Largest delay setTimeout accepts. */
+const MAX_TIMEOUT_MS = 2_147_483_647
 
 export function RequireAuth() {
   const token = localStorage.getItem(LOCAL_STORAGE_KEY)
   const [expired, setExpired] = useState(() => isSessionExpired())
+  const location = useLocation()
+  const { toast } = useToast()
 
   useEffect(() => {
     if (!token) return
@@ -78,7 +79,36 @@ export function RequireAuth() {
     return () => window.clearTimeout(timer)
   }, [token])
 
-  if (!token || expired) return <Navigate to="/login" replace />
+  useEffect(() => {
+    if (!token) return
+    let timer: number | undefined
+    const schedule = () => {
+      const expiry = getSessionExpiryMs()
+      if (expiry === null) return
+      const remaining = expiry - Date.now()
+      if (remaining <= 0) return
+      if (remaining <= EXPIRY_WARNING_MS) {
+        toast({
+          variant: 'info',
+          duration: 0,
+          message: 'Your session ends in 5 minutes. Save your work and sign in again.',
+        })
+        return
+      }
+      timer = window.setTimeout(schedule, Math.min(remaining - EXPIRY_WARNING_MS, MAX_TIMEOUT_MS))
+    }
+    schedule()
+    return () => window.clearTimeout(timer)
+  }, [token, toast])
+
+  if (!token || expired) {
+    const next = location.pathname + location.search
+    const target =
+      location.pathname.startsWith('/login') || next === '/'
+        ? '/login'
+        : `/login?next=${encodeURIComponent(next)}`
+    return <Navigate to={target} replace />
+  }
   return <Shell />
 }
 
@@ -139,15 +169,7 @@ export default function App() {
               </Route>
               <Route path="users" element={<SystemUsersPage />} />
               <Route path="mcp-servers" element={<MCPServersPage />} />
-              <Route
-                path="*"
-                element={
-                  <PlaceholderPage
-                    title="Not Found"
-                    description="This page does not exist."
-                  />
-                }
-              />
+              <Route path="*" element={<NotFoundPage />} />
             </Route>
           </Routes>
         </BrowserRouter>

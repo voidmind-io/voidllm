@@ -207,6 +207,7 @@ export default function OrgDetailTeamsTab() {
           className="!px-1.5 text-text-tertiary hover:text-error"
           disabled={deleteTeam.isPending}
           title="Delete team"
+          aria-label="Delete team"
         >
           <svg
             className="w-4 h-4"

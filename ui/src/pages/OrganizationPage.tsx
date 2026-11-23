@@ -3,11 +3,12 @@ import { PageHeader } from '../components/ui/PageHeader'
 import { Tabs } from '../components/ui/Tabs'
 import { useMe } from '../hooks/useMe'
 import type { Tab } from '../components/ui/Tabs'
+import { isOrgAdmin as hasOrgAdminRole } from '../lib/roles'
 
 export default function OrganizationPage() {
   const { data: me } = useMe()
 
-  const isOrgAdmin = me?.role === 'org_admin' || me?.role === 'system_admin'
+  const isOrgAdmin = hasOrgAdminRole(me)
 
   const tabs: Tab[] = [
     ...(isOrgAdmin
