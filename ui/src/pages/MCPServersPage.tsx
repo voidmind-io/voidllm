@@ -30,6 +30,7 @@ import { useTeams } from '../hooks/useTeams'
 import { useToast } from '../hooks/useToast'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import apiClient from '../api/client'
+import { isOrgAdmin as hasOrgAdminRole } from '../lib/roles'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1143,7 +1144,7 @@ export default function MCPServersPage() {
   const { data: me } = useMe()
   const orgId = me?.org_id ?? ''
   const isSystemAdmin = me?.is_system_admin === true
-  const isOrgAdmin = me?.role === 'org_admin' || isSystemAdmin
+  const isOrgAdmin = hasOrgAdminRole(me)
   const isTeamAdmin = me?.role === 'team_admin' || isOrgAdmin
   const canCreate = isTeamAdmin
 
@@ -1152,7 +1153,7 @@ export default function MCPServersPage() {
   const useGlobal = isSystemAdmin && !orgId
   const { data: globalServers, isLoading: globalLoading } = useQuery({
     queryKey: ['mcp-servers'],
-    queryFn: () => apiClient<MCPServerResponse[]>('/mcp-servers'),
+    queryFn: ({ signal }) => apiClient<MCPServerResponse[]>('/mcp-servers', { signal }),
     enabled: useGlobal,
   })
   const { data: orgServers, isLoading: orgLoading } = useOrgMCPServers(orgId)
@@ -1256,6 +1257,7 @@ export default function MCPServersPage() {
           (row.scope === 'team' && isTeamAdmin))
         return (
           <Toggle
+            aria-label={`Toggle ${row.name} active`}
             checked={row.is_active}
             onChange={(activate) =>
               toggleServer.mutate(
@@ -1289,6 +1291,7 @@ export default function MCPServersPage() {
           (row.scope === 'team' && isTeamAdmin))
         return (
           <Toggle
+            aria-label={`Toggle ${row.name} Code Mode`}
             checked={row.code_mode_enabled}
             onChange={(enabled) =>
               updateServer.mutate(
@@ -1357,6 +1360,7 @@ export default function MCPServersPage() {
               }}
               disabled={testServer.isPending && testServer.variables === row.id}
               title="Test connection"
+              aria-label="Test connection"
               className="p-1.5 rounded-md text-text-tertiary hover:text-accent hover:bg-accent/10 transition-colors disabled:opacity-40"
             >
               <IconPlug />
@@ -1367,6 +1371,7 @@ export default function MCPServersPage() {
                   type="button"
                   onClick={() => setEditServer(row)}
                   title="Edit server"
+                  aria-label="Edit server"
                   className="p-1.5 rounded-md text-text-tertiary hover:text-text-primary hover:bg-bg-tertiary transition-colors"
                 >
                   <IconPencil />
@@ -1376,6 +1381,7 @@ export default function MCPServersPage() {
                   onClick={() => setDeleteServerId(row.id)}
                   disabled={deleteServer.isPending && deleteServerId === row.id}
                   title="Delete server"
+                  aria-label="Delete server"
                   className="p-1.5 rounded-md text-text-tertiary hover:text-error hover:bg-error/10 transition-colors disabled:opacity-40"
                 >
                   <IconTrash />

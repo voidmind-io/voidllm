@@ -1,10 +1,9 @@
-import { useState, useMemo } from 'react'
+import { lazy, Suspense, useState, useMemo } from 'react'
 import { PageHeader } from '../components/ui/PageHeader'
 import { StatCard } from '../components/ui/StatCard'
 import { Banner } from '../components/ui/Banner'
 import { Dialog } from '../components/ui/Dialog'
 import { Button } from '../components/ui/Button'
-import { Markdown } from '../components/ui/Markdown'
 import { AreaChart } from '../components/ui/charts/AreaChart'
 import { DonutChart } from '../components/ui/charts/DonutChart'
 import { HorizontalBar } from '../components/ui/charts/HorizontalBar'
@@ -23,6 +22,10 @@ import { useModelHealth } from '../hooks/useModelHealth'
 import type { ModelHealthInfo } from '../hooks/useModelHealth'
 import { useUpdateCheck } from '../hooks/useUpdateCheck'
 import { formatTokens, formatCost, formatNumber } from '../lib/utils'
+
+const Markdown = lazy(() =>
+  import('../components/ui/Markdown').then((m) => ({ default: m.Markdown })),
+)
 
 // ---------------------------------------------------------------------------
 // Time range helpers
@@ -383,7 +386,8 @@ export default function DashboardPage() {
   const topModelsBars = useMemo(() => {
     if (!topModels?.data) return []
     return topModels.data.slice(0, 6).map((m) => ({
-      label: m.group_key,
+      id: m.group_key,
+      label: m.group_label || m.group_key,
       value: m.total_tokens,
       detail: `${formatTokens(m.total_tokens)} Tokens`,
     }))
@@ -405,7 +409,8 @@ export default function DashboardPage() {
   const teamBars = useMemo(() => {
     if (!teamUsage?.data) return []
     return teamUsage.data.slice(0, 6).map((t) => ({
-      label: t.group_key,
+      id: t.group_key,
+      label: t.group_label || t.group_key,
       value: t.total_requests,
       detail: `${formatNumber(t.total_requests)} Req`,
     }))
@@ -669,7 +674,9 @@ export default function DashboardPage() {
           </p>
           {updateInfo.release_notes != null && (
             <div className="text-sm text-text-secondary">
-              <Markdown>{updateInfo.release_notes}</Markdown>
+              <Suspense fallback={<p className="text-sm text-text-tertiary">Loading release notes...</p>}>
+                <Markdown>{updateInfo.release_notes}</Markdown>
+              </Suspense>
             </div>
           )}
         </Dialog>

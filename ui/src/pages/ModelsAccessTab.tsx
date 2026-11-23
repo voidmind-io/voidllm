@@ -17,7 +17,7 @@ import { providerBadgeVariant, isKnownProvider } from '../lib/providers'
 function useOrgModelAccess(orgId: string) {
   return useQuery({
     queryKey: ['model-access', orgId],
-    queryFn: () => apiClient<{ models: string[] }>(`/orgs/${orgId}/model-access`),
+    queryFn: ({ signal }) => apiClient<{ models: string[] }>(`/orgs/${orgId}/model-access`, { signal }),
     enabled: !!orgId,
   })
 }

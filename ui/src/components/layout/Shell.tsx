@@ -1,7 +1,9 @@
-import { Outlet } from 'react-router-dom'
+import { Outlet, useLocation } from 'react-router-dom'
 import { Sidebar } from './Sidebar'
+import { ErrorBoundary } from './ErrorBoundary'
 
 export function Shell() {
+  const location = useLocation()
   return (
     <div className="min-h-screen bg-bg-primary">
       <a
@@ -12,7 +14,9 @@ export function Shell() {
       </a>
       <Sidebar />
       <main id="main-content" className="ml-[260px] max-w-[calc(100%-260px)] p-8">
-        <Outlet />
+        <ErrorBoundary key={location.pathname}>
+          <Outlet />
+        </ErrorBoundary>
       </main>
     </div>
   )

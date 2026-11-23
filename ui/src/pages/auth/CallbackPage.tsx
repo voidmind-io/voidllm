@@ -1,5 +1,6 @@
 import { useEffect } from 'react'
 import { storeSession } from '../../lib/session'
+import { consumeNextPath } from '../../lib/nextPath'
 
 function getCookie(name: string): string | null {
   const match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'))
@@ -14,7 +15,8 @@ export default function CallbackPage() {
       storeSession(token, expiresAt ?? undefined)
       document.cookie = 'voidllm_oidc_token=; path=/auth/callback; max-age=0'
       document.cookie = 'voidllm_oidc_expires_at=; path=/auth/callback; max-age=0'
-      window.location.href = '/'
+      const next = consumeNextPath()
+      window.location.href = next
     } else {
       window.location.href = '/login?error=sso_error'
     }

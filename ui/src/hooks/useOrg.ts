@@ -26,7 +26,7 @@ export interface UpdateOrgParams {
 export function useOrg(orgId: string, opts?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ['org', orgId],
-    queryFn: () => apiClient<OrgResponse>(`/orgs/${orgId}`),
+    queryFn: ({ signal }) => apiClient<OrgResponse>(`/orgs/${orgId}`, { signal }),
     enabled: !!orgId && (opts?.enabled ?? true),
     staleTime: 5 * 60 * 1000,
   })

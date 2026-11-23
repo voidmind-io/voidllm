@@ -14,6 +14,7 @@ import { useTeams, useCreateTeam, useDeleteTeam } from '../hooks/useTeams'
 import type { TeamResponse, CreateTeamParams } from '../hooks/useTeams'
 import { useToast } from '../hooks/useToast'
 import { deriveSlug } from '../lib/slug'
+import { isOrgAdmin as hasOrgAdminRole } from '../lib/roles'
 
 // ---------------------------------------------------------------------------
 // Icons
@@ -212,7 +213,7 @@ function CreateTeamDialog({ open, onClose, orgId }: CreateTeamDialogProps) {
 export default function TeamsPage() {
   const { data: me } = useMe()
   const orgId = me?.org_id ?? ''
-  const isOrgAdmin = me?.role === 'org_admin' || me?.role === 'system_admin'
+  const isOrgAdmin = hasOrgAdminRole(me)
 
   const [cursor, setCursor] = useState<string | undefined>()
   const [prevCursors, setPrevCursors] = useState<string[]>([])
@@ -279,6 +280,7 @@ export default function TeamsPage() {
             onClick={() => setDeleteTeamId(row.id)}
             className="!px-1.5 text-error hover:text-error"
             title="Delete team"
+            aria-label="Delete team"
             disabled={deleteTeam.isPending}
           >
             <IconTrash />

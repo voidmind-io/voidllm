@@ -13,7 +13,7 @@ export interface UpdateInfo {
 export function useUpdateCheck() {
   return useQuery<UpdateInfo>({
     queryKey: ['update-check'],
-    queryFn: () => apiClient<UpdateInfo>('/system/update-check'),
+    queryFn: ({ signal }) => apiClient<UpdateInfo>('/system/update-check', { signal }),
     staleTime: 60 * 60 * 1000, // 1 hour
     refetchInterval: 60 * 60 * 1000,
   })

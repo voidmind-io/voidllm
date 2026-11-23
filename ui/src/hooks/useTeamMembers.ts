@@ -25,9 +25,9 @@ export function useTeamMembers(orgId: string, teamId: string, cursor?: string) {
   if (cursor) params.set('cursor', cursor)
   return useQuery({
     queryKey: ['team-members', orgId, teamId, cursor],
-    queryFn: () =>
+    queryFn: ({ signal }) =>
       apiClient<PaginatedTeamMemberships>(
-        `/orgs/${orgId}/teams/${teamId}/members?${params}`,
+        `/orgs/${orgId}/teams/${teamId}/members?${params}`, { signal },
       ),
     enabled: !!orgId && !!teamId,
   })

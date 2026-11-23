@@ -23,6 +23,7 @@ import { useToast } from '../hooks/useToast'
 import { canEditKey, canRotateKey, canRevokeKey } from '../lib/keyPermissions'
 import { parseLimitInput } from '../lib/utils'
 import apiClient from '../api/client'
+import { isOrgAdmin as hasOrgAdminRole } from '../lib/roles'
 
 // ---------------------------------------------------------------------------
 // Module-level constants
@@ -251,7 +252,7 @@ function CreateKeyDialog({ open, onClose, onCreated, orgId, isOrgAdmin }: Create
 
   const { data: availableModels } = useQuery({
     queryKey: ['available-models'],
-    queryFn: () => apiClient<{ models: string[] }>('/me/available-models'),
+    queryFn: ({ signal }) => apiClient<{ models: string[] }>('/me/available-models', { signal }),
   })
 
   const dailyTokenLimitResult = parseLimitInput(dailyTokenLimit)
@@ -876,7 +877,7 @@ function EditKeyDialog({ apiKey, onClose, orgId, isOrgAdmin }: EditKeyDialogProp
 export default function KeysPage() {
   const { data: me } = useMe()
   const orgId = me?.org_id ?? ''
-  const isOrgAdmin = me?.role === 'org_admin' || me?.role === 'system_admin' || me?.is_system_admin === true
+  const isOrgAdmin = hasOrgAdminRole(me)
 
   const [cursor, setCursor] = useState<string | undefined>()
   const [prevCursors, setPrevCursors] = useState<string[]>([])
@@ -954,6 +955,7 @@ export default function KeysPage() {
                 size="sm"
                 className="!px-1.5"
                 title="Edit key"
+                aria-label="Edit key"
                 onClick={() => setEditKey(row)}
                 disabled={deleteKey.isPending || rotateKey.isPending}
               >
@@ -966,6 +968,7 @@ export default function KeysPage() {
                 size="sm"
                 className="!px-1.5"
                 title="Rotate key"
+                aria-label="Rotate key"
                 onClick={() => setRotateKeyId(row.id)}
                 disabled={deleteKey.isPending || rotateKey.isPending}
               >
@@ -978,6 +981,7 @@ export default function KeysPage() {
                 size="sm"
                 className="!px-1.5 text-error hover:text-error"
                 title="Revoke key"
+                aria-label="Revoke key"
                 onClick={() => setRevokeKeyId(row.id)}
                 disabled={deleteKey.isPending || rotateKey.isPending}
               >

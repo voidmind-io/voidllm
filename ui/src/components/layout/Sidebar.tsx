@@ -303,7 +303,7 @@ export function Sidebar() {
                 <div className="h-px bg-white/10 my-2" />
               )}
               {group.label && (
-                <div className="text-[11px] uppercase tracking-wider text-text-tertiary/50 px-3 mb-1 mt-1">
+                <div className="text-[11px] uppercase tracking-wider text-text-tertiary px-3 mb-1 mt-1">
                   {group.label}
                 </div>
               )}
@@ -312,7 +312,7 @@ export function Sidebar() {
                   <NavLink
                     key={item.path}
                     to={item.path}
-                    className="flex items-center gap-3 px-3 py-2 rounded-lg text-sm opacity-50 hover:opacity-70 transition-opacity"
+                    className="flex items-center gap-3 px-3 py-2 rounded-lg text-sm opacity-70 hover:opacity-90 transition-opacity"
                   >
                     {item.icon}
                     <span className="flex-1">{item.label}</span>

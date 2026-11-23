@@ -37,8 +37,8 @@ export function useServiceAccounts(orgId: string, cursor?: string, opts?: { summ
   if (summary) params.set('summary', 'true')
   return useQuery({
     queryKey: ['service-accounts', orgId, cursor, summary],
-    queryFn: () =>
-      apiClient<PaginatedServiceAccounts>(`/orgs/${orgId}/service-accounts?${params}`),
+    queryFn: ({ signal }) =>
+      apiClient<PaginatedServiceAccounts>(`/orgs/${orgId}/service-accounts?${params}`, { signal }),
     enabled: !!orgId,
   })
 }

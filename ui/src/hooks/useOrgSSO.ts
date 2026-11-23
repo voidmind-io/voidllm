@@ -40,7 +40,7 @@ export interface SSOTestResult {
 export function useOrgSSO(orgId: string) {
   return useQuery({
     queryKey: ['org-sso', orgId],
-    queryFn: () => apiClient<SSOConfigResponse>(`/orgs/${orgId}/sso`),
+    queryFn: ({ signal }) => apiClient<SSOConfigResponse>(`/orgs/${orgId}/sso`, { signal }),
     enabled: !!orgId,
     retry: false,
   })
@@ -50,7 +50,7 @@ export function useOrgSSO(orgId: string) {
 export function useGlobalSSO() {
   return useQuery({
     queryKey: ['global-sso'],
-    queryFn: () => apiClient<SSOConfigResponse>('/settings/sso'),
+    queryFn: ({ signal }) => apiClient<SSOConfigResponse>('/settings/sso', { signal }),
     retry: false,
   })
 }

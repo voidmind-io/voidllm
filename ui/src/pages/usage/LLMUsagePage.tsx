@@ -255,7 +255,7 @@ export default function LLMUsagePage() {
 
   const columns = useMemo(() => buildColumns(groupBy), [groupBy])
 
-  const isDataLoading = !meLoaded || (isLoading && (crossOrg ? isSystemAdmin : canViewOrgUsage ? !!orgId : true))
+  const isDataLoading = !meLoaded || (isLoading && (crossOrgActive ? isSystemAdmin : canViewOrgUsage ? !!orgId : true))
 
   const totalPrompt = totals.prompt
   const totalCompletion = totals.completion
@@ -434,6 +434,7 @@ export default function LLMUsagePage() {
           <h3 className="text-sm font-semibold text-text-primary mb-4">Top by Tokens</h3>
           <HorizontalBar
             items={top5.map((d) => ({
+              id: d.group_key,
               label: d.group_label || d.group_key,
               value: d.total_tokens,
               detail: formatTokens(d.total_tokens),

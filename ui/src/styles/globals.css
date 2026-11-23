@@ -34,6 +34,7 @@
 }
 
 :root {
+  color-scheme: dark;
   --gradient-start: #6366f1;
   --gradient-mid: #8b5cf6;
   --gradient-end: #a855f7;

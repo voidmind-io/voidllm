@@ -41,7 +41,7 @@ export function useOrgs(cursor?: string, opts?: { summary?: boolean }) {
   if (summary) params.set('summary', 'true')
   return useQuery({
     queryKey: ['orgs', cursor, summary],
-    queryFn: () => apiClient<PaginatedOrgs>(`/orgs?${params}`),
+    queryFn: ({ signal }) => apiClient<PaginatedOrgs>(`/orgs?${params}`, { signal }),
   })
 }
 

@@ -1,0 +1,148 @@
+import { render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import LoginPage from './LoginPage'
+import CallbackPage from './CallbackPage'
+
+function mockFetch() {
+  return vi.fn(async (url: string) => {
+    if (url.endsWith('/auth/providers')) {
+      return { ok: true, status: 200, json: () => Promise.resolve({ local: true, oidc: true }) }
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve({ token: 'vl_sk_t', expires_at: '2099-01-01T00:00:00Z', user: { id: 'u' } }),
+    }
+  })
+}
+
+function renderLogin(path: string) {
+  return render(
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/keys" element={<div>keys page</div>} />
+          <Route path="/" element={<div>home page</div>} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  )
+}
+
+async function signIn() {
+  await userEvent.type(screen.getByLabelText('Email'), 'a@b.co')
+  await userEvent.type(screen.getByLabelText('Password'), 'secret')
+  await userEvent.click(screen.getByRole('button', { name: 'Sign in' }))
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  localStorage.clear()
+  sessionStorage.clear()
+})
+
+function nextValue(path: string, ts = Date.now()) {
+  sessionStorage.setItem('voidllm_next', JSON.stringify({ path, ts }))
+}
+
+describe('LoginPage return path', () => {
+  it('navigates to a safe next after login', async () => {
+    vi.stubGlobal('fetch', mockFetch())
+    renderLogin('/login?next=%2Fkeys')
+    await signIn()
+    expect(await screen.findByText('keys page')).toBeInTheDocument()
+  })
+
+  it('ignores an unsafe next', async () => {
+    vi.stubGlobal('fetch', mockFetch())
+    renderLogin('/login?next=%2F%2Fevil.com')
+    await signIn()
+    expect(await screen.findByText('home page')).toBeInTheDocument()
+  })
+
+  it('stores the validated next before starting SSO', async () => {
+    vi.stubGlobal('fetch', mockFetch())
+    renderLogin('/login?next=%2Fkeys')
+    const button = await screen.findByRole('button', { name: 'Sign in with SSO' })
+    button.closest('a')?.addEventListener('click', (e) => e.preventDefault())
+    await userEvent.click(button)
+    await waitFor(() => expect(JSON.parse(sessionStorage.getItem('voidllm_next') ?? 'null')).toMatchObject({ path: '/keys' }))
+  })
+
+  it('keeps an earlier stored next when SSO is clicked without a next param', async () => {
+    vi.stubGlobal('fetch', mockFetch())
+    const stored = JSON.stringify({ path: '/keys', ts: Date.now() })
+    sessionStorage.setItem('voidllm_next', stored)
+    renderLogin('/login?error=sso_error')
+    const button = await screen.findByRole('button', { name: 'Sign in with SSO' })
+    button.closest('a')?.addEventListener('click', (e) => e.preventDefault())
+    await userEvent.click(button)
+    expect(sessionStorage.getItem('voidllm_next')).toBe(stored)
+  })
+
+  it('clears a stored next after a successful password login', async () => {
+    vi.stubGlobal('fetch', mockFetch())
+    nextValue('/keys')
+    renderLogin('/login')
+    await signIn()
+    expect(await screen.findByText('home page')).toBeInTheDocument()
+    expect(sessionStorage.getItem('voidllm_next')).toBeNull()
+  })
+
+  it('shows messages for new SSO error codes', () => {
+    vi.stubGlobal('fetch', mockFetch())
+    renderLogin('/login?error=invalid_state')
+    expect(screen.getByText(/SSO sign-in expired/)).toBeInTheDocument()
+  })
+})
+
+describe('CallbackPage', () => {
+  it('goes to the stored next and clears it', () => {
+    const loc = { href: '', origin: 'http://localhost' }
+    vi.stubGlobal('location', loc)
+    document.cookie = 'voidllm_oidc_token=vl_sk_t'
+    nextValue('/usage/llm?range=7d')
+    render(<CallbackPage />)
+    expect(loc.href).toBe('/usage/llm?range=7d')
+    expect(sessionStorage.getItem('voidllm_next')).toBeNull()
+  })
+
+  it('re-validates the stored next', () => {
+    const loc = { href: '', origin: 'http://localhost' }
+    vi.stubGlobal('location', loc)
+    document.cookie = 'voidllm_oidc_token=vl_sk_t'
+    nextValue('//evil.com')
+    render(<CallbackPage />)
+    expect(loc.href).toBe('/')
+  })
+
+  function runCallback() {
+    const loc = { href: '', origin: 'http://localhost' }
+    vi.stubGlobal('location', loc)
+    document.cookie = 'voidllm_oidc_token=vl_sk_t'
+    render(<CallbackPage />)
+    return loc
+  }
+
+  it('ignores and removes a stored next older than 10 minutes', () => {
+    nextValue('/keys', Date.now() - 10 * 60_000 - 1_000)
+    expect(runCallback().href).toBe('/')
+    expect(sessionStorage.getItem('voidllm_next')).toBeNull()
+  })
+
+  it('ignores a legacy plain-string value', () => {
+    sessionStorage.setItem('voidllm_next', '/keys')
+    expect(runCallback().href).toBe('/')
+    expect(sessionStorage.getItem('voidllm_next')).toBeNull()
+  })
+
+  it('ignores malformed JSON', () => {
+    sessionStorage.setItem('voidllm_next', '{"path": 1')
+    expect(runCallback().href).toBe('/')
+  })
+})

@@ -55,7 +55,7 @@ export function useAPIKeys(orgId: string, cursor?: string, opts?: { summary?: bo
   if (summary) params.set('summary', 'true')
   return useQuery({
     queryKey: ['api-keys', orgId, cursor, summary],
-    queryFn: () => apiClient<PaginatedKeys>(`/orgs/${orgId}/keys?${params}`),
+    queryFn: ({ signal }) => apiClient<PaginatedKeys>(`/orgs/${orgId}/keys?${params}`, { signal }),
     enabled: !!orgId,
   })
 }

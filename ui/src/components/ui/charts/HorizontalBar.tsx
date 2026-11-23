@@ -1,4 +1,6 @@
 export interface HorizontalBarItem {
+  /** Stable unique key; falls back to label when omitted. */
+  id?: string
   label: string
   value: number
   detail?: string
@@ -28,7 +30,7 @@ export function HorizontalBar({ items, maxValue, color }: HorizontalBarProps) {
             }
 
         return (
-          <div key={item.label}>
+          <div key={item.id ?? item.label}>
             <div className="flex items-center justify-between mb-1.5">
               <span className="text-sm text-text-secondary truncate mr-2">{item.label}</span>
               {item.detail != null && (

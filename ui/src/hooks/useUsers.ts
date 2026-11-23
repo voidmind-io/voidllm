@@ -38,7 +38,7 @@ export interface PaginatedUsers {
 export function useUser(userId: string) {
   return useQuery({
     queryKey: ['user', userId],
-    queryFn: () => apiClient<UserResponse>(`/users/${userId}`),
+    queryFn: ({ signal }) => apiClient<UserResponse>(`/users/${userId}`, { signal }),
     enabled: !!userId,
     staleTime: 5 * 60 * 1000,
   })
@@ -51,7 +51,7 @@ export function useUsers(cursor?: string, opts?: { summary?: boolean }) {
   if (summary) params.set('summary', 'true')
   return useQuery({
     queryKey: ['users-list', cursor, summary],
-    queryFn: () => apiClient<PaginatedUsers>(`/users?${params}`),
+    queryFn: ({ signal }) => apiClient<PaginatedUsers>(`/users?${params}`, { signal }),
   })
 }
 

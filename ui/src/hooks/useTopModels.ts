@@ -7,11 +7,11 @@ export type { UsageDataPoint, UsageResponse }
 export function useTopModels(orgId: string, enabled = true) {
   return useQuery({
     queryKey: ['top-models', orgId],
-    queryFn: () => {
+    queryFn: ({ signal }) => {
       const from = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
       const to = new Date().toISOString()
       return apiClient<UsageResponse>(
-        `/orgs/${orgId}/usage?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&group_by=model`,
+        `/orgs/${orgId}/usage?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&group_by=model`, { signal },
       )
     },
     enabled: !!orgId && enabled,

@@ -1458,6 +1458,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                               onClick={(e) => handleEditDeploymentEntry(index, e)}
                               className="p-1 rounded text-text-tertiary hover:text-text-primary hover:bg-bg-tertiary transition-colors"
                               title="Edit deployment"
+                              aria-label="Edit deployment"
                             >
                               <IconPencil />
                             </button>
@@ -1467,6 +1468,7 @@ function CreateModelDialog({ open, onClose }: CreateModelDialogProps) {
                               disabled={isPending}
                               className="p-1 rounded text-text-tertiary hover:text-error hover:bg-error/10 transition-colors disabled:opacity-50 disabled:pointer-events-none"
                               title="Remove deployment"
+                              aria-label="Remove deployment"
                             >
                               <IconTrash />
                             </button>
@@ -2264,6 +2266,7 @@ export default function ModelsPage() {
       header: 'Status',
       render: (row) => (
         <Toggle
+          aria-label={`Toggle ${row.name} active`}
           checked={row.is_active}
           onChange={(activate) =>
             toggleModel.mutate(
@@ -2299,6 +2302,7 @@ export default function ModelsPage() {
                 type="button"
                 onClick={() => setEditDeployment({ modelId: row.id, deployment: null })}
                 title="Add deployment"
+                aria-label="Add deployment"
                 className="p-1.5 rounded-md text-text-tertiary hover:text-accent hover:bg-accent/10 transition-colors"
               >
                 <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
@@ -2311,6 +2315,7 @@ export default function ModelsPage() {
               onClick={() => setEditModel(row)}
               disabled={deleteModel.isPending && deleteModelId === row.id}
               title="Edit model"
+              aria-label="Edit model"
               className="p-1.5 rounded-md text-text-tertiary hover:text-text-primary hover:bg-bg-tertiary transition-colors disabled:opacity-40"
             >
               <IconPencil />
@@ -2320,6 +2325,7 @@ export default function ModelsPage() {
               onClick={() => setDeleteModelId(row.id)}
               disabled={deleteModel.isPending && deleteModelId === row.id}
               title="Delete model"
+              aria-label="Delete model"
               className="p-1.5 rounded-md text-text-tertiary hover:text-error hover:bg-error/10 transition-colors disabled:opacity-40"
             >
               <IconTrash />
@@ -2462,6 +2468,7 @@ export default function ModelsPage() {
                                 type="button"
                                 onClick={() => setEditDeployment({ modelId: row.id, deployment: dep })}
                                 title="Edit deployment"
+                                aria-label="Edit deployment"
                                 className="p-1 rounded text-text-tertiary hover:text-text-primary hover:bg-bg-tertiary transition-colors"
                               >
                                 <IconPencil />
@@ -2470,6 +2477,7 @@ export default function ModelsPage() {
                                 type="button"
                                 onClick={() => setDeleteDeployment({ modelId: row.id, deploymentId: dep.id })}
                                 title="Delete deployment"
+                                aria-label="Delete deployment"
                                 className="p-1 rounded text-text-tertiary hover:text-error hover:bg-error/10 transition-colors"
                               >
                                 <IconTrash />

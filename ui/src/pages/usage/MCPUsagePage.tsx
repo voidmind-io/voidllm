@@ -421,6 +421,7 @@ function MCPUsageContent() {
             <h3 className="text-sm font-semibold text-text-primary mb-4">Top Servers by Calls</h3>
             <HorizontalBar
               items={topServers.map((d) => ({
+                id: d.group_key,
                 label: d.group_label || d.group_key,
                 value: d.total_calls,
                 detail: formatNumber(d.total_calls),
@@ -432,6 +433,7 @@ function MCPUsageContent() {
             <h3 className="text-sm font-semibold text-text-primary mb-4">Top Tools by Calls</h3>
             <HorizontalBar
               items={topTools.map((d) => ({
+                id: d.group_key,
                 label: d.group_label || d.group_key,
                 value: d.total_calls,
                 detail: formatNumber(d.total_calls),
