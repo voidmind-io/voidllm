@@ -393,7 +393,7 @@ func (d *DB) GetMonthlyTokenUsage(ctx context.Context, orgID string) (int64, err
 
 	query := "SELECT COALESCE(SUM(total_tokens), 0) FROM usage_hourly " +
 		"WHERE org_id = " + d.dialect.Placeholder(1) +
-		" AND bucket_hour >= " + d.dialect.Placeholder(2)
+		" AND " + d.dialect.TimestampGreaterOrEqual("bucket_hour", d.dialect.Placeholder(2))
 
 	var total int64
 	err := d.sql.QueryRowContext(ctx, query, orgID, FormatTimestamp(monthStart)).Scan(&total)

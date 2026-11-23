@@ -19,6 +19,13 @@ type Dialect interface {
 	// Example (SQLite):   datetime(created_at) < datetime(?)
 	// Example (Postgres): created_at::timestamptz < ($1)::timestamptz
 	TimestampLessThan(column, placeholder string) string
+	// TimestampGreaterOrEqual is the >= counterpart of TimestampLessThan: it
+	// returns a SQL expression comparing the named TEXT-typed timestamp column
+	// to a parameter with the same driver-appropriate casting.
+	//
+	// Example (SQLite):   datetime(bucket_hour) >= datetime(?)
+	// Example (Postgres): bucket_hour::timestamptz >= ($1)::timestamptz
+	TimestampGreaterOrEqual(column, placeholder string) string
 	// CanonicalTimestamp returns a SQL expression that reformats the given TEXT
 	// timestamp expression into the canonical UTC "YYYY-MM-DDTHH:MM:SSZ" shape
 	// defined by TimestampLayout. expr may be a column name or any other SQL
@@ -61,6 +68,12 @@ func (SQLiteDialect) TimestampLessThan(column, placeholder string) string {
 	return "datetime(" + column + ") < datetime(" + placeholder + ")"
 }
 
+// TimestampGreaterOrEqual wraps both sides in datetime(), mirroring
+// TimestampLessThan.
+func (SQLiteDialect) TimestampGreaterOrEqual(column, placeholder string) string {
+	return "datetime(" + column + ") >= datetime(" + placeholder + ")"
+}
+
 // CanonicalTimestamp uses strftime to reformat expr into the canonical
 // "YYYY-MM-DDTHH:MM:SSZ" shape. strftime tolerates SQLite's own historical
 // "YYYY-MM-DD HH:MM:SS" DEFAULT CURRENT_TIMESTAMP output as well as the
@@ -95,6 +108,12 @@ func (PostgresDialect) SupportsMigrationLock() bool { return true }
 // ISO-8601 variant and compares as absolute instants.
 func (PostgresDialect) TimestampLessThan(column, placeholder string) string {
 	return column + "::timestamptz < (" + placeholder + ")::timestamptz"
+}
+
+// TimestampGreaterOrEqual casts both sides to timestamptz, mirroring
+// TimestampLessThan.
+func (PostgresDialect) TimestampGreaterOrEqual(column, placeholder string) string {
+	return column + "::timestamptz >= (" + placeholder + ")::timestamptz"
 }
 
 // CanonicalTimestamp casts expr (a TEXT column holding either the canonical

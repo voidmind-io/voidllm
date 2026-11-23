@@ -42,6 +42,8 @@ func baseHourlyRollup(keyID, modelName string) HourlyRollup {
 // that does not yet exist inserts a row with exactly the given values,
 // including the two cache-token columns added by migration 0016.
 func TestUpsertUsageHourly_InsertsFreshBucket(t *testing.T) {
+	t.Parallel()
+
 	forEachDialect(t, func(t *testing.T, d *DB) {
 
 		ctx := context.Background()
@@ -112,6 +114,8 @@ func TestUpsertUsageHourly_InsertsFreshBucket(t *testing.T) {
 // column rather than overwriting it — including cached_read_tokens and
 // cache_write_tokens, which is the specific behavior #179 added.
 func TestUpsertUsageHourly_AccumulatesOnConflict(t *testing.T) {
+	t.Parallel()
+
 	forEachDialect(t, func(t *testing.T, d *DB) {
 
 		ctx := context.Background()
@@ -215,6 +219,8 @@ func TestUpsertUsageHourly_AccumulatesOnConflict(t *testing.T) {
 // multiple hourly buckets for the same org, and computes a request-weighted
 // average duration.
 func TestGetHourlyUsageTotals_SumsAcrossBuckets(t *testing.T) {
+	t.Parallel()
+
 	forEachDialect(t, func(t *testing.T, d *DB) {
 
 		ctx := context.Background()
@@ -295,6 +301,8 @@ func TestGetHourlyUsageTotals_SumsAcrossBuckets(t *testing.T) {
 // with bucket_hour before `since` (truncated to the hour) are excluded from
 // the sum.
 func TestGetHourlyUsageTotals_SinceExcludesEarlierBuckets(t *testing.T) {
+	t.Parallel()
+
 	forEachDialect(t, func(t *testing.T, d *DB) {
 
 		ctx := context.Background()
@@ -341,6 +349,8 @@ func TestGetHourlyUsageTotals_SinceExcludesEarlierBuckets(t *testing.T) {
 // with no hourly rollup rows returns an all-zero UsageAggregate rather than an
 // error, matching the COALESCE(SUM(...), 0) semantics of the SQL.
 func TestGetHourlyUsageTotals_NoBuckets_ReturnsZero(t *testing.T) {
+	t.Parallel()
+
 	forEachDialect(t, func(t *testing.T, d *DB) {
 
 		ctx := context.Background()
@@ -376,6 +386,8 @@ func TestGetHourlyUsageTotals_NoBuckets_ReturnsZero(t *testing.T) {
 // optional TeamID/UserID/KeyID filters on UsageFilter narrow the sum, using
 // the cache-token columns as the distinguishing signal.
 func TestGetHourlyUsageTotals_ScopedByTeamAndUserAndKey(t *testing.T) {
+	t.Parallel()
+
 	forEachDialect(t, func(t *testing.T, d *DB) {
 
 		ctx := context.Background()
@@ -437,4 +449,34 @@ func TestGetHourlyUsageTotals_ScopedByTeamAndUserAndKey(t *testing.T) {
 func hourlyBucketWhere(d *DB) string {
 	p := d.dialect.Placeholder
 	return p(1) + " AND model_name = " + p(2) + " AND bucket_hour = " + p(3)
+}
+
+// TestGetHourlyUsageTotals_BucketAtSinceIncluded verifies the lower bound is
+// inclusive: a bucket whose hour equals `since` exactly is counted.
+func TestGetHourlyUsageTotals_BucketAtSinceIncluded(t *testing.T) {
+	t.Parallel()
+
+	forEachDialect(t, func(t *testing.T, d *DB) {
+		ctx := context.Background()
+
+		for _, hour := range []string{"2026-03-20T13:00:00Z", "2026-03-20T14:00:00Z"} {
+			r := HourlyRollup{
+				OrgID: "org-hourly-boundary", KeyID: "key-boundary", ModelName: "model-" + hour,
+				BucketHour: hour, RequestCount: 1, TotalTokens: 7,
+			}
+			if err := d.UpsertUsageHourly(ctx, r); err != nil {
+				t.Fatalf("UpsertUsageHourly(%s) error = %v", hour, err)
+			}
+		}
+
+		since := time.Date(2026, 3, 20, 14, 0, 0, 0, time.UTC)
+		agg, err := d.GetHourlyUsageTotals(ctx, UsageFilter{OrgID: "org-hourly-boundary"}, since)
+		if err != nil {
+			t.Fatalf("GetHourlyUsageTotals() error = %v", err)
+		}
+		if agg.TotalRequests != 1 || agg.TotalTokens != 7 {
+			t.Errorf("got requests=%d tokens=%d, want 1 and 7 (bucket at since included, earlier excluded)",
+				agg.TotalRequests, agg.TotalTokens)
+		}
+	})
 }

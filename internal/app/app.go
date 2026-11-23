@@ -1432,6 +1432,9 @@ func (a *Application) Start() error {
 		a.stopFuncs = append(a.stopFuncs, startTicker(5*time.Minute, memRL.EvictStale))
 	}
 
+	// One-time rebuild of usage_hourly from usage_events, in the background.
+	a.stopFuncs = append(a.stopFuncs, startUsageHourlyBackfill(a.database, a.log))
+
 	// Start upstream model health monitoring when at least one probe is enabled.
 	if a.healthChecker != nil {
 		a.stopFuncs = append(a.stopFuncs, a.healthChecker.Start())
