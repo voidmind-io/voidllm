@@ -45,7 +45,10 @@ func (d *DB) GetHourlyUsageTotals(ctx context.Context, filter UsageFilter, since
 	p := d.dialect.Placeholder
 	argN := 1
 
-	conditions := []string{d.dialect.TimestampGreaterOrEqual("bucket_hour", p(argN))}
+	// bucket_hour is always written in the canonical TimestampLayout form, so a
+	// plain text comparison is correct and lets the (org_id, bucket_hour) index
+	// serve the range. Casting the column would defeat the index.
+	conditions := []string{"bucket_hour >= " + p(argN)}
 	truncated := since.UTC().Truncate(time.Hour)
 	args := []any{FormatTimestamp(truncated)}
 	argN++

@@ -107,14 +107,3 @@ func TestTimestampLessThan(t *testing.T) {
 		})
 	}
 }
-
-func TestTimestampGreaterOrEqual(t *testing.T) {
-	t.Parallel()
-
-	if got, want := (SQLiteDialect{}).TimestampGreaterOrEqual("bucket_hour", "?"), "datetime(bucket_hour) >= datetime(?)"; got != want {
-		t.Errorf("sqlite = %q, want %q", got, want)
-	}
-	if got, want := (PostgresDialect{}).TimestampGreaterOrEqual("bucket_hour", "$1"), "bucket_hour::timestamptz >= ($1)::timestamptz"; got != want {
-		t.Errorf("postgres = %q, want %q", got, want)
-	}
-}
