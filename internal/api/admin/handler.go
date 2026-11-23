@@ -44,10 +44,13 @@ type Handler struct {
 	// enterprise deployments the process-level mutex is sufficient.
 	fallbackMu sync.Mutex
 
-	DB                *db.DB
-	HMACSecret        []byte
-	EncryptionKey     []byte // AES-256-GCM key for upstream API key encryption
-	KeyCache          *cache.Cache[string, auth.KeyInfo]
+	DB            *db.DB
+	HMACSecret    []byte
+	EncryptionKey []byte // AES-256-GCM key for upstream API key encryption
+	KeyCache      *cache.Cache[string, auth.KeyInfo]
+	// KeyReloader coalesces full key cache reloads. When nil, handlers reload
+	// the cache directly with auth.LoadKeysIntoCache.
+	KeyReloader       *auth.Reloader
 	Registry          *proxy.Registry
 	AccessCache       *proxy.ModelAccessCache  // in-memory model access cache; nil disables refresh
 	AliasCache        *proxy.AliasCache        // in-memory model alias cache; nil disables refresh
@@ -429,4 +432,28 @@ func rejectNegativeLimits(c fiber.Ctx, daily, monthly *int64, perMinute, perDay 
 		return true, apierror.BadRequest(c, name+" must be >= 0")
 	}
 	return false, nil
+}
+
+// refreshKeyCaches makes a change to org, team or membership limits take
+// effect on every instance. It reloads the local key cache (blocking until a
+// load that started after the database write has finished, so the change is
+// visible when the handler returns) and, when Redis is configured, publishes
+// payload on voidredis.ChannelKeys so other instances reload too. Failures are
+// logged and never fail the request: the database write already succeeded and
+// the periodic reload retries regardless.
+func (h *Handler) refreshKeyCaches(ctx context.Context, op, payload string) {
+	var err error
+	if h.KeyReloader != nil {
+		err = h.KeyReloader.Reload(ctx)
+	} else {
+		err = auth.LoadKeysIntoCache(ctx, h.DB, h.KeyCache, h.Log)
+	}
+	if err != nil {
+		h.Log.ErrorContext(ctx, op+": reload key cache", slog.String("error", err.Error()))
+	}
+	if h.Redis != nil {
+		if pubErr := h.Redis.PublishInvalidation(ctx, voidredis.ChannelKeys, payload); pubErr != nil {
+			h.Log.ErrorContext(ctx, op+": publish key cache invalidation", slog.String("error", pubErr.Error()))
+		}
+	}
 }

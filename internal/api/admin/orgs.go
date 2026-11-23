@@ -9,7 +9,6 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
-	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 )
 
 // slugRegex validates that a slug consists of lowercase alphanumeric characters
@@ -369,12 +368,9 @@ func (h *Handler) UpdateOrg(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update organization")
 	}
 
-	// Invalidate key cache so updated limits take effect immediately.
-	if h.Redis != nil {
-		if pubErr := h.Redis.PublishInvalidation(c.Context(), voidredis.ChannelKeys, "org:"+id); pubErr != nil {
-			h.Log.ErrorContext(c.Context(), "publish key cache invalidation", slog.String("error", pubErr.Error()))
-		}
-	}
+	// Org limits are cached inside every key's KeyInfo: reload locally and on
+	// other instances so the change applies immediately.
+	h.refreshKeyCaches(c.Context(), "update org", auth.KeyInvalidationOrgPrefix+id)
 
 	org, err := h.DB.GetOrgWithCounts(c.Context(), id)
 	if err != nil {
@@ -421,5 +417,8 @@ func (h *Handler) DeleteOrg(c fiber.Ctx) error {
 		h.Log.ErrorContext(c.Context(), "delete org", slog.String("error", err.Error()))
 		return apierror.InternalError(c, "failed to delete organization")
 	}
+
+	h.refreshKeyCaches(c.Context(), "delete org", auth.KeyInvalidationOrgPrefix+id)
+
 	return c.SendStatus(fiber.StatusNoContent)
 }

@@ -368,7 +368,6 @@ func (h *Handler) UpdateTeam(c fiber.Ctx) error {
 	if req.Slug != nil && !slugRegex.MatchString(*req.Slug) {
 		return apierror.BadRequest(c, "slug must be lowercase alphanumeric with hyphens, 2-63 characters")
 	}
-
 	if _, err := h.DB.UpdateTeam(c.Context(), existing.ID, db.UpdateTeamParams{
 		Name:              req.Name,
 		Slug:              req.Slug,
@@ -390,12 +389,9 @@ func (h *Handler) UpdateTeam(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update team")
 	}
 
-	// Invalidate key cache so updated limits take effect immediately.
-	if h.Redis != nil {
-		if pubErr := h.Redis.PublishInvalidation(c.Context(), voidredis.ChannelKeys, "team:"+existing.ID); pubErr != nil {
-			h.Log.ErrorContext(c.Context(), "publish key cache invalidation", slog.String("error", pubErr.Error()))
-		}
-	}
+	// Team limits are cached inside every key's KeyInfo: reload locally and on
+	// other instances so the change applies immediately.
+	h.refreshKeyCaches(c.Context(), "update team", auth.KeyInvalidationTeamPrefix+existing.ID)
 
 	team, err := h.DB.GetTeamWithCounts(c.Context(), existing.ID)
 	if err != nil {

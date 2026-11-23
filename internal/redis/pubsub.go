@@ -10,8 +10,16 @@ import (
 // unprefixed channel names; the Client methods apply the configured key prefix
 // automatically before publishing or subscribing.
 const (
-	// ChannelKeys is published when an API key is deleted. The payload is the
-	// key hash, allowing subscribers to evict exactly that entry from the cache.
+	// ChannelKeys is published when cached key data changes. The payload is
+	// one of:
+	//   - "reload": a change touching many keys (org memberships); subscribers
+	//     reload the key cache from the database.
+	//   - "org:<id>" or "team:<id>": the org's or team's limits changed (or the
+	//     org was deleted); subscribers reload the key cache from the database,
+	//     because limits are cached inside every affected key.
+	//   - anything else is a key hash; subscribers evict exactly that entry.
+	// Instances that predate the reload payloads treat them as an unknown key
+	// hash and evict nothing, so rolling upgrades are safe.
 	ChannelKeys = "invalidate:keys"
 
 	// ChannelModels is published when the model registry changes.

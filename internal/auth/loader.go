@@ -58,9 +58,10 @@ func LoadKeysIntoCache(ctx context.Context, database *db.DB, keyCache *cache.Cac
 }
 
 // StartCacheRefresh starts a background goroutine that reloads the key cache
-// from the database every interval. Returns a stop function that blocks until
-// the refresh goroutine has exited, ensuring a clean shutdown.
-func StartCacheRefresh(database *db.DB, keyCache *cache.Cache[string, KeyInfo], interval time.Duration, log *slog.Logger) func() {
+// through reloader every interval, so periodic reloads coalesce with reloads
+// triggered by admin changes and pub/sub messages. Returns a stop function that
+// blocks until the refresh goroutine has exited, ensuring a clean shutdown.
+func StartCacheRefresh(reloader *Reloader, interval time.Duration) func() {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -72,11 +73,8 @@ func StartCacheRefresh(database *db.DB, keyCache *cache.Cache[string, KeyInfo], 
 			select {
 			case <-ticker.C:
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				if err := LoadKeysIntoCache(ctx, database, keyCache, log); err != nil {
-					log.LogAttrs(ctx, slog.LevelError, "key cache refresh failed",
-						slog.String("error", err.Error()),
-					)
-				}
+				// A failed load is logged by the reloader.
+				_ = reloader.Reload(ctx)
 				cancel()
 			case <-done:
 				return

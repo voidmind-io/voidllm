@@ -835,7 +835,7 @@ func TestStartCacheRefresh(t *testing.T) {
 	log := discardLogger()
 
 	// Start the refresh loop with a short interval.
-	stop := StartCacheRefresh(d, kc, 50*time.Millisecond, log)
+	stop := StartCacheRefresh(NewReloader(d, kc, log), 50*time.Millisecond)
 	t.Cleanup(stop)
 
 	// Insert a key after the goroutine is already running.
