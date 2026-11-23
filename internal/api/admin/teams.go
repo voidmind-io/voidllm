@@ -331,8 +331,20 @@ func (h *Handler) ListTeams(c fiber.Ctx) error {
 	return c.JSON(resp)
 }
 
+// changesTeamLimits reports whether req sets any limit field to a value that
+// differs from the team's current one. Fields that are absent or re-sent
+// unchanged do not count.
+func changesTeamLimits(current *db.Team, req *updateTeamRequest) bool {
+	return (req.DailyTokenLimit != nil && *req.DailyTokenLimit != current.DailyTokenLimit) ||
+		(req.MonthlyTokenLimit != nil && *req.MonthlyTokenLimit != current.MonthlyTokenLimit) ||
+		(req.RequestsPerMinute != nil && *req.RequestsPerMinute != current.RequestsPerMinute) ||
+		(req.RequestsPerDay != nil && *req.RequestsPerDay != current.RequestsPerDay)
+}
+
 // UpdateTeam handles PATCH /api/v1/orgs/:org_id/teams/:team_id.
-// System admins and org admins of the target org may update teams.
+// System admins, org admins of the target org, and team admins who belong to
+// the team may update it, but changing any limit field requires org admin or
+// higher (403 otherwise); re-sending a limit's current value is allowed.
 // Returns 404 if the team belongs to a different org (cross-org protection).
 //
 // @Summary      Update a team
@@ -353,7 +365,7 @@ func (h *Handler) ListTeams(c fiber.Ctx) error {
 // @Security     BearerAuth
 // @Router       /orgs/{org_id}/teams/{team_id} [patch]
 func (h *Handler) UpdateTeam(c fiber.Ctx) error {
-	_, existing, ok := h.requireTeamAccess(c)
+	keyInfo, existing, ok := h.requireTeamAccess(c)
 	if !ok {
 		return nil
 	}
@@ -368,6 +380,10 @@ func (h *Handler) UpdateTeam(c fiber.Ctx) error {
 	if req.Slug != nil && !slugRegex.MatchString(*req.Slug) {
 		return apierror.BadRequest(c, "slug must be lowercase alphanumeric with hyphens, 2-63 characters")
 	}
+	if !auth.HasRole(keyInfo.Role, auth.RoleOrgAdmin) && changesTeamLimits(existing, &req) {
+		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "only org admins may change team limits")
+	}
+
 	if _, err := h.DB.UpdateTeam(c.Context(), existing.ID, db.UpdateTeamParams{
 		Name:              req.Name,
 		Slug:              req.Slug,

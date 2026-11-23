@@ -256,3 +256,68 @@ func TestOrgMembership_ChangesVisibleInKeyCacheImmediately(t *testing.T) {
 		})
 	}
 }
+
+func TestUpdateTeam_LimitChangeRoleMatrix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		role       string
+		body       map[string]any
+		wantStatus int
+		wantDaily  int64 // expected stored daily limit afterwards
+	}{
+		{"team_admin renames", auth.RoleTeamAdmin, map[string]any{"name": "Renamed"}, fiber.StatusOK, 100},
+		{"team_admin changes daily limit", auth.RoleTeamAdmin, map[string]any{"daily_token_limit": 999}, fiber.StatusForbidden, 100},
+		{"team_admin raises monthly limit", auth.RoleTeamAdmin, map[string]any{"monthly_token_limit": 5000}, fiber.StatusForbidden, 100},
+		{"team_admin changes rpm", auth.RoleTeamAdmin, map[string]any{"requests_per_minute": 99}, fiber.StatusForbidden, 100},
+		{"team_admin changes rpd", auth.RoleTeamAdmin, map[string]any{"requests_per_day": 99}, fiber.StatusForbidden, 100},
+		{"team_admin removes limit", auth.RoleTeamAdmin, map[string]any{"daily_token_limit": 0}, fiber.StatusForbidden, 100},
+		{"team_admin mixed rename and limit", auth.RoleTeamAdmin, map[string]any{"name": "X", "daily_token_limit": 1}, fiber.StatusForbidden, 100},
+		{"team_admin resends unchanged limits", auth.RoleTeamAdmin, map[string]any{
+			"name": "Same", "daily_token_limit": 100, "monthly_token_limit": 2000, "requests_per_minute": 10, "requests_per_day": 50,
+		}, fiber.StatusOK, 100},
+		{"org_admin changes limits", auth.RoleOrgAdmin, map[string]any{"daily_token_limit": 999}, fiber.StatusOK, 999},
+		{"system_admin changes limits", auth.RoleSystemAdmin, map[string]any{"daily_token_limit": 999}, fiber.StatusOK, 999},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dsn := fmt.Sprintf("file:TestTeamLimitMatrix_%d?mode=memory&cache=private", i)
+			app, database, keyCache := setupReloaderApp(t, dsn, true)
+
+			org := mustCreateOrg(t, database, "Matrix Org", fmt.Sprintf("matrix-org-%d", i))
+			team, err := database.CreateTeam(context.Background(), db.CreateTeamParams{
+				OrgID: org.ID, Name: "Team", Slug: fmt.Sprintf("matrix-team-%d", i),
+				DailyTokenLimit: 100, MonthlyTokenLimit: 2000, RequestsPerMinute: 10, RequestsPerDay: 50,
+			})
+			if err != nil {
+				t.Fatalf("CreateTeam: %v", err)
+			}
+			caller := mustCreateCacheTestUser(t, database, fmt.Sprintf("caller-%d@example.com", i))
+			if _, err := database.CreateTeamMembership(context.Background(), db.CreateTeamMembershipParams{
+				TeamID: team.ID, UserID: caller.ID, Role: auth.RoleTeamAdmin,
+			}); err != nil {
+				t.Fatalf("CreateTeamMembership: %v", err)
+			}
+			key := addTestKeyWithTeam(t, keyCache, tc.role, org.ID, team.ID, caller.ID)
+
+			got := doJSON(t, app, "PATCH", teamItemURL(org.ID, team.ID), key, tc.body)
+			if got != tc.wantStatus {
+				t.Errorf("status = %d, want %d", got, tc.wantStatus)
+			}
+
+			after, err := database.GetTeam(context.Background(), team.ID)
+			if err != nil {
+				t.Fatalf("GetTeam: %v", err)
+			}
+			if after.DailyTokenLimit != tc.wantDaily {
+				t.Errorf("stored daily limit = %d, want %d", after.DailyTokenLimit, tc.wantDaily)
+			}
+			if tc.wantStatus == fiber.StatusForbidden && after.Name != "Team" {
+				t.Errorf("rejected request still changed the name to %q", after.Name)
+			}
+		})
+	}
+}
