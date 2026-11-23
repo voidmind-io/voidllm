@@ -65,15 +65,17 @@ func (c *Client) BudgetKey(metric, bucket, scope string) string {
 }
 
 // SetBudgets stores the given values as the usage of one instance, in one
-// pipelined round trip: each value is written to the field named instanceID
-// of its counter hash, and the counter gets its expiry (re)set. Values are
-// absolute, so the call is idempotent: repeating it, or sending a newer value
-// after a lost one, leaves the counter correct.
+// round trip: each value is written to the field named instanceID of its
+// counter hash, and the counter gets its expiry (re)set. All writes of a call
+// run in one MULTI/EXEC transaction, so Redis applies either all of them or
+// none: a connection lost half way cannot leave a counter without an expiry.
+// Values are absolute, so the call is idempotent: repeating it, or sending a
+// newer value after a lost one, leaves the counter correct.
 func (c *Client) SetBudgets(ctx context.Context, instanceID string, values []BudgetValue) error {
 	if len(values) == 0 {
 		return nil
 	}
-	pipe := c.rdb.Pipeline()
+	pipe := c.rdb.TxPipeline()
 	for _, v := range values {
 		pipe.HSet(ctx, v.Key, instanceID, v.Value)
 		pipe.ExpireAt(ctx, v.Key, v.ExpireAt)

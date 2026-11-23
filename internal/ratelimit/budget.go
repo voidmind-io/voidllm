@@ -66,9 +66,10 @@ type UsageSeeder interface {
 	// QueryUsageTotals returns the usage of the events from from (inclusive)
 	// until until (exclusive; the zero time means no upper bound),
 	// aggregated by the database: rows of (org_id, team_id, user_id, key_id,
-	// tokens, cost, day_tokens, day_cost), where the day columns only cover
-	// events since dayStart. team_id and user_id are empty strings when
-	// unset; costs are in major currency units.
+	// tokens, cost_micros, day_tokens, day_cost_micros), where the day
+	// columns only cover events since dayStart. team_id and user_id are
+	// empty strings when unset; costs are integer micro-units, rounded per
+	// event like CostToMicros does.
 	QueryUsageTotals(ctx context.Context, from, until, dayStart time.Time) (RowScanner, error)
 }
 
@@ -243,7 +244,9 @@ func scanUsageSeed(ctx context.Context, seeder UsageSeeder, w budgetWindows, fn 
 		if err := rows.Scan(&keyID, &teamID, &orgID, &userID, &tokens, &cost, &inDay); err != nil {
 			return fmt.Errorf("scan usage_events row: %w", err)
 		}
-		u := Usage{Tokens: tokens, CostMicros: CostToMicros(cost)}
+		// A negative token count can only be bad data; it must not lower
+		// the usage of a scope.
+		u := Usage{Tokens: tokens, CostMicros: CostToMicros(cost)}.clamped()
 		forEachScope(Scopes{KeyID: keyID, UserID: userID, TeamID: teamID, OrgID: orgID}, func(scope string) {
 			fn(scope, u, inDay != 0)
 		})

@@ -23,6 +23,25 @@ type Client struct {
 // channel name. If keyPrefix is empty it defaults to "voidllm:"; a trailing
 // colon is appended if absent.
 func New(url, keyPrefix string) (*Client, error) {
+	c, err := NewUnverified(url, keyPrefix)
+	if err != nil {
+		return nil, err
+	}
+	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Ping(pingCtx); err != nil {
+		_ = c.Close() // best-effort cleanup on ping failure
+		return nil, err
+	}
+	return c, nil
+}
+
+// NewUnverified creates a Redis client from url without contacting the
+// server; it only fails when url cannot be parsed. The client connects on
+// first use and reconnects on its own, so it is usable for callers that can
+// work while Redis is down and want to pick it up once it is reachable.
+// keyPrefix is handled as in New.
+func NewUnverified(url, keyPrefix string) (*Client, error) {
 	opts, err := goredis.ParseURL(url)
 	if err != nil {
 		return nil, fmt.Errorf("parse redis url: %w", err)
@@ -32,13 +51,6 @@ func New(url, keyPrefix string) (*Client, error) {
 	opts.ContextTimeoutEnabled = true
 	rdb := goredis.NewClient(opts)
 
-	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := rdb.Ping(pingCtx).Err(); err != nil {
-		_ = rdb.Close() // best-effort cleanup on ping failure
-		return nil, fmt.Errorf("redis ping: %w", err)
-	}
-
 	if keyPrefix == "" {
 		keyPrefix = "voidllm:"
 	}
@@ -47,6 +59,14 @@ func New(url, keyPrefix string) (*Client, error) {
 	}
 
 	return &Client{rdb: rdb, keyPrefix: keyPrefix}, nil
+}
+
+// Ping checks that the Redis server answers.
+func (c *Client) Ping(ctx context.Context) error {
+	if err := c.rdb.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("redis ping: %w", err)
+	}
+	return nil
 }
 
 // Close closes the underlying Redis connection.

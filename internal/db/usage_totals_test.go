@@ -2,13 +2,11 @@ package db
 
 import (
 	"context"
-	"math"
 	"testing"
 	"time"
 )
 
-// totalsRow is one scanned QueryUsageTotals row, costs converted to
-// micro-units by rounding.
+// totalsRow is one scanned QueryUsageTotals row; costs are in micro-units.
 type totalsRow struct {
 	orgID, teamID, userID, keyID string
 	tokens, dayTokens            int64
@@ -26,12 +24,9 @@ func queryTotals(t *testing.T, d *DB, from, until, dayStart time.Time) map[strin
 	out := make(map[string]totalsRow)
 	for rows.Next() {
 		var r totalsRow
-		var cost, dayCost float64
-		if err := rows.Scan(&r.orgID, &r.teamID, &r.userID, &r.keyID, &r.tokens, &cost, &r.dayTokens, &dayCost); err != nil {
+		if err := rows.Scan(&r.orgID, &r.teamID, &r.userID, &r.keyID, &r.tokens, &r.cost, &r.dayTokens, &r.dayCost); err != nil {
 			t.Fatalf("rows.Scan() error = %v", err)
 		}
-		r.cost = int64(math.Round(cost * 1e6))
-		r.dayCost = int64(math.Round(dayCost * 1e6))
 		id := r.keyID + "/" + r.teamID + "/" + r.userID
 		if _, dup := out[id]; dup {
 			t.Fatalf("QueryUsageTotals() returned %q twice; rows must be aggregated", id)
@@ -71,6 +66,14 @@ func TestQueryUsageTotals(t *testing.T) {
 			{id: "t5", keyID: "k2", orgID: "o1", tokens: 50, createdAt: noon.Add(-time.Hour)},
 			// Another org, only earlier in the month.
 			{id: "t6", keyID: "k3", userID: "u9", orgID: "o2", tokens: 700, cost: cost(25), createdAt: monthStart.Add(48 * time.Hour)},
+			// Costs are rounded per event: three events of 0.4 micro-units
+			// are 0, not 1; one of 0.6 is 1.
+			{id: "t7", keyID: "k4", orgID: "o2", tokens: 1, cost: cost(0.0000004), createdAt: noon},
+			{id: "t8", keyID: "k4", orgID: "o2", tokens: 1, cost: cost(0.0000004), createdAt: noon},
+			{id: "t9", keyID: "k4", orgID: "o2", tokens: 1, cost: cost(0.0000004), createdAt: noon},
+			{id: "t10", keyID: "k4", orgID: "o2", tokens: 1, cost: cost(0.0000006), createdAt: noon},
+			// Negative values count as zero.
+			{id: "t11", keyID: "k4", orgID: "o2", tokens: -500, cost: cost(-3), createdAt: noon},
 		}
 		for _, e := range events {
 			insertSeedEvent(t, d, e)
@@ -82,6 +85,7 @@ func TestQueryUsageTotals(t *testing.T) {
 			"k1/t1/u1": {orgID: "o1", teamID: "t1", userID: "u1", keyID: "k1", tokens: 128, dayTokens: 8, cost: 12800, dayCost: 800},
 			"k2//":     {orgID: "o1", keyID: "k2", tokens: 50, dayTokens: 50},
 			"k3//u9":   {orgID: "o2", userID: "u9", keyID: "k3", tokens: 700, cost: 25_000_000},
+			"k4//":     {orgID: "o2", keyID: "k4", tokens: 4, dayTokens: 4, cost: 1, dayCost: 1},
 		}
 		if len(got) != len(want) {
 			t.Fatalf("QueryUsageTotals() returned %d rows, want %d: %+v", len(got), len(want), got)

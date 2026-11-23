@@ -816,12 +816,12 @@ func (f *fakeTotalsScanner) Scan(dest ...any) error {
 	*dest[2].(*string) = r.userID
 	*dest[3].(*string) = r.keyID
 	*dest[4].(*int64) = r.tokens
-	*dest[5].(*float64) = r.cost
+	*dest[5].(*int64) = CostToMicros(r.cost)
 	*dest[6].(*int64) = 0
-	*dest[7].(*float64) = 0
+	*dest[7].(*int64) = 0
 	if !r.at.Before(f.dayStart) {
 		*dest[6].(*int64) = r.tokens
-		*dest[7].(*float64) = r.cost
+		*dest[7].(*int64) = CostToMicros(r.cost)
 	}
 	return nil
 }
@@ -996,6 +996,30 @@ func TestMemoryBudgetCounter_Seed_EmptyUserID_NoUserEntry(t *testing.T) {
 		ScopeLimits{Team: Limits{DailyTokenLimit: 800}})
 	if !errors.Is(err, ErrTokenBudgetExceeded) {
 		t.Errorf("Check() = %v, want ErrTokenBudgetExceeded (team seeded 900 >= limit 800)", err)
+	}
+}
+
+// TestMemoryBudgetCounter_Seed_NegativeValuesCountAsZero verifies that a row
+// with a negative token count or cost cannot lower the usage of a scope.
+func TestMemoryBudgetCounter_Seed_NegativeValuesCountAsZero(t *testing.T) {
+	t.Parallel()
+
+	tc := NewMemoryBudgetCounter()
+	seeder := &fakeUsageSeeder{rows: []seedRow{
+		{keyID: "neg-key", orgID: "neg-org", tokens: 300, cost: 0.5},
+		{keyID: "neg-key", orgID: "neg-org", tokens: -1000, cost: -2},
+		{keyID: "neg-key", orgID: "neg-org", tokens: -5, cost: 0.25},
+	}}
+	if err := tc.Seed(context.Background(), seeder); err != nil {
+		t.Fatalf("Seed() error = %v", err)
+	}
+	snap, err := tc.Snapshot(context.Background(), []string{OrgScope("neg-org")})
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	want := Usage{Tokens: 300, CostMicros: 750_000}
+	if got := snap[OrgScope("neg-org")]; got.Daily != want || got.Monthly != want {
+		t.Errorf("usage = %+v, want daily and monthly %+v", got, want)
 	}
 }
 

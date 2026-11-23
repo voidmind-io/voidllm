@@ -102,7 +102,11 @@ type Application struct {
 	proxyHandler  *proxy.ProxyHandler
 	adminHandler  *admin.Handler
 
+	// redisClient is the Redis client when Redis answered at startup, nil
+	// otherwise. redisConn is the client whenever Redis is configured; it is
+	// what the budget counter uses and what cleanup closes.
 	redisClient *voidredis.Client
+	redisConn   *voidredis.Client
 	redisCancel context.CancelFunc
 
 	proxyApp *fiber.App
@@ -248,6 +252,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		auditLogger      *audit.Logger
 		retentionCleaner *retention.Cleaner
 		redisBudget      *ratelimit.RedisBudgetCounter
+		redisConn        *voidredis.Client
+		redisCancel      context.CancelFunc
 	)
 
 	// From this point on, any early return must clean up in reverse order.
@@ -269,6 +275,12 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		}
 		if redisBudget != nil {
 			stopRedisBudget(redisBudget)
+		}
+		if redisCancel != nil {
+			redisCancel()
+		}
+		if redisConn != nil {
+			redisConn.Close() //nolint:errcheck // best-effort on error path
 		}
 		crypto.ZeroKey(hmacSecret)
 		crypto.ZeroKey(encKey)
@@ -524,30 +536,48 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	}
 	log.LogAttrs(ctx, slog.LevelInfo, "key cache seeded", slog.Int("keys", keyCache.Len()))
 
-	// Step 7: connect Redis (optional). On failure, continue without Redis.
-	// The connection is made here, ahead of the pub/sub subscriber in step
-	// 10, because the budget counter below needs to know whether it can share
-	// its counters through Redis.
-	redisCtx, redisCancel := context.WithCancel(context.Background())
+	// Step 7: connect Redis (optional). The connection is made here, ahead
+	// of the pub/sub subscriber in step 10, because the budget counter below
+	// needs it.
+	//
+	// redisConn is the client whenever Redis is configured with a usable
+	// URL. redisClient is the same client, but only when Redis answered at
+	// startup: rate limiting, cache invalidation and the admin handlers use
+	// it and run without Redis otherwise, as they always have. The budget
+	// counter uses redisConn either way: with Redis down it starts degraded
+	// and picks Redis up once it is reachable, instead of counting per
+	// instance until the next restart.
+	redisCtx, cancelRedis := context.WithCancel(context.Background())
+	redisCancel = cancelRedis
 	var redisClient *voidredis.Client
 
 	if cfg.Redis.Enabled {
-		var redisErr error
-		redisClient, redisErr = voidredis.New(cfg.Redis.URL, cfg.Redis.KeyPrefix)
+		conn, redisErr := voidredis.NewUnverified(cfg.Redis.URL, cfg.Redis.KeyPrefix)
 		if redisErr != nil {
-			log.LogAttrs(ctx, slog.LevelError, "redis connection failed, continuing without redis",
+			log.LogAttrs(ctx, slog.LevelError, "redis configuration invalid, continuing without redis",
 				slog.String("error", redisErr.Error()),
 			)
 		} else {
-			log.LogAttrs(ctx, slog.LevelInfo, "redis connected")
+			redisConn = conn
+			pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
+			pingErr := conn.Ping(pingCtx)
+			pingCancel()
+			if pingErr != nil {
+				log.LogAttrs(ctx, slog.LevelError, "redis connection failed, continuing without redis; budgets are shared once redis is reachable",
+					slog.String("error", pingErr.Error()),
+				)
+			} else {
+				redisClient = conn
+				log.LogAttrs(ctx, slog.LevelInfo, "redis connected")
+			}
 		}
 	}
 
 	// Budget counter, seeded from recent usage events: shared through Redis
-	// when available, otherwise in the memory of this instance.
+	// when Redis is configured, otherwise in the memory of this instance.
 	var budgetCounter ratelimit.BudgetCounter
-	if redisClient != nil {
-		redisBudget = ratelimit.NewRedisBudgetCounter(redisClient, (*dbUsageSeeder)(database), log, cfg.Settings.Usage.FlushInterval)
+	if redisConn != nil {
+		redisBudget = ratelimit.NewRedisBudgetCounter(redisConn, (*dbUsageSeeder)(database), log, cfg.Settings.Usage.FlushInterval)
 		if err := redisBudget.Start(ctx); err != nil {
 			redisBudget = nil
 			redisCancel()
@@ -1366,6 +1396,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		proxyHandler:      proxyHandler,
 		adminHandler:      adminHandler,
 		redisClient:       redisClient,
+		redisConn:         redisConn,
 		redisCancel:       redisCancel,
 		otelShutdown:      otelShutdownFn,
 	}, nil
@@ -1932,8 +1963,8 @@ func (a *Application) cleanup(ctx context.Context) {
 	if a.redisBudget != nil {
 		stopRedisBudget(a.redisBudget)
 	}
-	if a.redisClient != nil {
-		if err := a.redisClient.Close(); err != nil {
+	if a.redisConn != nil {
+		if err := a.redisConn.Close(); err != nil {
 			a.log.LogAttrs(ctx, slog.LevelError, "redis close error",
 				slog.String("error", err.Error()),
 			)

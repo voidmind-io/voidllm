@@ -71,7 +71,7 @@ type nhOpts struct {
 	useRouter     bool
 	fallbackDepth int
 	rateLimiter   bool
-	tokenCounter  bool
+	budgetCounter bool
 	access        func(keyID string) *proxy.ModelAccessCache
 }
 
@@ -118,7 +118,7 @@ func newNHEnv(t *testing.T, o nhOpts) *nhEnv {
 	// An interface variable, so that it stays a nil interface (budget
 	// counting disabled) when no counter is wanted.
 	var tc ratelimit.BudgetCounter
-	if o.tokenCounter {
+	if o.budgetCounter {
 		tc = ratelimit.NewMemoryBudgetCounter()
 	}
 	ul := usage.NewLogger(d, config.UsageConfig{BufferSize: 64, FlushInterval: 20 * time.Millisecond}, log, tc)
@@ -670,7 +670,7 @@ func TestNativeHandler_TokenBudgetEnforced(t *testing.T) {
 			anth := jsonUpstream(t, http.StatusOK, messagesJSON(60, 60))
 			oai := jsonUpstream(t, http.StatusOK, responsesJSON(60, 60))
 			env := newNHEnv(t, nhOpts{
-				tokenCounter: true,
+				budgetCounter: true,
 				models: []config.ModelConfig{
 					anthModel("claude", anth.srv.URL),
 					oaiModel("gpt", "openai", oai.srv.URL),
@@ -776,9 +776,9 @@ func TestNativeHandler_CountTokensRateLimitedButNotBilled(t *testing.T) {
 		fmt.Fprint(w, messagesJSON(2, 3))
 	})
 	env := newNHEnv(t, nhOpts{
-		rateLimiter:  true,
-		tokenCounter: true,
-		models:       []config.ModelConfig{anthModel("claude", ct.srv.URL)},
+		rateLimiter:   true,
+		budgetCounter: true,
+		models:        []config.ModelConfig{anthModel("claude", ct.srv.URL)},
 		mutateKey: func(k *auth.KeyInfo) {
 			k.RequestsPerMinute = 2
 			k.DailyTokenLimit = 1

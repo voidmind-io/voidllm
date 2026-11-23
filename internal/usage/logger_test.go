@@ -45,7 +45,7 @@ func openTestDB(t *testing.T, dsn string) *db.DB {
 
 // newTestLogger builds a Logger backed by d and starts it. The caller is
 // responsible for calling Stop(). The logger discards all internal log output.
-// No TokenCounter is wired; token counting is tested separately.
+// No BudgetCounter is wired; budget counting is tested separately.
 func newTestLogger(d *db.DB, cfg config.UsageConfig) *Logger {
 	return NewLogger(d, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 }
@@ -798,14 +798,14 @@ func TestLog_BudgetCounterReceivesCost(t *testing.T) {
 	assertUsage("seeded after restart", restarted)
 }
 
-// TestLog_TokenCounterUpdatedBeforeFlush verifies that when a Logger is wired
+// TestLog_BudgetCounterUpdatedBeforeFlush verifies that when a Logger is wired
 // with a BudgetCounter, Log() increments the counter synchronously — before the
 // event reaches the database — so that a subsequent Check call sees the
 // current usage without waiting for the async flush.
-func TestLog_TokenCounterUpdatedBeforeFlush(t *testing.T) {
+func TestLog_BudgetCounterUpdatedBeforeFlush(t *testing.T) {
 	t.Parallel()
 
-	d := openTestDB(t, "file:TestLog_TokenCounterUpdatedBeforeFlush?mode=memory&cache=private")
+	d := openTestDB(t, "file:TestLog_BudgetCounterUpdatedBeforeFlush?mode=memory&cache=private")
 
 	counter := ratelimit.NewMemoryBudgetCounter()
 	cfg := defaultCfg() // long flush interval — DB write will not happen during the test
@@ -849,7 +849,7 @@ func TestLog_TokenCounterUpdatedBeforeFlush(t *testing.T) {
 	}
 }
 
-// TestLog_TokenCounterConsumesFullAnthropicShapedTotal verifies that an
+// TestLog_BudgetCounterConsumesFullAnthropicShapedTotal verifies that an
 // Anthropic-shaped event — where PromptTokens already includes the cache-read
 // tokens the adapter folded in (see AnthropicAdapter.TransformResponse /
 // StreamUsage) — is counted against the token budget by its full TotalTokens,
@@ -859,10 +859,10 @@ func TestLog_TokenCounterUpdatedBeforeFlush(t *testing.T) {
 // here (a caller could exceed their real token spend before CheckTokens
 // blocked them). This test uses realistic Anthropic-shaped numbers: 10 fresh
 // input tokens + 50 cache-read tokens + 40 completion tokens = 100 total.
-func TestLog_TokenCounterConsumesFullAnthropicShapedTotal(t *testing.T) {
+func TestLog_BudgetCounterConsumesFullAnthropicShapedTotal(t *testing.T) {
 	t.Parallel()
 
-	d := openTestDB(t, "file:TestLog_TokenCounterConsumesFullAnthropicShapedTotal?mode=memory&cache=private")
+	d := openTestDB(t, "file:TestLog_BudgetCounterConsumesFullAnthropicShapedTotal?mode=memory&cache=private")
 
 	counter := ratelimit.NewMemoryBudgetCounter()
 	cfg := defaultCfg()

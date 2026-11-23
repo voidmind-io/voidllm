@@ -77,7 +77,7 @@ func TestLogger_StoredCreatedAtEqualsEventTime(t *testing.T) {
 	}
 }
 
-// TestLogger_TokenCounterSeed_CountsTodayEventAfterRestart reproduces the
+// TestLogger_BudgetCounterSeed_CountsTodayEventAfterRestart reproduces the
 // #226 "daily token budget resets on restart" regression end-to-end: an event
 // is logged and flushed to a real database with an explicit CreatedAt set to
 // today (a date chosen relative to the actual time.Now() so the test is not
@@ -85,10 +85,10 @@ func TestLogger_StoredCreatedAtEqualsEventTime(t *testing.T) {
 // then a brand new budget counter — standing in for a freshly restarted
 // process — is seeded from that same database. The daily counter must
 // already reflect the persisted event's tokens.
-func TestLogger_TokenCounterSeed_CountsTodayEventAfterRestart(t *testing.T) {
+func TestLogger_BudgetCounterSeed_CountsTodayEventAfterRestart(t *testing.T) {
 	t.Parallel()
 
-	d := openTestDB(t, "file:TestLogger_TokenCounterSeed_CountsTodayEventAfterRestart?mode=memory&cache=private")
+	d := openTestDB(t, "file:TestLogger_BudgetCounterSeed_CountsTodayEventAfterRestart?mode=memory&cache=private")
 	l := newTestLogger(d, defaultCfg())
 	l.Start()
 

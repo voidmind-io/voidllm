@@ -29,8 +29,9 @@ const (
 	budgetReadTimeout = 500 * time.Millisecond
 	// budgetWriteTimeout bounds one write pipeline.
 	budgetWriteTimeout = 2 * time.Second
-	// budgetWriteChunk is the largest number of values sent in one pipeline.
-	budgetWriteChunk = 1000
+	// budgetWriteChunk is the largest number of values sent in one
+	// transaction.
+	budgetWriteChunk = 250
 	// budgetProbeInterval is how often a degraded counter lets one operation
 	// try Redis again; everything else uses the local counters meanwhile.
 	budgetProbeInterval = time.Second
@@ -55,6 +56,7 @@ const (
 	budgetOpSnapshot = "snapshot"
 	budgetOpFlush    = "flush"
 	budgetOpRefresh  = "refresh"
+	budgetOpStart    = "start"
 )
 
 // errBudgetCounterStarted is returned by a second call to Start.
@@ -133,7 +135,7 @@ func maxWindowUsage(a, b WindowUsage) WindowUsage {
 // Add never talks to Redis. It updates two local counters: the shadow counter
 // (usage persisted in the database when this instance started, plus its own)
 // and the own counter (only what this instance recorded). A background loop
-// writes the changed own totals every 250ms in one pipeline, and all own
+// writes the changed own totals every 250ms in one transaction, and all own
 // totals of the current windows every 30s, after Redis recovered, and on
 // EvictStale, which restores them if Redis lost data. Stop writes a final
 // time.
@@ -155,7 +157,9 @@ func maxWindowUsage(a, b WindowUsage) WindowUsage {
 //     later.
 //   - The field of a stopped instance stays until its bucket expires. That is
 //     intended: its usage still counts. A hash therefore grows by one field
-//     per instance start within its window.
+//     per instance start within its window: a monthly counter of a
+//     deployment with 5 instances that is rolled out 20 times in a month ends
+//     up with about 100 fields.
 //   - Usage that is only in the database is not in any field: usage from
 //     before shared budgets were first used in the current window, and the
 //     usage of stopped instances after Redis lost its data.
@@ -165,8 +169,10 @@ func maxWindowUsage(a, b WindowUsage) WindowUsage {
 // day (from the usage events, aggregated by the database) and combines them
 // with its own usage that is too recent to be persisted, see refreshedUsage.
 // With it, what an instance enforces is behind the true total of all
-// instances by at most one refresh interval plus the time the usage logger
-// takes to persist an event (its flush interval), whatever happened to Redis.
+// instances by at most one refresh interval (60s) plus the time the usage
+// logger takes to persist an event (its flush interval), whatever happened to
+// Redis. That is the worst case for how late usage recorded on one instance
+// becomes visible on another; while Redis works it is one write interval.
 // It can be ahead of the true total by the usage the instance itself recorded
 // in roughly two flush intervals plus ten seconds before a refresh; that part
 // is counted twice until the next refresh. The view only knows what reached
@@ -238,8 +244,10 @@ func NewRedisBudgetCounter(client *voidredis.Client, seeder UsageSeeder, log *sl
 
 // Start gives the instance its ID, seeds the shadow counter from the database
 // and launches the loops that write totals to Redis and refresh the database
-// view. It must be called once, before the counter is used; a second call
-// returns an error. Stop shuts the loops down.
+// view. It fails when the database cannot be read, but not when Redis cannot
+// be reached: the counter then starts degraded. It must be called once,
+// before the counter is used; a second call returns an error. Stop shuts the
+// loops down.
 func (r *RedisBudgetCounter) Start(ctx context.Context) error {
 	if !r.startCalled.CompareAndSwap(false, true) {
 		return errBudgetCounterStarted
@@ -252,6 +260,14 @@ func (r *RedisBudgetCounter) Start(ctx context.Context) error {
 	if err := r.shadow.Seed(ctx, r.seeder); err != nil {
 		return fmt.Errorf("seed shadow budget counter: %w", err)
 	}
+	// Redis being down is no reason not to start: the counter begins
+	// degraded, enforces with its local counters, and picks Redis up when it
+	// answers.
+	pingCtx, pingCancel := context.WithTimeout(ctx, budgetReadTimeout)
+	if err := r.client.Ping(pingCtx); err != nil {
+		r.backendError(ctx, budgetOpStart, err)
+	}
+	pingCancel()
 	runCtx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 	r.started.Store(true)
@@ -522,13 +538,18 @@ func (r *RedisBudgetCounter) refreshLoop(ctx context.Context) {
 func (r *RedisBudgetCounter) refreshPersisted(ctx context.Context) {
 	opCtx, cancel := context.WithTimeout(ctx, budgetRefreshTimeout)
 	defer cancel()
-	if err := r.persisted.refresh(opCtx, r.seeder); err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		metrics.BudgetBackendErrorsTotal.WithLabelValues(budgetOpRefresh).Inc()
-		r.log.LogAttrs(ctx, slog.LevelError, "budget refresh from database failed, keeping the previous view",
-			slog.String("error", err.Error()),
+	expired, err := r.persisted.refresh(opCtx, r.seeder)
+	if err == nil || ctx.Err() != nil {
+		return
+	}
+	metrics.BudgetBackendErrorsTotal.WithLabelValues(budgetOpRefresh).Inc()
+	r.log.LogAttrs(ctx, slog.LevelError, "budget refresh from database failed, keeping the previous view",
+		slog.String("error", err.Error()),
+	)
+	if expired > 0 {
+		r.log.LogAttrs(ctx, slog.LevelWarn, "budget refresh has been failing for too long, own usage from before is now taken as persisted",
+			slog.Duration("older_than", refreshSliceMaxAge),
+			slog.Int("slices", expired),
 		)
 	}
 }
@@ -556,8 +577,8 @@ func (r *RedisBudgetCounter) markAllDirty() {
 }
 
 // flush writes the totals scheduled since the last flush to Redis, in
-// pipelines of at most budgetWriteChunk values (one pipeline unless a resync
-// is due on a large installation). Totals that could not be written are
+// transactions of at most budgetWriteChunk values (a single one unless many
+// scopes changed or a resync is due). Totals that could not be written are
 // scheduled again. While the counter is degraded a flush only goes out when
 // it is its turn to probe, unless force is set.
 func (r *RedisBudgetCounter) flush(ctx context.Context, force bool) {

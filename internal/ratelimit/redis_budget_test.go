@@ -84,6 +84,13 @@ func (e *redisBudgetEnv) newCounter(t *testing.T, seeder UsageSeeder) (*RedisBud
 	if err != nil {
 		t.Fatalf("voidredis.New: %v", err)
 	}
+	return e.newCounterOn(t, client, seeder)
+}
+
+// newCounterOn is newCounter for a given client, which is closed when the
+// test ends.
+func (e *redisBudgetEnv) newCounterOn(t *testing.T, client *voidredis.Client, seeder UsageSeeder) (*RedisBudgetCounter, *lockedLog) {
+	t.Helper()
 	t.Cleanup(func() { _ = client.Close() })
 
 	logs := &lockedLog{}
@@ -438,9 +445,10 @@ func TestRedisBudgetCounter_FlushBatches(t *testing.T) {
 	}
 	before := env.mr.CommandCount()
 	flushNow(c)
-	// Key and org, day and month: four counters, each one HSET + EXPIREAT.
-	if got := env.mr.CommandCount() - before; got != 8 {
-		t.Errorf("flush after 1000 Adds sent %d commands, want 8", got)
+	// Key and org, day and month: four counters, each one HSET + EXPIREAT,
+	// in one MULTI/EXEC transaction.
+	if got := env.mr.CommandCount() - before; got != 10 {
+		t.Errorf("flush after 1000 Adds sent %d commands, want 10", got)
 	}
 	if got := env.field(t, env.key("tok", redisTestDay, "org:o"), c); got != 2000 {
 		t.Errorf("org daily = %d, want 2000", got)
@@ -457,8 +465,8 @@ func TestRedisBudgetCounter_FlushBatches(t *testing.T) {
 	addTokens(c, Scopes{KeyID: "k2", OrgID: "o"}, 1)
 	before = env.mr.CommandCount()
 	flushNow(c)
-	if got := env.mr.CommandCount() - before; got != 8 {
-		t.Errorf("flush after a change to two scopes sent %d commands, want 8", got)
+	if got := env.mr.CommandCount() - before; got != 10 {
+		t.Errorf("flush after a change to two scopes sent %d commands, want 10", got)
 	}
 	if got := env.field(t, env.key("tok", redisTestMonth, "org:o"), c); got != 2002 {
 		t.Errorf("org monthly = %d, want 2002", got)
@@ -1067,4 +1075,66 @@ func TestRedisBudgetCounter_RefreshHealsRedisDataLoss(t *testing.T) {
 	if got := snapshotOf(t, a, KeyScope("key-b")).Monthly.Tokens; got != 50 {
 		t.Errorf("a sees key-b usage %d, want 50", got)
 	}
+}
+
+// TestRedisBudgetCounter_StartsDegradedWhenRedisIsDown verifies that a
+// counter can start while Redis is unreachable: it reports the degraded state
+// once, enforces budgets with its local counters, and shares its totals as
+// soon as Redis answers, without a restart.
+func TestRedisBudgetCounter_StartsDegradedWhenRedisIsDown(t *testing.T) {
+	env := newRedisBudgetEnv(t)
+	addr := env.mr.Addr()
+	env.mr.Close()
+
+	client, err := voidredis.NewUnverified("redis://"+addr, "t")
+	if err != nil {
+		t.Fatalf("voidredis.NewUnverified: %v", err)
+	}
+	seeder := &fakeUsageSeeder{rows: []seedRow{{keyID: "k", orgID: "o", tokens: 50}}}
+	c, logs := env.newCounterOn(t, client, seeder)
+
+	startErrsBefore := backendErrors("start")
+	env.start(t, c)
+	if !c.degraded.Load() {
+		t.Fatal("counter not degraded after starting without redis")
+	}
+	if got := backendErrors("start") - startErrsBefore; got != 1 {
+		t.Errorf("start errors = %v, want 1", got)
+	}
+	if n := logs.count("budget backend degraded"); n != 1 {
+		t.Errorf("degraded logged %d times, want once", n)
+	}
+
+	// Budgets are enforced on the seeded history plus own usage.
+	s := Scopes{KeyID: "k", OrgID: "o"}
+	limits := ScopeLimits{Org: Limits{DailyTokenLimit: 100}}
+	addTokens(c, s, 30)
+	if err := checkTokens(c, s, limits); err != nil {
+		t.Fatalf("Check() without redis = %v, want nil (50 seeded + 30 < 100)", err)
+	}
+	addTokens(c, s, 20)
+	if err := checkTokens(c, s, limits); !errors.Is(err, ErrTokenBudgetExceeded) {
+		t.Errorf("Check() without redis = %v, want ErrTokenBudgetExceeded (50 seeded + 50 >= 100)", err)
+	}
+	flushNow(c)
+	if n := logs.count("budget backend degraded"); n != 1 {
+		t.Errorf("degraded logged %d times while redis stays down, want once", n)
+	}
+
+	// Redis comes up.
+	if err := env.mr.Restart(); err != nil {
+		t.Fatalf("miniredis Restart: %v", err)
+	}
+	env.mr.SetTime(redisTestNow)
+	eventually(t, "recovery", func() bool {
+		env.clock.Add(2 * budgetProbeInterval)
+		_ = checkTokens(c, s, limits)
+		return !c.degraded.Load()
+	})
+	if n := logs.count("budget backend recovered"); n != 1 {
+		t.Errorf("recovered logged %d times, want once", n)
+	}
+	// Its own 50 are shared; the seeded 50 are history and stay local.
+	orgDay := env.key("tok", redisTestDay, "org:o")
+	eventually(t, "own totals reach redis", func() bool { return env.field(t, orgDay, c) == 50 })
 }

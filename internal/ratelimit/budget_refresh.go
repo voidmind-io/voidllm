@@ -18,6 +18,9 @@ const (
 	// inserted when the usage logger flushes, so recent ranges can still
 	// gain rows; a range older than this is taken to be complete.
 	refreshFreezeLag = 5 * time.Minute
+	// refreshSliceMaxAge bounds how long own usage is remembered while
+	// refreshes fail. Usage that old has long been persisted or lost.
+	refreshSliceMaxAge = 2 * time.Hour
 )
 
 // refreshedView is the result of one refresh: the usage the database held at
@@ -56,9 +59,15 @@ type refreshedView struct {
 // To keep a refresh cheap the month is aggregated in full only by the first
 // refresh and the first one of each day. Every other refresh adds the events
 // of the range that became older than refreshFreezeLag since the previous one
-// to a frozen total, and reads only the events younger than that again. An
-// event inserted more than refreshFreezeLag after it happened is therefore
-// missing until the next full aggregation.
+// to a frozen total, and reads only the events younger than that again. The
+// frozen range always ends refreshFreezeLag before the refresh, also right
+// after midnight. An event inserted more than refreshFreezeLag after it
+// happened is therefore missing until the next full aggregation.
+//
+// While refreshes fail, the previous view stays in use and keeps growing by
+// own usage. The record of when own usage happened is kept across failures
+// (up to refreshSliceMaxAge), so that the first refresh that succeeds again
+// can tell what the database already holds.
 //
 // Before the first refresh the view is empty, and a view never has to be
 // trusted alone: callers combine it with their other counters by taking the
@@ -112,15 +121,16 @@ func (r *refreshedUsage) record(w budgetWindows, s Scopes, u Usage) {
 
 // refresh reads the persisted totals and replaces the view with them. On
 // failure the previous view stays in place and keeps growing by own usage.
-func (r *refreshedUsage) refresh(ctx context.Context, source UsageSeeder) error {
+// expired is the number of time slices of own usage that were given up
+// because refreshes have been failing for longer than refreshSliceMaxAge.
+func (r *refreshedUsage) refresh(ctx context.Context, source UsageSeeder) (expired int, err error) {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
 
 	at := windowsAt(r.now())
 	base, err := r.readTotals(ctx, source, at)
 	if err != nil {
-		r.compact()
-		return err
+		return r.expireSlices(at.now), err
 	}
 	cutoff := sliceIndex(at.now.Add(-r.allowance))
 
@@ -139,19 +149,21 @@ func (r *refreshedUsage) refresh(ctx context.Context, source UsageSeeder) error 
 		return true
 	})
 	r.view.Store(&refreshedView{at: at, base: base, pending: pending})
-	return nil
+	return 0, nil
 }
 
 // readTotals returns the persisted totals of the windows at, per counter
 // scope. It advances the frozen state only when every read succeeded. The
 // caller holds refreshMu.
 func (r *refreshedUsage) readTotals(ctx context.Context, source UsageSeeder, at budgetWindows) (map[string]WindowUsage, error) {
+	// The frozen range ends refreshFreezeLag ago in every case, also right
+	// after midnight: events of the last minutes of a day may still be
+	// inserted then and must stay in the part that is read again. The split
+	// between day and month is made by the query for either part. Only the
+	// start of the month bounds it, because nothing before counts.
 	freezeUntil := at.now.Add(-refreshFreezeLag)
-	if freezeUntil.Before(at.dayStart) {
-		// Never freeze across the start of the day: the frozen total is
-		// rebuilt when the day changes, and until then it must only hold
-		// ranges whose day split is final.
-		freezeUntil = at.dayStart
+	if freezeUntil.Before(at.monthStart) {
+		freezeUntil = at.monthStart
 	}
 
 	var frozen map[string]WindowUsage
@@ -185,33 +197,20 @@ func (r *refreshedUsage) readTotals(ctx context.Context, source UsageSeeder, at 
 	return base, nil
 }
 
-// compact folds all slices into the newest one. It runs when a refresh
-// failed, so that the number of slices stays bounded while the database is
-// unavailable.
-func (r *refreshedUsage) compact() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	newest, found := int64(0), false
+// expireSlices drops the time slices of own usage older than
+// refreshSliceMaxAge and returns how many it dropped. It runs when a refresh
+// failed, so that the slices stay bounded while the database is unavailable.
+func (r *refreshedUsage) expireSlices(now time.Time) int {
+	oldest := sliceIndex(now.Add(-refreshSliceMaxAge))
+	dropped := 0
 	r.slices.Range(func(key, _ any) bool {
-		if idx := key.(int64); !found || idx > newest {
-			newest, found = idx, true
+		if key.(int64) < oldest {
+			r.slices.Delete(key)
+			dropped++
 		}
 		return true
 	})
-	if !found {
-		return
-	}
-	target, _ := r.slices.Load(newest)
-	current := windowsAt(r.now())
-	r.slices.Range(func(key, value any) bool {
-		if key.(int64) == newest {
-			return true
-		}
-		mergeCounter(target.(*MemoryBudgetCounter), value.(*MemoryBudgetCounter), current)
-		r.slices.Delete(key)
-		return true
-	})
+	return dropped
 }
 
 // mergeCounter adds the usage src holds in the windows w to dst.
@@ -260,13 +259,12 @@ func scanUsageTotals(ctx context.Context, source UsageSeeder, from, until, daySt
 
 	for rows.Next() {
 		var orgID, teamID, userID, keyID string
-		var tokens, dayTokens int64
-		var cost, dayCost float64
-		if err := rows.Scan(&orgID, &teamID, &userID, &keyID, &tokens, &cost, &dayTokens, &dayCost); err != nil {
+		var tokens, costMicros, dayTokens, dayCostMicros int64
+		if err := rows.Scan(&orgID, &teamID, &userID, &keyID, &tokens, &costMicros, &dayTokens, &dayCostMicros); err != nil {
 			return fmt.Errorf("scan usage totals row: %w", err)
 		}
-		monthly := Usage{Tokens: tokens, CostMicros: CostToMicros(cost)}
-		daily := Usage{Tokens: dayTokens, CostMicros: CostToMicros(dayCost)}
+		monthly := Usage{Tokens: tokens, CostMicros: costMicros}.clamped()
+		daily := Usage{Tokens: dayTokens, CostMicros: dayCostMicros}.clamped()
 		forEachScope(Scopes{KeyID: keyID, UserID: userID, TeamID: teamID, OrgID: orgID}, func(scope string) {
 			t := totals[scope]
 			t.Daily.Tokens += daily.Tokens

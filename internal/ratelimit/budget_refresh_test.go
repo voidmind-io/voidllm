@@ -28,7 +28,7 @@ func viewTokens(r *refreshedUsage, scope string) (daily, monthly int64) {
 
 func mustRefresh(t *testing.T, r *refreshedUsage, db *fakeUsageSeeder) {
 	t.Helper()
-	if err := r.refresh(context.Background(), db); err != nil {
+	if _, err := r.refresh(context.Background(), db); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 }
@@ -161,10 +161,10 @@ func TestRefreshedUsage_ReadsOnlyRecentEventsAgain(t *testing.T) {
 	db.takeRanges()
 	clock.Set(time.Date(2026, 3, 11, 0, 2, 0, 0, time.UTC))
 	mustRefresh(t, r, db)
-	dayStart := time.Date(2026, 3, 11, 0, 0, 0, 0, time.UTC)
-	wantNextDay := []timeRange{{monthStart, dayStart}, {dayStart, time.Time{}}}
+	frozenNextDay := time.Date(2026, 3, 10, 23, 57, 0, 0, time.UTC)
+	wantNextDay := []timeRange{{monthStart, frozenNextDay}, {frozenNextDay, time.Time{}}}
 	if got := db.takeRanges(); !equalRanges(got, wantNextDay) {
-		t.Errorf("first refresh of the next day read %v, want %v (never frozen across the day start)", got, wantNextDay)
+		t.Errorf("first refresh of the next day read %v, want %v (the whole month again)", got, wantNextDay)
 	}
 	if d, m := viewTokens(r, org); d != 0 || m != 1107 {
 		t.Errorf("view on the next day = %d/%d, want 0/1107", d, m)
@@ -183,12 +183,14 @@ func equalRanges(a, b []timeRange) bool {
 	return true
 }
 
-// TestRefreshedUsage_FailedRefreshKeepsViewAndOwnUsage verifies that while
-// refreshes fail the previous view stays and keeps growing by the own usage
-// recorded since, however long the database stays away, that the slices are
-// folded so their number stays bounded, and that a failed refresh does not
-// advance what is taken as read.
-func TestRefreshedUsage_FailedRefreshKeepsViewAndOwnUsage(t *testing.T) {
+// TestRefreshedUsage_OutageDoesNotDoubleCountOnRecovery plays a database
+// outage that spans several refreshes while the usage logger still persists
+// this instance's usage (its writes get through, the reads time out). During
+// the outage the previous view keeps growing by the own usage. The first
+// refresh that succeeds again must know how old each piece of own usage is:
+// everything older than the allowance is in the database total and must not
+// be added again, only what is younger may be counted twice.
+func TestRefreshedUsage_OutageDoesNotDoubleCountOnRecovery(t *testing.T) {
 	t.Parallel()
 
 	start := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
@@ -199,33 +201,148 @@ func TestRefreshedUsage_FailedRefreshKeepsViewAndOwnUsage(t *testing.T) {
 	db := &fakeUsageSeeder{events: []persistedEvent{other}}
 	mustRefresh(t, r, db)
 
-	wantErr := errors.New("database is down")
-	db.setEvents(wantErr)
-	for range 20 {
-		recordTokens(r, s, 1)
+	// Five refreshes fail, one minute apart. Before each, the instance
+	// records 10 tokens that the usage logger persists.
+	wantErr := errors.New("read timeout")
+	persisted := []persistedEvent{other}
+	for range 5 {
+		recordTokens(r, s, 10)
+		persisted = append(persisted, persistedEvent{keyID: "k", orgID: "o", tokens: 10, at: clock.Now()})
 		clock.Add(time.Minute)
-		if err := r.refresh(context.Background(), db); !errors.Is(err, wantErr) {
+		db.setEvents(wantErr, persisted...)
+		expired, err := r.refresh(context.Background(), db)
+		if !errors.Is(err, wantErr) {
 			t.Fatalf("refresh error = %v, want %v", err, wantErr)
 		}
+		if expired != 0 {
+			t.Fatalf("refresh gave up %d slices within the first minutes of an outage", expired)
+		}
 	}
-	if d, _ := viewTokens(r, org); d != 120 {
-		t.Errorf("view during the outage = %d, want 120 (100 + all own usage)", d)
+	if d, _ := viewTokens(r, org); d != 150 {
+		t.Errorf("view during the outage = %d, want 150 (100 + all own usage)", d)
 	}
-	if n := countSlices(r); n != 1 {
-		t.Errorf("%d slices after failed refreshes, want 1 (folded)", n)
+	if n := countSlices(r); n != 5 {
+		t.Errorf("%d slices after the failed refreshes, want 5 (one per recording, ages kept)", n)
 	}
 
-	// The database is back, with another instance's usage from the middle
-	// of the outage: the range the failed refreshes could not read is read
-	// now. Own usage of the outage that is older than the allowance is taken
-	// to be in the database total; if it never got there, only the recording
-	// instance's shadow counter still has it, which is why the view is never
-	// used alone.
-	recordTokens(r, s, 1)
-	db.setEvents(nil, other, persistedEvent{keyID: "other", orgID: "o", tokens: 40, at: start.Add(8 * time.Minute)})
+	// 3 more tokens right before the database answers again; they are not
+	// persisted yet.
+	recordTokens(r, s, 3)
+	db.setEvents(nil, persisted...)
 	mustRefresh(t, r, db)
-	if d, _ := viewTokens(r, org); d != 141 {
-		t.Errorf("view right after the outage = %d, want 141 (100 + 40 + the own usage just recorded)", d)
+	// Database: 100 + 50. Own usage younger than the allowance: 3. The 50
+	// from the outage are between one and five minutes old and must not be
+	// added a second time.
+	if d, m := viewTokens(r, org); d != 153 || m != 153 {
+		t.Errorf("view after recovery = %d/%d, want 153/153 (no second count of the outage's usage)", d, m)
+	}
+
+	// Once the 3 are persisted and older than the allowance: exactly the
+	// database total.
+	db.addEvents(persistedEvent{keyID: "k", orgID: "o", tokens: 3, at: clock.Now()})
+	clock.Add(time.Minute)
+	mustRefresh(t, r, db)
+	if d, _ := viewTokens(r, org); d != 153 {
+		t.Errorf("view in the end = %d, want 153", d)
+	}
+	if n := countSlices(r); n != 0 {
+		t.Errorf("%d slices left, want 0", n)
+	}
+}
+
+// TestRefreshedUsage_LongOutageExpiresOldSlices verifies that the record of
+// own usage stays bounded while refreshes fail: slices older than
+// refreshSliceMaxAge are given up and reported, younger ones stay, and the
+// view in use keeps all own usage.
+func TestRefreshedUsage_LongOutageExpiresOldSlices(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2026, 3, 10, 6, 0, 0, 0, time.UTC)
+	r, clock := newTestRefreshedUsage(start)
+	s := Scopes{KeyID: "k", OrgID: "o"}
+	db := &fakeUsageSeeder{}
+	mustRefresh(t, r, db)
+
+	db.setEvents(errors.New("database is down"))
+	recordTokens(r, s, 1) // 06:00
+	clock.Add(90 * time.Minute)
+	recordTokens(r, s, 1) // 07:30
+	if expired, err := r.refresh(context.Background(), db); err == nil || expired != 0 {
+		t.Fatalf("refresh = %d, %v; want 0 expired slices and an error", expired, err)
+	}
+	clock.Add(45 * time.Minute) // 08:15: the first slice is older than two hours
+	expired, err := r.refresh(context.Background(), db)
+	if err == nil || expired != 1 {
+		t.Fatalf("refresh = %d, %v; want 1 expired slice and an error", expired, err)
+	}
+	if n := countSlices(r); n != 1 {
+		t.Errorf("%d slices left, want 1", n)
+	}
+	if d, _ := viewTokens(r, OrgScope("o")); d != 2 {
+		t.Errorf("view during the outage = %d, want 2 (expiring a slice does not touch the view in use)", d)
+	}
+}
+
+// TestRefreshedUsage_LateEventAroundMidnight verifies that an event of the
+// last minutes of a day that is inserted after midnight is still picked up:
+// the range read again always reaches back by the freeze lag, also on the
+// first refresh of the new day.
+func TestRefreshedUsage_LateEventAroundMidnight(t *testing.T) {
+	t.Parallel()
+
+	monthStart := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	r, clock := newTestRefreshedUsage(time.Date(2026, 3, 10, 23, 50, 0, 0, time.UTC))
+	org := OrgScope("o")
+	db := &fakeUsageSeeder{events: []persistedEvent{
+		{keyID: "k", orgID: "o", tokens: 100, at: time.Date(2026, 3, 10, 9, 0, 0, 0, time.UTC)},
+	}}
+	mustRefresh(t, r, db)
+	db.takeRanges()
+
+	// First refresh of the new day, 30s after midnight. The month is read
+	// in full, frozen only up to five minutes ago.
+	clock.Set(time.Date(2026, 3, 11, 0, 0, 30, 0, time.UTC))
+	mustRefresh(t, r, db)
+	frozenUntil := time.Date(2026, 3, 10, 23, 55, 30, 0, time.UTC)
+	want := []timeRange{{monthStart, frozenUntil}, {frozenUntil, time.Time{}}}
+	if got := db.takeRanges(); !equalRanges(got, want) {
+		t.Errorf("first refresh after midnight read %v, want %v", got, want)
+	}
+	if d, m := viewTokens(r, org); d != 0 || m != 100 {
+		t.Fatalf("view after midnight = %d/%d, want 0/100", d, m)
+	}
+
+	// An event from 23:58 is inserted only now, together with one from
+	// 00:00:10.
+	db.addEvents(
+		persistedEvent{keyID: "k", orgID: "o", tokens: 40, at: time.Date(2026, 3, 10, 23, 58, 0, 0, time.UTC)},
+		persistedEvent{keyID: "k", orgID: "o", tokens: 7, at: time.Date(2026, 3, 11, 0, 0, 10, 0, time.UTC)},
+	)
+	clock.Add(time.Minute)
+	mustRefresh(t, r, db)
+	if d, m := viewTokens(r, org); d != 7 || m != 147 {
+		t.Errorf("view with the late event = %d/%d, want 7/147 (late event in the month, not in the new day)", d, m)
+	}
+
+	// Later, when both are in the frozen part, nothing changes.
+	clock.Add(10 * time.Minute)
+	mustRefresh(t, r, db)
+	if d, m := viewTokens(r, org); d != 7 || m != 147 {
+		t.Errorf("view after freezing = %d/%d, want 7/147", d, m)
+	}
+
+	// At the start of a month the frozen range does not reach back into
+	// the previous month.
+	clock.Set(time.Date(2026, 4, 1, 0, 1, 0, 0, time.UTC))
+	db.takeRanges()
+	mustRefresh(t, r, db)
+	april := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	want = []timeRange{{april, april}, {april, time.Time{}}}
+	if got := db.takeRanges(); !equalRanges(got, want) {
+		t.Errorf("first refresh of a month read %v, want %v", got, want)
+	}
+	if d, m := viewTokens(r, org); d != 0 || m != 0 {
+		t.Errorf("view in the new month = %d/%d, want 0/0", d, m)
 	}
 }
 
@@ -282,7 +399,7 @@ func TestRefreshedUsage_ConcurrentRecordAndRefresh(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				if err := r.refresh(context.Background(), db); err != nil {
+				if _, err := r.refresh(context.Background(), db); err != nil {
 					t.Errorf("refresh: %v", err)
 					return
 				}
