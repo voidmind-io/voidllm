@@ -14,24 +14,21 @@ import (
 // non-nil) and counts how often it ran and how many ran concurrently at most.
 func newCountingReloader(gate <-chan struct{}) (*Reloader, *atomic.Int32, *atomic.Int32) {
 	var runs, maxConcurrent, concurrent atomic.Int32
-	r := &Reloader{
-		log: discardLogger(),
-		load: func(ctx context.Context) error {
-			n := concurrent.Add(1)
-			for {
-				m := maxConcurrent.Load()
-				if n <= m || maxConcurrent.CompareAndSwap(m, n) {
-					break
-				}
+	r := newReloader(func(ctx context.Context) error {
+		n := concurrent.Add(1)
+		for {
+			m := maxConcurrent.Load()
+			if n <= m || maxConcurrent.CompareAndSwap(m, n) {
+				break
 			}
-			runs.Add(1)
-			if gate != nil {
-				<-gate
-			}
-			concurrent.Add(-1)
-			return nil
-		},
-	}
+		}
+		runs.Add(1)
+		if gate != nil {
+			<-gate
+		}
+		concurrent.Add(-1)
+		return nil
+	}, discardLogger())
 	return r, &runs, &maxConcurrent
 }
 
@@ -80,15 +77,12 @@ func TestReloader_NoLostTrigger(t *testing.T) {
 	var runs atomic.Int32
 	started := make(chan struct{}, 4)
 	release := make(chan struct{})
-	r := &Reloader{
-		log: discardLogger(),
-		load: func(ctx context.Context) error {
-			runs.Add(1)
-			started <- struct{}{}
-			<-release
-			return nil
-		},
-	}
+	r := newReloader(func(ctx context.Context) error {
+		runs.Add(1)
+		started <- struct{}{}
+		<-release
+		return nil
+	}, discardLogger())
 
 	r.Trigger()
 	<-started // first load is in flight
@@ -116,18 +110,15 @@ func TestReloader_ReloadSeesWriteBeforeCall(t *testing.T) {
 	slowStarted := make(chan struct{})
 	releaseSlow := make(chan struct{})
 	var first atomic.Bool
-	r := &Reloader{
-		log: discardLogger(),
-		load: func(ctx context.Context) error {
-			v := dbValue.Load() // snapshot at load start
-			if first.CompareAndSwap(false, true) {
-				close(slowStarted)
-				<-releaseSlow
-			}
-			cached.Store(v)
-			return nil
-		},
-	}
+	r := newReloader(func(ctx context.Context) error {
+		v := dbValue.Load() // snapshot at load start
+		if first.CompareAndSwap(false, true) {
+			close(slowStarted)
+			<-releaseSlow
+		}
+		cached.Store(v)
+		return nil
+	}, discardLogger())
 
 	r.Trigger()
 	<-slowStarted // in-flight load already read dbValue == 0

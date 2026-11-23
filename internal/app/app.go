@@ -1847,7 +1847,7 @@ func isCodeModeOOM(msg string) bool {
 }
 
 // cleanup tears down resources in reverse startup order: Redis pub/sub,
-// background tickers (LIFO), usage/audit loggers, Redis connection, database.
+// key cache reloader, background tickers (LIFO), usage/audit loggers, Redis connection, database.
 // Sensitive key material is zeroed last, after all components that might still
 // need to decrypt data have been stopped. cleanup must be called exactly once,
 // by WaitForShutdown.
@@ -1861,6 +1861,12 @@ func (a *Application) cleanup(ctx context.Context) {
 			)
 		}
 	}
+
+	// Stop the key cache reloader before the tickers and long before the
+	// database closes: it cancels a load in flight, waits for its goroutine
+	// and makes every later reload request (refresh ticker, a late pub/sub
+	// message) return at once instead of querying a closing database.
+	a.keyReloader.Stop()
 
 	// Stop background tickers in LIFO order.
 	for i := len(a.stopFuncs) - 1; i >= 0; i-- {
