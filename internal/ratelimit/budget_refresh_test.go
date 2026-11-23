@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -422,5 +423,57 @@ func TestRefreshedUsage_ConcurrentRecordAndRefresh(t *testing.T) {
 	mustRefresh(t, r, db)
 	if d, m := viewTokens(r, OrgScope("o")); d != 100+goroutines*each || m != 100+goroutines*each {
 		t.Errorf("view = %d/%d, want %d for both", d, m, 100+goroutines*each)
+	}
+}
+
+// TestRefreshedUsage_EvictStaleBoundsPendingDuringOutage verifies that the
+// own usage kept in the view in use does not grow with every scope that was
+// ever used while refreshes fail: scopes without usage in the current month
+// are dropped, current ones stay.
+func TestRefreshedUsage_EvictStaleBoundsPendingDuringOutage(t *testing.T) {
+	t.Parallel()
+
+	r, clock := newTestRefreshedUsage(time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC))
+	db := &fakeUsageSeeder{}
+	r.evictStale() // no view yet: nothing to do
+	mustRefresh(t, r, db)
+	db.setEvents(errors.New("database is down"))
+
+	// March: 500 keys that are never used again.
+	for i := range 500 {
+		recordTokens(r, Scopes{KeyID: "old-" + strconv.Itoa(i), OrgID: "old-org"}, 1)
+	}
+	pendingEntries := func() int {
+		n := 0
+		r.view.Load().pending.entries.Range(func(_, _ any) bool { n++; return true })
+		return n
+	}
+	if n := pendingEntries(); n != 501 {
+		t.Fatalf("pending entries = %d, want 501 (500 keys + their org)", n)
+	}
+
+	// April, still no successful refresh. One key is in use.
+	clock.Set(time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC))
+	current := Scopes{KeyID: "current", OrgID: "current-org"}
+	recordTokens(r, current, 9)
+	if _, err := r.refresh(context.Background(), db); err == nil {
+		t.Fatal("refresh error = nil, want the outage")
+	}
+	r.evictStale()
+	if n := pendingEntries(); n != 2 {
+		t.Errorf("pending entries after eviction = %d, want 2 (the current key and its org)", n)
+	}
+	if d, m := viewTokens(r, OrgScope("current-org")); d != 9 || m != 9 {
+		t.Errorf("view of the current org = %d/%d, want 9/9", d, m)
+	}
+
+	// Usage after an eviction is still counted.
+	recordTokens(r, current, 1)
+	recordTokens(r, Scopes{KeyID: "old-again", OrgID: "old-org"}, 4)
+	if d, _ := viewTokens(r, KeyScope("current")); d != 10 {
+		t.Errorf("view of the current key = %d, want 10", d)
+	}
+	if d, _ := viewTokens(r, OrgScope("old-org")); d != 4 {
+		t.Errorf("view of the evicted org after new usage = %d, want 4", d)
 	}
 }

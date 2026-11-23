@@ -57,6 +57,7 @@ const (
 	budgetOpFlush    = "flush"
 	budgetOpRefresh  = "refresh"
 	budgetOpStart    = "start"
+	budgetOpProbe    = "probe"
 )
 
 // errBudgetCounterStarted is returned by a second call to Start.
@@ -180,6 +181,10 @@ func maxWindowUsage(a, b WindowUsage) WindowUsage {
 // missing from it and remains only in the shadow of the instance that
 // recorded it, and events older than the usage event retention are gone from
 // it like they are from the startup seed.
+//
+// A single Redis endpoint is required: a check sums several counters in one
+// script call and a write updates several in one transaction, which Redis
+// Cluster does not allow across slots. Redis Cluster is not supported.
 //
 // The zero value is not usable; construct via NewRedisBudgetCounter and call
 // Start before use.
@@ -422,6 +427,7 @@ func (r *RedisBudgetCounter) Snapshot(ctx context.Context, scopeKeys []string) (
 func (r *RedisBudgetCounter) EvictStale() {
 	r.shadow.EvictStale()
 	r.own.EvictStale()
+	r.persisted.evictStale()
 	r.requestResync()
 }
 
@@ -589,6 +595,7 @@ func (r *RedisBudgetCounter) flush(ctx context.Context, force bool) {
 	batch := r.dirty
 	if len(batch) == 0 {
 		r.mu.Unlock()
+		r.probeIfDegraded(ctx)
 		return
 	}
 	r.dirty = make(map[dirtyKey]dirtyEntry, len(batch))
@@ -624,6 +631,24 @@ func (r *RedisBudgetCounter) flush(ctx context.Context, force bool) {
 		}
 		r.backendOK(ctx)
 	}
+}
+
+// probeIfDegraded checks whether Redis answers again when the counter is
+// degraded and it is its turn to probe. It runs when a flush has nothing to
+// write, so that an instance without traffic still notices the recovery and
+// writes its totals again, instead of staying degraded until its next
+// request.
+func (r *RedisBudgetCounter) probeIfDegraded(ctx context.Context) {
+	if !r.degraded.Load() || !r.backendAllowed(r.now()) {
+		return
+	}
+	opCtx, cancel := context.WithTimeout(ctx, budgetReadTimeout)
+	defer cancel()
+	if err := r.client.Ping(opCtx); err != nil {
+		r.backendError(ctx, budgetOpProbe, err)
+		return
+	}
+	r.backendOK(ctx)
 }
 
 // appendValues appends the Redis values for the totals of one scope. Zero

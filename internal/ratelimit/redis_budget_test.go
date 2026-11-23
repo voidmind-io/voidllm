@@ -1138,3 +1138,53 @@ func TestRedisBudgetCounter_StartsDegradedWhenRedisIsDown(t *testing.T) {
 	orgDay := env.key("tok", redisTestDay, "org:o")
 	eventually(t, "own totals reach redis", func() bool { return env.field(t, orgDay, c) == 50 })
 }
+
+// TestRedisBudgetCounter_IdleCounterRecovers verifies that a degraded counter
+// notices Redis coming back without any request: the write loop probes when
+// it has nothing to write, and the recovery writes all totals again.
+func TestRedisBudgetCounter_IdleCounterRecovers(t *testing.T) {
+	env := newRedisBudgetEnv(t)
+	c, logs := env.newCounter(t, &fakeUsageSeeder{})
+	c.flushInterval = 5 * time.Millisecond // resync stays off: nothing gets scheduled on its own
+	env.start(t, c)
+
+	s := Scopes{KeyID: "k", OrgID: "o"}
+	orgDay := env.key("tok", redisTestDay, "org:o")
+	addTokens(c, s, 80)
+	eventually(t, "totals in redis", func() bool { return env.field(t, orgDay, c) == 80 })
+
+	// Redis goes down; one check notices. Nothing is left to write.
+	probeErrsBefore := backendErrors("probe")
+	env.mr.Close()
+	if err := checkTokens(c, s, ScopeLimits{Org: Limits{DailyTokenLimit: 100}}); err != nil {
+		t.Fatalf("Check() during outage = %v, want nil", err)
+	}
+	if !c.degraded.Load() {
+		t.Fatal("counter not degraded after a failed check")
+	}
+
+	// While Redis stays down the idle loop probes once per probe interval.
+	env.clock.Add(2 * budgetProbeInterval)
+	eventually(t, "a failed probe", func() bool { return backendErrors("probe") > probeErrsBefore })
+	if !c.degraded.Load() {
+		t.Fatal("counter left degraded mode although redis is still down")
+	}
+
+	// Redis comes back empty. No Add, no Check, no Snapshot from here on.
+	if err := env.mr.Restart(); err != nil {
+		t.Fatalf("miniredis Restart: %v", err)
+	}
+	env.mr.FlushAll()
+	env.mr.SetTime(redisTestNow)
+	eventually(t, "recovery without traffic", func() bool {
+		env.clock.Add(2 * budgetProbeInterval)
+		return !c.degraded.Load()
+	})
+	eventually(t, "totals rewritten without traffic", func() bool { return env.field(t, orgDay, c) == 80 })
+	if n := logs.count("budget backend recovered"); n != 1 {
+		t.Errorf("recovered logged %d times, want once", n)
+	}
+	if n := logs.count("budget backend degraded"); n != 1 {
+		t.Errorf("degraded logged %d times, want once", n)
+	}
+}

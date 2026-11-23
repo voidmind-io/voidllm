@@ -137,6 +137,7 @@ func (r *refreshedUsage) refresh(ctx context.Context, source UsageSeeder) (expir
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	pending := NewMemoryBudgetCounter()
+	pending.now = r.now
 	current := windowsAt(r.now())
 	r.slices.Range(func(key, value any) bool {
 		// A slice is kept while any part of it is younger than the
@@ -211,6 +212,16 @@ func (r *refreshedUsage) expireSlices(now time.Time) int {
 		return true
 	})
 	return dropped
+}
+
+// evictStale drops the own usage of scopes without usage in the current
+// windows from the view in use. A refresh rebuilds that part from scratch,
+// but while refreshes fail it is the only thing that keeps it from growing
+// with every scope that was ever used.
+func (r *refreshedUsage) evictStale() {
+	if view := r.view.Load(); view != nil {
+		view.pending.EvictStale()
+	}
 }
 
 // mergeCounter adds the usage src holds in the windows w to dst.
