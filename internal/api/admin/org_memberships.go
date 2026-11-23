@@ -160,12 +160,8 @@ func (h *Handler) CreateOrgMembership(c fiber.Ctx) error {
 
 	// Reload the key cache so a user_key or session_key belonging to req.UserID
 	// that could not previously be cached for lack of a membership row (see
-	// auth.Cacheable) becomes usable locally right away. The membership itself
-	// already succeeded above; a reload failure here is logged only, since the
-	// periodic reload will retry regardless.
-	if err := auth.LoadKeysIntoCache(c.Context(), h.DB, h.KeyCache, h.Log); err != nil {
-		h.Log.ErrorContext(c.Context(), "create org membership: reload key cache", slog.String("error", err.Error()))
-	}
+	// auth.Cacheable) becomes usable right away, here and on other instances.
+	h.refreshKeyCaches(c.Context(), "create org membership", auth.KeyInvalidationReload)
 
 	return c.Status(fiber.StatusCreated).JSON(orgMembershipToResponse(m))
 }
@@ -329,20 +325,11 @@ func (h *Handler) UpdateOrgMembership(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update org membership")
 	}
 
-	// Refresh the key cache from the DB so the new limits are enforced
-	// immediately, without waiting for the next periodic key cache reload.
-	// A prior version patched matching cache entries in place, but that
-	// Range-then-Set sequence is not atomic with respect to the periodic
-	// full reload goroutine: a reload running concurrently could win the
-	// race and overwrite this patch with the role/limit state it read just
-	// before the DB write above, leaving the cache stale until the next
-	// reload cycle. A full reload has no such race — it always reflects the
-	// DB state as of when it ran. The membership update itself already
-	// succeeded above; a reload failure here is logged only, since the
-	// periodic reload will retry regardless.
-	if err := auth.LoadKeysIntoCache(c.Context(), h.DB, h.KeyCache, h.Log); err != nil {
-		h.Log.ErrorContext(c.Context(), "update org membership: reload key cache", slog.String("error", err.Error()))
-	}
+	// Refresh the key cache from the DB so the new role and limits are
+	// enforced immediately, here and on other instances. A full reload (rather
+	// than patching entries in place) cannot lose a race with the periodic
+	// reload: it always reflects the DB state as of when it ran.
+	h.refreshKeyCaches(c.Context(), "update org membership", auth.KeyInvalidationReload)
 
 	return c.JSON(orgMembershipToResponse(m))
 }
@@ -429,6 +416,8 @@ func (h *Handler) DeleteOrgMembership(c fiber.Ctx) error {
 			}
 		}
 	}
+
+	h.refreshKeyCaches(c.Context(), "delete org membership", auth.KeyInvalidationReload)
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

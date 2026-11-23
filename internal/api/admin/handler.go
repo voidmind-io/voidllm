@@ -44,10 +44,13 @@ type Handler struct {
 	// enterprise deployments the process-level mutex is sufficient.
 	fallbackMu sync.Mutex
 
-	DB                *db.DB
-	HMACSecret        []byte
-	EncryptionKey     []byte // AES-256-GCM key for upstream API key encryption
-	KeyCache          *cache.Cache[string, auth.KeyInfo]
+	DB            *db.DB
+	HMACSecret    []byte
+	EncryptionKey []byte // AES-256-GCM key for upstream API key encryption
+	KeyCache      *cache.Cache[string, auth.KeyInfo]
+	// KeyReloader coalesces full key cache reloads. When nil, handlers reload
+	// the cache directly with auth.LoadKeysIntoCache.
+	KeyReloader       *auth.Reloader
 	Registry          *proxy.Registry
 	AccessCache       *proxy.ModelAccessCache  // in-memory model access cache; nil disables refresh
 	AliasCache        *proxy.AliasCache        // in-memory model alias cache; nil disables refresh
@@ -429,4 +432,52 @@ func rejectNegativeLimits(c fiber.Ctx, daily, monthly *int64, perMinute, perDay 
 		return true, apierror.BadRequest(c, name+" must be >= 0")
 	}
 	return false, nil
+}
+
+// refreshKeyCaches makes a change to org, team or membership limits take
+// effect on every instance. When Redis is configured it publishes payload on
+// voidredis.ChannelKeys asynchronously so other instances reload too, then
+// reloads the local key cache (blocking until a load that started after the
+// database write has finished, so the change is visible when the handler
+// returns).
+//
+// The publish runs in its own goroutine under a fresh context bounded by
+// keyInvalidationPublishTimeout, independent of ctx: the database write is
+// already committed, so the other instances must hear about it even when the
+// client disconnects, and the local reload never waits for Redis. The goroutine
+// is bounded by that timeout. Failures are logged and never fail the request:
+// the database write already succeeded and the periodic reload retries
+// regardless. The local reload stays bounded by ctx.
+func (h *Handler) refreshKeyCaches(ctx context.Context, op, payload string) {
+	if h.Redis != nil {
+		go h.publishKeyInvalidations(op, []string{payload})
+	}
+
+	var err error
+	if h.KeyReloader != nil {
+		err = h.KeyReloader.Reload(ctx)
+	} else {
+		err = auth.LoadKeysIntoCache(ctx, h.DB, h.KeyCache, h.Log)
+	}
+	if err != nil {
+		h.Log.ErrorContext(ctx, op+": reload key cache", slog.String("error", err.Error()))
+	}
+}
+
+// keyInvalidationPublishTimeout bounds the Redis publishes of one
+// publishKeyInvalidations call.
+const keyInvalidationPublishTimeout = 2 * time.Second
+
+// publishKeyInvalidations publishes each payload on voidredis.ChannelKeys under
+// a context that is independent of any request and bounded by
+// keyInvalidationPublishTimeout in total. Failures are logged. h.Redis must be
+// non-nil.
+func (h *Handler) publishKeyInvalidations(op string, payloads []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), keyInvalidationPublishTimeout)
+	defer cancel()
+	for _, payload := range payloads {
+		if err := h.Redis.PublishInvalidation(ctx, voidredis.ChannelKeys, payload); err != nil {
+			h.Log.ErrorContext(ctx, op+": publish key cache invalidation", slog.String("error", err.Error()))
+		}
+	}
 }

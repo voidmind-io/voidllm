@@ -886,9 +886,11 @@ func TestDeleteOrg_ThenGetReturns404(t *testing.T) {
 	t.Parallel()
 
 	app, database, keyCache := setupTestApp(t, "file:TestDeleteOrg_ThenGet?mode=memory&cache=private")
-	testKey := addTestKey(t, keyCache, auth.RoleSystemAdmin, "")
-
 	org := mustCreateOrg(t, database, "Ephemeral Org", "ephemeral-org")
+	// DeleteOrg reloads the key cache from the DB, so the caller must be a
+	// stored key belonging to a different org to survive the reload.
+	home := mustCreateOrg(t, database, "Home Org", "home-org-delete-get")
+	testKey := mustCreateSystemAdminCallerKey(t, database, keyCache, home.ID)
 
 	// Delete the org.
 	delReq := httptest.NewRequest("DELETE", "/api/v1/orgs/"+org.ID, nil)

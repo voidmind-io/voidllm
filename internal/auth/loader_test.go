@@ -835,8 +835,12 @@ func TestStartCacheRefresh(t *testing.T) {
 	log := discardLogger()
 
 	// Start the refresh loop with a short interval.
-	stop := StartCacheRefresh(d, kc, 50*time.Millisecond, log)
-	t.Cleanup(stop)
+	reloader := NewReloader(d, kc, log)
+	stop := StartCacheRefresh(reloader, 50*time.Millisecond)
+	t.Cleanup(func() {
+		reloader.Stop()
+		stop()
+	})
 
 	// Insert a key after the goroutine is already running.
 	orgID := createOrg(t, d, "OrgRefresh", "org-refresh", db.CreateOrgParams{})

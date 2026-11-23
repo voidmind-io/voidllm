@@ -73,6 +73,7 @@ type Application struct {
 
 	registry          *proxy.Registry
 	keyCache          *cache.Cache[string, auth.KeyInfo]
+	keyReloader       *auth.Reloader
 	accessCache       *proxy.ModelAccessCache
 	aliasCache        *proxy.AliasCache
 	mcpServerCache    *proxy.MCPServerCache
@@ -492,6 +493,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		return nil, fmt.Errorf("bootstrap auth: %w", err)
 	}
 
+	keyReloader := auth.NewReloader(database, keyCache, log)
 	if err := auth.LoadKeysIntoCache(ctx, database, keyCache, log); err != nil {
 		return nil, fmt.Errorf("load keys into cache: %w", err)
 	}
@@ -590,8 +592,10 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 			go redisClient.SubscribeInvalidations(redisCtx, log, func(channel, payload string) {
 				switch channel {
 				case voidredis.ChannelKeys:
-					// Payload is the key hash — evict exactly that entry.
-					keyCache.Delete(payload)
+					// "reload", "org:<id>" and "team:<id>" reload the key cache
+					// (limits are cached inside KeyInfo); anything else is a key
+					// hash and evicts exactly that entry.
+					auth.HandleKeyInvalidation(payload, keyReloader, keyCache)
 					log.LogAttrs(context.Background(), slog.LevelDebug, "redis: key cache invalidated")
 				case voidredis.ChannelModels:
 					// Reload all active models into the registry from the DB.
@@ -767,6 +771,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		HMACSecret:         hmacSecret,
 		EncryptionKey:      encKey,
 		KeyCache:           keyCache,
+		KeyReloader:        keyReloader,
 		Registry:           registry,
 		AccessCache:        accessCache,
 		AliasCache:         aliasCache,
@@ -1291,6 +1296,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		hmacSecret:        hmacSecret,
 		registry:          registry,
 		keyCache:          keyCache,
+		keyReloader:       keyReloader,
 		accessCache:       accessCache,
 		aliasCache:        aliasCache,
 		mcpServerCache:    mcpServerCache,
@@ -1339,7 +1345,7 @@ func (a *Application) Start() error {
 	// Cache refresh tickers. Stop functions are registered in LIFO order so
 	// that the key refresh stops first on shutdown (matching startup order).
 	a.stopFuncs = append(a.stopFuncs,
-		auth.StartCacheRefresh(a.database, a.keyCache, a.cfg.Cache.KeyTTL, a.log),
+		auth.StartCacheRefresh(a.keyReloader, a.cfg.Cache.KeyTTL),
 		startTicker(a.cfg.Cache.ModelTTL, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -1841,7 +1847,7 @@ func isCodeModeOOM(msg string) bool {
 }
 
 // cleanup tears down resources in reverse startup order: Redis pub/sub,
-// background tickers (LIFO), usage/audit loggers, Redis connection, database.
+// key cache reloader, background tickers (LIFO), usage/audit loggers, Redis connection, database.
 // Sensitive key material is zeroed last, after all components that might still
 // need to decrypt data have been stopped. cleanup must be called exactly once,
 // by WaitForShutdown.
@@ -1855,6 +1861,12 @@ func (a *Application) cleanup(ctx context.Context) {
 			)
 		}
 	}
+
+	// Stop the key cache reloader before the tickers and long before the
+	// database closes: it cancels a load in flight, waits for its goroutine
+	// and makes every later reload request (refresh ticker, a late pub/sub
+	// message) return at once instead of querying a closing database.
+	a.keyReloader.Stop()
 
 	// Stop background tickers in LIFO order.
 	for i := len(a.stopFuncs) - 1; i >= 0; i-- {

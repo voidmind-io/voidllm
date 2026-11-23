@@ -8,7 +8,6 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
-	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 )
 
 // createTeamRequest is the JSON body accepted by CreateTeam.
@@ -331,8 +330,39 @@ func (h *Handler) ListTeams(c fiber.Ctx) error {
 	return c.JSON(resp)
 }
 
+// changesTeamLimits reports whether req sets any limit field to a value that
+// differs from the team's current one. Fields that are absent or re-sent
+// unchanged do not count.
+func changesTeamLimits(current *db.Team, req *updateTeamRequest) bool {
+	return (req.DailyTokenLimit != nil && *req.DailyTokenLimit != current.DailyTokenLimit) ||
+		(req.MonthlyTokenLimit != nil && *req.MonthlyTokenLimit != current.MonthlyTokenLimit) ||
+		(req.RequestsPerMinute != nil && *req.RequestsPerMinute != current.RequestsPerMinute) ||
+		(req.RequestsPerDay != nil && *req.RequestsPerDay != current.RequestsPerDay)
+}
+
+// teamUpdateParams turns req into the fields to write for a caller with
+// callerRole. It returns false when the caller is below org admin and req
+// changes a limit relative to current.
+//
+// For callers below org admin the limit fields are never written, even when
+// req re-sends the values in current: current was read before the write, so
+// writing it back could overwrite a limit an org admin changed in between.
+func teamUpdateParams(callerRole string, current *db.Team, req *updateTeamRequest) (db.UpdateTeamParams, bool) {
+	params := db.UpdateTeamParams{Name: req.Name, Slug: req.Slug}
+	if !auth.HasRole(callerRole, auth.RoleOrgAdmin) {
+		return params, !changesTeamLimits(current, req)
+	}
+	params.DailyTokenLimit = req.DailyTokenLimit
+	params.MonthlyTokenLimit = req.MonthlyTokenLimit
+	params.RequestsPerMinute = req.RequestsPerMinute
+	params.RequestsPerDay = req.RequestsPerDay
+	return params, true
+}
+
 // UpdateTeam handles PATCH /api/v1/orgs/:org_id/teams/:team_id.
-// System admins and org admins of the target org may update teams.
+// System admins, org admins of the target org, and team admins who belong to
+// the team may update it, but changing any limit field requires org admin or
+// higher (403 otherwise); re-sending a limit's current value is allowed.
 // Returns 404 if the team belongs to a different org (cross-org protection).
 //
 // @Summary      Update a team
@@ -353,7 +383,7 @@ func (h *Handler) ListTeams(c fiber.Ctx) error {
 // @Security     BearerAuth
 // @Router       /orgs/{org_id}/teams/{team_id} [patch]
 func (h *Handler) UpdateTeam(c fiber.Ctx) error {
-	_, existing, ok := h.requireTeamAccess(c)
+	keyInfo, existing, ok := h.requireTeamAccess(c)
 	if !ok {
 		return nil
 	}
@@ -368,15 +398,12 @@ func (h *Handler) UpdateTeam(c fiber.Ctx) error {
 	if req.Slug != nil && !slugRegex.MatchString(*req.Slug) {
 		return apierror.BadRequest(c, "slug must be lowercase alphanumeric with hyphens, 2-63 characters")
 	}
+	params, allowed := teamUpdateParams(keyInfo.Role, existing, &req)
+	if !allowed {
+		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "only org admins may change team limits")
+	}
 
-	if _, err := h.DB.UpdateTeam(c.Context(), existing.ID, db.UpdateTeamParams{
-		Name:              req.Name,
-		Slug:              req.Slug,
-		DailyTokenLimit:   req.DailyTokenLimit,
-		MonthlyTokenLimit: req.MonthlyTokenLimit,
-		RequestsPerMinute: req.RequestsPerMinute,
-		RequestsPerDay:    req.RequestsPerDay,
-	}); err != nil {
+	if _, err := h.DB.UpdateTeam(c.Context(), existing.ID, params); err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			return apierror.NotFound(c, "team not found")
 		}
@@ -390,12 +417,9 @@ func (h *Handler) UpdateTeam(c fiber.Ctx) error {
 		return apierror.InternalError(c, "failed to update team")
 	}
 
-	// Invalidate key cache so updated limits take effect immediately.
-	if h.Redis != nil {
-		if pubErr := h.Redis.PublishInvalidation(c.Context(), voidredis.ChannelKeys, "team:"+existing.ID); pubErr != nil {
-			h.Log.ErrorContext(c.Context(), "publish key cache invalidation", slog.String("error", pubErr.Error()))
-		}
-	}
+	// Team limits are cached inside every key's KeyInfo: reload locally and on
+	// other instances so the change applies immediately.
+	h.refreshKeyCaches(c.Context(), "update team", auth.KeyInvalidationTeamPrefix+existing.ID)
 
 	team, err := h.DB.GetTeamWithCounts(c.Context(), existing.ID)
 	if err != nil {
@@ -451,14 +475,9 @@ func (h *Handler) DeleteTeam(c fiber.Ctx) error {
 	}
 	for _, keyHash := range hashes {
 		h.KeyCache.Delete(keyHash)
-
-		if h.Redis != nil {
-			if err := h.Redis.PublishInvalidation(c.Context(), voidredis.ChannelKeys, keyHash); err != nil {
-				h.Log.LogAttrs(c.Context(), slog.LevelWarn, "redis: publish key invalidation failed",
-					slog.String("error", err.Error()),
-				)
-			}
-		}
+	}
+	if h.Redis != nil && len(hashes) > 0 {
+		go h.publishKeyInvalidations("delete team", hashes)
 	}
 
 	return c.SendStatus(fiber.StatusNoContent)
