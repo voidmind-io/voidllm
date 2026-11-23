@@ -3,7 +3,7 @@ import { MemoryRouter, Routes, Route, Link, useLocation } from 'react-router-dom
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import userEvent from '@testing-library/user-event'
 import { ErrorBoundary } from './ErrorBoundary'
-import { handlePreloadError, clearPreloadReloadGuard } from '../../lib/preloadError'
+import { handlePreloadError } from '../../lib/preloadError'
 
 function Boom(): never {
   throw new Error('boom')
@@ -78,16 +78,6 @@ describe('handlePreloadError', () => {
     expect(reload).toHaveBeenCalledTimes(1)
     expect(first.defaultPrevented).toBe(true)
     expect(second.defaultPrevented).toBe(false)
-    vi.unstubAllGlobals()
-  })
-
-  it('can reload again after the guard is cleared', () => {
-    const reload = vi.fn()
-    vi.stubGlobal('location', { reload })
-    handlePreloadError(new Event('vite:preloadError', { cancelable: true }))
-    clearPreloadReloadGuard()
-    handlePreloadError(new Event('vite:preloadError', { cancelable: true }))
-    expect(reload).toHaveBeenCalledTimes(2)
     vi.unstubAllGlobals()
   })
 })

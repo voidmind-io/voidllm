@@ -31,3 +31,34 @@ export function loginUrlWithNext(): string {
   if (pathname.startsWith('/login')) return '/login'
   return `/login?next=${encodeURIComponent(pathname + search + hash)}`
 }
+
+/** Stored next paths older than this are ignored. */
+export const NEXT_PATH_TTL_MS = 10 * 60 * 1000
+
+/** Persists the validated post-login destination with a timestamp. */
+export function storeNextPath(path: string): void {
+  sessionStorage.setItem(NEXT_PATH_KEY, JSON.stringify({ path: safeNextPath(path), ts: Date.now() }))
+}
+
+/** Removes any stored post-login destination. */
+export function clearNextPath(): void {
+  sessionStorage.removeItem(NEXT_PATH_KEY)
+}
+
+/** Reads and removes the stored destination; returns '/' when missing, malformed, legacy or expired. */
+export function consumeNextPath(): string {
+  const raw = sessionStorage.getItem(NEXT_PATH_KEY)
+  clearNextPath()
+  if (raw === null) return '/'
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return '/'
+  }
+  if (typeof parsed !== 'object' || parsed === null) return '/'
+  const { path, ts } = parsed as { path?: unknown; ts?: unknown }
+  if (typeof path !== 'string' || typeof ts !== 'number') return '/'
+  if (Date.now() - ts > NEXT_PATH_TTL_MS) return '/'
+  return safeNextPath(path)
+}

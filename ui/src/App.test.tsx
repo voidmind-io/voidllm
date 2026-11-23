@@ -180,4 +180,61 @@ describe('RequireAuth expiry warning', () => {
     unmount()
     expect(vi.getTimerCount()).toBe(baseline)
   })
+
+  it('replaces a previous warning instead of stacking', () => {
+    localStorage.setItem(LOCAL_STORAGE_KEY, 'vl_sk_x')
+    localStorage.setItem(SESSION_EXPIRY_KEY, new Date(Date.now() + 2 * 60_000 + 7_000).toISOString())
+    renderGuard()
+    expect(screen.getAllByText(WARNING)).toHaveLength(1)
+    localStorage.setItem(SESSION_EXPIRY_KEY, new Date(Date.now() + 4 * 60_000 + 7_000).toISOString())
+    act(() => {
+      window.dispatchEvent(new StorageEvent('storage', { key: SESSION_EXPIRY_KEY }))
+    })
+    expect(screen.getAllByText(WARNING)).toHaveLength(1)
+    expect(screen.getByText(/Your session ends in 5 minutes\./)).toBeInTheDocument()
+  })
+
+  it('dismisses the warning when another tab extends the session', () => {
+    localStorage.setItem(LOCAL_STORAGE_KEY, 'vl_sk_x')
+    localStorage.setItem(SESSION_EXPIRY_KEY, new Date(Date.now() + 2 * 60_000 + 7_000).toISOString())
+    renderGuard()
+    expect(screen.getByText(WARNING)).toBeInTheDocument()
+    localStorage.setItem(SESSION_EXPIRY_KEY, new Date(Date.now() + 60 * 60_000).toISOString())
+    act(() => {
+      window.dispatchEvent(new StorageEvent('storage', { key: SESSION_EXPIRY_KEY }))
+    })
+    expect(screen.queryByText(WARNING)).not.toBeInTheDocument()
+  })
+
+  it('dismisses the warning and redirects when another tab signs out', () => {
+    localStorage.setItem(LOCAL_STORAGE_KEY, 'vl_sk_x')
+    localStorage.setItem(SESSION_EXPIRY_KEY, new Date(Date.now() + 2 * 60_000 + 9_000).toISOString())
+    renderGuard()
+    expect(screen.getByText(WARNING)).toBeInTheDocument()
+    localStorage.clear()
+    act(() => {
+      window.dispatchEvent(new StorageEvent('storage', { key: LOCAL_STORAGE_KEY }))
+    })
+    expect(screen.queryByText(WARNING)).not.toBeInTheDocument()
+    expect(screen.getByText(/login page/)).toBeInTheDocument()
+  })
+
+  it('removes the storage listener on unmount', () => {
+    const remove = vi.spyOn(window, 'removeEventListener')
+    localStorage.setItem(LOCAL_STORAGE_KEY, 'vl_sk_x')
+    const { unmount } = render(
+      <ToastProvider>
+        <MemoryRouter>
+          <Routes>
+            <Route element={<RequireAuth />}>
+              <Route index element={<div>home</div>} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </ToastProvider>,
+    )
+    unmount()
+    expect(remove).toHaveBeenCalledWith('storage', expect.any(Function))
+    remove.mockRestore()
+  })
 })

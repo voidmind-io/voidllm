@@ -1,20 +1,12 @@
 const PRELOAD_RELOAD_KEY = 'voidllm_preload_reload'
-const GUARD_RESET_DELAY_MS = 5_000
+const RELOAD_COOLDOWN_MS = 60_000
 
-/** Reloads once when a lazy chunk fails to load (stale deploy); guarded against loops. */
+/** Reloads when a lazy chunk fails to load (stale deploy), at most once per minute. */
 export function handlePreloadError(event: Event): void {
-  if (sessionStorage.getItem(PRELOAD_RELOAD_KEY) === '1') return
-  sessionStorage.setItem(PRELOAD_RELOAD_KEY, '1')
+  const last = Number(sessionStorage.getItem(PRELOAD_RELOAD_KEY))
+  const now = Date.now()
+  if (Number.isFinite(last) && last > 0 && now - last <= RELOAD_COOLDOWN_MS) return
+  sessionStorage.setItem(PRELOAD_RELOAD_KEY, String(now))
   event.preventDefault()
   window.location.reload()
-}
-
-/** Clears the reload guard so a later deploy in the same tab can auto-reload again. */
-export function clearPreloadReloadGuard(): void {
-  sessionStorage.removeItem(PRELOAD_RELOAD_KEY)
-}
-
-/** Clears the reload guard once the app has been running for a short while. */
-export function scheduleReloadGuardReset(): void {
-  window.setTimeout(clearPreloadReloadGuard, GUARD_RESET_DELAY_MS)
 }

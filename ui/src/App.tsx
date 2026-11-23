@@ -43,7 +43,7 @@ import SystemUsersPage from './pages/SystemUsersPage'
 import MCPServersPage from './pages/MCPServersPage'
 import { ToastProvider, useToast } from './hooks/useToast'
 import { Shell } from './components/layout/Shell'
-import { LOCAL_STORAGE_KEY } from './lib/constants'
+import { LOCAL_STORAGE_KEY, SESSION_EXPIRY_KEY } from './lib/constants'
 import {
   clearSession,
   getSessionExpiryMs,
@@ -70,6 +70,22 @@ export function RequireAuth() {
   const [expired, setExpired] = useState(() => isSessionExpired())
   const location = useLocation()
   const { toast, dismiss } = useToast()
+  const [syncTick, setSyncTick] = useState(0)
+
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== null && e.key !== LOCAL_STORAGE_KEY && e.key !== SESSION_EXPIRY_KEY) return
+      if (warningToastId !== null) {
+        dismiss(warningToastId)
+        warningToastId = null
+      }
+      warnedExpiry = null
+      if (!localStorage.getItem(LOCAL_STORAGE_KEY)) setExpired(true)
+      setSyncTick((n) => n + 1)
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [dismiss])
 
   useEffect(() => {
     if (!token) return
@@ -86,7 +102,7 @@ export function RequireAuth() {
     }
     check()
     return () => window.clearTimeout(timer)
-  }, [token])
+  }, [token, syncTick])
 
   useEffect(() => {
     if (!token) return
@@ -99,6 +115,7 @@ export function RequireAuth() {
       if (remaining <= EXPIRY_WARNING_MS) {
         if (warnedExpiry === expiry) return
         warnedExpiry = expiry
+        if (warningToastId !== null) dismiss(warningToastId)
         warningToastId = toast({
           variant: 'info',
           duration: 0,
@@ -117,7 +134,7 @@ export function RequireAuth() {
         warnedExpiry = null
       }
     }
-  }, [token, toast, dismiss])
+  }, [token, toast, dismiss, syncTick])
 
   if (!token || expired) {
     const next = location.pathname + location.search + location.hash

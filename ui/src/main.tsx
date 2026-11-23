@@ -2,7 +2,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles/globals.css'
 import App from './App.tsx'
-import { handlePreloadError, scheduleReloadGuardReset } from './lib/preloadError'
+import { handlePreloadError } from './lib/preloadError'
 
 window.addEventListener('vite:preloadError', handlePreloadError)
 
@@ -14,4 +14,3 @@ createRoot(root).render(
     <App />
   </StrictMode>,
 )
-scheduleReloadGuardReset()

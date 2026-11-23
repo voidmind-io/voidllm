@@ -6,7 +6,7 @@ import { Input } from '../../components/ui/Input'
 import { Button } from '../../components/ui/Button'
 import { Banner } from '../../components/ui/Banner'
 import { storeSession } from '../../lib/session'
-import { NEXT_PATH_KEY, safeNextPath } from '../../lib/nextPath'
+import { clearNextPath, safeNextPath, storeNextPath } from '../../lib/nextPath'
 import type { MeResponse } from '../../hooks/useMe'
 
 interface AuthProviders {
@@ -77,6 +77,7 @@ export default function LoginPage() {
 
       const data = (await res.json()) as { token: string; expires_at: string; user: MeResponse }
       storeSession(data.token, data.expires_at)
+      clearNextPath()
       queryClient.setQueryData(['me'], data.user)
       navigate(safeNextPath(searchParams.get('next')), { replace: true })
     } catch {
@@ -139,7 +140,7 @@ export default function LoginPage() {
               className="block w-full"
               onClick={() => {
                 const next = safeNextPath(searchParams.get('next'))
-                if (next !== '/') sessionStorage.setItem(NEXT_PATH_KEY, next)
+                if (next !== '/') storeNextPath(next)
               }}
             >
               <Button variant="secondary" fullWidth size="lg" type="button">
