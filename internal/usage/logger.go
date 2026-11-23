@@ -85,9 +85,9 @@ func (l *Logger) BufferLen() int {
 }
 
 // Log enqueues an event for async persistence. When a BudgetCounter is wired
-// it is incremented immediately — before the channel send — so that in-flight
-// token budget checks see the most current totals without waiting for the DB
-// flush. When the internal buffer is full and dropOnFull is true, the event is
+// it is incremented immediately, with the event's tokens and cost — before the
+// channel send — so that in-flight budget checks see the most current totals
+// without waiting for the DB flush. When the internal buffer is full and dropOnFull is true, the event is
 // silently dropped rather than blocking the caller. This ensures the proxy hot
 // path is never delayed by a slow DB.
 func (l *Logger) Log(event Event) {
@@ -101,15 +101,23 @@ func (l *Logger) Log(event Event) {
 	}
 
 	// Increment the budget counter immediately so that subsequent budget
-	// checks reflect this request even before it reaches the DB. Only tokens
-	// are counted; cost is not part of live budget accounting yet.
-	if l.budget != nil && event.TotalTokens > 0 {
-		l.budget.Add(context.Background(), ratelimit.Scopes{
-			KeyID:  event.KeyID,
-			UserID: event.UserID,
-			TeamID: event.TeamID,
-			OrgID:  event.OrgID,
-		}, ratelimit.Usage{Tokens: int64(event.TotalTokens)})
+	// checks reflect this request even before it reaches the DB. Cost is
+	// counted with the same rounding the counter uses when it is seeded from
+	// the stored events; an event without a cost estimate (unpriced model)
+	// counts as 0.
+	if l.budget != nil {
+		used := ratelimit.Usage{Tokens: int64(event.TotalTokens)}
+		if event.CostEstimate != nil {
+			used.CostMicros = ratelimit.CostToMicros(*event.CostEstimate)
+		}
+		if used.Tokens > 0 || used.CostMicros > 0 {
+			l.budget.Add(context.Background(), ratelimit.Scopes{
+				KeyID:  event.KeyID,
+				UserID: event.UserID,
+				TeamID: event.TeamID,
+				OrgID:  event.OrgID,
+			}, used)
+		}
 	}
 
 	if l.dropOnFull {

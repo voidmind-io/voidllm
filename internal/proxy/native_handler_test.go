@@ -191,7 +191,7 @@ func (e *nhEnv) scopes() ratelimit.Scopes {
 
 // checkTokens runs a token budget check for the env's key against limits.
 func (e *nhEnv) checkTokens(limits ratelimit.ScopeLimits) error {
-	return e.tc.Check(context.Background(), e.scopes(), limits, ratelimit.CheckOptions{})
+	return e.tc.Check(context.Background(), e.scopes(), limits)
 }
 
 func (e *nhEnv) do(t *testing.T, path, body string, hdr map[string]string) (int, http.Header, string) {

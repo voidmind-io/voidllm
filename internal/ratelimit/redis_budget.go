@@ -187,7 +187,7 @@ func (r *RedisBudgetCounter) Stop(ctx context.Context) {
 }
 
 // Check implements BudgetCounter.
-func (r *RedisBudgetCounter) Check(ctx context.Context, s Scopes, l ScopeLimits, _ CheckOptions) error {
+func (r *RedisBudgetCounter) Check(ctx context.Context, s Scopes, l ScopeLimits) error {
 	var checkBuf [maxBudgetChecks]budgetCheck
 	checks := appendBudgetChecks(checkBuf[:0], s, l)
 	if len(checks) == 0 {

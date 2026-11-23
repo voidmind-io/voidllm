@@ -1060,7 +1060,7 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 	}
 
 	if p.BudgetCounter != nil {
-		if err := p.BudgetCounter.Check(c.Context(), scopes, limits, ratelimit.CheckOptions{}); err != nil {
+		if err := p.BudgetCounter.Check(c.Context(), scopes, limits); err != nil {
 			metrics.RateLimitRejectionsTotal.WithLabelValues("token").Inc()
 			attrs := []slog.Attr{
 				slog.String("key_id", keyInfo.ID),

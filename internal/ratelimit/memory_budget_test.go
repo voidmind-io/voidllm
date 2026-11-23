@@ -31,7 +31,7 @@ func addTokens(c BudgetCounter, s Scopes, n int64) {
 
 // checkTokens runs a budget check for s against l.
 func checkTokens(c BudgetCounter, s Scopes, l ScopeLimits) error {
-	return c.Check(context.Background(), s, l, CheckOptions{})
+	return c.Check(context.Background(), s, l)
 }
 
 // hasScopeWithPrefix reports whether the counter holds an entry whose scope
@@ -710,7 +710,7 @@ func TestMemoryBudgetCounter_CostCarriedThrough(t *testing.T) {
 		t.Errorf("Snapshot() for an unknown scope = %+v, want zero", got)
 	}
 
-	if err := tc.Check(context.Background(), scopes, ScopeLimits{Key: Limits{DailyTokenLimit: 16}}, CheckOptions{EnforceCost: true}); err != nil {
+	if err := checkTokens(tc, scopes, ScopeLimits{Key: Limits{DailyTokenLimit: 16}}); err != nil {
 		t.Errorf("Check() = %v, want nil (15 tokens < 16; cost has no limit)", err)
 	}
 }
@@ -941,8 +941,8 @@ func TestCostToMicros(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := costToMicros(tc.in); got != tc.want {
-				t.Errorf("costToMicros(%v) = %d, want %d", tc.in, got, tc.want)
+			if got := CostToMicros(tc.in); got != tc.want {
+				t.Errorf("CostToMicros(%v) = %d, want %d", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -975,7 +975,7 @@ func BenchmarkMemoryBudgetCounter_Check(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if err := tc.Check(ctx, scopes, limits, CheckOptions{}); err != nil {
+			if err := tc.Check(ctx, scopes, limits); err != nil {
 				b.Fatal(err)
 			}
 		}

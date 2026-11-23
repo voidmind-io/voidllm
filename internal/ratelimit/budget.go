@@ -29,14 +29,6 @@ type WindowUsage struct {
 	Monthly Usage
 }
 
-// CheckOptions controls which budgets BudgetCounter.Check evaluates.
-type CheckOptions struct {
-	// EnforceCost asks Check to evaluate cost budgets in addition to token
-	// budgets. Limits carries no cost limits yet, so there is nothing for it
-	// to select and it does not change the outcome.
-	EnforceCost bool
-}
-
 // BudgetCounter tracks token and cost usage per scope in daily and monthly
 // UTC windows and enforces the budgets configured for those scopes.
 // Implementations must be safe for concurrent use.
@@ -48,7 +40,7 @@ type BudgetCounter interface {
 	// a *LimitError wrapping ErrTokenBudgetExceeded whose RetryAfter is the
 	// time until the latest reset among all exceeded windows, because the
 	// request stays blocked until every one of them has reset.
-	Check(ctx context.Context, s Scopes, l ScopeLimits, opts CheckOptions) error
+	Check(ctx context.Context, s Scopes, l ScopeLimits) error
 	// Add records the usage of one request for every scope in s. It never
 	// blocks on I/O.
 	Add(ctx context.Context, s Scopes, u Usage)
@@ -242,7 +234,7 @@ func scanUsageSeed(ctx context.Context, seeder UsageSeeder, since time.Time, fn 
 		if err := rows.Scan(&keyID, &teamID, &orgID, &userID, &tokens, &cost); err != nil {
 			return fmt.Errorf("scan usage_events row: %w", err)
 		}
-		u := Usage{Tokens: tokens, CostMicros: costToMicros(cost)}
+		u := Usage{Tokens: tokens, CostMicros: CostToMicros(cost)}
 		forEachScope(Scopes{KeyID: keyID, UserID: userID, TeamID: teamID, OrgID: orgID}, func(scope string) {
 			fn(scope, u)
 		})
@@ -253,11 +245,12 @@ func scanUsageSeed(ctx context.Context, seeder UsageSeeder, since time.Time, fn 
 	return nil
 }
 
-// costToMicros converts a cost estimate in major currency units to
+// CostToMicros converts a cost estimate in major currency units to
 // micro-units, rounded to the nearest micro-unit. Values that are not
 // positive (including NaN) convert to 0; values beyond the int64 range are
-// capped.
-func costToMicros(cost float64) int64 {
+// capped. Live usage and seeded usage both go through it, so a request counts
+// the same before and after a restart.
+func CostToMicros(cost float64) int64 {
 	if !(cost > 0) {
 		return 0
 	}

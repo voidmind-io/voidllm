@@ -47,7 +47,7 @@ func NewMemoryBudgetCounter() *MemoryBudgetCounter {
 }
 
 // Check implements BudgetCounter.
-func (m *MemoryBudgetCounter) Check(_ context.Context, s Scopes, l ScopeLimits, _ CheckOptions) error {
+func (m *MemoryBudgetCounter) Check(_ context.Context, s Scopes, l ScopeLimits) error {
 	var checkBuf [maxBudgetChecks]budgetCheck
 	checks := appendBudgetChecks(checkBuf[:0], s, l)
 	if len(checks) == 0 {

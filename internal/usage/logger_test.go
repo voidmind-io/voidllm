@@ -727,7 +727,75 @@ func TestLog_RequestedModelNameEqualsModelNameWhenNoFallback(t *testing.T) {
 
 // checkTokens runs a token budget check against c.
 func checkTokens(c ratelimit.BudgetCounter, s ratelimit.Scopes, l ratelimit.ScopeLimits) error {
-	return c.Check(context.Background(), s, l, ratelimit.CheckOptions{})
+	return c.Check(context.Background(), s, l)
+}
+
+// TestLog_BudgetCounterReceivesCost verifies that Log() adds the event's cost
+// estimate to the budget counter in micro-units next to its tokens, that an
+// event without a cost estimate (unpriced model) counts as zero cost, and
+// that a restarted counter seeded from the flushed events reports the same
+// totals as the live one.
+func TestLog_BudgetCounterReceivesCost(t *testing.T) {
+	t.Parallel()
+
+	d := openTestDB(t, "file:TestLog_BudgetCounterReceivesCost?mode=memory&cache=private")
+
+	counter := ratelimit.NewMemoryBudgetCounter()
+	l := NewLogger(d, defaultCfg(), slog.New(slog.NewTextHandler(io.Discard, nil)), counter)
+	l.Start()
+
+	priced, tiny := 0.0123456, 0.0000004
+	events := []Event{
+		{KeyID: "cost-key", KeyType: "user_key", OrgID: "cost-org", TeamID: "cost-team", UserID: "cost-user",
+			ModelName: "priced", TotalTokens: 100, CostEstimate: &priced, StatusCode: 200},
+		// Unpriced model: tokens count, cost does not.
+		{KeyID: "cost-key", KeyType: "user_key", OrgID: "cost-org", ModelName: "unpriced", TotalTokens: 50, StatusCode: 200},
+		// Below half a micro-unit: rounds to zero.
+		{KeyID: "cost-key", KeyType: "user_key", OrgID: "cost-org", ModelName: "priced", TotalTokens: 1, CostEstimate: &tiny, StatusCode: 200},
+		// Cost without tokens is still counted.
+		{KeyID: "other-key", KeyType: "user_key", OrgID: "cost-org", ModelName: "priced", CostEstimate: &priced, StatusCode: 200},
+	}
+	for _, ev := range events {
+		l.Log(ev)
+	}
+
+	keys := []string{
+		ratelimit.KeyScope("cost-key"), ratelimit.KeyScope("other-key"), ratelimit.OrgScope("cost-org"),
+		ratelimit.TeamScope("cost-team"), ratelimit.UserScope("cost-org", "cost-user"),
+	}
+	want := map[string]ratelimit.Usage{
+		ratelimit.KeyScope("cost-key"):               {Tokens: 151, CostMicros: 12346},
+		ratelimit.KeyScope("other-key"):              {Tokens: 0, CostMicros: 12346},
+		ratelimit.OrgScope("cost-org"):               {Tokens: 151, CostMicros: 24692},
+		ratelimit.TeamScope("cost-team"):             {Tokens: 100, CostMicros: 12346},
+		ratelimit.UserScope("cost-org", "cost-user"): {Tokens: 100, CostMicros: 12346},
+	}
+	assertUsage := func(stage string, c ratelimit.BudgetCounter) {
+		t.Helper()
+		snap, err := c.Snapshot(context.Background(), keys)
+		if err != nil {
+			t.Fatalf("%s: Snapshot() error = %v", stage, err)
+		}
+		for k, w := range want {
+			if snap[k].Daily != w || snap[k].Monthly != w {
+				t.Errorf("%s: usage of %s = %+v, want daily and monthly %+v", stage, k, snap[k], w)
+			}
+		}
+	}
+	assertUsage("live", counter)
+
+	// Cost is counted, never enforced: only the token limit decides.
+	scopes := ratelimit.Scopes{KeyID: "cost-key", OrgID: "cost-org"}
+	if err := checkTokens(counter, scopes, ratelimit.ScopeLimits{Key: ratelimit.Limits{DailyTokenLimit: 152}}); err != nil {
+		t.Errorf("Check() = %v, want nil (151 tokens < 152, cost has no limit)", err)
+	}
+
+	stopAndWait(t, l, d, len(events))
+	restarted := ratelimit.NewMemoryBudgetCounter()
+	if err := restarted.Seed(context.Background(), dbUsageSeeder{d}); err != nil {
+		t.Fatalf("Seed() error = %v", err)
+	}
+	assertUsage("seeded after restart", restarted)
 }
 
 // TestLog_TokenCounterUpdatedBeforeFlush verifies that when a Logger is wired
