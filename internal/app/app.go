@@ -132,16 +132,17 @@ type Application struct {
 // an import cycle between the db and ratelimit packages.
 type dbUsageSeeder db.DB
 
-func (s *dbUsageSeeder) QueryUsageSeed(ctx context.Context, since time.Time) (ratelimit.RowScanner, error) {
-	return (*db.DB)(s).QueryUsageSeed(ctx, since)
+func (s *dbUsageSeeder) QueryUsageSeed(ctx context.Context, monthStart, dayStart time.Time) (ratelimit.RowScanner, error) {
+	return (*db.DB)(s).QueryUsageSeed(ctx, monthStart, dayStart)
 }
 
-// redisBudgetDrainTimeout bounds how long shutdown waits for queued budget
-// increments to be written to Redis.
+// redisBudgetDrainTimeout bounds how long shutdown waits for the final budget
+// totals to be written to Redis.
 const redisBudgetDrainTimeout = 5 * time.Second
 
-// stopRedisBudget drains and stops the Redis budget counter, giving up after
-// redisBudgetDrainTimeout. It must run before the Redis client is closed.
+// stopRedisBudget has the Redis budget counter write its final totals and
+// stops it, giving up after redisBudgetDrainTimeout. It must run after the
+// usage logger has stopped and before the Redis client is closed.
 func stopRedisBudget(counter *ratelimit.RedisBudgetCounter) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisBudgetDrainTimeout)
 	defer cancel()
@@ -1891,27 +1892,16 @@ func isCodeModeOOM(msg string) bool {
 	return strings.Contains(lower, "out of memory") || strings.Contains(lower, "stack overflow")
 }
 
-// cleanup tears down resources in reverse startup order: budget counter, Redis pub/sub,
-// key cache reloader, background tickers (LIFO), usage/audit loggers, Redis connection, database.
+// cleanup tears down resources in reverse startup order: Redis pub/sub,
+// key cache reloader, background tickers (LIFO), usage/audit loggers, budget
+// counter, Redis connection, database.
 // Sensitive key material is zeroed last, after all components that might still
 // need to decrypt data have been stopped. cleanup must be called exactly once,
 // by WaitForShutdown.
 func (a *Application) cleanup(ctx context.Context) {
-	// Write the queued budget increments to Redis while the client is still
-	// open.
-	if a.redisBudget != nil {
-		stopRedisBudget(a.redisBudget)
-	}
-
-	// Cancel Redis pub/sub subscriber before stopping the client.
+	// Cancel the Redis pub/sub subscriber. The client itself stays open
+	// until the budget counter has written its final totals below.
 	a.redisCancel()
-	if a.redisClient != nil {
-		if err := a.redisClient.Close(); err != nil {
-			a.log.LogAttrs(ctx, slog.LevelError, "redis close error",
-				slog.String("error", err.Error()),
-			)
-		}
-	}
 
 	// Stop the key cache reloader before the tickers and long before the
 	// database closes: it cancels a load in flight, waits for its goroutine
@@ -1931,6 +1921,19 @@ func (a *Application) cleanup(ctx context.Context) {
 	}
 	if a.auditLogger != nil {
 		a.auditLogger.Stop()
+	}
+
+	// With the usage logger stopped no more usage is recorded: write the
+	// final budget totals to Redis, then close the client.
+	if a.redisBudget != nil {
+		stopRedisBudget(a.redisBudget)
+	}
+	if a.redisClient != nil {
+		if err := a.redisClient.Close(); err != nil {
+			a.log.LogAttrs(ctx, slog.LevelError, "redis close error",
+				slog.String("error", err.Error()),
+			)
+		}
 	}
 
 	// Flush buffered OTel spans. Use a bounded context so a slow collector

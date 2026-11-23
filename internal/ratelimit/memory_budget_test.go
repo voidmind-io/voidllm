@@ -718,17 +718,18 @@ func TestMemoryBudgetCounter_CostCarriedThrough(t *testing.T) {
 // ---- Seed ---------------------------------------------------------------------
 
 // seedRow is one (key_id, team_id, org_id, user_id, total_tokens,
-// cost_estimate) tuple returned by a fakeUsageSeeder, matching the column
-// order of db.QueryUsageSeed / ratelimit.UsageSeeder.
+// cost_estimate, in_day) tuple returned by a fakeUsageSeeder, matching the
+// column order of db.QueryUsageSeed / ratelimit.UsageSeeder. A row is from
+// the current day unless earlierThisMonth is set.
 type seedRow struct {
 	keyID, teamID, orgID, userID string
 	tokens                       int64
 	cost                         float64
+	earlierThisMonth             bool
 }
 
 // fakeUsageSeeder is an in-memory UsageSeeder for testing seeding without a
-// real database. It returns the same rows for every window and counts its
-// queries.
+// real database. It returns its rows for every query and counts the queries.
 type fakeUsageSeeder struct {
 	mu    sync.Mutex
 	rows  []seedRow
@@ -736,7 +737,7 @@ type fakeUsageSeeder struct {
 	calls int
 }
 
-func (f *fakeUsageSeeder) QueryUsageSeed(_ context.Context, _ time.Time) (RowScanner, error) {
+func (f *fakeUsageSeeder) QueryUsageSeed(_ context.Context, _, _ time.Time) (RowScanner, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -779,6 +780,10 @@ func (f *fakeRowScanner) Scan(dest ...any) error {
 	*dest[3].(*string) = r.userID
 	*dest[4].(*int64) = r.tokens
 	*dest[5].(*float64) = r.cost
+	*dest[6].(*int64) = 1
+	if r.earlierThisMonth {
+		*dest[6].(*int64) = 0
+	}
 	return nil
 }
 
@@ -811,10 +816,11 @@ func TestMemoryBudgetCounter_Seed_PopulatesUserScope(t *testing.T) {
 	}
 }
 
-// TestMemoryBudgetCounter_Seed_CountsEachWindowOnce verifies that the daily
-// rows only feed the daily windows and the monthly rows only the monthly
-// ones, and that cost is converted to micro-units by rounding.
-func TestMemoryBudgetCounter_Seed_CountsEachWindowOnce(t *testing.T) {
+// TestMemoryBudgetCounter_Seed_OneQueryFeedsBothWindows verifies that Seed
+// reads the database once, that every row counts towards the month but only
+// rows of the current day towards the day, and that cost is converted to
+// micro-units by rounding.
+func TestMemoryBudgetCounter_Seed_OneQueryFeedsBothWindows(t *testing.T) {
 	t.Parallel()
 
 	tc := NewMemoryBudgetCounter()
@@ -822,25 +828,32 @@ func TestMemoryBudgetCounter_Seed_CountsEachWindowOnce(t *testing.T) {
 		{keyID: "seed-once-key", teamID: "seed-once-team", orgID: "seed-once-org", userID: "seed-once-user", tokens: 300, cost: 0.0123456},
 		{keyID: "seed-once-key", orgID: "seed-once-org", tokens: 200, cost: 0.0000004}, // rounds to 0
 		{keyID: "seed-once-key", orgID: "seed-once-org", tokens: 1, cost: 0.0000006},   // rounds to 1
+		{keyID: "seed-once-key", teamID: "seed-once-team", orgID: "seed-once-org", tokens: 4000, cost: 1, earlierThisMonth: true},
 	}}
 	if err := tc.Seed(context.Background(), seeder); err != nil {
 		t.Fatalf("Seed() error = %v", err)
 	}
-	if got := seeder.queries(); got != 2 {
-		t.Errorf("Seed() ran %d queries, want 2 (day and month)", got)
+	if got := seeder.queries(); got != 1 {
+		t.Errorf("Seed() ran %d queries, want 1", got)
 	}
 
 	snap, err := tc.Snapshot(context.Background(), []string{KeyScope("seed-once-key"), TeamScope("seed-once-team")})
 	if err != nil {
 		t.Fatalf("Snapshot() error = %v", err)
 	}
-	wantKey := Usage{Tokens: 501, CostMicros: 12347}
-	if got := snap[KeyScope("seed-once-key")]; got.Daily != wantKey || got.Monthly != wantKey {
-		t.Errorf("key usage = %+v, want daily and monthly %+v", got, wantKey)
+	wantKey := WindowUsage{
+		Daily:   Usage{Tokens: 501, CostMicros: 12347},
+		Monthly: Usage{Tokens: 4501, CostMicros: 1_012_347},
 	}
-	wantTeam := Usage{Tokens: 300, CostMicros: 12346}
-	if got := snap[TeamScope("seed-once-team")]; got.Daily != wantTeam || got.Monthly != wantTeam {
-		t.Errorf("team usage = %+v, want daily and monthly %+v", got, wantTeam)
+	if got := snap[KeyScope("seed-once-key")]; got != wantKey {
+		t.Errorf("key usage = %+v, want %+v", got, wantKey)
+	}
+	wantTeam := WindowUsage{
+		Daily:   Usage{Tokens: 300, CostMicros: 12346},
+		Monthly: Usage{Tokens: 4300, CostMicros: 1_012_346},
+	}
+	if got := snap[TeamScope("seed-once-team")]; got != wantTeam {
+		t.Errorf("team usage = %+v, want %+v", got, wantTeam)
 	}
 }
 

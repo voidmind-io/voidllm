@@ -58,10 +58,11 @@ type BudgetCounter interface {
 // from.
 type UsageSeeder interface {
 	// QueryUsageSeed returns rows of (key_id, team_id, org_id, user_id,
-	// total_tokens, cost_estimate) for usage events since the given time.
+	// total_tokens, cost_estimate, in_day) for usage events since monthStart.
 	// team_id and user_id are empty strings when unset, cost_estimate is 0
-	// when the event has no cost.
-	QueryUsageSeed(ctx context.Context, since time.Time) (RowScanner, error)
+	// when the event has no cost, and in_day is 1 for events since dayStart
+	// and 0 for earlier ones.
+	QueryUsageSeed(ctx context.Context, monthStart, dayStart time.Time) (RowScanner, error)
 }
 
 // RowScanner iterates over database rows. *sql.Rows satisfies this interface.
@@ -216,12 +217,13 @@ func evaluateBudget(checks []budgetCheck, spent []int64, w budgetWindows) error 
 	return exceeded
 }
 
-// scanUsageSeed reads the usage events persisted since the given time and
-// calls fn once per event and scope the event counts towards. The user scope
+// scanUsageSeed reads the usage events persisted in the month of w, in one
+// query, and calls fn once per event and scope the event counts towards.
+// inDay tells whether the event also falls into the day of w. The user scope
 // is skipped for events without a user (team keys, service-account keys) and
 // the team scope for events without a team.
-func scanUsageSeed(ctx context.Context, seeder UsageSeeder, since time.Time, fn func(scope string, u Usage)) error {
-	rows, err := seeder.QueryUsageSeed(ctx, since)
+func scanUsageSeed(ctx context.Context, seeder UsageSeeder, w budgetWindows, fn func(scope string, u Usage, inDay bool)) error {
+	rows, err := seeder.QueryUsageSeed(ctx, w.monthStart, w.dayStart)
 	if err != nil {
 		return fmt.Errorf("query usage_events: %w", err)
 	}
@@ -229,14 +231,14 @@ func scanUsageSeed(ctx context.Context, seeder UsageSeeder, since time.Time, fn 
 
 	for rows.Next() {
 		var keyID, teamID, orgID, userID string
-		var tokens int64
+		var tokens, inDay int64
 		var cost float64
-		if err := rows.Scan(&keyID, &teamID, &orgID, &userID, &tokens, &cost); err != nil {
+		if err := rows.Scan(&keyID, &teamID, &orgID, &userID, &tokens, &cost, &inDay); err != nil {
 			return fmt.Errorf("scan usage_events row: %w", err)
 		}
 		u := Usage{Tokens: tokens, CostMicros: CostToMicros(cost)}
 		forEachScope(Scopes{KeyID: keyID, UserID: userID, TeamID: teamID, OrgID: orgID}, func(scope string) {
-			fn(scope, u)
+			fn(scope, u, inDay != 0)
 		})
 	}
 	if err := rows.Err(); err != nil {

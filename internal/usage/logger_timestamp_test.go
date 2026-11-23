@@ -23,8 +23,8 @@ import (
 // duplicated here because that one is unexported in a different package.
 type dbUsageSeeder struct{ d *db.DB }
 
-func (s dbUsageSeeder) QueryUsageSeed(ctx context.Context, since time.Time) (ratelimit.RowScanner, error) {
-	return s.d.QueryUsageSeed(ctx, since)
+func (s dbUsageSeeder) QueryUsageSeed(ctx context.Context, monthStart, dayStart time.Time) (ratelimit.RowScanner, error) {
+	return s.d.QueryUsageSeed(ctx, monthStart, dayStart)
 }
 
 // TestLogger_StoredCreatedAtEqualsEventTime verifies that usage_events.created_at

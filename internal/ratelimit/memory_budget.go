@@ -70,23 +70,22 @@ func (m *MemoryBudgetCounter) Snapshot(_ context.Context, scopeKeys []string) (m
 	return m.snapshotAt(windowsAt(m.now()), scopeKeys), nil
 }
 
-// Seed loads the usage persisted for the current day and the current month
-// into the counter, so that its state matches what was recorded before this
-// process started. It should be called once at startup before the proxy
-// begins serving requests.
+// Seed loads the usage persisted for the current month into the counter, so
+// that its state matches what was recorded before this process started. It
+// reads the month once; events of the current day also count towards the
+// daily windows. It should be called once at startup before the proxy begins
+// serving requests.
 func (m *MemoryBudgetCounter) Seed(ctx context.Context, seeder UsageSeeder) error {
 	w := windowsAt(m.now())
-	err := scanUsageSeed(ctx, seeder, w.dayStart, func(scope string, u Usage) {
-		m.addScope(scope, w, u, Usage{})
+	err := scanUsageSeed(ctx, seeder, w, func(scope string, u Usage, inDay bool) {
+		daily := Usage{}
+		if inDay {
+			daily = u
+		}
+		m.addScope(scope, w, daily, u)
 	})
 	if err != nil {
-		return fmt.Errorf("seed daily counters: %w", err)
-	}
-	err = scanUsageSeed(ctx, seeder, w.monthStart, func(scope string, u Usage) {
-		m.addScope(scope, w, Usage{}, u)
-	})
-	if err != nil {
-		return fmt.Errorf("seed monthly counters: %w", err)
+		return fmt.Errorf("seed budget counters: %w", err)
 	}
 	return nil
 }

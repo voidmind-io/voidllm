@@ -2,9 +2,7 @@ package redis
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -18,20 +16,32 @@ const (
 	BudgetMetricCost = "cost"
 )
 
-// budgetSeedDone is the value of a seed marker whose bucket has been
-// rehydrated. Any other value is the claim token of a rehydration in progress.
-const budgetSeedDone = "done"
-
-// BudgetIncrement is one counter increment together with the instant the
-// counter may be discarded.
-type BudgetIncrement struct {
+// BudgetValue is the usage one instance reports for one budget counter,
+// together with the instant the counter may be discarded.
+type BudgetValue struct {
 	// Key is the full counter key, as returned by BudgetKey.
 	Key string
-	// Delta is the amount to add.
-	Delta int64
+	// Value is the absolute usage of the reporting instance.
+	Value int64
 	// ExpireAt is when Redis evicts the counter.
 	ExpireAt time.Time
 }
+
+// budgetSumScript returns, for every key, the sum of all fields of the hash
+// stored there (0 for a missing key). Summing on the server keeps a budget
+// check at one round trip and one small reply regardless of how many
+// instances reported into a counter. Sums are exact up to 2^53.
+var budgetSumScript = goredis.NewScript(`
+local sums = {}
+for i, key in ipairs(KEYS) do
+    local sum = 0
+    for _, v in ipairs(redis.call('HVALS', key)) do
+        sum = sum + tonumber(v)
+    end
+    sums[i] = sum
+end
+return sums
+`)
 
 // BudgetDayBucket returns the bucket segment for the UTC day containing t,
 // e.g. "d:2026-11-23".
@@ -48,125 +58,45 @@ func BudgetMonthBucket(t time.Time) string {
 // BudgetKey returns the key of the budget counter for a metric
 // (BudgetMetricTokens or BudgetMetricCost), a bucket (BudgetDayBucket or
 // BudgetMonthBucket) and a counter scope such as "team:<id>":
-// "<prefix>budget:<metric>:<bucket>:<scope>".
+// "<prefix>budget:<metric>:<bucket>:<scope>". The counter is a hash with one
+// field per reporting instance.
 func (c *Client) BudgetKey(metric, bucket, scope string) string {
 	return c.key("budget", metric, bucket, scope)
 }
 
-// budgetSeedKey returns the key of the seed marker of a bucket:
-// "<prefix>budget:seeded:<bucket>".
-func (c *Client) budgetSeedKey(bucket string) string {
-	return c.key("budget", "seeded", bucket)
-}
-
-// IncrBudgets applies all increments in one pipelined round trip. Each
-// counter gets its expiry (re)set, which is idempotent because the expiry of
-// a bucket never changes.
-func (c *Client) IncrBudgets(ctx context.Context, incs []BudgetIncrement) error {
-	if len(incs) == 0 {
+// SetBudgets stores the given values as the usage of one instance, in one
+// pipelined round trip: each value is written to the field named instanceID
+// of its counter hash, and the counter gets its expiry (re)set. Values are
+// absolute, so the call is idempotent: repeating it, or sending a newer value
+// after a lost one, leaves the counter correct.
+func (c *Client) SetBudgets(ctx context.Context, instanceID string, values []BudgetValue) error {
+	if len(values) == 0 {
 		return nil
 	}
 	pipe := c.rdb.Pipeline()
-	for _, inc := range incs {
-		pipe.IncrBy(ctx, inc.Key, inc.Delta)
-		pipe.ExpireAt(ctx, inc.Key, inc.ExpireAt)
+	for _, v := range values {
+		pipe.HSet(ctx, v.Key, instanceID, v.Value)
+		pipe.ExpireAt(ctx, v.Key, v.ExpireAt)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("redis incr budgets: %w", err)
+		return fmt.Errorf("redis set budgets: %w", err)
 	}
 	return nil
 }
 
-// GetBudgets returns the values of the given counters in one MGET, in the
-// order of keys. Counters that do not exist read as 0.
-func (c *Client) GetBudgets(ctx context.Context, keys []string) ([]int64, error) {
+// SumBudgets returns, in the order of keys, the usage all instances together
+// reported for each counter, in one round trip. Counters that do not exist
+// read as 0.
+func (c *Client) SumBudgets(ctx context.Context, keys []string) ([]int64, error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
-	raw, err := c.rdb.MGet(ctx, keys...).Result()
+	sums, err := budgetSumScript.Run(ctx, c.rdb, keys).Int64Slice()
 	if err != nil {
-		return nil, fmt.Errorf("redis get budgets: %w", err)
+		return nil, fmt.Errorf("redis sum budgets: %w", err)
 	}
-	if len(raw) != len(keys) {
-		return nil, fmt.Errorf("redis get budgets: got %d values for %d keys", len(raw), len(keys))
+	if len(sums) != len(keys) {
+		return nil, fmt.Errorf("redis sum budgets: got %d sums for %d keys", len(sums), len(keys))
 	}
-	vals := make([]int64, len(raw))
-	for i, v := range raw {
-		if v == nil {
-			continue
-		}
-		s, ok := v.(string)
-		if !ok {
-			return nil, fmt.Errorf("redis get budgets: unexpected value type %T", v)
-		}
-		n, err := strconv.ParseInt(s, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("redis get budgets: parse counter: %w", err)
-		}
-		vals[i] = n
-	}
-	return vals, nil
-}
-
-// ClaimBudgetSeed tries to become the instance that rehydrates a bucket. It
-// sets the seed marker of the bucket to token if no marker exists and reports
-// whether it did. The claim expires after ttl, so a claimant that dies before
-// CommitBudgetSeed does not block the bucket forever. token must be unique
-// per attempt.
-func (c *Client) ClaimBudgetSeed(ctx context.Context, bucket, token string, ttl time.Duration) (bool, error) {
-	claimed, err := c.rdb.SetNX(ctx, c.budgetSeedKey(bucket), token, ttl).Result()
-	if err != nil {
-		return false, fmt.Errorf("redis claim budget seed: %w", err)
-	}
-	return claimed, nil
-}
-
-// BudgetSeedDone reports whether the bucket has been rehydrated. It is false
-// while the marker is missing or still holds a claim.
-func (c *Client) BudgetSeedDone(ctx context.Context, bucket string) (bool, error) {
-	v, err := c.rdb.Get(ctx, c.budgetSeedKey(bucket)).Result()
-	if errors.Is(err, goredis.Nil) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("redis get budget seed marker: %w", err)
-	}
-	return v == budgetSeedDone, nil
-}
-
-// CommitBudgetSeed applies the rehydration increments of a bucket and marks
-// the bucket as seeded until markerExpireAt, all in one transaction that only
-// runs while the marker still holds token. It reports false, without applying
-// anything, when the claim was lost (expired, or taken over by another
-// instance), so a bucket is never rehydrated twice.
-func (c *Client) CommitBudgetSeed(ctx context.Context, bucket, token string, incs []BudgetIncrement, markerExpireAt time.Time) (bool, error) {
-	marker := c.budgetSeedKey(bucket)
-	errClaimLost := errors.New("claim lost")
-
-	err := c.rdb.Watch(ctx, func(tx *goredis.Tx) error {
-		v, err := tx.Get(ctx, marker).Result()
-		if errors.Is(err, goredis.Nil) || (err == nil && v != token) {
-			return errClaimLost
-		}
-		if err != nil {
-			return err
-		}
-		_, err = tx.TxPipelined(ctx, func(pipe goredis.Pipeliner) error {
-			for _, inc := range incs {
-				pipe.IncrBy(ctx, inc.Key, inc.Delta)
-				pipe.ExpireAt(ctx, inc.Key, inc.ExpireAt)
-			}
-			pipe.Set(ctx, marker, budgetSeedDone, 0)
-			pipe.ExpireAt(ctx, marker, markerExpireAt)
-			return nil
-		})
-		return err
-	}, marker)
-	if errors.Is(err, errClaimLost) || errors.Is(err, goredis.TxFailedErr) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("redis commit budget seed: %w", err)
-	}
-	return true, nil
+	return sums, nil
 }

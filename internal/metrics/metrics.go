@@ -76,9 +76,9 @@ var RateLimitRejectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 
 // BudgetBackendErrorsTotal counts failures of the shared (Redis) budget
 // counter backend, partitioned by operation: "check" for a failed budget read
-// (the check falls back to the local counters), "flush" for a failed counter
-// increment, "seed" for a failed rehydration from the database, and
-// "queue_full" for an increment dropped because the write queue was full.
+// before a request (the check falls back to the local counters), "snapshot"
+// for a failed read of the usage overview, and "flush" for a failed write of
+// this instance's totals (they are written again with the next flush).
 var BudgetBackendErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "voidllm_budget_backend_errors_total",
 	Help: "Total errors of the shared budget counter backend.",

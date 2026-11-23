@@ -2,8 +2,10 @@ package ratelimit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,45 +19,37 @@ import (
 var _ BudgetCounter = (*RedisBudgetCounter)(nil)
 
 const (
-	// budgetQueueSize bounds the increments waiting to be written to Redis.
-	budgetQueueSize = 8192
-	// budgetOpTimeout bounds every single Redis round trip of the counter.
-	budgetOpTimeout = 500 * time.Millisecond
-	// budgetProbeInterval is how often a degraded counter lets one check try
-	// Redis again; all other checks use the local counters meanwhile.
+	// budgetFlushInterval is how often changed totals are written to Redis.
+	budgetFlushInterval = 250 * time.Millisecond
+	// budgetResyncInterval is how often every total of the current windows
+	// is written again, changed or not, so that Redis heals from lost data
+	// without waiting for new usage.
+	budgetResyncInterval = 30 * time.Second
+	// budgetReadTimeout bounds the Redis round trip of a check or snapshot.
+	budgetReadTimeout = 500 * time.Millisecond
+	// budgetWriteTimeout bounds one write pipeline.
+	budgetWriteTimeout = 2 * time.Second
+	// budgetWriteChunk is the largest number of values sent in one pipeline.
+	budgetWriteChunk = 1000
+	// budgetProbeInterval is how often a degraded counter lets one operation
+	// try Redis again; everything else uses the local counters meanwhile.
 	budgetProbeInterval = time.Second
-	// budgetSeedClaimTTL is how long a rehydration claim is held. It must
-	// exceed budgetSeedTimeout so that a claim cannot expire under a
-	// rehydration that is still running.
-	budgetSeedClaimTTL = 2 * time.Minute
-	// budgetSeedTimeout bounds one rehydration (database read and Redis
-	// write).
-	budgetSeedTimeout = 90 * time.Second
-	// budgetSeedRetry is the pause before a bucket that could not be
-	// confirmed as rehydrated is looked at again.
-	budgetSeedRetry = 30 * time.Second
-	// budgetDropWarnInterval limits the warning about dropped increments.
-	budgetDropWarnInterval = time.Minute
 	// budgetDayGrace and budgetMonthGrace are how long daily and monthly
-	// counters outlive their window before Redis evicts them.
+	// counters outlive their window before Redis evicts them. Totals of a
+	// finished window are not written any more once its grace has passed.
 	budgetDayGrace   = 24 * time.Hour
 	budgetMonthGrace = 48 * time.Hour
 )
 
 // Values of the "op" label of metrics.BudgetBackendErrorsTotal.
 const (
-	budgetOpCheck     = "check"
-	budgetOpFlush     = "flush"
-	budgetOpSeed      = "seed"
-	budgetOpQueueFull = "queue_full"
+	budgetOpCheck    = "check"
+	budgetOpSnapshot = "snapshot"
+	budgetOpFlush    = "flush"
 )
 
-// budgetOp is one recorded usage waiting to be written to Redis.
-type budgetOp struct {
-	scopes Scopes
-	usage  Usage
-	at     budgetWindows
-}
+// errBudgetCounterStarted is returned by a second call to Start.
+var errBudgetCounterStarted = errors.New("budget counter already started")
 
 // budgetBuckets holds the Redis bucket names and counter expiries of one UTC
 // day and the month it belongs to.
@@ -67,50 +61,86 @@ type budgetBuckets struct {
 	monthExpire time.Time
 }
 
-// bucketSeed is the rehydration state of one bucket as known to the worker.
-type bucketSeed struct {
-	bucket    string
-	confirmed bool
-	retryAt   time.Time
+// bucketsOf returns the bucket names and expiries for the windows w.
+func bucketsOf(w budgetWindows) *budgetBuckets {
+	return &budgetBuckets{
+		dayStart:    w.dayStart.Unix(),
+		day:         voidredis.BudgetDayBucket(w.dayStart),
+		month:       voidredis.BudgetMonthBucket(w.monthStart),
+		dayExpire:   nextUTCMidnight(w.dayStart).Add(budgetDayGrace),
+		monthExpire: nextUTCMonth(w.monthStart).Add(budgetMonthGrace),
+	}
 }
 
-// RedisBudgetCounter is a BudgetCounter whose counters live in Redis, so that
-// all VoidLLM instances sharing that Redis enforce one budget together.
+// dirtyKey identifies totals that still have to be written to Redis: one
+// scope in the windows of one day. A scope used across midnight has one entry
+// per day, so the final totals of the finished day are still written.
+type dirtyKey struct {
+	scope    string
+	dayStart int64
+}
+
+// dirtyEntry holds the windows a dirtyKey refers to and the highest totals
+// seen for them. Totals only grow within a window, so the highest is the
+// latest.
+type dirtyEntry struct {
+	at    budgetWindows
+	usage WindowUsage
+}
+
+// raise lifts the totals of e to those of u where u is higher.
+func (e *dirtyEntry) raise(u WindowUsage) {
+	e.usage.Daily.Tokens = max(e.usage.Daily.Tokens, u.Daily.Tokens)
+	e.usage.Daily.CostMicros = max(e.usage.Daily.CostMicros, u.Daily.CostMicros)
+	e.usage.Monthly.Tokens = max(e.usage.Monthly.Tokens, u.Monthly.Tokens)
+	e.usage.Monthly.CostMicros = max(e.usage.Monthly.CostMicros, u.Monthly.CostMicros)
+}
+
+// RedisBudgetCounter is a BudgetCounter that shares usage through Redis, so
+// that all VoidLLM instances on that Redis enforce one budget together.
 //
-// Counters are plain integers under
-// "<prefix>budget:<tok|cost>:<d:YYYY-MM-DD|m:YYYY-MM>:<scope>". They expire
-// 24 hours after their day and 48 hours after their month ended.
+// Model: every instance reports its own absolute totals, never increments.
+// A counter is a hash under
+// "<prefix>budget:<tok|cost>:<d:YYYY-MM-DD|m:YYYY-MM>:<scope>" with one field
+// per instance (a random ID generated at Start) holding the usage that
+// instance recorded itself in that window since it started. The usage of a
+// scope is the sum of all fields. Because a write replaces the instance's
+// field with its current total, a repeated write changes nothing and a lost
+// one is corrected by the next: there is nothing to reconcile after an
+// outage. Counters expire 24 hours after their day and 48 hours after their
+// month ended.
 //
-// Add never talks to Redis on the caller's goroutine. It updates a local
-// shadow MemoryBudgetCounter synchronously and hands the increment to a
-// bounded queue that a single worker writes to Redis (INCRBY + EXPIREAT in
-// one pipeline, 500ms per round trip). When the queue is full the increment
-// is dropped from Redis and counted in voidllm_budget_backend_errors_total;
-// it stays in the shadow counter and in the database. The same holds for an
-// increment whose write fails.
+// Add never talks to Redis. It updates two local counters: the shadow counter
+// (usage persisted in the database when this instance started, plus its own)
+// and the own counter (only what this instance recorded). A background loop
+// writes the changed own totals every 250ms in one pipeline, and all own
+// totals of the current windows every 30s, after Redis recovered, and on
+// EvictStale, which restores them if Redis lost data. Stop writes a final
+// time.
 //
-// Check reads only the counters of budgets that are actually set, in one
-// MGET, and makes no Redis call for a request without budgets. Each budget is
-// evaluated against the larger of the shared and the shadow value, so this
-// instance never enforces less than its own view. When Redis fails, the check
-// is decided on the shadow counter alone (the usage persisted when this
-// instance started plus everything it recorded itself): neither fail-open nor
-// fail-closed. While degraded, one check per second probes Redis; the
-// transitions to degraded and back are each logged once.
+// Check reads only the counters of budgets that are actually set, summed on
+// the server in one round trip, and makes no Redis call for a request without
+// budgets. Each budget is evaluated against the larger of the shared sum and
+// the shadow value. When Redis fails, the check is decided on the shadow
+// counter alone: neither fail-open nor fail-closed. While degraded, one
+// operation per second probes Redis; the transitions to degraded and back are
+// each logged once and failures are counted in
+// voidllm_budget_backend_errors_total.
 //
-// Rehydration: a bucket whose seed marker ("<prefix>budget:seeded:<bucket>")
-// is missing has never been filled, because Redis budgets were just enabled,
-// a new day or month began, or Redis lost its data. The instance that wins
-// the marker with SET NX adds the usage persisted in the database for that
-// bucket and marks it done in the same transaction. Markers are re-checked at
-// startup, when a new bucket begins, on every EvictStale and after Redis
-// recovered. Usage of the bucket that had reached the database when the
-// rehydration read it, and that instances also add to the bucket themselves,
-// is counted twice. That errs on the strict side and is bounded by what was
-// recorded between the start of the bucket (or the loss of the Redis data)
-// and its rehydration: at most about one usage flush interval at a window
-// rollover and on first use, and up to the marker re-check interval when
-// Redis lost its data without the connection failing.
+// What the shared sum does not contain:
+//   - Usage an instance recorded in the last flush interval before it crashed
+//     is missing from the other instances' sums. It is in the database (after
+//     the usage flush) and therefore in the shadow of every instance started
+//     later.
+//   - The field of a stopped instance stays until its bucket expires. That is
+//     intended: its usage still counts. A hash therefore grows by one field
+//     per instance start within its window.
+//   - Usage that is only in the database is not in any field: usage from
+//     before shared budgets were first used in the current window, and the
+//     usage of stopped instances after Redis lost its data. An instance knows
+//     such usage only through its shadow, as of its own start. A budget is
+//     then enforced on max(sum of the live reports, own shadow), which can be
+//     below the true total until the window ends or the instances restart.
 //
 // The zero value is not usable; construct via NewRedisBudgetCounter and call
 // Start before use.
@@ -119,42 +149,64 @@ type RedisBudgetCounter struct {
 	seeder UsageSeeder
 	log    *slog.Logger
 	shadow *MemoryBudgetCounter
+	own    *MemoryBudgetCounter
 	now    func() time.Time
 
-	queue   chan budgetOp
-	recheck chan struct{}
-	stop    chan struct{}
-	done    chan struct{}
-	cancel  context.CancelFunc
-	started atomic.Bool
-	stopped atomic.Bool
+	flushInterval  time.Duration
+	resyncInterval time.Duration
+	instanceID     string
 
-	degraded     atomic.Bool
-	nextProbe    atomic.Int64 // UnixNano; meaningful while degraded
-	lastDropWarn atomic.Int64 // UnixNano
-	buckets      atomic.Pointer[budgetBuckets]
+	mu    sync.Mutex // guards dirty
+	dirty map[dirtyKey]dirtyEntry
+	// flushMu serializes flushes, so that an older total can never be
+	// written after a newer one.
+	flushMu sync.Mutex
+
+	resync      chan struct{}
+	stop        chan struct{}
+	done        chan struct{}
+	cancel      context.CancelFunc
+	startCalled atomic.Bool
+	started     atomic.Bool
+	stopped     atomic.Bool
+
+	degraded  atomic.Bool
+	nextProbe atomic.Int64 // UnixNano; meaningful while degraded
+	buckets   atomic.Pointer[budgetBuckets]
 }
 
-// NewRedisBudgetCounter returns a RedisBudgetCounter that keeps its counters
-// in client's Redis and rehydrates them from seeder.
+// NewRedisBudgetCounter returns a RedisBudgetCounter that shares usage
+// through client's Redis and seeds its shadow counter from seeder.
 func NewRedisBudgetCounter(client *voidredis.Client, seeder UsageSeeder, log *slog.Logger) *RedisBudgetCounter {
 	return &RedisBudgetCounter{
-		client:  client,
-		seeder:  seeder,
-		log:     log,
-		shadow:  NewMemoryBudgetCounter(),
-		now:     time.Now,
-		queue:   make(chan budgetOp, budgetQueueSize),
-		recheck: make(chan struct{}, 1),
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+		client:         client,
+		seeder:         seeder,
+		log:            log,
+		shadow:         NewMemoryBudgetCounter(),
+		own:            NewMemoryBudgetCounter(),
+		now:            time.Now,
+		flushInterval:  budgetFlushInterval,
+		resyncInterval: budgetResyncInterval,
+		dirty:          make(map[dirtyKey]dirtyEntry),
+		resync:         make(chan struct{}, 1),
+		stop:           make(chan struct{}),
+		done:           make(chan struct{}),
 	}
 }
 
-// Start seeds the shadow counter from the database and launches the worker
-// that writes increments to Redis and rehydrates buckets. It must be called
-// exactly once, before the counter is used. Stop shuts the worker down.
+// Start gives the instance its ID, seeds the shadow counter from the database
+// and launches the loop that writes totals to Redis. It must be called once,
+// before the counter is used; a second call returns an error. Stop shuts the
+// loop down.
 func (r *RedisBudgetCounter) Start(ctx context.Context) error {
+	if !r.startCalled.CompareAndSwap(false, true) {
+		return errBudgetCounterStarted
+	}
+	id, err := uuid.NewRandom()
+	if err != nil {
+		return fmt.Errorf("generate budget instance id: %w", err)
+	}
+	r.instanceID = id.String()
 	if err := r.shadow.Seed(ctx, r.seeder); err != nil {
 		return fmt.Errorf("seed shadow budget counter: %w", err)
 	}
@@ -165,10 +217,11 @@ func (r *RedisBudgetCounter) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop writes the queued increments to Redis and stops the worker. It blocks
-// until the worker has exited; when ctx ends first, the remaining work is
-// abandoned. Usage recorded after Stop only reaches the shadow counter. Stop
-// must be called before the Redis client is closed.
+// Stop writes the final totals to Redis and stops the loop. It blocks until
+// the loop has exited; when ctx ends first, the write is abandoned. Usage
+// recorded after Stop only reaches the local counters, so Stop must be called
+// after everything that records usage has stopped and before the Redis client
+// is closed.
 func (r *RedisBudgetCounter) Stop(ctx context.Context) {
 	if !r.started.Load() || !r.stopped.CompareAndSwap(false, true) {
 		return
@@ -177,9 +230,7 @@ func (r *RedisBudgetCounter) Stop(ctx context.Context) {
 	select {
 	case <-r.done:
 	case <-ctx.Done():
-		r.log.LogAttrs(ctx, slog.LevelWarn, "budget counter drain deadline exceeded, abandoning queued increments",
-			slog.Int("queued", len(r.queue)),
-		)
+		r.log.LogAttrs(ctx, slog.LevelWarn, "budget counter final flush deadline exceeded, abandoning it")
 		r.cancel()
 		<-r.done
 	}
@@ -207,7 +258,7 @@ func (r *RedisBudgetCounter) Check(ctx context.Context, s Scopes, l ScopeLimits)
 			}
 			keys[i] = r.client.BudgetKey(voidredis.BudgetMetricTokens, bucket, c.scope)
 		}
-		shared, err := r.getBudgets(ctx, keys)
+		shared, err := r.sumBudgets(ctx, keys)
 		if err != nil {
 			r.backendError(ctx, budgetOpCheck, err)
 		} else {
@@ -221,27 +272,33 @@ func (r *RedisBudgetCounter) Check(ctx context.Context, s Scopes, l ScopeLimits)
 }
 
 // Add implements BudgetCounter.
-func (r *RedisBudgetCounter) Add(ctx context.Context, s Scopes, u Usage) {
+func (r *RedisBudgetCounter) Add(_ context.Context, s Scopes, u Usage) {
 	u = u.clamped()
-	w := windowsAt(r.now())
-	r.shadow.addAt(w, s, u)
-	if (u.Tokens == 0 && u.CostMicros == 0) || r.stopped.Load() {
+	if u.Tokens == 0 && u.CostMicros == 0 {
 		return
 	}
-	select {
-	case r.queue <- budgetOp{scopes: s, usage: u, at: w}:
-	default:
-		metrics.BudgetBackendErrorsTotal.WithLabelValues(budgetOpQueueFull).Inc()
-		last := r.lastDropWarn.Load()
-		if w.now.UnixNano()-last >= int64(budgetDropWarnInterval) && r.lastDropWarn.CompareAndSwap(last, w.now.UnixNano()) {
-			r.log.LogAttrs(ctx, slog.LevelWarn, "budget counter queue full, usage not added to shared counters")
-		}
+	w := windowsAt(r.now())
+	r.shadow.addAt(w, s, u)
+	r.own.addAt(w, s, u)
+	if r.stopped.Load() {
+		return
 	}
+
+	dayStart := w.dayStart.Unix()
+	r.mu.Lock()
+	forEachScope(s, func(scope string) {
+		k := dirtyKey{scope: scope, dayStart: dayStart}
+		e := r.dirty[k]
+		e.at = w
+		e.raise(r.own.usage(scope, w))
+		r.dirty[k] = e
+	})
+	r.mu.Unlock()
 }
 
 // Snapshot implements BudgetCounter. Like Check it reports the larger of the
-// shared and the shadow value and falls back to the shadow counter when Redis
-// fails, so it never returns an error.
+// shared sum and the shadow value and falls back to the shadow counter when
+// Redis fails, so it never returns an error.
 func (r *RedisBudgetCounter) Snapshot(ctx context.Context, scopeKeys []string) (map[string]WindowUsage, error) {
 	w := windowsAt(r.now())
 	out := r.shadow.snapshotAt(w, scopeKeys)
@@ -259,9 +316,9 @@ func (r *RedisBudgetCounter) Snapshot(ctx context.Context, scopeKeys []string) (
 			r.client.BudgetKey(voidredis.BudgetMetricCost, b.month, scope),
 		)
 	}
-	shared, err := r.getBudgets(ctx, keys)
+	shared, err := r.sumBudgets(ctx, keys)
 	if err != nil {
-		r.backendError(ctx, budgetOpCheck, err)
+		r.backendError(ctx, budgetOpSnapshot, err)
 		return out, nil
 	}
 	r.backendOK(ctx)
@@ -277,41 +334,35 @@ func (r *RedisBudgetCounter) Snapshot(ctx context.Context, scopeKeys []string) (
 }
 
 // EvictStale implements BudgetCounter. It evicts expired windows from the
-// shadow counter (Redis counters expire on their own) and asks the worker to
-// verify the seed markers of the current buckets again.
+// local counters (Redis counters expire on their own) and has all totals of
+// the current windows written to Redis again.
 func (r *RedisBudgetCounter) EvictStale() {
 	r.shadow.EvictStale()
-	r.requestRecheck()
+	r.own.EvictStale()
+	r.requestResync()
 }
 
-// getBudgets reads counters with the per-operation timeout.
-func (r *RedisBudgetCounter) getBudgets(ctx context.Context, keys []string) ([]int64, error) {
-	opCtx, cancel := context.WithTimeout(ctx, budgetOpTimeout)
+// sumBudgets reads counter sums with the read timeout.
+func (r *RedisBudgetCounter) sumBudgets(ctx context.Context, keys []string) ([]int64, error) {
+	opCtx, cancel := context.WithTimeout(ctx, budgetReadTimeout)
 	defer cancel()
-	return r.client.GetBudgets(opCtx, keys)
+	return r.client.SumBudgets(opCtx, keys)
 }
 
 // bucketsFor returns the bucket names and expiries for the windows w. The
 // value for the most recently used day is cached, so the request path does
 // not format dates.
 func (r *RedisBudgetCounter) bucketsFor(w budgetWindows) *budgetBuckets {
-	dayStart := w.dayStart.Unix()
-	if b := r.buckets.Load(); b != nil && b.dayStart == dayStart {
+	if b := r.buckets.Load(); b != nil && b.dayStart == w.dayStart.Unix() {
 		return b
 	}
-	b := &budgetBuckets{
-		dayStart:    dayStart,
-		day:         voidredis.BudgetDayBucket(w.dayStart),
-		month:       voidredis.BudgetMonthBucket(w.monthStart),
-		dayExpire:   nextUTCMidnight(w.dayStart).Add(budgetDayGrace),
-		monthExpire: nextUTCMonth(w.monthStart).Add(budgetMonthGrace),
-	}
+	b := bucketsOf(w)
 	r.buckets.Store(b)
 	return b
 }
 
-// backendAllowed reports whether a read may go to Redis. While the counter is
-// degraded only one caller per budgetProbeInterval gets through.
+// backendAllowed reports whether an operation may go to Redis. While the
+// counter is degraded only one caller per budgetProbeInterval gets through.
 func (r *RedisBudgetCounter) backendAllowed(now time.Time) bool {
 	if !r.degraded.Load() {
 		return true
@@ -341,217 +392,161 @@ func (r *RedisBudgetCounter) backendError(ctx context.Context, op string, err er
 }
 
 // backendOK records a successful Redis operation. When the counter was
-// degraded it logs the recovery once and has the seed markers verified again,
-// because Redis may have come back empty.
+// degraded it logs the recovery once and has all totals written again,
+// because Redis missed the writes of the outage and may have come back empty.
 func (r *RedisBudgetCounter) backendOK(ctx context.Context) {
 	if !r.degraded.Load() || !r.degraded.CompareAndSwap(true, false) {
 		return
 	}
 	r.log.LogAttrs(ctx, slog.LevelWarn, "budget backend recovered, enforcing budgets with shared counters")
-	r.requestRecheck()
+	r.requestResync()
 }
 
-// requestRecheck asks the worker to verify the seed markers of the current
-// buckets. Requests coalesce while one is pending.
-func (r *RedisBudgetCounter) requestRecheck() {
+// requestResync asks the loop to write all totals of the current windows.
+// Requests coalesce while one is pending.
+func (r *RedisBudgetCounter) requestResync() {
 	select {
-	case r.recheck <- struct{}{}:
+	case r.resync <- struct{}{}:
 	default:
 	}
 }
 
-// run is the worker loop. It rehydrates the current buckets when needed and
-// writes queued increments to Redis until Stop is called, then drains the
-// queue. Every operation derives from ctx, which Stop cancels when its own
-// deadline passes.
+// run is the write loop. Every operation derives from ctx, which Stop cancels
+// when its own deadline passes.
 func (r *RedisBudgetCounter) run(ctx context.Context) {
 	defer close(r.done)
 
-	var day, month bucketSeed
-	r.ensureSeeded(ctx, &day, &month)
+	flushTicker := time.NewTicker(r.flushInterval)
+	defer flushTicker.Stop()
+	resyncTicker := time.NewTicker(r.resyncInterval)
+	defer resyncTicker.Stop()
+
 	for {
 		select {
-		case op := <-r.queue:
-			r.ensureSeeded(ctx, &day, &month)
-			r.flush(ctx, op)
-		case <-r.recheck:
-			day, month = bucketSeed{}, bucketSeed{}
-			r.ensureSeeded(ctx, &day, &month)
+		case <-flushTicker.C:
+			r.flush(ctx, false)
+		case <-resyncTicker.C:
+			r.markAllDirty()
+		case <-r.resync:
+			r.markAllDirty()
+			r.flush(ctx, false)
 		case <-r.stop:
-			for ctx.Err() == nil {
-				select {
-				case op := <-r.queue:
-					r.flush(ctx, op)
-				default:
-					return
-				}
-			}
+			r.flush(ctx, true)
 			return
 		}
 	}
 }
 
-// flush writes one recorded usage to the Redis counters of all its scopes.
-// Zero amounts are skipped.
-func (r *RedisBudgetCounter) flush(ctx context.Context, op budgetOp) {
-	b := r.bucketsFor(op.at)
-	incs := make([]voidredis.BudgetIncrement, 0, 16)
-	forEachScope(op.scopes, func(scope string) {
-		incs = r.appendIncrements(incs, b, scope, op.usage, op.usage)
-	})
+// markAllDirty schedules every own total of the current windows for writing.
+func (r *RedisBudgetCounter) markAllDirty() {
+	w := windowsAt(r.now())
+	dayStart := w.dayStart.Unix()
 
-	opCtx, cancel := context.WithTimeout(ctx, budgetOpTimeout)
-	defer cancel()
-	if err := r.client.IncrBudgets(opCtx, incs); err != nil {
-		r.backendError(ctx, budgetOpFlush, err)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.own.entries.Range(func(key, _ any) bool {
+		scope := key.(string)
+		u := r.own.usage(scope, w)
+		if u == (WindowUsage{}) {
+			return true
+		}
+		k := dirtyKey{scope: scope, dayStart: dayStart}
+		e := r.dirty[k]
+		e.at = w
+		e.raise(u)
+		r.dirty[k] = e
+		return true
+	})
+}
+
+// flush writes the totals scheduled since the last flush to Redis, in
+// pipelines of at most budgetWriteChunk values (one pipeline unless a resync
+// is due on a large installation). Totals that could not be written are
+// scheduled again. While the counter is degraded a flush only goes out when
+// it is its turn to probe, unless force is set.
+func (r *RedisBudgetCounter) flush(ctx context.Context, force bool) {
+	r.flushMu.Lock()
+	defer r.flushMu.Unlock()
+
+	r.mu.Lock()
+	batch := r.dirty
+	if len(batch) == 0 {
+		r.mu.Unlock()
 		return
 	}
-	r.backendOK(ctx)
-}
+	r.dirty = make(map[dirtyKey]dirtyEntry, len(batch))
+	r.mu.Unlock()
 
-// appendIncrements appends the increments that add daily to the day bucket
-// and monthly to the month bucket of one scope, skipping zero amounts.
-func (r *RedisBudgetCounter) appendIncrements(dst []voidredis.BudgetIncrement, b *budgetBuckets, scope string, daily, monthly Usage) []voidredis.BudgetIncrement {
-	add := func(metric, bucket string, delta int64, expireAt time.Time) {
-		if delta == 0 {
+	now := r.now()
+	if !force && !r.backendAllowed(now) {
+		r.reschedule(batch, now)
+		return
+	}
+
+	values := make([]voidredis.BudgetValue, 0, 2*len(batch))
+	for k, e := range batch {
+		// Write the newest totals of the entry's windows that are still
+		// live. Without this, the entry of a finished day could write an
+		// older monthly total over a newer one of the same month.
+		e.raise(r.own.usage(k.scope, e.at))
+		batch[k] = e
+		values = r.appendValues(values, k.scope, e, now)
+	}
+	for len(values) > 0 {
+		chunk := values[:min(len(values), budgetWriteChunk)]
+		values = values[len(chunk):]
+
+		opCtx, cancel := context.WithTimeout(ctx, budgetWriteTimeout)
+		err := r.client.SetBudgets(opCtx, r.instanceID, chunk)
+		cancel()
+		if err != nil {
+			r.backendError(ctx, budgetOpFlush, err)
+			// Absolute values: writing the whole batch again is harmless.
+			r.reschedule(batch, now)
 			return
 		}
-		dst = append(dst, voidredis.BudgetIncrement{
+		r.backendOK(ctx)
+	}
+}
+
+// appendValues appends the Redis values for the totals of one scope. Zero
+// totals are skipped, and so are the totals of a window whose counter has
+// outlived its grace: nobody reads it any more.
+func (r *RedisBudgetCounter) appendValues(dst []voidredis.BudgetValue, scope string, e dirtyEntry, now time.Time) []voidredis.BudgetValue {
+	b := bucketsOf(e.at)
+	add := func(metric, bucket string, value int64, expireAt time.Time) {
+		if value == 0 || !now.Before(expireAt) {
+			return
+		}
+		dst = append(dst, voidredis.BudgetValue{
 			Key:      r.client.BudgetKey(metric, bucket, scope),
-			Delta:    delta,
+			Value:    value,
 			ExpireAt: expireAt,
 		})
 	}
-	add(voidredis.BudgetMetricTokens, b.day, daily.Tokens, b.dayExpire)
-	add(voidredis.BudgetMetricTokens, b.month, monthly.Tokens, b.monthExpire)
-	add(voidredis.BudgetMetricCost, b.day, daily.CostMicros, b.dayExpire)
-	add(voidredis.BudgetMetricCost, b.month, monthly.CostMicros, b.monthExpire)
+	add(voidredis.BudgetMetricTokens, b.day, e.usage.Daily.Tokens, b.dayExpire)
+	add(voidredis.BudgetMetricTokens, b.month, e.usage.Monthly.Tokens, b.monthExpire)
+	add(voidredis.BudgetMetricCost, b.day, e.usage.Daily.CostMicros, b.dayExpire)
+	add(voidredis.BudgetMetricCost, b.month, e.usage.Monthly.CostMicros, b.monthExpire)
 	return dst
 }
 
-// ensureSeeded makes sure the current day and month buckets are rehydrated,
-// or known to be, tracking what it learned in day and month.
-func (r *RedisBudgetCounter) ensureSeeded(ctx context.Context, day, month *bucketSeed) {
-	w := windowsAt(r.now())
-	b := r.bucketsFor(w)
-	r.ensureBucket(ctx, day, b.day, w, false)
-	r.ensureBucket(ctx, month, b.month, w, true)
-}
-
-// ensureBucket rehydrates one bucket unless state already confirms it, or a
-// recent attempt asked to wait.
-func (r *RedisBudgetCounter) ensureBucket(ctx context.Context, state *bucketSeed, bucket string, w budgetWindows, monthly bool) {
-	if state.bucket != bucket {
-		*state = bucketSeed{bucket: bucket}
-	}
-	if state.confirmed || w.now.Before(state.retryAt) {
-		return
-	}
-	state.confirmed = r.seedBucket(ctx, bucket, w, monthly)
-	if !state.confirmed {
-		state.retryAt = w.now.Add(budgetSeedRetry)
-	}
-}
-
-// seedBucket claims the seed marker of a bucket and, when it wins, adds the
-// usage persisted in the database for that bucket to the Redis counters. It
-// reports whether the bucket is now known to be rehydrated, by this instance
-// or by another one. It reports false while another instance holds the claim
-// and when anything fails; an abandoned claim expires on its own.
-func (r *RedisBudgetCounter) seedBucket(ctx context.Context, bucket string, w budgetWindows, monthly bool) bool {
-	seedCtx, cancel := context.WithTimeout(ctx, budgetSeedTimeout)
-	defer cancel()
-
-	id, err := uuid.NewRandom()
-	if err != nil {
-		r.seedFailed(ctx, bucket, fmt.Errorf("generate claim token: %w", err))
-		return false
-	}
-	token := "pending:" + id.String()
-
-	claimed, err := r.claimSeed(seedCtx, bucket, token)
-	if err != nil {
-		r.backendError(ctx, budgetOpSeed, err)
-		return false
-	}
-	if !claimed {
-		done, err := r.seedDone(seedCtx, bucket)
-		if err != nil {
-			r.backendError(ctx, budgetOpSeed, err)
-			return false
+// reschedule puts totals that were not written back for the next flush,
+// keeping whatever newer totals were scheduled meanwhile. Entries whose
+// windows are both past their grace are dropped, which bounds the schedule
+// during a long outage.
+func (r *RedisBudgetCounter) reschedule(batch map[dirtyKey]dirtyEntry, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for k, old := range batch {
+		if !now.Before(nextUTCMonth(old.at.monthStart).Add(budgetMonthGrace)) {
+			continue
 		}
-		return done
-	}
-
-	b := r.bucketsFor(w)
-	since, expireAt := w.dayStart, b.dayExpire
-	if monthly {
-		since, expireAt = w.monthStart, b.monthExpire
-	}
-
-	totals := make(map[string]Usage)
-	err = scanUsageSeed(seedCtx, r.seeder, since, func(scope string, u Usage) {
-		t := totals[scope]
-		t.Tokens += u.Tokens
-		t.CostMicros += u.CostMicros
-		totals[scope] = t
-	})
-	if err != nil {
-		r.seedFailed(ctx, bucket, err)
-		return false
-	}
-
-	incs := make([]voidredis.BudgetIncrement, 0, len(totals))
-	for scope, t := range totals {
-		if monthly {
-			incs = r.appendIncrements(incs, b, scope, Usage{}, t)
-		} else {
-			incs = r.appendIncrements(incs, b, scope, t, Usage{})
+		e, ok := r.dirty[k]
+		if !ok {
+			e.at = old.at
 		}
+		e.raise(old.usage)
+		r.dirty[k] = e
 	}
-
-	committed, err := r.client.CommitBudgetSeed(seedCtx, bucket, token, incs, expireAt)
-	if err != nil {
-		r.backendError(ctx, budgetOpSeed, err)
-		return false
-	}
-	if !committed {
-		r.log.LogAttrs(ctx, slog.LevelWarn, "budget rehydration claim lost, leaving the bucket to its new owner",
-			slog.String("bucket", bucket),
-		)
-		return false
-	}
-	r.backendOK(ctx)
-	r.log.LogAttrs(ctx, slog.LevelInfo, "budget counters rehydrated from database",
-		slog.String("bucket", bucket),
-		slog.Int("scopes", len(totals)),
-	)
-	return true
-}
-
-// claimSeed claims the seed marker with the per-operation timeout.
-func (r *RedisBudgetCounter) claimSeed(ctx context.Context, bucket, token string) (bool, error) {
-	opCtx, cancel := context.WithTimeout(ctx, budgetOpTimeout)
-	defer cancel()
-	return r.client.ClaimBudgetSeed(opCtx, bucket, token, budgetSeedClaimTTL)
-}
-
-// seedDone reads the seed marker with the per-operation timeout.
-func (r *RedisBudgetCounter) seedDone(ctx context.Context, bucket string) (bool, error) {
-	opCtx, cancel := context.WithTimeout(ctx, budgetOpTimeout)
-	defer cancel()
-	return r.client.BudgetSeedDone(opCtx, bucket)
-}
-
-// seedFailed records a rehydration that failed for a reason other than Redis
-// itself, such as the database read.
-func (r *RedisBudgetCounter) seedFailed(ctx context.Context, bucket string, err error) {
-	if ctx.Err() != nil {
-		return
-	}
-	metrics.BudgetBackendErrorsTotal.WithLabelValues(budgetOpSeed).Inc()
-	r.log.LogAttrs(ctx, slog.LevelError, "budget rehydration failed",
-		slog.String("bucket", bucket),
-		slog.String("error", err.Error()),
-	)
 }

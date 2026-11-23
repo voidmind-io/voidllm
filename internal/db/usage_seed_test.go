@@ -48,11 +48,12 @@ type seedRow struct {
 	keyID, teamID, orgID, userID string
 	tokens                       int64
 	costMicros                   int64
+	inDay                        bool
 }
 
-func querySeedRows(t *testing.T, d *DB, since time.Time) []seedRow {
+func querySeedRows(t *testing.T, d *DB, monthStart, dayStart time.Time) []seedRow {
 	t.Helper()
-	rows, err := d.QueryUsageSeed(context.Background(), since)
+	rows, err := d.QueryUsageSeed(context.Background(), monthStart, dayStart)
 	if err != nil {
 		t.Fatalf("QueryUsageSeed() error = %v", err)
 	}
@@ -62,17 +63,22 @@ func querySeedRows(t *testing.T, d *DB, since time.Time) []seedRow {
 	if err != nil {
 		t.Fatalf("rows.Columns() error = %v", err)
 	}
-	if len(cols) != 6 {
-		t.Fatalf("QueryUsageSeed() returned %d columns, want 6", len(cols))
+	if len(cols) != 7 {
+		t.Fatalf("QueryUsageSeed() returned %d columns, want 7", len(cols))
 	}
 
 	var out []seedRow
 	for rows.Next() {
 		var r seedRow
 		var cost float64
-		if err := rows.Scan(&r.keyID, &r.teamID, &r.orgID, &r.userID, &r.tokens, &cost); err != nil {
+		var inDay int64
+		if err := rows.Scan(&r.keyID, &r.teamID, &r.orgID, &r.userID, &r.tokens, &cost, &inDay); err != nil {
 			t.Fatalf("rows.Scan() error = %v", err)
 		}
+		if inDay != 0 && inDay != 1 {
+			t.Fatalf("in_day = %d, want 0 or 1", inDay)
+		}
+		r.inDay = inDay == 1
 		r.costMicros = int64(math.Round(cost * 1e6))
 		out = append(out, r)
 	}
@@ -84,14 +90,18 @@ func querySeedRows(t *testing.T, d *DB, since time.Time) []seedRow {
 }
 
 // TestQueryUsageSeed verifies, on every supported dialect, the rows the
-// budget counters are seeded from: one row per event on or after since, NULL
-// team and user as empty strings, and the cost estimate as a number that is 0
-// for events without pricing.
+// budget counters are seeded from: one row per event on or after the month
+// start, NULL team and user as empty strings, the cost estimate as a number
+// that is 0 for events without pricing, and the flag that tells whether the
+// event is on or after the day start.
 func TestQueryUsageSeed(t *testing.T) {
 	t.Parallel()
 
 	forEachDialect(t, func(t *testing.T, d *DB) {
 		since := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+		// "Today" starts exactly at event e3; e4 and e5 are later that day
+		// or after it.
+		dayStart := since.Add(48 * time.Hour)
 		cost := func(v float64) *float64 { return &v }
 
 		events := []seedEvent{
@@ -111,13 +121,17 @@ func TestQueryUsageSeed(t *testing.T) {
 			insertSeedEvent(t, d, e)
 		}
 
-		got := querySeedRows(t, d, since)
+		// One event sits one second before the day start.
+		insertSeedEvent(t, d, seedEvent{id: "e6", keyID: "k2", orgID: "o1", tokens: 250, createdAt: dayStart.Add(-time.Second)})
+
+		got := querySeedRows(t, d, since, dayStart)
 		want := []seedRow{
 			{keyID: "k1", teamID: "t1", orgID: "o1", userID: "u1", tokens: 100, costMicros: 12300},
 			{keyID: "k2", orgID: "o1", tokens: 200, costMicros: 0},
-			{keyID: "k3", orgID: "o2", userID: "u2", tokens: 300, costMicros: 0},
-			{keyID: "k3", teamID: "t2", orgID: "o2", tokens: 400, costMicros: 1},
-			{keyID: "k4", orgID: "o2", tokens: 500, costMicros: 25_000_000},
+			{keyID: "k2", orgID: "o1", tokens: 250, costMicros: 0},
+			{keyID: "k3", orgID: "o2", userID: "u2", tokens: 300, costMicros: 0, inDay: true},
+			{keyID: "k3", teamID: "t2", orgID: "o2", tokens: 400, costMicros: 1, inDay: true},
+			{keyID: "k4", orgID: "o2", tokens: 500, costMicros: 25_000_000, inDay: true},
 		}
 		if len(got) != len(want) {
 			t.Fatalf("QueryUsageSeed() returned %d rows, want %d: %+v", len(got), len(want), got)
@@ -128,14 +142,27 @@ func TestQueryUsageSeed(t *testing.T) {
 			}
 		}
 
-		// A later window start narrows the result.
-		later := querySeedRows(t, d, since.Add(48*time.Hour))
-		if len(later) != 3 || later[0].tokens != 300 {
-			t.Errorf("QueryUsageSeed(later) = %+v, want the 3 events from the later window", later)
+		// On the first day of the month both windows start together: every
+		// returned event is in the day.
+		first := querySeedRows(t, d, since, since)
+		if len(first) != len(want) {
+			t.Errorf("QueryUsageSeed(month start = day start) returned %d rows, want %d", len(first), len(want))
+		}
+		for _, r := range first {
+			if !r.inDay {
+				t.Errorf("row %+v not in day although the day starts with the month", r)
+			}
+		}
+
+		// A later month start narrows the result.
+		later := querySeedRows(t, d, dayStart, dayStart.Add(24*time.Hour))
+		if len(later) != 3 || later[0].tokens != 300 || later[0].inDay || later[1].inDay || !later[2].inDay {
+			t.Errorf("QueryUsageSeed(later) = %+v, want the 3 later events with only the last one in the day", later)
 		}
 
 		// Nothing in the window: no rows, no error.
-		if none := querySeedRows(t, d, since.Add(365*24*time.Hour)); len(none) != 0 {
+		future := since.Add(365 * 24 * time.Hour)
+		if none := querySeedRows(t, d, future, future); len(none) != 0 {
 			t.Errorf("QueryUsageSeed(future) = %+v, want no rows", none)
 		}
 	})
