@@ -19,7 +19,10 @@
 // of every key set after the load began.
 package cache
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // mutation is the most recent point write to a key while a load was in flight.
 type mutation struct {
@@ -30,16 +33,26 @@ type mutation struct {
 // LoadToken identifies one full load started with BeginLoad. It must be passed
 // to exactly one of CommitLoad or AbortLoad; further calls with the same token
 // are no-ops, so deferring AbortLoad after a successful CommitLoad is safe.
+//
+// A token is bound to the cache that issued it: passing it to another cache's
+// CommitLoad or AbortLoad is a no-op.
 type LoadToken struct {
+	owner uint64
 	id    uint64
 	start uint64
 }
+
+// nextCacheID hands out the unique identity bound into every LoadToken.
+var nextCacheID atomic.Uint64
 
 // Cache is a typed, concurrent map safe for use by multiple goroutines.
 // The zero value is not usable; construct with New.
 type Cache[K comparable, V any] struct {
 	mu sync.RWMutex
 	m  map[K]V
+
+	// id uniquely identifies this cache instance; it is immutable.
+	id uint64
 
 	// gen is advanced by every Set and Delete. Guarded by mu.
 	gen uint64
@@ -63,6 +76,7 @@ type Cache[K comparable, V any] struct {
 // New returns a ready-to-use empty Cache.
 func New[K comparable, V any]() *Cache[K, V] {
 	return &Cache[K, V]{
+		id:        nextCacheID.Add(1),
 		m:         make(map[K]V),
 		mutations: make(map[K]mutation),
 		active:    make(map[uint64]uint64),
@@ -114,7 +128,7 @@ func (c *Cache[K, V]) record(key K, deleted bool) {
 func (c *Cache[K, V]) BeginLoad() LoadToken {
 	c.mu.Lock()
 	c.nextLoadID++
-	t := LoadToken{id: c.nextLoadID, start: c.gen}
+	t := LoadToken{owner: c.id, id: c.nextLoadID, start: c.gen}
 	c.active[t.id] = t.start
 	c.mu.Unlock()
 	return t
@@ -132,10 +146,13 @@ func (c *Cache[K, V]) CommitLoad(t LoadToken, entries map[K]V) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if t.owner != c.id {
+		return false
+	}
 	if _, ok := c.active[t.id]; !ok {
 		return false
 	}
-	if c.committed && t.id < c.committedID {
+	if c.committed && t.id <= c.committedID {
 		c.finish(t)
 		return false
 	}
@@ -166,7 +183,7 @@ func (c *Cache[K, V]) CommitLoad(t LoadToken, entries map[K]V) bool {
 // when t was already committed or aborted.
 func (c *Cache[K, V]) AbortLoad(t LoadToken) {
 	c.mu.Lock()
-	if _, ok := c.active[t.id]; ok {
+	if _, ok := c.active[t.id]; ok && t.owner == c.id {
 		c.finish(t)
 	}
 	c.mu.Unlock()
@@ -202,9 +219,16 @@ func (c *Cache[K, V]) finish(t LoadToken) {
 // LoadAll installs entries unconditionally. When entries is a snapshot read
 // from a slow source while other goroutines Set or Delete keys, use BeginLoad
 // and CommitLoad instead so those writes are not undone.
+//
+// LoadAll counts as the latest commit: every load in flight (begun before
+// LoadAll) is superseded and its CommitLoad returns false, so an older snapshot
+// can never override the entries installed here.
 func (c *Cache[K, V]) LoadAll(entries map[K]V) {
 	c.mu.Lock()
 	c.m = entries
+	c.gen++
+	c.committed = true
+	c.committedID = c.nextLoadID
 	c.mu.Unlock()
 }
 

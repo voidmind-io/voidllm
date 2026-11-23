@@ -435,25 +435,22 @@ func rejectNegativeLimits(c fiber.Ctx, daily, monthly *int64, perMinute, perDay 
 }
 
 // refreshKeyCaches makes a change to org, team or membership limits take
-// effect on every instance. When Redis is configured it first publishes payload
-// on voidredis.ChannelKeys so other instances reload too, then reloads the
-// local key cache (blocking until a load that started after the database write
-// has finished, so the change is visible when the handler returns).
+// effect on every instance. When Redis is configured it publishes payload on
+// voidredis.ChannelKeys asynchronously so other instances reload too, then
+// reloads the local key cache (blocking until a load that started after the
+// database write has finished, so the change is visible when the handler
+// returns).
 //
-// The publish comes first and runs under its own short-lived context rather
-// than ctx: the database write is already committed, so the other instances
-// must hear about it even when the client disconnects or the local reload
-// uses up the request's remaining time. The local reload stays bounded by ctx.
-// Failures are logged and never fail the request: the database write already
-// succeeded and the periodic reload retries regardless.
+// The publish runs in its own goroutine under a fresh context bounded by
+// keyInvalidationPublishTimeout, independent of ctx: the database write is
+// already committed, so the other instances must hear about it even when the
+// client disconnects, and the local reload never waits for Redis. The goroutine
+// is bounded by that timeout. Failures are logged and never fail the request:
+// the database write already succeeded and the periodic reload retries
+// regardless. The local reload stays bounded by ctx.
 func (h *Handler) refreshKeyCaches(ctx context.Context, op, payload string) {
 	if h.Redis != nil {
-		pubCtx, cancel := context.WithTimeout(context.Background(), keyInvalidationPublishTimeout)
-		pubErr := h.Redis.PublishInvalidation(pubCtx, voidredis.ChannelKeys, payload)
-		cancel()
-		if pubErr != nil {
-			h.Log.ErrorContext(ctx, op+": publish key cache invalidation", slog.String("error", pubErr.Error()))
-		}
+		go h.publishKeyInvalidations(op, []string{payload})
 	}
 
 	var err error
@@ -467,5 +464,20 @@ func (h *Handler) refreshKeyCaches(ctx context.Context, op, payload string) {
 	}
 }
 
-// keyInvalidationPublishTimeout bounds the Redis publish in refreshKeyCaches.
+// keyInvalidationPublishTimeout bounds the Redis publishes of one
+// publishKeyInvalidations call.
 const keyInvalidationPublishTimeout = 2 * time.Second
+
+// publishKeyInvalidations publishes each payload on voidredis.ChannelKeys under
+// a context that is independent of any request and bounded by
+// keyInvalidationPublishTimeout in total. Failures are logged. h.Redis must be
+// non-nil.
+func (h *Handler) publishKeyInvalidations(op string, payloads []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), keyInvalidationPublishTimeout)
+	defer cancel()
+	for _, payload := range payloads {
+		if err := h.Redis.PublishInvalidation(ctx, voidredis.ChannelKeys, payload); err != nil {
+			h.Log.ErrorContext(ctx, op+": publish key cache invalidation", slog.String("error", err.Error()))
+		}
+	}
+}

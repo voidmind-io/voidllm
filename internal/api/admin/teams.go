@@ -8,7 +8,6 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
-	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 )
 
 // createTeamRequest is the JSON body accepted by CreateTeam.
@@ -476,14 +475,9 @@ func (h *Handler) DeleteTeam(c fiber.Ctx) error {
 	}
 	for _, keyHash := range hashes {
 		h.KeyCache.Delete(keyHash)
-
-		if h.Redis != nil {
-			if err := h.Redis.PublishInvalidation(c.Context(), voidredis.ChannelKeys, keyHash); err != nil {
-				h.Log.LogAttrs(c.Context(), slog.LevelWarn, "redis: publish key invalidation failed",
-					slog.String("error", err.Error()),
-				)
-			}
-		}
+	}
+	if h.Redis != nil && len(hashes) > 0 {
+		go h.publishKeyInvalidations("delete team", hashes)
 	}
 
 	return c.SendStatus(fiber.StatusNoContent)

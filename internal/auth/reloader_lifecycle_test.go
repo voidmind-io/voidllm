@@ -67,8 +67,16 @@ func TestReloader_ReloadWaitsForTrailingLoad(t *testing.T) {
 	release := make(chan struct{})
 	r := newReloader(func(ctx context.Context) error {
 		n := runs.Add(1)
-		started <- n
-		<-release
+		select {
+		case started <- n:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		return nil
 	}, discardLogger())
 	t.Cleanup(r.Stop)
@@ -119,8 +127,16 @@ func TestReloader_LoadFailure(t *testing.T) {
 	release := make(chan struct{})
 	r := newReloader(func(ctx context.Context) error {
 		n := runs.Add(1)
-		started <- struct{}{}
-		<-release
+		select {
+		case started <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		return results[n-1]
 	}, discardLogger())
 	t.Cleanup(r.Stop)
@@ -317,7 +333,10 @@ func TestLoadKeysIntoCache_StaleSnapshot(t *testing.T) {
 		loadErr <- loadKeysIntoCache(ctx, func(ctx context.Context) ([]db.KeyRecord, []error, error) {
 			records, skipped, err := d.LoadAllActiveKeys(ctx)
 			close(readDone) // the snapshot is taken: it contains the revoked key
-			<-release
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
 			return records, skipped, err
 		}, kc, log)
 	}()

@@ -316,3 +316,38 @@ func TestLoad_Concurrent(t *testing.T) {
 		t.Error("k0 present after being deleted during the final load")
 	}
 }
+
+func TestCommitLoad_TokenFromOtherCache(t *testing.T) {
+	a := New[string, int]()
+	b := New[string, int]()
+	b.Set("b", 1)
+
+	token := a.BeginLoad()
+	if b.CommitLoad(token, map[string]int{"x": 1}) {
+		t.Error("CommitLoad with a foreign token = true, want false")
+	}
+	b.AbortLoad(token)
+	if _, ok := b.Get("b"); !ok || b.Len() != 1 {
+		t.Error("foreign token changed the other cache")
+	}
+	if !a.CommitLoad(token, map[string]int{"a": 1}) {
+		t.Error("owner's token was consumed by the foreign cache")
+	}
+}
+
+func TestLoadAll_SupersedesInFlightLoad(t *testing.T) {
+	c := New[string, int]()
+	token := c.BeginLoad()
+	c.Set("k", 1)
+	c.LoadAll(map[string]int{"all": 1})
+	if c.CommitLoad(token, map[string]int{"old": 1}) {
+		t.Error("CommitLoad begun before LoadAll = true, want false")
+	}
+	if _, ok := c.Get("all"); !ok || c.Len() != 1 {
+		t.Errorf("cache does not hold LoadAll content, len = %d", c.Len())
+	}
+	token = c.BeginLoad()
+	if !c.CommitLoad(token, map[string]int{"new": 1}) {
+		t.Error("load begun after LoadAll was discarded")
+	}
+}
