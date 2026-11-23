@@ -63,6 +63,13 @@ type UsageSeeder interface {
 	// when the event has no cost, and in_day is 1 for events since dayStart
 	// and 0 for earlier ones.
 	QueryUsageSeed(ctx context.Context, monthStart, dayStart time.Time) (RowScanner, error)
+	// QueryUsageTotals returns the usage of the events from from (inclusive)
+	// until until (exclusive; the zero time means no upper bound),
+	// aggregated by the database: rows of (org_id, team_id, user_id, key_id,
+	// tokens, cost, day_tokens, day_cost), where the day columns only cover
+	// events since dayStart. team_id and user_id are empty strings when
+	// unset; costs are in major currency units.
+	QueryUsageTotals(ctx context.Context, from, until, dayStart time.Time) (RowScanner, error)
 }
 
 // RowScanner iterates over database rows. *sql.Rows satisfies this interface.

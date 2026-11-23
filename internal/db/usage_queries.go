@@ -390,6 +390,42 @@ func (d *DB) QueryUsageSeed(ctx context.Context, monthStart, dayStart time.Time)
 	return rows, nil
 }
 
+// QueryUsageTotals implements ratelimit.UsageSeeder. It aggregates the usage
+// events recorded from from (inclusive) until until (exclusive; the zero time
+// means no upper bound) and returns one row per (org_id, team_id, user_id,
+// key_id) with the columns (org_id, team_id, user_id, key_id, tokens, cost,
+// day_tokens, day_cost): tokens and cost sum every event in the range, the
+// day columns only those recorded on or after dayStart. team_id and user_id
+// are empty strings when NULL; costs are in major currency units, 0 for
+// events without pricing. The range filter uses the created_at index, so the
+// cost of the query follows the size of the range. The returned *sql.Rows
+// must be closed by the caller.
+func (d *DB) QueryUsageTotals(ctx context.Context, from, until, dayStart time.Time) (*sql.Rows, error) {
+	p := d.dialect.Placeholder
+	// cost_estimate is single precision on PostgreSQL; summing it as double
+	// precision keeps the aggregate from losing further digits.
+	const cost = "CAST(COALESCE(cost_estimate, 0) AS DOUBLE PRECISION)"
+	query := "SELECT org_id, COALESCE(team_id, ''), COALESCE(user_id, ''), key_id, " +
+		"COALESCE(SUM(total_tokens), 0), " +
+		"COALESCE(SUM(" + cost + "), 0), " +
+		"COALESCE(SUM(CASE WHEN created_at >= " + p(1) + " THEN total_tokens ELSE 0 END), 0), " +
+		"COALESCE(SUM(CASE WHEN created_at >= " + p(2) + " THEN " + cost + " ELSE 0 END), 0) " +
+		"FROM usage_events WHERE created_at >= " + p(3)
+	day := FormatTimestamp(dayStart)
+	args := []any{day, day, FormatTimestamp(from)}
+	if !until.IsZero() {
+		query += " AND created_at < " + p(4)
+		args = append(args, FormatTimestamp(until))
+	}
+	query += " GROUP BY org_id, COALESCE(team_id, ''), COALESCE(user_id, ''), key_id"
+
+	rows, err := d.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("QueryUsageTotals: %w", err)
+	}
+	return rows, nil
+}
+
 // GetMonthlyTokenUsage returns the total number of tokens consumed by an
 // organization from the first day of the current calendar month (UTC) up to
 // the present moment. Returns 0 with no error when there are no matching rows.

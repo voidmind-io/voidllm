@@ -136,6 +136,10 @@ func (s *dbUsageSeeder) QueryUsageSeed(ctx context.Context, monthStart, dayStart
 	return (*db.DB)(s).QueryUsageSeed(ctx, monthStart, dayStart)
 }
 
+func (s *dbUsageSeeder) QueryUsageTotals(ctx context.Context, from, until, dayStart time.Time) (ratelimit.RowScanner, error) {
+	return (*db.DB)(s).QueryUsageTotals(ctx, from, until, dayStart)
+}
+
 // redisBudgetDrainTimeout bounds how long shutdown waits for the final budget
 // totals to be written to Redis.
 const redisBudgetDrainTimeout = 5 * time.Second
@@ -543,7 +547,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// when available, otherwise in the memory of this instance.
 	var budgetCounter ratelimit.BudgetCounter
 	if redisClient != nil {
-		redisBudget = ratelimit.NewRedisBudgetCounter(redisClient, (*dbUsageSeeder)(database), log)
+		redisBudget = ratelimit.NewRedisBudgetCounter(redisClient, (*dbUsageSeeder)(database), log, cfg.Settings.Usage.FlushInterval)
 		if err := redisBudget.Start(ctx); err != nil {
 			redisBudget = nil
 			redisCancel()

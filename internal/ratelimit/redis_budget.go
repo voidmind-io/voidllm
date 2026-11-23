@@ -39,6 +39,14 @@ const (
 	// finished window are not written any more once its grace has passed.
 	budgetDayGrace   = 24 * time.Hour
 	budgetMonthGrace = 48 * time.Hour
+	// budgetRefreshInterval is how often the usage persisted in the database
+	// by all instances is read again.
+	budgetRefreshInterval = 60 * time.Second
+	// budgetRefreshTimeout bounds one such read.
+	budgetRefreshTimeout = 30 * time.Second
+	// budgetPersistSlack is added to twice the usage logger's flush interval
+	// to get the time after which recorded usage is taken to be persisted.
+	budgetPersistSlack = 5 * time.Second
 )
 
 // Values of the "op" label of metrics.BudgetBackendErrorsTotal.
@@ -46,6 +54,7 @@ const (
 	budgetOpCheck    = "check"
 	budgetOpSnapshot = "snapshot"
 	budgetOpFlush    = "flush"
+	budgetOpRefresh  = "refresh"
 )
 
 // errBudgetCounterStarted is returned by a second call to Start.
@@ -90,10 +99,21 @@ type dirtyEntry struct {
 
 // raise lifts the totals of e to those of u where u is higher.
 func (e *dirtyEntry) raise(u WindowUsage) {
-	e.usage.Daily.Tokens = max(e.usage.Daily.Tokens, u.Daily.Tokens)
-	e.usage.Daily.CostMicros = max(e.usage.Daily.CostMicros, u.Daily.CostMicros)
-	e.usage.Monthly.Tokens = max(e.usage.Monthly.Tokens, u.Monthly.Tokens)
-	e.usage.Monthly.CostMicros = max(e.usage.Monthly.CostMicros, u.Monthly.CostMicros)
+	e.usage = maxWindowUsage(e.usage, u)
+}
+
+// maxWindowUsage returns, value by value, the larger of a and b.
+func maxWindowUsage(a, b WindowUsage) WindowUsage {
+	return WindowUsage{
+		Daily: Usage{
+			Tokens:     max(a.Daily.Tokens, b.Daily.Tokens),
+			CostMicros: max(a.Daily.CostMicros, b.Daily.CostMicros),
+		},
+		Monthly: Usage{
+			Tokens:     max(a.Monthly.Tokens, b.Monthly.Tokens),
+			CostMicros: max(a.Monthly.CostMicros, b.Monthly.CostMicros),
+		},
+	}
 }
 
 // RedisBudgetCounter is a BudgetCounter that shares usage through Redis, so
@@ -120,9 +140,10 @@ func (e *dirtyEntry) raise(u WindowUsage) {
 //
 // Check reads only the counters of budgets that are actually set, summed on
 // the server in one round trip, and makes no Redis call for a request without
-// budgets. Each budget is evaluated against the larger of the shared sum and
-// the shadow value. When Redis fails, the check is decided on the shadow
-// counter alone: neither fail-open nor fail-closed. While degraded, one
+// budgets. Each budget is evaluated against the largest of the shared sum,
+// the shadow value and the refreshed database view (below). When Redis
+// fails, the check is decided on the two local values alone: neither
+// fail-open nor fail-closed. While degraded, one
 // operation per second probes Redis; the transitions to degraded and back are
 // each logged once and failures are counted in
 // voidllm_budget_backend_errors_total.
@@ -137,10 +158,22 @@ func (e *dirtyEntry) raise(u WindowUsage) {
 //     per instance start within its window.
 //   - Usage that is only in the database is not in any field: usage from
 //     before shared budgets were first used in the current window, and the
-//     usage of stopped instances after Redis lost its data. An instance knows
-//     such usage only through its shadow, as of its own start. A budget is
-//     then enforced on max(sum of the live reports, own shadow), which can be
-//     below the true total until the window ends or the instances restart.
+//     usage of stopped instances after Redis lost its data.
+//
+// The refreshed database view covers that last case. Every 60s the instance
+// reads the totals all instances have persisted for the current month and
+// day (from the usage events, aggregated by the database) and combines them
+// with its own usage that is too recent to be persisted, see refreshedUsage.
+// With it, what an instance enforces is behind the true total of all
+// instances by at most one refresh interval plus the time the usage logger
+// takes to persist an event (its flush interval), whatever happened to Redis.
+// It can be ahead of the true total by the usage the instance itself recorded
+// in roughly two flush intervals plus ten seconds before a refresh; that part
+// is counted twice until the next refresh. The view only knows what reached
+// the usage events: usage the usage logger dropped or failed to write is
+// missing from it and remains only in the shadow of the instance that
+// recorded it, and events older than the usage event retention are gone from
+// it like they are from the startup seed.
 //
 // The zero value is not usable; construct via NewRedisBudgetCounter and call
 // Start before use.
@@ -150,11 +183,14 @@ type RedisBudgetCounter struct {
 	log    *slog.Logger
 	shadow *MemoryBudgetCounter
 	own    *MemoryBudgetCounter
-	now    func() time.Time
+	// persisted is the refreshed view of the usage in the database.
+	persisted *refreshedUsage
+	now       func() time.Time
 
-	flushInterval  time.Duration
-	resyncInterval time.Duration
-	instanceID     string
+	flushInterval   time.Duration
+	resyncInterval  time.Duration
+	refreshInterval time.Duration
+	instanceID      string
 
 	mu    sync.Mutex // guards dirty
 	dirty map[dirtyKey]dirtyEntry
@@ -176,28 +212,34 @@ type RedisBudgetCounter struct {
 }
 
 // NewRedisBudgetCounter returns a RedisBudgetCounter that shares usage
-// through client's Redis and seeds its shadow counter from seeder.
-func NewRedisBudgetCounter(client *voidredis.Client, seeder UsageSeeder, log *slog.Logger) *RedisBudgetCounter {
-	return &RedisBudgetCounter{
-		client:         client,
-		seeder:         seeder,
-		log:            log,
-		shadow:         NewMemoryBudgetCounter(),
-		own:            NewMemoryBudgetCounter(),
-		now:            time.Now,
-		flushInterval:  budgetFlushInterval,
-		resyncInterval: budgetResyncInterval,
-		dirty:          make(map[dirtyKey]dirtyEntry),
-		resync:         make(chan struct{}, 1),
-		stop:           make(chan struct{}),
-		done:           make(chan struct{}),
+// through client's Redis, seeds its shadow counter from seeder and refreshes
+// its database view from it. usageFlushInterval is the flush interval of the
+// usage logger that persists the usage this counter is given; it determines
+// how long recorded usage is treated as possibly not persisted yet.
+func NewRedisBudgetCounter(client *voidredis.Client, seeder UsageSeeder, log *slog.Logger, usageFlushInterval time.Duration) *RedisBudgetCounter {
+	r := &RedisBudgetCounter{
+		client:          client,
+		seeder:          seeder,
+		log:             log,
+		shadow:          NewMemoryBudgetCounter(),
+		own:             NewMemoryBudgetCounter(),
+		now:             time.Now,
+		flushInterval:   budgetFlushInterval,
+		resyncInterval:  budgetResyncInterval,
+		refreshInterval: budgetRefreshInterval,
+		dirty:           make(map[dirtyKey]dirtyEntry),
+		resync:          make(chan struct{}, 1),
+		stop:            make(chan struct{}),
+		done:            make(chan struct{}),
 	}
+	r.persisted = newRefreshedUsage(func() time.Time { return r.now() }, 2*usageFlushInterval+budgetPersistSlack)
+	return r
 }
 
 // Start gives the instance its ID, seeds the shadow counter from the database
-// and launches the loop that writes totals to Redis. It must be called once,
-// before the counter is used; a second call returns an error. Stop shuts the
-// loop down.
+// and launches the loops that write totals to Redis and refresh the database
+// view. It must be called once, before the counter is used; a second call
+// returns an error. Stop shuts the loops down.
 func (r *RedisBudgetCounter) Start(ctx context.Context) error {
 	if !r.startCalled.CompareAndSwap(false, true) {
 		return errBudgetCounterStarted
@@ -213,12 +255,25 @@ func (r *RedisBudgetCounter) Start(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 	r.started.Store(true)
-	go r.run(runCtx)
+	var loops sync.WaitGroup
+	loops.Add(2)
+	go func() {
+		defer loops.Done()
+		r.run(runCtx)
+	}()
+	go func() {
+		defer loops.Done()
+		r.refreshLoop(runCtx)
+	}()
+	go func() {
+		loops.Wait()
+		close(r.done)
+	}()
 	return nil
 }
 
-// Stop writes the final totals to Redis and stops the loop. It blocks until
-// the loop has exited; when ctx ends first, the write is abandoned. Usage
+// Stop writes the final totals to Redis and stops the loops. It blocks until
+// they have exited; when ctx ends first, the write is abandoned. Usage
 // recorded after Stop only reaches the local counters, so Stop must be called
 // after everything that records usage has stopped and before the Redis client
 // is closed.
@@ -247,6 +302,14 @@ func (r *RedisBudgetCounter) Check(ctx context.Context, s Scopes, l ScopeLimits)
 	w := windowsAt(r.now())
 	var spentBuf [maxBudgetChecks]int64
 	spent := r.shadow.spent(spentBuf[:0], checks, w)
+	for i, c := range checks {
+		view := r.persisted.usage(c.scope, w)
+		if c.monthly {
+			spent[i] = max(spent[i], view.Monthly.Tokens)
+		} else {
+			spent[i] = max(spent[i], view.Daily.Tokens)
+		}
+	}
 
 	if r.backendAllowed(w.now) {
 		b := r.bucketsFor(w)
@@ -280,6 +343,7 @@ func (r *RedisBudgetCounter) Add(_ context.Context, s Scopes, u Usage) {
 	w := windowsAt(r.now())
 	r.shadow.addAt(w, s, u)
 	r.own.addAt(w, s, u)
+	r.persisted.record(w, s, u)
 	if r.stopped.Load() {
 		return
 	}
@@ -296,12 +360,16 @@ func (r *RedisBudgetCounter) Add(_ context.Context, s Scopes, u Usage) {
 	r.mu.Unlock()
 }
 
-// Snapshot implements BudgetCounter. Like Check it reports the larger of the
-// shared sum and the shadow value and falls back to the shadow counter when
-// Redis fails, so it never returns an error.
+// Snapshot implements BudgetCounter. Like Check it reports the largest of the
+// shared sum, the shadow value and the refreshed database view, and falls
+// back to the two local values when Redis fails, so it never returns an
+// error.
 func (r *RedisBudgetCounter) Snapshot(ctx context.Context, scopeKeys []string) (map[string]WindowUsage, error) {
 	w := windowsAt(r.now())
 	out := r.shadow.snapshotAt(w, scopeKeys)
+	for _, scope := range scopeKeys {
+		out[scope] = maxWindowUsage(out[scope], r.persisted.usage(scope, w))
+	}
 	if len(scopeKeys) == 0 || !r.backendAllowed(w.now) {
 		return out, nil
 	}
@@ -323,12 +391,11 @@ func (r *RedisBudgetCounter) Snapshot(ctx context.Context, scopeKeys []string) (
 	}
 	r.backendOK(ctx)
 	for i, scope := range scopeKeys {
-		u, v := out[scope], shared[4*i:4*i+4]
-		u.Daily.Tokens = max(u.Daily.Tokens, v[0])
-		u.Monthly.Tokens = max(u.Monthly.Tokens, v[1])
-		u.Daily.CostMicros = max(u.Daily.CostMicros, v[2])
-		u.Monthly.CostMicros = max(u.Monthly.CostMicros, v[3])
-		out[scope] = u
+		v := shared[4*i : 4*i+4]
+		out[scope] = maxWindowUsage(out[scope], WindowUsage{
+			Daily:   Usage{Tokens: v[0], CostMicros: v[2]},
+			Monthly: Usage{Tokens: v[1], CostMicros: v[3]},
+		})
 	}
 	return out, nil
 }
@@ -414,8 +481,6 @@ func (r *RedisBudgetCounter) requestResync() {
 // run is the write loop. Every operation derives from ctx, which Stop cancels
 // when its own deadline passes.
 func (r *RedisBudgetCounter) run(ctx context.Context) {
-	defer close(r.done)
-
 	flushTicker := time.NewTicker(r.flushInterval)
 	defer flushTicker.Stop()
 	resyncTicker := time.NewTicker(r.resyncInterval)
@@ -434,6 +499,37 @@ func (r *RedisBudgetCounter) run(ctx context.Context) {
 			r.flush(ctx, true)
 			return
 		}
+	}
+}
+
+// refreshLoop refreshes the database view until Stop is called. It runs apart
+// from the write loop so that a slow database read never delays writes.
+func (r *RedisBudgetCounter) refreshLoop(ctx context.Context) {
+	ticker := time.NewTicker(r.refreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			r.refreshPersisted(ctx)
+		case <-r.stop:
+			return
+		}
+	}
+}
+
+// refreshPersisted reads the usage persisted by all instances into the
+// database view. On failure the previous view stays in use.
+func (r *RedisBudgetCounter) refreshPersisted(ctx context.Context) {
+	opCtx, cancel := context.WithTimeout(ctx, budgetRefreshTimeout)
+	defer cancel()
+	if err := r.persisted.refresh(opCtx, r.seeder); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		metrics.BudgetBackendErrorsTotal.WithLabelValues(budgetOpRefresh).Inc()
+		r.log.LogAttrs(ctx, slog.LevelError, "budget refresh from database failed, keeping the previous view",
+			slog.String("error", err.Error()),
+		)
 	}
 }
 

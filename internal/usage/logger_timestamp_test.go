@@ -27,6 +27,10 @@ func (s dbUsageSeeder) QueryUsageSeed(ctx context.Context, monthStart, dayStart 
 	return s.d.QueryUsageSeed(ctx, monthStart, dayStart)
 }
 
+func (s dbUsageSeeder) QueryUsageTotals(ctx context.Context, from, until, dayStart time.Time) (ratelimit.RowScanner, error) {
+	return s.d.QueryUsageTotals(ctx, from, until, dayStart)
+}
+
 // TestLogger_StoredCreatedAtEqualsEventTime verifies that usage_events.created_at
 // reflects each event's own CreatedAt — set well before the flush actually
 // happens — rather than the wall-clock time of the flush itself. One event is

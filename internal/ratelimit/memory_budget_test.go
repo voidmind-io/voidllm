@@ -728,14 +728,106 @@ type seedRow struct {
 	earlierThisMonth             bool
 }
 
-// fakeUsageSeeder is an in-memory UsageSeeder for testing seeding without a
-// real database. It returns its rows for every query and counts the queries.
-type fakeUsageSeeder struct {
-	mu    sync.Mutex
-	rows  []seedRow
-	err   error
-	calls int
+// persistedEvent is one usage event in the fake database that
+// QueryUsageTotals reads: usage of one key recorded at a point in time.
+type persistedEvent struct {
+	keyID, teamID, orgID, userID string
+	tokens                       int64
+	cost                         float64
+	at                           time.Time
 }
+
+// fakeUsageSeeder is an in-memory UsageSeeder for testing seeding and
+// refreshing without a real database. It returns rows for every seed query
+// and counts those queries. QueryUsageTotals reads events, honouring its time
+// range, and remembers the ranges it was asked for.
+type fakeUsageSeeder struct {
+	mu        sync.Mutex
+	rows      []seedRow
+	err       error
+	calls     int
+	events    []persistedEvent
+	eventsErr error
+	ranges    []timeRange
+}
+
+// timeRange is one [from, until) range a QueryUsageTotals call asked for.
+type timeRange struct{ from, until time.Time }
+
+func (f *fakeUsageSeeder) QueryUsageTotals(_ context.Context, from, until, dayStart time.Time) (RowScanner, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ranges = append(f.ranges, timeRange{from, until})
+	if f.eventsErr != nil {
+		return nil, f.eventsErr
+	}
+	var rows []persistedEvent
+	for _, e := range f.events {
+		if e.at.Before(from) || (!until.IsZero() && !e.at.Before(until)) {
+			continue
+		}
+		rows = append(rows, e)
+	}
+	return &fakeTotalsScanner{rows: rows, dayStart: dayStart, idx: -1}, nil
+}
+
+// setEvents replaces the events subsequent QueryUsageTotals calls read and
+// clears or sets their error.
+func (f *fakeUsageSeeder) setEvents(err error, events ...persistedEvent) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events, f.eventsErr = events, err
+}
+
+// addEvents appends to the events QueryUsageTotals reads.
+func (f *fakeUsageSeeder) addEvents(events ...persistedEvent) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, events...)
+}
+
+// takeRanges returns the ranges QueryUsageTotals was asked for since the last
+// call and forgets them.
+func (f *fakeUsageSeeder) takeRanges() []timeRange {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := f.ranges
+	f.ranges = nil
+	return out
+}
+
+// fakeTotalsScanner implements ratelimit.RowScanner with the column order of
+// QueryUsageTotals, one row per event.
+type fakeTotalsScanner struct {
+	rows     []persistedEvent
+	dayStart time.Time
+	idx      int
+}
+
+func (f *fakeTotalsScanner) Next() bool {
+	f.idx++
+	return f.idx < len(f.rows)
+}
+
+func (f *fakeTotalsScanner) Scan(dest ...any) error {
+	r := f.rows[f.idx]
+	*dest[0].(*string) = r.orgID
+	*dest[1].(*string) = r.teamID
+	*dest[2].(*string) = r.userID
+	*dest[3].(*string) = r.keyID
+	*dest[4].(*int64) = r.tokens
+	*dest[5].(*float64) = r.cost
+	*dest[6].(*int64) = 0
+	*dest[7].(*float64) = 0
+	if !r.at.Before(f.dayStart) {
+		*dest[6].(*int64) = r.tokens
+		*dest[7].(*float64) = r.cost
+	}
+	return nil
+}
+
+func (f *fakeTotalsScanner) Close() error { return nil }
+func (f *fakeTotalsScanner) Err() error   { return nil }
 
 func (f *fakeUsageSeeder) QueryUsageSeed(_ context.Context, _, _ time.Time) (RowScanner, error) {
 	f.mu.Lock()
@@ -752,13 +844,6 @@ func (f *fakeUsageSeeder) queries() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
-}
-
-// setRows replaces the rows returned by subsequent queries.
-func (f *fakeUsageSeeder) setRows(rows []seedRow) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.rows = rows
 }
 
 // fakeRowScanner implements ratelimit.RowScanner over an in-memory slice.

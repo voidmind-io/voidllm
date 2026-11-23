@@ -69,9 +69,15 @@ func (e *redisBudgetEnv) setTime(now time.Time) {
 	e.mr.SetTime(now)
 }
 
+// redisTestUsageFlush is the usage logger flush interval the test counters
+// are built for. Recorded usage is treated as possibly not persisted for
+// twice that plus budgetPersistSlack.
+const redisTestUsageFlush = 5 * time.Second
+
 // newCounter returns a counter on the shared Redis that has not been started.
-// Its write loop is effectively off (one hour intervals), so that tests decide
-// when totals are written by calling flush themselves.
+// Its loops are effectively off (one hour intervals), so that tests decide
+// when totals are written and when the database view is refreshed by calling
+// flush and refreshPersisted themselves.
 func (e *redisBudgetEnv) newCounter(t *testing.T, seeder UsageSeeder) (*RedisBudgetCounter, *lockedLog) {
 	t.Helper()
 	client, err := voidredis.New("redis://"+e.mr.Addr(), "t")
@@ -81,12 +87,13 @@ func (e *redisBudgetEnv) newCounter(t *testing.T, seeder UsageSeeder) (*RedisBud
 	t.Cleanup(func() { _ = client.Close() })
 
 	logs := &lockedLog{}
-	c := NewRedisBudgetCounter(client, seeder, slog.New(slog.NewTextHandler(logs, nil)))
+	c := NewRedisBudgetCounter(client, seeder, slog.New(slog.NewTextHandler(logs, nil)), redisTestUsageFlush)
 	c.now = e.clock.Now
 	c.shadow.now = e.clock.Now
 	c.own.now = e.clock.Now
 	c.flushInterval = time.Hour
 	c.resyncInterval = time.Hour
+	c.refreshInterval = time.Hour
 	return c, logs
 }
 
@@ -903,5 +910,161 @@ func TestRedisBudgetCounter_StartGuards(t *testing.T) {
 	flushNow(c)
 	if keys := env.mr.Keys(); len(keys) != 0 {
 		t.Errorf("redis keys after a full write without own usage = %v, want none", keys)
+	}
+}
+
+// refreshNow refreshes c's view of the usage persisted in the database.
+func refreshNow(c *RedisBudgetCounter) {
+	c.refreshPersisted(context.Background())
+}
+
+// orgTokens returns the daily and monthly org tokens c enforces.
+func orgTokens(t *testing.T, c *RedisBudgetCounter, orgID string) (daily, monthly int64) {
+	t.Helper()
+	u := snapshotOf(t, c, OrgScope(orgID))
+	return u.Daily.Tokens, u.Monthly.Tokens
+}
+
+// TestRedisBudgetCounter_RefreshClosesHistoryGap plays a mid-month upgrade to
+// shared budgets with three instances: the database holds 100 tokens that no
+// Redis counter knows about. Usage recorded on the other instances must
+// become visible to each instance with its next refresh, exactly, and own
+// usage must be counted once whether or not it has been persisted yet.
+func TestRedisBudgetCounter_RefreshClosesHistoryGap(t *testing.T) {
+	env := newRedisBudgetEnv(t)
+	db := &fakeUsageSeeder{
+		rows:   []seedRow{{keyID: "key-h", orgID: "o", tokens: 100}},
+		events: []persistedEvent{{keyID: "key-h", orgID: "o", tokens: 100, at: redisTestNow.Add(-2 * time.Hour)}},
+	}
+	a, _ := env.counter(t, db)
+	b, _ := env.counter(t, db)
+	c, _ := env.counter(t, db)
+	all := map[string]*RedisBudgetCounter{"a": a, "b": b, "c": c}
+
+	addTokens(b, Scopes{KeyID: "key-b", OrgID: "o"}, 20)
+	addTokens(c, Scopes{KeyID: "key-c", OrgID: "o"}, 30)
+	flushNow(b)
+	flushNow(c)
+
+	// Before any refresh: Redis only has the live 50, a's shadow only the
+	// seeded 100. The true total is 150.
+	if d, m := orgTokens(t, a, "o"); d != 100 || m != 100 {
+		t.Fatalf("a before refresh sees %d/%d, want 100/100 (the gap the refresh closes)", d, m)
+	}
+
+	// The usage loggers persist the live usage; one refresh interval later
+	// every instance reads it.
+	db.addEvents(
+		persistedEvent{keyID: "key-b", orgID: "o", tokens: 20, at: env.clock.Now()},
+		persistedEvent{keyID: "key-c", orgID: "o", tokens: 30, at: env.clock.Now()},
+	)
+	env.clock.Add(budgetRefreshInterval)
+	for name, inst := range all {
+		refreshNow(inst)
+		if d, m := orgTokens(t, inst, "o"); d != 150 || m != 150 {
+			t.Errorf("instance %s after refresh sees %d/%d, want 150/150", name, d, m)
+		}
+		s := Scopes{KeyID: "key-" + name, OrgID: "o"}
+		if err := checkTokens(inst, s, ScopeLimits{Org: Limits{MonthlyTokenLimit: 151}}); err != nil {
+			t.Errorf("instance %s: Check() with limit 151 = %v, want nil", name, err)
+		}
+		if err := checkTokens(inst, s, ScopeLimits{Org: Limits{MonthlyTokenLimit: 150}}); !errors.Is(err, ErrTokenBudgetExceeded) {
+			t.Errorf("instance %s: Check() with limit 150 = %v, want ErrTokenBudgetExceeded", name, err)
+		}
+	}
+
+	// a records 7 more. They are not persisted yet: a counts them on top of
+	// the database total at once, the others still see 150.
+	recordedAt := env.clock.Now()
+	addTokens(a, Scopes{KeyID: "key-a", OrgID: "o"}, 7)
+	if d, _ := orgTokens(t, a, "o"); d != 157 {
+		t.Errorf("a right after its own usage sees %d, want 157", d)
+	}
+	if d, _ := orgTokens(t, b, "o"); d != 150 {
+		t.Errorf("b before a's usage is shared sees %d, want 150", d)
+	}
+
+	// A refresh before the usage logger persisted the 7 must not lose them.
+	env.clock.Add(2 * time.Second)
+	refreshNow(a)
+	if d, _ := orgTokens(t, a, "o"); d != 157 {
+		t.Errorf("a after a refresh that did not contain its own usage sees %d, want 157", d)
+	}
+
+	// Now they are persisted. Until they are older than the persist
+	// allowance a counts them twice (strict side, bounded by its own usage
+	// of that time), afterwards exactly once; b sees them with its refresh.
+	db.addEvents(persistedEvent{keyID: "key-a", orgID: "o", tokens: 7, at: recordedAt})
+	env.clock.Add(2 * time.Second)
+	refreshNow(a)
+	if d, _ := orgTokens(t, a, "o"); d != 164 {
+		t.Errorf("a within the persist allowance sees %d, want 164 (157 + its own 7 once more)", d)
+	}
+	env.clock.Add(budgetRefreshInterval)
+	refreshNow(a)
+	refreshNow(b)
+	for name, inst := range map[string]*RedisBudgetCounter{"a": a, "b": b} {
+		if d, m := orgTokens(t, inst, "o"); d != 157 || m != 157 {
+			t.Errorf("instance %s in the end sees %d/%d, want 157/157", name, d, m)
+		}
+	}
+}
+
+// TestRedisBudgetCounter_RefreshHealsRedisDataLoss verifies that after Redis
+// lost the field of a stopped instance, the running instance is back at the
+// true total with its next refresh, and that a failed refresh keeps the
+// previous view and is counted.
+func TestRedisBudgetCounter_RefreshHealsRedisDataLoss(t *testing.T) {
+	env := newRedisBudgetEnv(t)
+	db := &fakeUsageSeeder{}
+	a, logs := env.counter(t, db)
+	b, _ := env.newCounter(t, db)
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	recordedAt := env.clock.Now()
+	addTokens(a, Scopes{KeyID: "key-a", OrgID: "o"}, 60)
+	addTokens(b, Scopes{KeyID: "key-b", OrgID: "o"}, 50)
+	flushNow(a)
+	stopCounter(b)
+	if d, _ := orgTokens(t, a, "o"); d != 110 {
+		t.Fatalf("a before the data loss sees %d, want 110", d)
+	}
+
+	env.mr.FlushAll()
+	a.markAllDirty()
+	flushNow(a)
+	if d, _ := orgTokens(t, a, "o"); d != 60 {
+		t.Fatalf("a after the data loss sees %d, want 60 (only its own usage is left)", d)
+	}
+
+	// A refresh that fails changes nothing and is reported.
+	before := backendErrors("refresh")
+	db.setEvents(errors.New("database is down"))
+	env.clock.Add(budgetRefreshInterval)
+	refreshNow(a)
+	if d, _ := orgTokens(t, a, "o"); d != 60 {
+		t.Errorf("a after a failed refresh sees %d, want 60", d)
+	}
+	if got := backendErrors("refresh") - before; got != 1 {
+		t.Errorf("refresh errors = %v, want 1", got)
+	}
+	if n := logs.count("budget refresh from database failed"); n != 1 {
+		t.Errorf("refresh failure logged %d times, want once", n)
+	}
+
+	// The database has everything both instances recorded.
+	db.setEvents(nil,
+		persistedEvent{keyID: "key-a", orgID: "o", tokens: 60, at: recordedAt},
+		persistedEvent{keyID: "key-b", orgID: "o", tokens: 50, at: recordedAt},
+	)
+	env.clock.Add(budgetRefreshInterval)
+	refreshNow(a)
+	if d, m := orgTokens(t, a, "o"); d != 110 || m != 110 {
+		t.Errorf("a after the refresh sees %d/%d, want 110/110", d, m)
+	}
+	if got := snapshotOf(t, a, KeyScope("key-b")).Monthly.Tokens; got != 50 {
+		t.Errorf("a sees key-b usage %d, want 50", got)
 	}
 }
