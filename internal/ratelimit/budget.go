@@ -98,8 +98,9 @@ const (
 )
 
 // maxBudgetChecks is the largest number of budgets one request can be subject
-// to: daily and monthly tokens on each of the four scopes.
-const maxBudgetChecks = 8
+// to: 4 scopes x daily/monthly x tokens/cost. Cost budgets are enforced in
+// addition to token budgets, so the bound covers both.
+const maxBudgetChecks = 16
 
 // KeyScope returns the counter scope key of an API key.
 func KeyScope(keyID string) string { return scopeKindKey + ":" + keyID }

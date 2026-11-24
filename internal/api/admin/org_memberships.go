@@ -36,12 +36,12 @@ type updateOrgMembershipRequest struct {
 	RequestsPerMinute *int    `json:"requests_per_minute"`
 	RequestsPerDay    *int    `json:"requests_per_day"`
 	// DailyCostLimit is the user's daily cost budget in this org in major
-	// currency units as a decimal string, for example "25.00". "0" means
-	// unlimited. Requires a license with cost budgets.
+	// currency units as a decimal string, for example "25.00". Omitted or null
+	// leaves it unchanged, "0" means unlimited. Requires a license with cost budgets.
 	DailyCostLimit json.RawMessage `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
 	// MonthlyCostLimit is the user's monthly cost budget in this org in major
-	// currency units as a decimal string, for example "500.00". "0" means
-	// unlimited. Requires a license with cost budgets.
+	// currency units as a decimal string, for example "500.00". Omitted or null
+	// leaves it unchanged, "0" means unlimited. Requires a license with cost budgets.
 	MonthlyCostLimit json.RawMessage `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
 }
 
@@ -334,7 +334,8 @@ func (h *Handler) UpdateOrgMembership(c fiber.Ctx) error {
 	storedCost := func() (money.Micros, money.Micros, error) {
 		return existing.DailyCostLimit, existing.MonthlyCostLimit, nil
 	}
-	if sent, err := h.rejectUnlicensedCostLimits(c, costLimits, storedCost, "org membership not found"); sent {
+	costLimits, sent, err = h.rejectUnlicensedCostLimits(c, costLimits, storedCost, "org membership not found")
+	if sent {
 		return err
 	}
 

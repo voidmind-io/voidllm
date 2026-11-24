@@ -115,17 +115,19 @@ func (m Micros) String() string {
 }
 
 // FromCost converts a cost in major currency units to micro-units, rounded to
-// the nearest micro-unit. Values that are not positive (including NaN) convert
-// to 0 and values beyond the int64 range are capped. Live usage and seeded
-// usage both go through it, so a request counts the same before and after a
-// restart.
+// the nearest micro-unit (half away from zero). Values that are not positive
+// (including NaN) convert to 0 and values above MaxMicros are clamped to
+// MaxMicros, so every returned value round-trips through JSON. Live usage and
+// seeded usage both go through it, so a request counts the same before and
+// after a restart. SQL aggregates round per event with FLOOR(x+0.5) and may
+// differ from this in the last micro for pathological values.
 func FromCost(cost float64) Micros {
 	if !(cost > 0) {
 		return 0
 	}
 	micros := math.Round(cost * Scale)
-	if micros >= math.MaxInt64 {
-		return math.MaxInt64
+	if micros >= float64(MaxMicros) {
+		return MaxMicros
 	}
 	return Micros(micros)
 }

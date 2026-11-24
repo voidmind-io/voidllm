@@ -100,14 +100,16 @@ func TestFromCost(t *testing.T) {
 		{"negative", -1.5, 0},
 		{"negative zero", math.Copysign(0, -1), 0},
 		{"nan", math.NaN(), 0},
-		{"positive infinity", math.Inf(1), math.MaxInt64},
+		{"positive infinity", math.Inf(1), MaxMicros},
 		{"negative infinity", math.Inf(-1), 0},
 		{"one micro", 0.000001, 1},
 		{"rounds up", 0.0000016, 2},
 		{"rounds down", 0.0000014, 1},
 		{"major units", 25, 25_000_000},
 		{"float noise", 0.000123, 123},
-		{"beyond int64", 1e300, math.MaxInt64},
+		{"beyond int64", 1e300, MaxMicros},
+		{"just above max", float64(MaxUnits) + 1, MaxMicros},
+		{"exactly max", float64(MaxUnits), MaxMicros},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -116,6 +118,24 @@ func TestFromCost(t *testing.T) {
 				t.Errorf("FromCost(%v) = %d, want %d", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestFromCostRoundTripsThroughJSON(t *testing.T) {
+	t.Parallel()
+
+	for _, in := range []float64{1e300, math.Inf(1), float64(MaxUnits) * 2, 25.5} {
+		out, err := json.Marshal(FromCost(in))
+		if err != nil {
+			t.Fatalf("marshal FromCost(%v): %v", in, err)
+		}
+		var back Micros
+		if err := json.Unmarshal(out, &back); err != nil {
+			t.Fatalf("FromCost(%v) = %s does not round-trip: %v", in, out, err)
+		}
+		if back != FromCost(in) {
+			t.Errorf("FromCost(%v) round-tripped to %d, want %d", in, back, FromCost(in))
+		}
 	}
 }
 

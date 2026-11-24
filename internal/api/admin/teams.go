@@ -40,12 +40,12 @@ type updateTeamRequest struct {
 	RequestsPerMinute *int    `json:"requests_per_minute"`
 	RequestsPerDay    *int    `json:"requests_per_day"`
 	// DailyCostLimit is the daily cost budget in major currency units as a
-	// decimal string, for example "25.00". "0" or omitted means unlimited.
-	// Requires a license with cost budgets.
+	// decimal string, for example "25.00". Omitted or null leaves it
+	// unchanged, "0" means unlimited. Requires a license with cost budgets.
 	DailyCostLimit json.RawMessage `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
 	// MonthlyCostLimit is the monthly cost budget in major currency units as a
-	// decimal string, for example "500.00". "0" or omitted means unlimited.
-	// Requires a license with cost budgets.
+	// decimal string, for example "500.00". Omitted or null leaves it
+	// unchanged, "0" means unlimited. Requires a license with cost budgets.
 	MonthlyCostLimit json.RawMessage `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
 }
 
@@ -176,7 +176,7 @@ func (h *Handler) CreateTeam(c fiber.Ctx) error {
 	if !slugRegex.MatchString(req.Slug) {
 		return apierror.BadRequest(c, "slug must be lowercase alphanumeric with hyphens, 2-63 characters")
 	}
-	if sent, err := h.rejectUnlicensedCostLimits(c, costLimits, nil, ""); sent {
+	if _, sent, err := h.rejectUnlicensedCostLimits(c, costLimits, nil, ""); sent {
 		return err
 	}
 
@@ -447,8 +447,15 @@ func (h *Handler) UpdateTeam(c fiber.Ctx) error {
 	storedCost := func() (money.Micros, money.Micros, error) {
 		return existing.DailyCostLimit, existing.MonthlyCostLimit, nil
 	}
-	if sent, err := h.rejectUnlicensedCostLimits(c, costLimits, storedCost, "team not found"); sent {
+	costLimits, sent, err = h.rejectUnlicensedCostLimits(c, costLimits, storedCost, "team not found")
+	if sent {
 		return err
+	}
+	if params.DailyCostLimit != nil {
+		params.DailyCostLimit = costLimits.Daily
+	}
+	if params.MonthlyCostLimit != nil {
+		params.MonthlyCostLimit = costLimits.Monthly
 	}
 
 	if _, err := h.DB.UpdateTeam(c.Context(), existing.ID, params); err != nil {

@@ -85,14 +85,18 @@ func parseCostLimits(c fiber.Ctx, daily, monthly json.RawMessage) (costLimitChan
 // Setting a non-zero limit requires license.CostBudgetsEnabled; zero is always
 // allowed, and so is re-sending the value that is already stored, so stored
 // limits survive a lapsed license and clients may echo them back unchanged.
+// An echoed unchanged non-zero value is accepted but dropped from the returned
+// change on updates, so the write cannot overwrite a limit another admin
+// cleared in the meantime; callers must write the returned change, not ch.
 // current loads the stored values and is only called when the license lacks
 // the feature and a non-zero value was sent; nil means there is no stored
-// record (create), where every stored value counts as zero. notFound is the
-// 404 message used when current reports db.ErrNotFound. It sends the response
-// and reports sent=true when the write must be rejected.
-func (h *Handler) rejectUnlicensedCostLimits(c fiber.Ctx, ch costLimitChange, current func() (money.Micros, money.Micros, error), notFound string) (bool, error) {
+// record (create), where every stored value counts as zero and nothing is
+// dropped. notFound is the 404 message used when current reports
+// db.ErrNotFound. It sends the response and reports sent=true when the write
+// must be rejected.
+func (h *Handler) rejectUnlicensedCostLimits(c fiber.Ctx, ch costLimitChange, current func() (money.Micros, money.Micros, error), notFound string) (costLimitChange, bool, error) {
 	if !ch.setsNonZero() || license.CostBudgetsEnabled(h.License.Load()) {
-		return false, nil
+		return ch, false, nil
 	}
 	var curDaily, curMonthly money.Micros
 	if current != nil {
@@ -100,16 +104,25 @@ func (h *Handler) rejectUnlicensedCostLimits(c fiber.Ctx, ch costLimitChange, cu
 		curDaily, curMonthly, err = current()
 		if err != nil {
 			if errors.Is(err, db.ErrNotFound) {
-				return true, apierror.NotFound(c, notFound)
+				return ch, true, apierror.NotFound(c, notFound)
 			}
 			h.Log.ErrorContext(c.Context(), "load stored cost limits", slog.String("error", err.Error()))
-			return true, apierror.InternalError(c, "failed to check cost limits")
+			return ch, true, apierror.InternalError(c, "failed to check cost limits")
 		}
 	}
 	if (ch.Daily != nil && *ch.Daily != 0 && *ch.Daily != curDaily) ||
 		(ch.Monthly != nil && *ch.Monthly != 0 && *ch.Monthly != curMonthly) {
-		return true, apierror.Send(c, fiber.StatusForbidden, "feature_unavailable",
+		return ch, true, apierror.Send(c, fiber.StatusForbidden, "feature_unavailable",
 			"cost limits require a Pro license")
 	}
-	return false, nil
+	if current == nil {
+		return ch, false, nil
+	}
+	if ch.Daily != nil && *ch.Daily != 0 {
+		ch.Daily = nil
+	}
+	if ch.Monthly != nil && *ch.Monthly != 0 {
+		ch.Monthly = nil
+	}
+	return ch, false, nil
 }
