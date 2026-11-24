@@ -13,6 +13,10 @@ import (
 // budget is exceeded.
 var ErrTokenBudgetExceeded = errors.New("token budget exceeded")
 
+// ErrCostBudgetExceeded is returned by BudgetCounter.Check when a cost budget
+// is exceeded and no token budget is.
+var ErrCostBudgetExceeded = errors.New("cost budget exceeded")
+
 // Usage is the consumption of one request, or the accumulated consumption of
 // one window.
 type Usage struct {
@@ -34,13 +38,16 @@ type WindowUsage struct {
 // UTC windows and enforces the budgets configured for those scopes.
 // Implementations must be safe for concurrent use.
 type BudgetCounter interface {
-	// Check verifies that no scope in s has used up a budget in l. A budget
-	// is available while the usage is below its limit; a zero limit means
-	// unlimited. The user scope is skipped when s.UserID is empty and the
-	// team scope when s.TeamID is empty. When a budget is used up it returns
-	// a *LimitError wrapping ErrTokenBudgetExceeded whose RetryAfter is the
-	// time until the latest reset among all exceeded windows, because the
-	// request stays blocked until every one of them has reset.
+	// Check verifies that no scope in s has used up a token or cost budget
+	// in l. A budget is available while the usage is below its limit; a zero
+	// limit means unlimited, so a caller that must not enforce cost budgets
+	// passes l.WithoutCostLimits(). The user scope is skipped when s.UserID
+	// is empty and the team scope when s.TeamID is empty. When a budget is
+	// used up it returns a *LimitError whose RetryAfter is the time until the
+	// latest reset among all exceeded budgets, because the request stays
+	// blocked until every one of them has reset. The error wraps
+	// ErrTokenBudgetExceeded when at least one token budget is exceeded and
+	// ErrCostBudgetExceeded when only cost budgets are.
 	Check(ctx context.Context, s Scopes, l ScopeLimits) error
 	// Add records the usage of one request for every scope in s. It never
 	// blocks on I/O.
@@ -93,6 +100,7 @@ const (
 // Values of LimitError.Metric and LimitError.Window for budget errors.
 const (
 	metricTokens  = "tokens"
+	metricCost    = "cost"
 	windowDaily   = "daily"
 	windowMonthly = "monthly"
 )
@@ -149,42 +157,57 @@ func windowsAt(now time.Time) budgetWindows {
 	}
 }
 
-// budgetCheck is one budget a request is subject to: a token limit of one
-// scope in one window.
+// budgetCheck is one budget a request is subject to: a token or cost limit of
+// one scope in one window.
 type budgetCheck struct {
 	scope   string // counter scope key, e.g. "team:<id>"
 	kind    string // scope kind, e.g. "team"
 	monthly bool   // monthly window when true, daily otherwise
+	cost    bool   // cost budget (micro-units) when true, token budget otherwise
 	limit   int64  // always > 0
 }
 
+// spentOf returns the part of u that the budget c is measured against.
+func (c budgetCheck) spentOf(u WindowUsage) int64 {
+	w := u.Daily
+	if c.monthly {
+		w = u.Monthly
+	}
+	if c.cost {
+		return w.CostMicros
+	}
+	return w.Tokens
+}
+
 // appendBudgetChecks appends one budgetCheck per configured (non-zero) token
-// limit of the scopes in s to dst, in the order key, user, team, org with the
-// daily window before the monthly one. Scopes without any limit add nothing,
-// so a request without budgets yields no checks at all.
+// or cost limit of the scopes in s to dst, in the order key, user, team, org;
+// within a scope the token budgets come before the cost budgets and the daily
+// window before the monthly one. Scopes without any limit add nothing, so a
+// request without budgets yields no checks at all.
 func appendBudgetChecks(dst []budgetCheck, s Scopes, l ScopeLimits) []budgetCheck {
-	if hasTokenLimit(l.Key) {
+	if hasBudget(l.Key) {
 		dst = appendScopeChecks(dst, scopeKindKey, KeyScope(s.KeyID), l.Key)
 	}
-	if s.UserID != "" && hasTokenLimit(l.User) {
+	if s.UserID != "" && hasBudget(l.User) {
 		dst = appendScopeChecks(dst, scopeKindUser, UserScope(s.OrgID, s.UserID), l.User)
 	}
-	if s.TeamID != "" && hasTokenLimit(l.Team) {
+	if s.TeamID != "" && hasBudget(l.Team) {
 		dst = appendScopeChecks(dst, scopeKindTeam, TeamScope(s.TeamID), l.Team)
 	}
-	if hasTokenLimit(l.Org) {
+	if hasBudget(l.Org) {
 		dst = appendScopeChecks(dst, scopeKindOrg, OrgScope(s.OrgID), l.Org)
 	}
 	return dst
 }
 
-// hasTokenLimit reports whether lim sets a daily or monthly token limit.
-func hasTokenLimit(lim Limits) bool {
-	return lim.DailyTokenLimit > 0 || lim.MonthlyTokenLimit > 0
+// hasBudget reports whether lim sets a daily or monthly token or cost limit.
+func hasBudget(lim Limits) bool {
+	return lim.DailyTokenLimit > 0 || lim.MonthlyTokenLimit > 0 ||
+		lim.DailyCostLimit > 0 || lim.MonthlyCostLimit > 0
 }
 
-// appendScopeChecks appends the daily and monthly token budgets that lim sets
-// for one scope to dst.
+// appendScopeChecks appends the daily and monthly token and cost budgets that
+// lim sets for one scope to dst.
 func appendScopeChecks(dst []budgetCheck, kind, scope string, lim Limits) []budgetCheck {
 	if lim.DailyTokenLimit > 0 {
 		dst = append(dst, budgetCheck{scope: scope, kind: kind, limit: lim.DailyTokenLimit})
@@ -192,37 +215,65 @@ func appendScopeChecks(dst []budgetCheck, kind, scope string, lim Limits) []budg
 	if lim.MonthlyTokenLimit > 0 {
 		dst = append(dst, budgetCheck{scope: scope, kind: kind, monthly: true, limit: lim.MonthlyTokenLimit})
 	}
+	if lim.DailyCostLimit > 0 {
+		dst = append(dst, budgetCheck{scope: scope, kind: kind, cost: true, limit: lim.DailyCostLimit})
+	}
+	if lim.MonthlyCostLimit > 0 {
+		dst = append(dst, budgetCheck{scope: scope, kind: kind, monthly: true, cost: true, limit: lim.MonthlyCostLimit})
+	}
 	return dst
 }
 
 // evaluateBudget compares the usage spent[i] with the limit of checks[i]. It
 // returns nil while every usage is below its limit. Otherwise it returns a
-// *LimitError wrapping ErrTokenBudgetExceeded that describes the exceeded
+// *LimitError whose RetryAfter, Metric, Scope and Window describe the exceeded
 // budget with the latest reset: daily budgets reset at the next UTC midnight,
-// monthly ones on the 1st of the next UTC month.
+// monthly ones on the 1st of the next UTC month. Among budgets that reset at
+// the same time a token budget is described rather than a cost budget, and
+// otherwise the first in check order. The error wraps ErrTokenBudgetExceeded
+// when any token budget is exceeded, whichever budget resets last, and
+// ErrCostBudgetExceeded when only cost budgets are.
 func evaluateBudget(checks []budgetCheck, spent []int64, w budgetWindows) error {
-	var exceeded *LimitError
+	var (
+		latest         budgetCheck
+		latestReset    time.Duration
+		found          bool
+		tokensExceeded bool
+	)
 	for i, c := range checks {
 		if spent[i] < c.limit {
 			continue
 		}
-		reset, window := nextUTCMidnight(w.now).Sub(w.now), windowDaily
-		if c.monthly {
-			reset, window = nextUTCMonth(w.now).Sub(w.now), windowMonthly
+		if !c.cost {
+			tokensExceeded = true
 		}
-		if exceeded != nil && reset <= exceeded.RetryAfter {
+		reset := nextUTCMidnight(w.now).Sub(w.now)
+		if c.monthly {
+			reset = nextUTCMonth(w.now).Sub(w.now)
+		}
+		if found && (reset < latestReset || (reset == latestReset && (c.cost || !latest.cost))) {
 			continue
 		}
-		exceeded = &LimitError{
-			Err:        ErrTokenBudgetExceeded,
-			RetryAfter: reset,
-			Metric:     metricTokens,
-			Scope:      c.kind,
-			Window:     window,
-		}
+		latest, latestReset, found = c, reset, true
 	}
-	if exceeded == nil {
+	if !found {
 		return nil
+	}
+	exceeded := &LimitError{
+		Err:        ErrCostBudgetExceeded,
+		RetryAfter: latestReset,
+		Metric:     metricTokens,
+		Scope:      latest.kind,
+		Window:     windowDaily,
+	}
+	if tokensExceeded {
+		exceeded.Err = ErrTokenBudgetExceeded
+	}
+	if latest.cost {
+		exceeded.Metric = metricCost
+	}
+	if latest.monthly {
+		exceeded.Window = windowMonthly
 	}
 	return exceeded
 }

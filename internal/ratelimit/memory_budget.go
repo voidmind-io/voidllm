@@ -218,15 +218,11 @@ func windowUsage(w *usageWindow, start int64) Usage {
 	return Usage{Tokens: w.tokens.Load(), CostMicros: w.cost.Load()}
 }
 
-// spent appends the tokens used so far for each of checks to dst, in order.
+// spent appends the usage so far for each of checks to dst, in order: tokens
+// for token budgets and cost in micro-units for cost budgets.
 func (m *MemoryBudgetCounter) spent(dst []int64, checks []budgetCheck, w budgetWindows) []int64 {
 	for _, c := range checks {
-		u := m.usage(c.scope, w)
-		if c.monthly {
-			dst = append(dst, u.Monthly.Tokens)
-		} else {
-			dst = append(dst, u.Daily.Tokens)
-		}
+		dst = append(dst, c.spentOf(m.usage(c.scope, w)))
 	}
 	return dst
 }

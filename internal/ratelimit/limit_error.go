@@ -5,17 +5,20 @@ import (
 	"time"
 )
 
-// LimitError wraps ErrRateLimitExceeded or ErrTokenBudgetExceeded together
-// with the time after which the rejected request may succeed again. It
-// satisfies errors.Is for the wrapped sentinel, so existing sentinel checks
-// keep working.
+// LimitError wraps ErrRateLimitExceeded, ErrTokenBudgetExceeded or
+// ErrCostBudgetExceeded together with the time after which the rejected
+// request may succeed again. It satisfies errors.Is for the wrapped sentinel,
+// so existing sentinel checks keep working.
 type LimitError struct {
 	// Err is the wrapped sentinel.
 	Err error
 	// RetryAfter is how long until the exceeded window resets.
 	RetryAfter time.Duration
-	// Metric names what ran out ("tokens" or "cost"). It is set for budget
-	// errors only and is meant for logs and metrics, never for clients.
+	// Metric names the metric of the budget that determines RetryAfter
+	// ("tokens" or "cost"). When token and cost budgets are exceeded together
+	// it can be "cost" although Err is ErrTokenBudgetExceeded; which kind of
+	// rejection it is follows from Err. Set for budget errors only; for logs
+	// and metrics, never for clients.
 	Metric string
 	// Scope names the kind of scope whose budget determines RetryAfter
 	// ("key", "user", "team" or "org"). Set for budget errors only; for logs

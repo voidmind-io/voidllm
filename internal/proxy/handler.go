@@ -29,6 +29,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/circuitbreaker"
 	"github.com/voidmind-io/voidllm/internal/cooldown"
 	"github.com/voidmind-io/voidllm/internal/jsonx"
+	"github.com/voidmind-io/voidllm/internal/license"
 	"github.com/voidmind-io/voidllm/internal/metrics"
 	"github.com/voidmind-io/voidllm/internal/pii"
 	"github.com/voidmind-io/voidllm/internal/provider"
@@ -57,7 +58,8 @@ type ProxyHandler struct {
 	HTTPClient        *http.Client
 	UsageLogger       *usage.Logger           // nil disables usage logging
 	RateLimiter       ratelimit.Checker       // nil disables rate limiting
-	BudgetCounter     ratelimit.BudgetCounter // nil disables token budget enforcement
+	BudgetCounter     ratelimit.BudgetCounter // nil disables token and cost budget enforcement
+	License           *license.Holder         // gates cost budget enforcement at request time; nil disables it
 	ShutdownState     *shutdown.State         // nil disables in-flight tracking and graceful drain
 	Tracer            trace.Tracer            // nil disables distributed tracing
 	AWSSigner         BedrockSigner           // signs bedrock models with bedrock_auth "iam"; nil makes them fail with 502
@@ -1001,11 +1003,20 @@ func (p *ProxyHandler) readAndValidateBody(c fiber.Ctx, maxRequestBody int) ([]b
 	return body, envelope, nil
 }
 
-// checkLimits evaluates rate limits and token budgets for the authenticated key.
-// It builds the Scopes and four-tier ScopeLimits from keyInfo and delegates to
-// the RateLimiter and BudgetCounter. If either check rejects the request, an API
-// error response is sent and the error is returned. Nil-safe for both
-// RateLimiter and BudgetCounter; a nil keyInfo is also safe and skips all checks.
+// checkLimits evaluates rate limits and token and cost budgets for the
+// authenticated key. It builds the Scopes and four-tier ScopeLimits from
+// keyInfo and delegates to the RateLimiter and BudgetCounter. If either check
+// rejects the request, an API error response is sent and the error is returned.
+// Nil-safe for both RateLimiter and BudgetCounter; a nil keyInfo is also safe
+// and skips all checks.
+//
+// Cost budgets are enforced only while the current license allows them (see
+// costBudgetsEnforced); usage is counted either way. A budget is checked
+// against the cost recorded so far: the cost of a request is only known once
+// its response is complete, so nothing is reserved up front, a budget can be
+// overshot by the requests in flight when it runs out, and running streams are
+// not cut. A model without prices adds no cost and therefore never uses up a
+// cost budget.
 func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 	if keyInfo == nil {
 		return nil
@@ -1068,8 +1079,18 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 	}
 
 	if p.BudgetCounter != nil {
-		if err := p.BudgetCounter.Check(c.Context(), scopes, limits); err != nil {
-			metrics.RateLimitRejectionsTotal.WithLabelValues("token").Inc()
+		budgetLimits := limits
+		if !p.costBudgetsEnforced() {
+			budgetLimits = limits.WithoutCostLimits()
+		}
+		if err := p.BudgetCounter.Check(c.Context(), scopes, budgetLimits); err != nil {
+			// A request over token and cost budgets at once is reported as a
+			// token rejection; only a cost-only rejection gets the cost code.
+			rejection := budgetRejectionToken
+			if errors.Is(err, ratelimit.ErrCostBudgetExceeded) {
+				rejection = budgetRejectionCost
+			}
+			metrics.RateLimitRejectionsTotal.WithLabelValues(rejection.metricLabel).Inc()
 			attrs := []slog.Attr{
 				slog.String("key_id", keyInfo.ID),
 				slog.String("org_id", keyInfo.OrgID),
@@ -1082,12 +1103,12 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 					slog.String("window", limitErr.Window),
 				)
 			}
-			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "token budget exceeded", attrs...)
+			p.Log.LogAttrs(c.Context(), slog.LevelWarn, rejection.message, attrs...)
 			// A budget only resets at a window boundary: tell clients not to
 			// retry-loop (x-should-retry) and when the budget frees up.
 			setRetryAfter(c, err)
 			c.Set("x-should-retry", "false")
-			if err := apierror.SendProxyQuota(c, fiber.StatusTooManyRequests, "token_limit_exceeded", "token budget exceeded"); err != nil {
+			if err := apierror.SendProxyQuota(c, fiber.StatusTooManyRequests, rejection.code, rejection.message); err != nil {
 				return err
 			}
 			return errResponseSent
@@ -1095,6 +1116,26 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 	}
 
 	return nil
+}
+
+// budgetRejection describes how a used-up budget is reported.
+type budgetRejection struct {
+	metricLabel string // "scope" label of metrics.RateLimitRejectionsTotal
+	code        string // error code sent to the client
+	message     string // error message sent to the client and logged
+}
+
+// The two kinds of budget rejection.
+var (
+	budgetRejectionToken = budgetRejection{metricLabel: "token", code: "token_limit_exceeded", message: "token budget exceeded"}
+	budgetRejectionCost  = budgetRejection{metricLabel: "cost", code: "cost_limit_exceeded", message: "cost budget exceeded"}
+)
+
+// costBudgetsEnforced reports whether the current license allows cost budgets.
+// It is read per request, so enforcement starts and stops with the license
+// without a restart.
+func (p *ProxyHandler) costBudgetsEnforced() bool {
+	return p.License != nil && license.CostBudgetsEnabled(p.License.Load())
 }
 
 // setRetryAfter sets the Retry-After header (whole seconds, at least 1) from
