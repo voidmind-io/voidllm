@@ -45,7 +45,7 @@ func openTestDB(t *testing.T, dsn string) *db.DB {
 
 // newTestLogger builds a Logger backed by d and starts it. The caller is
 // responsible for calling Stop(). The logger discards all internal log output.
-// No TokenCounter is wired; token counting is tested separately.
+// No BudgetCounter is wired; budget counting is tested separately.
 func newTestLogger(d *db.DB, cfg config.UsageConfig) *Logger {
 	return NewLogger(d, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 }
@@ -725,16 +725,89 @@ func TestLog_RequestedModelNameEqualsModelNameWhenNoFallback(t *testing.T) {
 	}
 }
 
-// TestLog_TokenCounterUpdatedBeforeFlush verifies that when a Logger is wired
-// with a TokenCounter, Log() increments the counter synchronously — before the
-// event reaches the database — so that a subsequent CheckTokens call sees the
-// current usage without waiting for the async flush.
-func TestLog_TokenCounterUpdatedBeforeFlush(t *testing.T) {
+// checkTokens runs a token budget check against c.
+func checkTokens(c ratelimit.BudgetCounter, s ratelimit.Scopes, l ratelimit.ScopeLimits) error {
+	return c.Check(context.Background(), s, l)
+}
+
+// TestLog_BudgetCounterReceivesCost verifies that Log() adds the event's cost
+// estimate to the budget counter in micro-units next to its tokens, that an
+// event without a cost estimate (unpriced model) counts as zero cost, and
+// that a restarted counter seeded from the flushed events reports the same
+// totals as the live one.
+func TestLog_BudgetCounterReceivesCost(t *testing.T) {
 	t.Parallel()
 
-	d := openTestDB(t, "file:TestLog_TokenCounterUpdatedBeforeFlush?mode=memory&cache=private")
+	d := openTestDB(t, "file:TestLog_BudgetCounterReceivesCost?mode=memory&cache=private")
 
-	counter := ratelimit.NewTokenCounter()
+	counter := ratelimit.NewMemoryBudgetCounter()
+	l := NewLogger(d, defaultCfg(), slog.New(slog.NewTextHandler(io.Discard, nil)), counter)
+	l.Start()
+
+	priced, tiny := 0.0123456, 0.0000004
+	events := []Event{
+		{KeyID: "cost-key", KeyType: "user_key", OrgID: "cost-org", TeamID: "cost-team", UserID: "cost-user",
+			ModelName: "priced", TotalTokens: 100, CostEstimate: &priced, StatusCode: 200},
+		// Unpriced model: tokens count, cost does not.
+		{KeyID: "cost-key", KeyType: "user_key", OrgID: "cost-org", ModelName: "unpriced", TotalTokens: 50, StatusCode: 200},
+		// Below half a micro-unit: rounds to zero.
+		{KeyID: "cost-key", KeyType: "user_key", OrgID: "cost-org", ModelName: "priced", TotalTokens: 1, CostEstimate: &tiny, StatusCode: 200},
+		// Cost without tokens is still counted.
+		{KeyID: "other-key", KeyType: "user_key", OrgID: "cost-org", ModelName: "priced", CostEstimate: &priced, StatusCode: 200},
+	}
+	for _, ev := range events {
+		l.Log(ev)
+	}
+
+	keys := []string{
+		ratelimit.KeyScope("cost-key"), ratelimit.KeyScope("other-key"), ratelimit.OrgScope("cost-org"),
+		ratelimit.TeamScope("cost-team"), ratelimit.UserScope("cost-org", "cost-user"),
+	}
+	want := map[string]ratelimit.Usage{
+		ratelimit.KeyScope("cost-key"):               {Tokens: 151, CostMicros: 12346},
+		ratelimit.KeyScope("other-key"):              {Tokens: 0, CostMicros: 12346},
+		ratelimit.OrgScope("cost-org"):               {Tokens: 151, CostMicros: 24692},
+		ratelimit.TeamScope("cost-team"):             {Tokens: 100, CostMicros: 12346},
+		ratelimit.UserScope("cost-org", "cost-user"): {Tokens: 100, CostMicros: 12346},
+	}
+	assertUsage := func(stage string, c ratelimit.BudgetCounter) {
+		t.Helper()
+		snap, err := c.Snapshot(context.Background(), keys)
+		if err != nil {
+			t.Fatalf("%s: Snapshot() error = %v", stage, err)
+		}
+		for k, w := range want {
+			if snap[k].Daily != w || snap[k].Monthly != w {
+				t.Errorf("%s: usage of %s = %+v, want daily and monthly %+v", stage, k, snap[k], w)
+			}
+		}
+	}
+	assertUsage("live", counter)
+
+	// Cost is counted, never enforced: only the token limit decides.
+	scopes := ratelimit.Scopes{KeyID: "cost-key", OrgID: "cost-org"}
+	if err := checkTokens(counter, scopes, ratelimit.ScopeLimits{Key: ratelimit.Limits{DailyTokenLimit: 152}}); err != nil {
+		t.Errorf("Check() = %v, want nil (151 tokens < 152, cost has no limit)", err)
+	}
+
+	stopAndWait(t, l, d, len(events))
+	restarted := ratelimit.NewMemoryBudgetCounter()
+	if err := restarted.Seed(context.Background(), dbUsageSeeder{d}); err != nil {
+		t.Fatalf("Seed() error = %v", err)
+	}
+	assertUsage("seeded after restart", restarted)
+}
+
+// TestLog_BudgetCounterUpdatedBeforeFlush verifies that when a Logger is wired
+// with a BudgetCounter, Log() increments the counter synchronously — before the
+// event reaches the database — so that a subsequent Check call sees the
+// current usage without waiting for the async flush.
+func TestLog_BudgetCounterUpdatedBeforeFlush(t *testing.T) {
+	t.Parallel()
+
+	d := openTestDB(t, "file:TestLog_BudgetCounterUpdatedBeforeFlush?mode=memory&cache=private")
+
+	counter := ratelimit.NewMemoryBudgetCounter()
 	cfg := defaultCfg() // long flush interval — DB write will not happen during the test
 	l := NewLogger(d, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), counter)
 	l.Start()
@@ -760,14 +833,14 @@ func TestLog_TokenCounterUpdatedBeforeFlush(t *testing.T) {
 	noLimits := ratelimit.Limits{}
 
 	scopes := ratelimit.Scopes{KeyID: "tc-key", TeamID: "tc-team", OrgID: "tc-org"}
-	if err := counter.CheckTokens(scopes, ratelimit.ScopeLimits{Key: keyLimits, Team: noLimits, Org: noLimits}); err != nil {
-		t.Errorf("CheckTokens() immediately after Log() = %v, want nil (100 tokens < limit 200)", err)
+	if err := checkTokens(counter, scopes, ratelimit.ScopeLimits{Key: keyLimits, Team: noLimits, Org: noLimits}); err != nil {
+		t.Errorf("Check() immediately after Log() = %v, want nil (100 tokens < limit 200)", err)
 	}
 
 	// Now verify the counter blocks a request that would exceed the budget.
 	keyLimitsExceeded := ratelimit.Limits{DailyTokenLimit: 100}
-	if err := counter.CheckTokens(scopes, ratelimit.ScopeLimits{Key: keyLimitsExceeded, Team: noLimits, Org: noLimits}); err == nil {
-		t.Error("CheckTokens() = nil, want ErrTokenBudgetExceeded (100 tokens >= limit 100)")
+	if err := checkTokens(counter, scopes, ratelimit.ScopeLimits{Key: keyLimitsExceeded, Team: noLimits, Org: noLimits}); err == nil {
+		t.Error("Check() = nil, want ErrTokenBudgetExceeded (100 tokens >= limit 100)")
 	}
 
 	// Confirm the DB row is not yet written (flush has not fired).
@@ -776,7 +849,7 @@ func TestLog_TokenCounterUpdatedBeforeFlush(t *testing.T) {
 	}
 }
 
-// TestLog_TokenCounterConsumesFullAnthropicShapedTotal verifies that an
+// TestLog_BudgetCounterConsumesFullAnthropicShapedTotal verifies that an
 // Anthropic-shaped event — where PromptTokens already includes the cache-read
 // tokens the adapter folded in (see AnthropicAdapter.TransformResponse /
 // StreamUsage) — is counted against the token budget by its full TotalTokens,
@@ -786,12 +859,12 @@ func TestLog_TokenCounterUpdatedBeforeFlush(t *testing.T) {
 // here (a caller could exceed their real token spend before CheckTokens
 // blocked them). This test uses realistic Anthropic-shaped numbers: 10 fresh
 // input tokens + 50 cache-read tokens + 40 completion tokens = 100 total.
-func TestLog_TokenCounterConsumesFullAnthropicShapedTotal(t *testing.T) {
+func TestLog_BudgetCounterConsumesFullAnthropicShapedTotal(t *testing.T) {
 	t.Parallel()
 
-	d := openTestDB(t, "file:TestLog_TokenCounterConsumesFullAnthropicShapedTotal?mode=memory&cache=private")
+	d := openTestDB(t, "file:TestLog_BudgetCounterConsumesFullAnthropicShapedTotal?mode=memory&cache=private")
 
-	counter := ratelimit.NewTokenCounter()
+	counter := ratelimit.NewMemoryBudgetCounter()
 	cfg := defaultCfg()
 	l := NewLogger(d, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), counter)
 	l.Start()
@@ -822,14 +895,14 @@ func TestLog_TokenCounterConsumesFullAnthropicShapedTotal(t *testing.T) {
 	keyLimitsExceeded := ratelimit.Limits{DailyTokenLimit: 99}
 	noLimits := ratelimit.Limits{}
 	scopes := ratelimit.Scopes{KeyID: "anthropic-cache-key", OrgID: "anthropic-cache-org"}
-	if err := counter.CheckTokens(scopes, ratelimit.ScopeLimits{Key: keyLimitsExceeded, Team: noLimits, Org: noLimits}); err == nil {
-		t.Error("CheckTokens() = nil, want ErrTokenBudgetExceeded (full 100-token total, including cache reads, must be counted)")
+	if err := checkTokens(counter, scopes, ratelimit.ScopeLimits{Key: keyLimitsExceeded, Team: noLimits, Org: noLimits}); err == nil {
+		t.Error("Check() = nil, want ErrTokenBudgetExceeded (full 100-token total, including cache reads, must be counted)")
 	}
 
 	// A budget of exactly 100 (the correct, fully-inclusive total) must not
 	// yet be exceeded — this distinguishes "counts the full total" from "over-counts".
 	keyLimitsExact := ratelimit.Limits{DailyTokenLimit: 101}
-	if err := counter.CheckTokens(scopes, ratelimit.ScopeLimits{Key: keyLimitsExact, Team: noLimits, Org: noLimits}); err != nil {
-		t.Errorf("CheckTokens() with limit 101 = %v, want nil (100 tokens < limit 101)", err)
+	if err := checkTokens(counter, scopes, ratelimit.ScopeLimits{Key: keyLimitsExact, Team: noLimits, Org: noLimits}); err != nil {
+		t.Errorf("Check() with limit 101 = %v, want nil (100 tokens < limit 101)", err)
 	}
 }

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -22,9 +23,15 @@ func limitApp(t *testing.T, info auth.KeyInfo) (*fiber.App, *ProxyHandler, strin
 	t.Helper()
 	h := testProxyHandler(t, "http://127.0.0.1:1")
 	h.RateLimiter = ratelimit.NewRateLimiter()
-	h.TokenCounter = ratelimit.NewTokenCounter()
+	h.BudgetCounter = ratelimit.NewMemoryBudgetCounter()
 	app, key := testAppWithAuth(t, h, info)
 	return app, h, key
+}
+
+// chargeTokens records n tokens for the given key and org on h's budget
+// counter.
+func chargeTokens(h *ProxyHandler, keyID, orgID string, n int64) {
+	h.BudgetCounter.Add(context.Background(), ratelimit.Scopes{KeyID: keyID, OrgID: orgID}, ratelimit.Usage{Tokens: n})
 }
 
 func postLimited(t *testing.T, app *fiber.App, path, key string) *http.Response {
@@ -49,7 +56,7 @@ func TestLimitRejection_TokenBudgetHeaders(t *testing.T) {
 			t.Parallel()
 			info := auth.KeyInfo{ID: "tok-key", KeyType: keygen.KeyTypeUser, OrgID: "tok-org", Role: auth.RoleMember, DailyTokenLimit: 100}
 			app, h, key := limitApp(t, info)
-			h.TokenCounter.Add(ratelimit.Scopes{KeyID: "tok-key", OrgID: "tok-org"}, 100)
+			chargeTokens(h, "tok-key", "tok-org", 100)
 
 			resp := postLimited(t, app, path, key)
 			if resp.StatusCode != http.StatusTooManyRequests {
@@ -70,7 +77,7 @@ func TestLimitRejection_MonthlyBudgetRetryAfterIsUntilMonthEnd(t *testing.T) {
 	t.Parallel()
 	info := auth.KeyInfo{ID: "mon-key", KeyType: keygen.KeyTypeUser, OrgID: "mon-org", Role: auth.RoleMember, MonthlyTokenLimit: 50}
 	app, h, key := limitApp(t, info)
-	h.TokenCounter.Add(ratelimit.Scopes{KeyID: "mon-key", OrgID: "mon-org"}, 50)
+	chargeTokens(h, "mon-key", "mon-org", 50)
 
 	resp := postLimited(t, app, "/v1/chat/completions", key)
 	if resp.StatusCode != http.StatusTooManyRequests {
@@ -132,7 +139,7 @@ func TestLimitRejection_TokenBudgetBodyShape(t *testing.T) {
 			t.Parallel()
 			info := auth.KeyInfo{ID: "tok-key", KeyType: keygen.KeyTypeUser, OrgID: "tok-org", Role: auth.RoleMember, DailyTokenLimit: 100}
 			app, h, key := limitApp(t, info)
-			h.TokenCounter.Add(ratelimit.Scopes{KeyID: "tok-key", OrgID: "tok-org"}, 100)
+			chargeTokens(h, "tok-key", "tok-org", 100)
 
 			resp := postLimited(t, app, tt.path, key)
 			if resp.StatusCode != http.StatusTooManyRequests {
@@ -159,7 +166,7 @@ func TestLimitRejection_TokenBudgetMessagesKeepsAnthropicEnvelope(t *testing.T) 
 	t.Parallel()
 	info := auth.KeyInfo{ID: "tok-key", KeyType: keygen.KeyTypeUser, OrgID: "tok-org", Role: auth.RoleMember, DailyTokenLimit: 100}
 	app, h, key := limitApp(t, info)
-	h.TokenCounter.Add(ratelimit.Scopes{KeyID: "tok-key", OrgID: "tok-org"}, 100)
+	chargeTokens(h, "tok-key", "tok-org", 100)
 
 	resp := postLimited(t, app, "/v1/messages", key)
 	if resp.StatusCode != http.StatusTooManyRequests {

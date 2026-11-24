@@ -84,8 +84,12 @@ type Application struct {
 	// disabled — see reconcileMCPListenTargets, which no-ops in that case.
 	mcpListenManager *mcp.ListenManager
 
-	rateLimiter      ratelimit.Checker
-	tokenCounter     *ratelimit.TokenCounter
+	rateLimiter   ratelimit.Checker
+	budgetCounter ratelimit.BudgetCounter
+	// redisBudget is budgetCounter when budgets are shared through Redis,
+	// kept by its concrete type because it has a worker to stop on shutdown.
+	// Nil when budgets are counted in memory.
+	redisBudget      *ratelimit.RedisBudgetCounter
 	loginThrottle    *auth.LoginThrottle
 	usageLogger      *usage.Logger
 	mcpLogger        *usage.MCPLogger
@@ -98,7 +102,11 @@ type Application struct {
 	proxyHandler  *proxy.ProxyHandler
 	adminHandler  *admin.Handler
 
+	// redisClient is the Redis client when Redis answered at startup, nil
+	// otherwise. redisConn is the client whenever Redis is configured; it is
+	// what the budget counter uses and what cleanup closes.
 	redisClient *voidredis.Client
+	redisConn   *voidredis.Client
 	redisCancel context.CancelFunc
 
 	proxyApp *fiber.App
@@ -128,8 +136,25 @@ type Application struct {
 // an import cycle between the db and ratelimit packages.
 type dbUsageSeeder db.DB
 
-func (s *dbUsageSeeder) QueryUsageSeed(ctx context.Context, since time.Time) (ratelimit.RowScanner, error) {
-	return (*db.DB)(s).QueryUsageSeed(ctx, since)
+func (s *dbUsageSeeder) QueryUsageSeed(ctx context.Context, monthStart, dayStart time.Time) (ratelimit.RowScanner, error) {
+	return (*db.DB)(s).QueryUsageSeed(ctx, monthStart, dayStart)
+}
+
+func (s *dbUsageSeeder) QueryUsageTotals(ctx context.Context, from, until, dayStart time.Time) (ratelimit.RowScanner, error) {
+	return (*db.DB)(s).QueryUsageTotals(ctx, from, until, dayStart)
+}
+
+// redisBudgetDrainTimeout bounds how long shutdown waits for the final budget
+// totals to be written to Redis.
+const redisBudgetDrainTimeout = 5 * time.Second
+
+// stopRedisBudget has the Redis budget counter write its final totals and
+// stops it, giving up after redisBudgetDrainTimeout. It must run after the
+// usage logger has stopped and before the Redis client is closed.
+func stopRedisBudget(counter *ratelimit.RedisBudgetCounter) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisBudgetDrainTimeout)
+	defer cancel()
+	counter.Stop(ctx)
 }
 
 // New constructs a fully-initialised Application by wiring all dependencies in
@@ -226,6 +251,9 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		usageLogger      *usage.Logger
 		auditLogger      *audit.Logger
 		retentionCleaner *retention.Cleaner
+		redisBudget      *ratelimit.RedisBudgetCounter
+		redisConn        *voidredis.Client
+		redisCancel      context.CancelFunc
 	)
 
 	// From this point on, any early return must clean up in reverse order.
@@ -244,6 +272,15 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		}
 		if auditLogger != nil {
 			auditLogger.Stop()
+		}
+		if redisBudget != nil {
+			stopRedisBudget(redisBudget)
+		}
+		if redisCancel != nil {
+			redisCancel()
+		}
+		if redisConn != nil {
+			redisConn.Close() //nolint:errcheck // best-effort on error path
 		}
 		crypto.ZeroKey(hmacSecret)
 		crypto.ZeroKey(encKey)
@@ -499,14 +536,67 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	}
 	log.LogAttrs(ctx, slog.LevelInfo, "key cache seeded", slog.Int("keys", keyCache.Len()))
 
-	// Step 7: seed token counter from recent usage events.
-	tokenCounter := ratelimit.NewTokenCounter()
-	if err := tokenCounter.Seed(ctx, (*dbUsageSeeder)(database)); err != nil {
-		return nil, fmt.Errorf("seed token counter: %w", err)
+	// Step 7: connect Redis (optional). The connection is made here, ahead
+	// of the pub/sub subscriber in step 10, because the budget counter below
+	// needs it.
+	//
+	// redisConn is the client whenever Redis is configured with a usable
+	// URL. redisClient is the same client, but only when Redis answered at
+	// startup: rate limiting, cache invalidation and the admin handlers use
+	// it and run without Redis otherwise, as they always have. The budget
+	// counter uses redisConn either way: with Redis down it starts degraded
+	// and picks Redis up once it is reachable, instead of counting per
+	// instance until the next restart.
+	redisCtx, cancelRedis := context.WithCancel(context.Background())
+	redisCancel = cancelRedis
+	var redisClient *voidredis.Client
+
+	if cfg.Redis.Enabled {
+		conn, redisErr := voidredis.NewUnverified(cfg.Redis.URL, cfg.Redis.KeyPrefix)
+		if redisErr != nil {
+			log.LogAttrs(ctx, slog.LevelError, "redis configuration invalid, continuing without redis",
+				slog.String("error", redisErr.Error()),
+			)
+		} else {
+			redisConn = conn
+			pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
+			pingErr := conn.Ping(pingCtx)
+			pingCancel()
+			if pingErr != nil {
+				log.LogAttrs(ctx, slog.LevelError, "redis connection failed, continuing without redis; budgets are shared once redis is reachable",
+					slog.String("error", pingErr.Error()),
+				)
+			} else {
+				redisClient = conn
+				log.LogAttrs(ctx, slog.LevelInfo, "redis connected")
+			}
+		}
+	}
+
+	// Budget counter, seeded from recent usage events: shared through Redis
+	// when Redis is configured, otherwise in the memory of this instance.
+	var budgetCounter ratelimit.BudgetCounter
+	if redisConn != nil {
+		redisBudget = ratelimit.NewRedisBudgetCounter(redisConn, (*dbUsageSeeder)(database), log, cfg.Settings.Usage.FlushInterval)
+		if err := redisBudget.Start(ctx); err != nil {
+			redisBudget = nil
+			redisCancel()
+			return nil, fmt.Errorf("start budget counter: %w", err)
+		}
+		budgetCounter = redisBudget
+		log.LogAttrs(ctx, slog.LevelInfo, "token budgets: distributed (Redis)")
+	} else {
+		memBudget := ratelimit.NewMemoryBudgetCounter()
+		if err := memBudget.Seed(ctx, (*dbUsageSeeder)(database)); err != nil {
+			redisCancel()
+			return nil, fmt.Errorf("seed budget counter: %w", err)
+		}
+		budgetCounter = memBudget
+		log.LogAttrs(ctx, slog.LevelInfo, "token budgets: in-memory (single instance)")
 	}
 
 	// Step 8: start usage logger (always) and audit logger (if enabled).
-	usageLogger = usage.NewLogger(database, cfg.Settings.Usage, log, tokenCounter)
+	usageLogger = usage.NewLogger(database, cfg.Settings.Usage, log, budgetCounter)
 	usageLogger.Start()
 
 	metrics.RegisterDBCollectors(database.SQL())
@@ -527,6 +617,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	accessCache := proxy.NewModelAccessCache()
 	orgA, teamA, keyA, err := database.LoadAllModelAccess(ctx)
 	if err != nil {
+		redisCancel()
 		return nil, fmt.Errorf("load model access cache: %w", err)
 	}
 	accessCache.Load(orgA, teamA, keyA)
@@ -572,68 +663,56 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	// simply has not been reconciled yet.
 	mcpSessionRegistry := mcp.NewSessionRegistry()
 
-	// Step 10: connect Redis (optional). On failure, continue without Redis.
-	redisCtx, redisCancel := context.WithCancel(context.Background())
-	var redisClient *voidredis.Client
-
-	if cfg.Redis.Enabled {
-		var redisErr error
-		redisClient, redisErr = voidredis.New(cfg.Redis.URL, cfg.Redis.KeyPrefix)
-		if redisErr != nil {
-			log.LogAttrs(ctx, slog.LevelError, "redis connection failed, continuing without redis",
-				slog.String("error", redisErr.Error()),
-			)
-		} else {
-			log.LogAttrs(ctx, slog.LevelInfo, "redis connected")
-
-			// Start the pub/sub subscriber goroutine. It blocks until redisCtx
-			// is canceled (on shutdown) and handles cache invalidation messages
-			// published by other VoidLLM instances.
-			go redisClient.SubscribeInvalidations(redisCtx, log, func(channel, payload string) {
-				switch channel {
-				case voidredis.ChannelKeys:
-					// "reload", "org:<id>" and "team:<id>" reload the key cache
-					// (limits are cached inside KeyInfo); anything else is a key
-					// hash and evicts exactly that entry.
-					auth.HandleKeyInvalidation(payload, keyReloader, keyCache)
-					log.LogAttrs(context.Background(), slog.LevelDebug, "redis: key cache invalidated")
-				case voidredis.ChannelModels:
-					// Reload all active models into the registry from the DB.
-					if loadErr := loadModelsIntoRegistry(context.Background()); loadErr != nil {
-						log.LogAttrs(context.Background(), slog.LevelError,
-							"redis: reload model registry failed",
-							slog.String("error", loadErr.Error()),
-						)
-						return
-					}
-					log.LogAttrs(context.Background(), slog.LevelDebug, "redis: model registry reloaded")
-				case voidredis.ChannelAccess:
-					// Reload full model access cache from the database.
-					orgA, teamA, keyA, loadErr := database.LoadAllModelAccess(context.Background())
-					if loadErr != nil {
-						log.LogAttrs(context.Background(), slog.LevelError,
-							"redis: reload access cache failed",
-							slog.String("error", loadErr.Error()),
-						)
-						return
-					}
-					accessCache.Load(orgA, teamA, keyA)
-					log.LogAttrs(context.Background(), slog.LevelDebug, "redis: access cache reloaded")
-				case voidredis.ChannelAliases:
-					// Reload full alias cache from the database.
-					orgAl, teamAl, loadErr := database.LoadAllModelAliases(context.Background())
-					if loadErr != nil {
-						log.LogAttrs(context.Background(), slog.LevelError,
-							"redis: reload alias cache failed",
-							slog.String("error", loadErr.Error()),
-						)
-						return
-					}
-					aliasCache.Load(orgAl, teamAl)
-					log.LogAttrs(context.Background(), slog.LevelDebug, "redis: alias cache reloaded")
+	// Step 10: subscribe to Redis cache invalidations (when Redis is
+	// connected, see step 7).
+	if redisClient != nil {
+		// Start the pub/sub subscriber goroutine. It blocks until redisCtx
+		// is canceled (on shutdown) and handles cache invalidation messages
+		// published by other VoidLLM instances.
+		go redisClient.SubscribeInvalidations(redisCtx, log, func(channel, payload string) {
+			switch channel {
+			case voidredis.ChannelKeys:
+				// "reload", "org:<id>" and "team:<id>" reload the key cache
+				// (limits are cached inside KeyInfo); anything else is a key
+				// hash and evicts exactly that entry.
+				auth.HandleKeyInvalidation(payload, keyReloader, keyCache)
+				log.LogAttrs(context.Background(), slog.LevelDebug, "redis: key cache invalidated")
+			case voidredis.ChannelModels:
+				// Reload all active models into the registry from the DB.
+				if loadErr := loadModelsIntoRegistry(context.Background()); loadErr != nil {
+					log.LogAttrs(context.Background(), slog.LevelError,
+						"redis: reload model registry failed",
+						slog.String("error", loadErr.Error()),
+					)
+					return
 				}
-			})
-		}
+				log.LogAttrs(context.Background(), slog.LevelDebug, "redis: model registry reloaded")
+			case voidredis.ChannelAccess:
+				// Reload full model access cache from the database.
+				orgA, teamA, keyA, loadErr := database.LoadAllModelAccess(context.Background())
+				if loadErr != nil {
+					log.LogAttrs(context.Background(), slog.LevelError,
+						"redis: reload access cache failed",
+						slog.String("error", loadErr.Error()),
+					)
+					return
+				}
+				accessCache.Load(orgA, teamA, keyA)
+				log.LogAttrs(context.Background(), slog.LevelDebug, "redis: access cache reloaded")
+			case voidredis.ChannelAliases:
+				// Reload full alias cache from the database.
+				orgAl, teamAl, loadErr := database.LoadAllModelAliases(context.Background())
+				if loadErr != nil {
+					log.LogAttrs(context.Background(), slog.LevelError,
+						"redis: reload alias cache failed",
+						slog.String("error", loadErr.Error()),
+					)
+					return
+				}
+				aliasCache.Load(orgAl, teamAl)
+				log.LogAttrs(context.Background(), slog.LevelDebug, "redis: alias cache reloaded")
+			}
+		})
 	}
 
 	// Select rate limiter implementation: distributed (Redis) when available,
@@ -746,7 +825,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	proxyHandler.Router = modelRouter
 	proxyHandler.UsageLogger = usageLogger
 	proxyHandler.RateLimiter = rateLimiter
-	proxyHandler.TokenCounter = tokenCounter
+	proxyHandler.BudgetCounter = budgetCounter
 	proxyHandler.ShutdownState = shutdownState
 	proxyHandler.Tracer = tracer
 	proxyHandler.MaxRequestBody = cfg.Server.Proxy.MaxRequestBody
@@ -1304,7 +1383,8 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		mcpTransportCache: mcpTransportCache,
 		mcpListenManager:  mcpListenManager,
 		rateLimiter:       rateLimiter,
-		tokenCounter:      tokenCounter,
+		budgetCounter:     budgetCounter,
+		redisBudget:       redisBudget,
 		loginThrottle:     loginThrottle,
 		usageLogger:       usageLogger,
 		mcpLogger:         mcpLogger,
@@ -1316,6 +1396,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 		proxyHandler:      proxyHandler,
 		adminHandler:      adminHandler,
 		redisClient:       redisClient,
+		redisConn:         redisConn,
 		redisCancel:       redisCancel,
 		otelShutdown:      otelShutdownFn,
 	}, nil
@@ -1371,7 +1452,7 @@ func (a *Application) Start() error {
 			a.aliasCache.Load(orgAliases, teamAliases)
 		}),
 		startTicker(5*time.Minute, func() {
-			a.tokenCounter.EvictStale()
+			a.budgetCounter.EvictStale()
 			a.loginThrottle.EvictStale()
 		}),
 		startTicker(30*time.Second, func() {
@@ -1847,20 +1928,15 @@ func isCodeModeOOM(msg string) bool {
 }
 
 // cleanup tears down resources in reverse startup order: Redis pub/sub,
-// key cache reloader, background tickers (LIFO), usage/audit loggers, Redis connection, database.
+// key cache reloader, background tickers (LIFO), usage/audit loggers, budget
+// counter, Redis connection, database.
 // Sensitive key material is zeroed last, after all components that might still
 // need to decrypt data have been stopped. cleanup must be called exactly once,
 // by WaitForShutdown.
 func (a *Application) cleanup(ctx context.Context) {
-	// Cancel Redis pub/sub subscriber before stopping the client.
+	// Cancel the Redis pub/sub subscriber. The client itself stays open
+	// until the budget counter has written its final totals below.
 	a.redisCancel()
-	if a.redisClient != nil {
-		if err := a.redisClient.Close(); err != nil {
-			a.log.LogAttrs(ctx, slog.LevelError, "redis close error",
-				slog.String("error", err.Error()),
-			)
-		}
-	}
 
 	// Stop the key cache reloader before the tickers and long before the
 	// database closes: it cancels a load in flight, waits for its goroutine
@@ -1880,6 +1956,19 @@ func (a *Application) cleanup(ctx context.Context) {
 	}
 	if a.auditLogger != nil {
 		a.auditLogger.Stop()
+	}
+
+	// With the usage logger stopped no more usage is recorded: write the
+	// final budget totals to Redis, then close the client.
+	if a.redisBudget != nil {
+		stopRedisBudget(a.redisBudget)
+	}
+	if a.redisConn != nil {
+		if err := a.redisConn.Close(); err != nil {
+			a.log.LogAttrs(ctx, slog.LevelError, "redis close error",
+				slog.String("error", err.Error()),
+			)
+		}
 	}
 
 	// Flush buffered OTel spans. Use a bounded context so a slow collector

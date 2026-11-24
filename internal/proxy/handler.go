@@ -57,7 +57,7 @@ type ProxyHandler struct {
 	HTTPClient        *http.Client
 	UsageLogger       *usage.Logger           // nil disables usage logging
 	RateLimiter       ratelimit.Checker       // nil disables rate limiting
-	TokenCounter      *ratelimit.TokenCounter // nil disables token budget enforcement
+	BudgetCounter     ratelimit.BudgetCounter // nil disables token budget enforcement
 	ShutdownState     *shutdown.State         // nil disables in-flight tracking and graceful drain
 	Tracer            trace.Tracer            // nil disables distributed tracing
 	AWSSigner         BedrockSigner           // signs bedrock models with bedrock_auth "iam"; nil makes them fail with 502
@@ -1003,9 +1003,9 @@ func (p *ProxyHandler) readAndValidateBody(c fiber.Ctx, maxRequestBody int) ([]b
 
 // checkLimits evaluates rate limits and token budgets for the authenticated key.
 // It builds the Scopes and four-tier ScopeLimits from keyInfo and delegates to
-// the RateLimiter and TokenCounter. If either check rejects the request, an API
+// the RateLimiter and BudgetCounter. If either check rejects the request, an API
 // error response is sent and the error is returned. Nil-safe for both
-// RateLimiter and TokenCounter; a nil keyInfo is also safe and skips all checks.
+// RateLimiter and BudgetCounter; a nil keyInfo is also safe and skips all checks.
 func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 	if keyInfo == nil {
 		return nil
@@ -1059,13 +1059,22 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 		}
 	}
 
-	if p.TokenCounter != nil {
-		if err := p.TokenCounter.CheckTokens(scopes, limits); err != nil {
+	if p.BudgetCounter != nil {
+		if err := p.BudgetCounter.Check(c.Context(), scopes, limits); err != nil {
 			metrics.RateLimitRejectionsTotal.WithLabelValues("token").Inc()
-			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "token budget exceeded",
+			attrs := []slog.Attr{
 				slog.String("key_id", keyInfo.ID),
 				slog.String("org_id", keyInfo.OrgID),
-			)
+			}
+			var limitErr *ratelimit.LimitError
+			if errors.As(err, &limitErr) {
+				attrs = append(attrs,
+					slog.String("metric", limitErr.Metric),
+					slog.String("scope", limitErr.Scope),
+					slog.String("window", limitErr.Window),
+				)
+			}
+			p.Log.LogAttrs(c.Context(), slog.LevelWarn, "token budget exceeded", attrs...)
 			// A budget only resets at a window boundary: tell clients not to
 			// retry-loop (x-should-retry) and when the budget frees up.
 			setRetryAfter(c, err)

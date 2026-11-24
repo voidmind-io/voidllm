@@ -71,7 +71,7 @@ type nhOpts struct {
 	useRouter     bool
 	fallbackDepth int
 	rateLimiter   bool
-	tokenCounter  bool
+	budgetCounter bool
 	access        func(keyID string) *proxy.ModelAccessCache
 }
 
@@ -79,7 +79,7 @@ type nhEnv struct {
 	app     *fiber.App
 	h       *proxy.ProxyHandler
 	d       *db.DB
-	tc      *ratelimit.TokenCounter
+	tc      ratelimit.BudgetCounter
 	logs    *lockedBuf
 	key     string
 	info    auth.KeyInfo
@@ -115,9 +115,11 @@ func newNHEnv(t *testing.T, o nhOpts) *nhEnv {
 		t.Fatalf("db.RunMigrations: %v", err)
 	}
 
-	var tc *ratelimit.TokenCounter
-	if o.tokenCounter {
-		tc = ratelimit.NewTokenCounter()
+	// An interface variable, so that it stays a nil interface (budget
+	// counting disabled) when no counter is wanted.
+	var tc ratelimit.BudgetCounter
+	if o.budgetCounter {
+		tc = ratelimit.NewMemoryBudgetCounter()
 	}
 	ul := usage.NewLogger(d, config.UsageConfig{BufferSize: 64, FlushInterval: 20 * time.Millisecond}, log, tc)
 	ul.Start()
@@ -128,7 +130,7 @@ func newNHEnv(t *testing.T, o nhOpts) *nhEnv {
 	}
 	h := proxy.NewProxyHandler(reg, log)
 	h.UsageLogger = ul
-	h.TokenCounter = tc
+	h.BudgetCounter = tc
 	h.FallbackMaxDepth = o.fallbackDepth
 	if o.rateLimiter {
 		h.RateLimiter = ratelimit.NewRateLimiter()
@@ -185,6 +187,11 @@ func (e *nhEnv) addKey(t *testing.T, id string, mutate func(*auth.KeyInfo)) (str
 
 func (e *nhEnv) scopes() ratelimit.Scopes {
 	return ratelimit.Scopes{KeyID: e.info.ID, OrgID: e.info.OrgID}
+}
+
+// checkTokens runs a token budget check for the env's key against limits.
+func (e *nhEnv) checkTokens(limits ratelimit.ScopeLimits) error {
+	return e.tc.Check(context.Background(), e.scopes(), limits)
 }
 
 func (e *nhEnv) do(t *testing.T, path, body string, hdr map[string]string) (int, http.Header, string) {
@@ -663,7 +670,7 @@ func TestNativeHandler_TokenBudgetEnforced(t *testing.T) {
 			anth := jsonUpstream(t, http.StatusOK, messagesJSON(60, 60))
 			oai := jsonUpstream(t, http.StatusOK, responsesJSON(60, 60))
 			env := newNHEnv(t, nhOpts{
-				tokenCounter: true,
+				budgetCounter: true,
 				models: []config.ModelConfig{
 					anthModel("claude", anth.srv.URL),
 					oaiModel("gpt", "openai", oai.srv.URL),
@@ -672,7 +679,7 @@ func TestNativeHandler_TokenBudgetEnforced(t *testing.T) {
 			})
 			limits := ratelimit.ScopeLimits{Key: ratelimit.Limits{DailyTokenLimit: 100}}
 
-			if err := env.tc.CheckTokens(env.scopes(), limits); err != nil {
+			if err := env.checkTokens(limits); err != nil {
 				t.Fatalf("budget exhausted before any request: %v", err)
 			}
 			charge := messagesBody("claude", false)
@@ -683,7 +690,7 @@ func TestNativeHandler_TokenBudgetEnforced(t *testing.T) {
 				t.Fatalf("charging request: status %d body %s", status, body)
 			}
 			waitFor(t, "usage charged to the token counter", func() bool {
-				return env.tc.CheckTokens(env.scopes(), limits) != nil
+				return env.checkTokens(limits) != nil
 			})
 
 			status, body := env.post(t, "/v1/messages", messagesBody("claude", false))
@@ -769,9 +776,9 @@ func TestNativeHandler_CountTokensRateLimitedButNotBilled(t *testing.T) {
 		fmt.Fprint(w, messagesJSON(2, 3))
 	})
 	env := newNHEnv(t, nhOpts{
-		rateLimiter:  true,
-		tokenCounter: true,
-		models:       []config.ModelConfig{anthModel("claude", ct.srv.URL)},
+		rateLimiter:   true,
+		budgetCounter: true,
+		models:        []config.ModelConfig{anthModel("claude", ct.srv.URL)},
 		mutateKey: func(k *auth.KeyInfo) {
 			k.RequestsPerMinute = 2
 			k.DailyTokenLimit = 1
@@ -807,7 +814,7 @@ func TestNativeHandler_CountTokensRateLimitedButNotBilled(t *testing.T) {
 	if len(rows) != 1 || rows[0].keyID != "nh-other" {
 		t.Errorf("usage rows = %+v, want exactly the sentinel row (count_tokens must not log usage)", rows)
 	}
-	if err := env.tc.CheckTokens(env.scopes(), ratelimit.ScopeLimits{Key: ratelimit.Limits{DailyTokenLimit: 1}}); err != nil {
+	if err := env.checkTokens(ratelimit.ScopeLimits{Key: ratelimit.Limits{DailyTokenLimit: 1}}); err != nil {
 		t.Errorf("count_tokens charged tokens to the key: %v", err)
 	}
 }

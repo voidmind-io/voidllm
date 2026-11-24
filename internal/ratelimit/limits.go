@@ -21,7 +21,7 @@ type Limits struct {
 // Scopes identifies the key, user, team, and org a request belongs to, for
 // counter keying and limit lookups. UserID is empty for keys that are not
 // user-scoped (team keys, service-account keys); TeamID is empty for keys
-// that are not team-scoped. Both are skipped by Checker and TokenCounter
+// that are not team-scoped. Both are skipped by Checker and BudgetCounter
 // implementations when empty.
 type Scopes struct {
 	// KeyID is the API key's own ID. Always non-empty.

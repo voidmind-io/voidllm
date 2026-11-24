@@ -371,15 +371,66 @@ func (d *DB) GetCrossOrgUsageAggregates(ctx context.Context, from, to time.Time,
 }
 
 // QueryUsageSeed implements ratelimit.UsageSeeder. It returns rows of
-// (key_id, team_id, org_id, user_id, total_tokens) for all usage events
-// recorded on or after since. The returned *sql.Rows must be closed by the
-// caller.
-func (d *DB) QueryUsageSeed(ctx context.Context, since time.Time) (*sql.Rows, error) {
-	query := "SELECT key_id, COALESCE(team_id, ''), org_id, COALESCE(user_id, ''), total_tokens " +
-		"FROM usage_events WHERE created_at >= " + d.dialect.Placeholder(1)
-	rows, err := d.sql.QueryContext(ctx, query, FormatTimestamp(since))
+// (key_id, team_id, org_id, user_id, total_tokens, cost_estimate, in_day) for
+// all usage events recorded on or after monthStart. team_id and user_id are
+// returned as empty strings when NULL; cost_estimate is returned in major
+// currency units as a float, 0 when NULL (no pricing configured); in_day is 1
+// for events recorded on or after dayStart and 0 otherwise, so one read
+// serves both the monthly and the daily window. The returned *sql.Rows must
+// be closed by the caller.
+func (d *DB) QueryUsageSeed(ctx context.Context, monthStart, dayStart time.Time) (*sql.Rows, error) {
+	query := "SELECT key_id, COALESCE(team_id, ''), org_id, COALESCE(user_id, ''), total_tokens, " +
+		"COALESCE(cost_estimate, 0), " +
+		"CASE WHEN created_at >= " + d.dialect.Placeholder(1) + " THEN 1 ELSE 0 END " +
+		"FROM usage_events WHERE created_at >= " + d.dialect.Placeholder(2)
+	rows, err := d.sql.QueryContext(ctx, query, FormatTimestamp(dayStart), FormatTimestamp(monthStart))
 	if err != nil {
 		return nil, fmt.Errorf("QueryUsageSeed: %w", err)
+	}
+	return rows, nil
+}
+
+// QueryUsageTotals implements ratelimit.UsageSeeder. It aggregates the usage
+// events recorded from from (inclusive) until until (exclusive; the zero time
+// means no upper bound) and returns one row per (org_id, team_id, user_id,
+// key_id) with the columns (org_id, team_id, user_id, key_id, tokens,
+// cost_micros, day_tokens, day_cost_micros): tokens and cost sum every event
+// in the range, the day columns only those recorded on or after dayStart.
+// team_id and user_id are empty strings when NULL. Costs are integers in
+// micro-units of the currency: each event's cost estimate is rounded to the
+// nearest micro-unit before it is summed, the same way the budget counters
+// round the cost of a single request, so the aggregate equals what they
+// counted event by event. Events without pricing cost 0, and negative token
+// counts or costs count as 0. The range filter uses the created_at index, so
+// the cost of the query follows the size of the range. The returned *sql.Rows
+// must be closed by the caller.
+func (d *DB) QueryUsageTotals(ctx context.Context, from, until, dayStart time.Time) (*sql.Rows, error) {
+	p := d.dialect.Placeholder
+	const tokens = "CASE WHEN total_tokens > 0 THEN total_tokens ELSE 0 END"
+	// FLOOR(x + 0.5) rounds half up on both dialects; ROUND would not
+	// (PostgreSQL rounds double precision half to even). cost_estimate is
+	// single precision on PostgreSQL and is widened before the arithmetic,
+	// like the driver widens it when the seed query returns it.
+	const micros = "CASE WHEN cost_estimate > 0 " +
+		"THEN FLOOR(CAST(cost_estimate AS DOUBLE PRECISION) * 1000000.0 + 0.5) ELSE 0 END"
+	// The day start is bound twice: SQLite placeholders cannot be reused.
+	query := "SELECT org_id, COALESCE(team_id, ''), COALESCE(user_id, ''), key_id, " +
+		"CAST(COALESCE(SUM(" + tokens + "), 0) AS BIGINT), " +
+		"CAST(COALESCE(SUM(" + micros + "), 0) AS BIGINT), " +
+		"CAST(COALESCE(SUM(CASE WHEN created_at >= " + p(1) + " THEN " + tokens + " ELSE 0 END), 0) AS BIGINT), " +
+		"CAST(COALESCE(SUM(CASE WHEN created_at >= " + p(2) + " THEN " + micros + " ELSE 0 END), 0) AS BIGINT) " +
+		"FROM usage_events WHERE created_at >= " + p(3)
+	day := FormatTimestamp(dayStart)
+	args := []any{day, day, FormatTimestamp(from)}
+	if !until.IsZero() {
+		query += " AND created_at < " + p(4)
+		args = append(args, FormatTimestamp(until))
+	}
+	query += " GROUP BY org_id, COALESCE(team_id, ''), COALESCE(user_id, ''), key_id"
+
+	rows, err := d.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("QueryUsageTotals: %w", err)
 	}
 	return rows, nil
 }
