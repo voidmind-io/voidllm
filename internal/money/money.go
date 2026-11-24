@@ -17,8 +17,10 @@ import (
 // Scale is the number of micro-units in one major currency unit.
 const Scale = 1_000_000
 
-// MaxUnits is the largest amount, in major units, that Parse accepts.
-const MaxUnits = 1_000_000_000_000
+// MaxUnits is the largest amount, in major units, that Parse accepts (one
+// billion). It keeps MaxMicros (1e15) below 2^53 so sums of counters near the
+// limit stay exact in float64 arithmetic such as Redis Lua.
+const MaxUnits = 1_000_000_000
 
 // MaxMicros is the largest amount, in micro-units, that Parse accepts.
 const MaxMicros Micros = MaxUnits * Scale

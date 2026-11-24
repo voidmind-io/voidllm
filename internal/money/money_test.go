@@ -24,8 +24,8 @@ func TestParse(t *testing.T) {
 		{"025", 25_000_000, false},
 		{"0.000001", 1, false},
 		{"25.123456", 25_123_456, false},
-		{"1000000000000", MaxMicros, false},
-		{"1000000000000.000000", MaxMicros, false},
+		{"1000000000", MaxMicros, false},
+		{"1000000000.000000", MaxMicros, false},
 		{"", 0, true},
 		{".", 0, true},
 		{"25.", 0, true},
@@ -41,8 +41,8 @@ func TestParse(t *testing.T) {
 		{"1.2.3", 0, true},
 		{"abc", 0, true},
 		{"0.0000001", 0, true},
-		{"1000000000000.000001", 0, true},
-		{"1000000000001", 0, true},
+		{"1000000000.000001", 0, true},
+		{"1000000001", 0, true},
 		{"99999999999999999999", 0, true},
 		{"NaN", 0, true},
 		{"Inf", 0, true},
@@ -78,7 +78,7 @@ func TestString(t *testing.T) {
 		{25_100_000, "25.10"},
 		{25_123_456, "25.123456"},
 		{123, "0.000123"},
-		{MaxMicros, "1000000000000.00"},
+		{MaxMicros, "1000000000.00"},
 		{-1_500_000, "-1.50"},
 	}
 	for _, tc := range tests {
@@ -186,7 +186,7 @@ func TestJSON(t *testing.T) {
 }
 
 func FuzzParseRoundTrip(f *testing.F) {
-	for _, seed := range []string{"0", "0.5", "25.00", "1e3", "-1", "1000000000000", ".5", "0.000001", "9999999999999999999"} {
+	for _, seed := range []string{"0", "0.5", "25.00", "1e3", "-1", "1000000000", ".5", "0.000001", "9999999999999999999"} {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, s string) {

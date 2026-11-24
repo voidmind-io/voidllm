@@ -252,7 +252,7 @@ func TestCostLimits_InvalidInputNamesField(t *testing.T) {
 		{"update key", "PATCH", f.keyPath(), nil},
 		{"update membership", "PATCH", f.memberPath(), nil},
 	}
-	values := []any{"-1", -1, "abc", "1e3", json.RawMessage("1e3"), "0.0000001", "1,5", "", true, []any{}, "1000000000001"}
+	values := []any{"-1", -1, "abc", "1e3", json.RawMessage("1e3"), "0.0000001", "1,5", "", true, []any{}, "1000000001"}
 	for _, ep := range endpoints {
 		for _, field := range []string{"daily_cost_limit", "monthly_cost_limit"} {
 			for i, v := range values {
