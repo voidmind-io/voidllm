@@ -45,6 +45,9 @@ func (d *DB) GetHourlyUsageTotals(ctx context.Context, filter UsageFilter, since
 	p := d.dialect.Placeholder
 	argN := 1
 
+	// bucket_hour is always written in the canonical TimestampLayout form, so a
+	// plain text comparison is correct and lets the (org_id, bucket_hour) index
+	// serve the range. Casting the column would defeat the index.
 	conditions := []string{"bucket_hour >= " + p(argN)}
 	truncated := since.UTC().Truncate(time.Hour)
 	args := []any{FormatTimestamp(truncated)}
@@ -106,16 +109,16 @@ func (d *DB) UpsertUsageHourly(ctx context.Context, r HourlyRollup) error {
 		p(11) + ", " + p(12) + ", " +
 		p(13) + ", " + p(14) + ", " + p(15) + ", " + p(16) +
 		") ON CONFLICT (key_id, model_name, bucket_hour) DO UPDATE SET " +
-		"request_count = request_count + excluded.request_count, " +
-		"prompt_tokens = prompt_tokens + excluded.prompt_tokens, " +
-		"completion_tokens = completion_tokens + excluded.completion_tokens, " +
-		"total_tokens = total_tokens + excluded.total_tokens, " +
-		"cached_read_tokens = cached_read_tokens + excluded.cached_read_tokens, " +
-		"cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens, " +
-		"cost_sum = cost_sum + excluded.cost_sum, " +
-		"duration_sum_ms = duration_sum_ms + excluded.duration_sum_ms, " +
-		"ttft_sum_ms = ttft_sum_ms + excluded.ttft_sum_ms, " +
-		"ttft_count = ttft_count + excluded.ttft_count"
+		"request_count = usage_hourly.request_count + excluded.request_count, " +
+		"prompt_tokens = usage_hourly.prompt_tokens + excluded.prompt_tokens, " +
+		"completion_tokens = usage_hourly.completion_tokens + excluded.completion_tokens, " +
+		"total_tokens = usage_hourly.total_tokens + excluded.total_tokens, " +
+		"cached_read_tokens = usage_hourly.cached_read_tokens + excluded.cached_read_tokens, " +
+		"cache_write_tokens = usage_hourly.cache_write_tokens + excluded.cache_write_tokens, " +
+		"cost_sum = usage_hourly.cost_sum + excluded.cost_sum, " +
+		"duration_sum_ms = usage_hourly.duration_sum_ms + excluded.duration_sum_ms, " +
+		"ttft_sum_ms = usage_hourly.ttft_sum_ms + excluded.ttft_sum_ms, " +
+		"ttft_count = usage_hourly.ttft_count + excluded.ttft_count"
 
 	_, err := d.sql.ExecContext(ctx, query,
 		r.OrgID, r.TeamID, r.UserID, r.KeyID, r.ModelName, r.BucketHour,

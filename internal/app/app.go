@@ -128,6 +128,10 @@ type Application struct {
 	// stopFuncs holds cleanup callbacks registered during Start. They are
 	// invoked in LIFO order during cleanup().
 	stopFuncs []func()
+
+	// processStart is captured at the beginning of New, before the usage logger
+	// starts. It bounds the one-time usage_hourly backfill.
+	processStart time.Time
 }
 
 // dbUsageSeeder adapts *db.DB to the ratelimit.UsageSeeder interface. The DB
@@ -175,6 +179,7 @@ func stopRedisBudget(counter *ratelimit.RedisBudgetCounter) {
 // New returns a non-nil error if any required step fails; in that case no
 // goroutines have been started and no cleanup is needed by the caller.
 func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, error) {
+	processStart := time.Now()
 	ctx := context.Background()
 
 	enterpriseDev := devMode && (os.Getenv("VOIDLLM_ENTERPRISE_DEV") == "1" || os.Getenv("VOIDLLM_ENTERPRISE_DEV") == "true")
@@ -1364,6 +1369,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 
 	success = true
 	return &Application{
+		processStart:      processStart,
 		cfg:               cfg,
 		log:               log,
 		devMode:           devMode,
@@ -1512,6 +1518,9 @@ func (a *Application) Start() error {
 	if memRL, ok := a.rateLimiter.(*ratelimit.RateLimiter); ok {
 		a.stopFuncs = append(a.stopFuncs, startTicker(5*time.Minute, memRL.EvictStale))
 	}
+
+	// One-time rebuild of usage_hourly from usage_events, in the background.
+	a.stopFuncs = append(a.stopFuncs, startUsageHourlyBackfill(a.database, a.log, a.processStart))
 
 	// Start upstream model health monitoring when at least one probe is enabled.
 	if a.healthChecker != nil {
