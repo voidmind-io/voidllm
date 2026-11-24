@@ -9,6 +9,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/cache"
+	"github.com/voidmind-io/voidllm/internal/money"
 	"github.com/voidmind-io/voidllm/pkg/keygen"
 )
 
@@ -40,6 +41,10 @@ type KeyInfo struct {
 	RequestsPerMinute int
 	// RequestsPerDay is the maximum number of requests allowed per day. Zero means unlimited.
 	RequestsPerDay int
+	// DailyCostLimit is the maximum cost allowed per day (UTC). Zero means unlimited.
+	DailyCostLimit money.Micros
+	// MonthlyCostLimit is the maximum cost allowed per calendar month (UTC). Zero means unlimited.
+	MonthlyCostLimit money.Micros
 	// ExpiresAt is the expiration time of the key. Nil means no expiration.
 	ExpiresAt *time.Time
 
@@ -68,6 +73,12 @@ type KeyInfo struct {
 	// OrgRequestsPerDay is the org-level requests-per-day limit cached alongside the key.
 	// Zero means unlimited.
 	OrgRequestsPerDay int
+	// OrgDailyCostLimit is the org-level daily cost limit cached alongside the key.
+	// Zero means unlimited.
+	OrgDailyCostLimit money.Micros
+	// OrgMonthlyCostLimit is the org-level monthly cost limit cached alongside the key.
+	// Zero means unlimited.
+	OrgMonthlyCostLimit money.Micros
 
 	// TeamDailyTokenLimit is the team-level daily token limit cached alongside the key.
 	// Zero means unlimited.
@@ -81,6 +92,12 @@ type KeyInfo struct {
 	// TeamRequestsPerDay is the team-level requests-per-day limit cached alongside the key.
 	// Zero means unlimited.
 	TeamRequestsPerDay int
+	// TeamDailyCostLimit is the team-level daily cost limit cached alongside the key.
+	// Zero means unlimited.
+	TeamDailyCostLimit money.Micros
+	// TeamMonthlyCostLimit is the team-level monthly cost limit cached alongside the key.
+	// Zero means unlimited.
+	TeamMonthlyCostLimit money.Micros
 
 	// UserDailyTokenLimit is the per-user daily token limit cached alongside the
 	// key, sourced from the org membership. It applies across every key the
@@ -98,6 +115,12 @@ type KeyInfo struct {
 	// the key, sourced from the org membership. It applies across every key the
 	// user owns in this org. Zero means unlimited.
 	UserRequestsPerDay int
+	// UserDailyCostLimit is the per-user daily cost limit cached alongside the
+	// key, sourced from the org membership. Zero means unlimited.
+	UserDailyCostLimit money.Micros
+	// UserMonthlyCostLimit is the per-user monthly cost limit cached alongside
+	// the key, sourced from the org membership. Zero means unlimited.
+	UserMonthlyCostLimit money.Micros
 }
 
 // Middleware returns a Fiber handler that authenticates requests via Bearer token

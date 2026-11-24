@@ -8,12 +8,13 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/voidmind-io/voidllm/internal/money"
 )
 
 // orgSelectColumns is the ordered column list used in all org SELECT queries.
 // It must match the scan order in scanOrg.
 const orgSelectColumns = "id, name, slug, timezone, daily_token_limit, monthly_token_limit, " +
-	"requests_per_minute, requests_per_day, created_at, updated_at, deleted_at"
+	"requests_per_minute, requests_per_day, daily_cost_limit, monthly_cost_limit, created_at, updated_at, deleted_at"
 
 // Org represents an organization record in the database.
 type Org struct {
@@ -25,6 +26,8 @@ type Org struct {
 	MonthlyTokenLimit int64
 	RequestsPerMinute int
 	RequestsPerDay    int
+	DailyCostLimit    money.Micros
+	MonthlyCostLimit  money.Micros
 	CreatedAt         string
 	UpdatedAt         string
 	DeletedAt         *string
@@ -39,6 +42,8 @@ type CreateOrgParams struct {
 	MonthlyTokenLimit int64
 	RequestsPerMinute int
 	RequestsPerDay    int
+	DailyCostLimit    money.Micros
+	MonthlyCostLimit  money.Micros
 }
 
 // UpdateOrgParams holds optional fields for updating an organization.
@@ -51,6 +56,8 @@ type UpdateOrgParams struct {
 	MonthlyTokenLimit *int64
 	RequestsPerMinute *int
 	RequestsPerDay    *int
+	DailyCostLimit    *money.Micros
+	MonthlyCostLimit  *money.Micros
 }
 
 // CreateOrg inserts a new organization and returns the persisted record.
@@ -69,10 +76,10 @@ func (d *DB) CreateOrg(ctx context.Context, params CreateOrgParams) (*Org, error
 
 	p := d.dialect.Placeholder
 	insertQuery := "INSERT INTO organizations " +
-		"(id, name, slug, timezone, daily_token_limit, monthly_token_limit, requests_per_minute, requests_per_day, created_at, updated_at) " +
+		"(id, name, slug, timezone, daily_token_limit, monthly_token_limit, requests_per_minute, requests_per_day, daily_cost_limit, monthly_cost_limit, created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " +
-		p(5) + ", " + p(6) + ", " + p(7) + ", " + p(8) + ", " +
+		p(5) + ", " + p(6) + ", " + p(7) + ", " + p(8) + ", " + p(9) + ", " + p(10) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + orgSelectColumns +
@@ -89,6 +96,8 @@ func (d *DB) CreateOrg(ctx context.Context, params CreateOrgParams) (*Org, error
 			params.MonthlyTokenLimit,
 			params.RequestsPerMinute,
 			params.RequestsPerDay,
+			params.DailyCostLimit,
+			params.MonthlyCostLimit,
 		)
 		if execErr != nil {
 			return translateError(execErr)
@@ -172,6 +181,7 @@ func (d *DB) ListOrgs(ctx context.Context, cursor string, limit int, includeDele
 			&o.ID, &o.Name, &o.Slug, &o.Timezone,
 			&o.DailyTokenLimit, &o.MonthlyTokenLimit,
 			&o.RequestsPerMinute, &o.RequestsPerDay,
+			&o.DailyCostLimit, &o.MonthlyCostLimit,
 			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
 		); err != nil {
 			return nil, fmt.Errorf("ListOrgs scan: %w", err)
@@ -235,6 +245,16 @@ func (d *DB) UpdateOrg(ctx context.Context, id string, params UpdateOrgParams) (
 	if params.RequestsPerDay != nil {
 		setClauses = append(setClauses, "requests_per_day = "+p(argN))
 		args = append(args, *params.RequestsPerDay)
+		argN++
+	}
+	if params.DailyCostLimit != nil {
+		setClauses = append(setClauses, "daily_cost_limit = "+p(argN))
+		args = append(args, int64(*params.DailyCostLimit))
+		argN++
+	}
+	if params.MonthlyCostLimit != nil {
+		setClauses = append(setClauses, "monthly_cost_limit = "+p(argN))
+		args = append(args, int64(*params.MonthlyCostLimit))
 		argN++
 	}
 
@@ -315,6 +335,7 @@ func scanOrg(row *sql.Row) (*Org, error) {
 		&o.ID, &o.Name, &o.Slug, &o.Timezone,
 		&o.DailyTokenLimit, &o.MonthlyTokenLimit,
 		&o.RequestsPerMinute, &o.RequestsPerDay,
+		&o.DailyCostLimit, &o.MonthlyCostLimit,
 		&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
 	)
 	if err != nil {
@@ -337,6 +358,7 @@ type OrgWithCounts struct {
 const orgWithCountsBase = "SELECT o.id, o.name, o.slug, o.timezone, " +
 	"o.daily_token_limit, o.monthly_token_limit, " +
 	"o.requests_per_minute, o.requests_per_day, " +
+	"o.daily_cost_limit, o.monthly_cost_limit, " +
 	"o.created_at, o.updated_at, o.deleted_at, " +
 	"(SELECT COUNT(*) FROM org_memberships WHERE org_id = o.id) AS member_count, " +
 	"(SELECT COUNT(*) FROM teams WHERE org_id = o.id AND deleted_at IS NULL) AS team_count " +
@@ -351,6 +373,7 @@ func scanOrgWithCounts(rows interface {
 		&o.ID, &o.Name, &o.Slug, &o.Timezone,
 		&o.DailyTokenLimit, &o.MonthlyTokenLimit,
 		&o.RequestsPerMinute, &o.RequestsPerDay,
+		&o.DailyCostLimit, &o.MonthlyCostLimit,
 		&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
 		&o.MemberCount, &o.TeamCount,
 	)

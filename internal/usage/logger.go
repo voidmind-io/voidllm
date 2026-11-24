@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/voidmind-io/voidllm/internal/config"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/money"
 	"github.com/voidmind-io/voidllm/internal/ratelimit"
 )
 
@@ -108,7 +109,7 @@ func (l *Logger) Log(event Event) {
 	if l.budget != nil {
 		used := ratelimit.Usage{Tokens: int64(event.TotalTokens)}
 		if event.CostEstimate != nil {
-			used.CostMicros = ratelimit.CostToMicros(*event.CostEstimate)
+			used.CostMicros = int64(money.FromCost(*event.CostEstimate))
 		}
 		if used.Tokens > 0 || used.CostMicros > 0 {
 			l.budget.Add(context.Background(), ratelimit.Scopes{

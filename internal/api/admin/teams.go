@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"encoding/json"
 	"errors"
 	"log/slog"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/money"
 )
 
 // createTeamRequest is the JSON body accepted by CreateTeam.
@@ -18,6 +20,14 @@ type createTeamRequest struct {
 	MonthlyTokenLimit int64  `json:"monthly_token_limit"`
 	RequestsPerMinute int    `json:"requests_per_minute"`
 	RequestsPerDay    int    `json:"requests_per_day"`
+	// DailyCostLimit is the daily cost budget in major currency units as a
+	// decimal string, for example "25.00". "0" or omitted means unlimited.
+	// Requires a license with cost budgets.
+	DailyCostLimit json.RawMessage `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
+	// MonthlyCostLimit is the monthly cost budget in major currency units as a
+	// decimal string, for example "500.00". "0" or omitted means unlimited.
+	// Requires a license with cost budgets.
+	MonthlyCostLimit json.RawMessage `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
 }
 
 // updateTeamRequest is the JSON body accepted by UpdateTeam.
@@ -29,23 +39,37 @@ type updateTeamRequest struct {
 	MonthlyTokenLimit *int64  `json:"monthly_token_limit"`
 	RequestsPerMinute *int    `json:"requests_per_minute"`
 	RequestsPerDay    *int    `json:"requests_per_day"`
+	// DailyCostLimit is the daily cost budget in major currency units as a
+	// decimal string, for example "25.00". "0" or omitted means unlimited.
+	// Requires a license with cost budgets.
+	DailyCostLimit json.RawMessage `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
+	// MonthlyCostLimit is the monthly cost budget in major currency units as a
+	// decimal string, for example "500.00". "0" or omitted means unlimited.
+	// Requires a license with cost budgets.
+	MonthlyCostLimit json.RawMessage `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
 }
 
 // teamResponse is the JSON representation of a team returned by the API.
 type teamResponse struct {
-	ID                string  `json:"id"`
-	OrgID             string  `json:"org_id"`
-	Name              string  `json:"name"`
-	Slug              string  `json:"slug"`
-	DailyTokenLimit   int64   `json:"daily_token_limit"`
-	MonthlyTokenLimit int64   `json:"monthly_token_limit"`
-	RequestsPerMinute int     `json:"requests_per_minute"`
-	RequestsPerDay    int     `json:"requests_per_day"`
-	MemberCount       int     `json:"member_count"`
-	KeyCount          int     `json:"key_count"`
-	CreatedAt         string  `json:"created_at"`
-	UpdatedAt         string  `json:"updated_at"`
-	DeletedAt         *string `json:"deleted_at,omitempty"`
+	ID                string `json:"id"`
+	OrgID             string `json:"org_id"`
+	Name              string `json:"name"`
+	Slug              string `json:"slug"`
+	DailyTokenLimit   int64  `json:"daily_token_limit"`
+	MonthlyTokenLimit int64  `json:"monthly_token_limit"`
+	RequestsPerMinute int    `json:"requests_per_minute"`
+	RequestsPerDay    int    `json:"requests_per_day"`
+	// DailyCostLimit is the daily cost budget as a decimal string in major
+	// currency units. "0.00" means unlimited.
+	DailyCostLimit money.Micros `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
+	// MonthlyCostLimit is the monthly cost budget as a decimal string in major
+	// currency units. "0.00" means unlimited.
+	MonthlyCostLimit money.Micros `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
+	MemberCount      int          `json:"member_count"`
+	KeyCount         int          `json:"key_count"`
+	CreatedAt        string       `json:"created_at"`
+	UpdatedAt        string       `json:"updated_at"`
+	DeletedAt        *string      `json:"deleted_at,omitempty"`
 }
 
 // paginatedTeamsResponse wraps a page of teams with pagination metadata.
@@ -92,6 +116,8 @@ func teamToResponse(t *db.Team, memberCount, keyCount int) teamResponse {
 		MonthlyTokenLimit: t.MonthlyTokenLimit,
 		RequestsPerMinute: t.RequestsPerMinute,
 		RequestsPerDay:    t.RequestsPerDay,
+		DailyCostLimit:    t.DailyCostLimit,
+		MonthlyCostLimit:  t.MonthlyCostLimit,
 		MemberCount:       memberCount,
 		KeyCount:          keyCount,
 		CreatedAt:         t.CreatedAt,
@@ -137,6 +163,10 @@ func (h *Handler) CreateTeam(c fiber.Ctx) error {
 	if sent, err := rejectNegativeLimits(c, &req.DailyTokenLimit, &req.MonthlyTokenLimit, &req.RequestsPerMinute, &req.RequestsPerDay); sent {
 		return err
 	}
+	costLimits, sent, err := parseCostLimits(c, req.DailyCostLimit, req.MonthlyCostLimit)
+	if sent {
+		return err
+	}
 	if req.Name == "" {
 		return apierror.BadRequest(c, "name is required")
 	}
@@ -145,6 +175,9 @@ func (h *Handler) CreateTeam(c fiber.Ctx) error {
 	}
 	if !slugRegex.MatchString(req.Slug) {
 		return apierror.BadRequest(c, "slug must be lowercase alphanumeric with hyphens, 2-63 characters")
+	}
+	if sent, err := h.rejectUnlicensedCostLimits(c, costLimits, nil, ""); sent {
+		return err
 	}
 
 	lic := h.License.Load()
@@ -168,6 +201,8 @@ func (h *Handler) CreateTeam(c fiber.Ctx) error {
 		MonthlyTokenLimit: req.MonthlyTokenLimit,
 		RequestsPerMinute: req.RequestsPerMinute,
 		RequestsPerDay:    req.RequestsPerDay,
+		DailyCostLimit:    costLimits.dailyValue(),
+		MonthlyCostLimit:  costLimits.monthlyValue(),
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
@@ -333,8 +368,9 @@ func (h *Handler) ListTeams(c fiber.Ctx) error {
 // changesTeamLimits reports whether req sets any limit field to a value that
 // differs from the team's current one. Fields that are absent or re-sent
 // unchanged do not count.
-func changesTeamLimits(current *db.Team, req *updateTeamRequest) bool {
-	return (req.DailyTokenLimit != nil && *req.DailyTokenLimit != current.DailyTokenLimit) ||
+func changesTeamLimits(current *db.Team, req *updateTeamRequest, cost costLimitChange) bool {
+	return cost.differsFrom(current.DailyCostLimit, current.MonthlyCostLimit) ||
+		(req.DailyTokenLimit != nil && *req.DailyTokenLimit != current.DailyTokenLimit) ||
 		(req.MonthlyTokenLimit != nil && *req.MonthlyTokenLimit != current.MonthlyTokenLimit) ||
 		(req.RequestsPerMinute != nil && *req.RequestsPerMinute != current.RequestsPerMinute) ||
 		(req.RequestsPerDay != nil && *req.RequestsPerDay != current.RequestsPerDay)
@@ -347,15 +383,17 @@ func changesTeamLimits(current *db.Team, req *updateTeamRequest) bool {
 // For callers below org admin the limit fields are never written, even when
 // req re-sends the values in current: current was read before the write, so
 // writing it back could overwrite a limit an org admin changed in between.
-func teamUpdateParams(callerRole string, current *db.Team, req *updateTeamRequest) (db.UpdateTeamParams, bool) {
+func teamUpdateParams(callerRole string, current *db.Team, req *updateTeamRequest, cost costLimitChange) (db.UpdateTeamParams, bool) {
 	params := db.UpdateTeamParams{Name: req.Name, Slug: req.Slug}
 	if !auth.HasRole(callerRole, auth.RoleOrgAdmin) {
-		return params, !changesTeamLimits(current, req)
+		return params, !changesTeamLimits(current, req, cost)
 	}
 	params.DailyTokenLimit = req.DailyTokenLimit
 	params.MonthlyTokenLimit = req.MonthlyTokenLimit
 	params.RequestsPerMinute = req.RequestsPerMinute
 	params.RequestsPerDay = req.RequestsPerDay
+	params.DailyCostLimit = cost.Daily
+	params.MonthlyCostLimit = cost.Monthly
 	return params, true
 }
 
@@ -395,12 +433,22 @@ func (h *Handler) UpdateTeam(c fiber.Ctx) error {
 	if sent, err := rejectNegativeLimits(c, req.DailyTokenLimit, req.MonthlyTokenLimit, req.RequestsPerMinute, req.RequestsPerDay); sent {
 		return err
 	}
+	costLimits, sent, err := parseCostLimits(c, req.DailyCostLimit, req.MonthlyCostLimit)
+	if sent {
+		return err
+	}
 	if req.Slug != nil && !slugRegex.MatchString(*req.Slug) {
 		return apierror.BadRequest(c, "slug must be lowercase alphanumeric with hyphens, 2-63 characters")
 	}
-	params, allowed := teamUpdateParams(keyInfo.Role, existing, &req)
+	params, allowed := teamUpdateParams(keyInfo.Role, existing, &req, costLimits)
 	if !allowed {
 		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "only org admins may change team limits")
+	}
+	storedCost := func() (money.Micros, money.Micros, error) {
+		return existing.DailyCostLimit, existing.MonthlyCostLimit, nil
+	}
+	if sent, err := h.rejectUnlicensedCostLimits(c, costLimits, storedCost, "team not found"); sent {
+		return err
 	}
 
 	if _, err := h.DB.UpdateTeam(c.Context(), existing.ID, params); err != nil {

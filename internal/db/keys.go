@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/voidmind-io/voidllm/internal/money"
 )
 
 // KeyRecord holds all columns returned by LoadAllActiveKeys. It carries the
@@ -67,6 +69,8 @@ type KeyRecord struct {
 	MonthlyTokenLimit int64
 	RequestsPerMinute int
 	RequestsPerDay    int
+	DailyCostLimit    money.Micros
+	MonthlyCostLimit  money.Micros
 
 	// ExpiresAt is the optional key expiry, stored as RFC3339 in the DB.
 	ExpiresAt *time.Time
@@ -76,12 +80,16 @@ type KeyRecord struct {
 	OrgMonthlyTokenLimit int64
 	OrgRequestsPerMinute int
 	OrgRequestsPerDay    int
+	OrgDailyCostLimit    money.Micros
+	OrgMonthlyCostLimit  money.Micros
 
 	// Team-level rate and token limits resolved via LEFT JOIN. Zero when no team.
 	TeamDailyTokenLimit   int64
 	TeamMonthlyTokenLimit int64
 	TeamRequestsPerMinute int
 	TeamRequestsPerDay    int
+	TeamDailyCostLimit    money.Micros
+	TeamMonthlyCostLimit  money.Micros
 
 	// User-level rate and token limits resolved via LEFT JOIN on the owning
 	// user's org membership. Zero when there is no membership row (e.g.
@@ -90,6 +98,8 @@ type KeyRecord struct {
 	UserMonthlyTokenLimit int64
 	UserRequestsPerMinute int
 	UserRequestsPerDay    int
+	UserDailyCostLimit    money.Micros
+	UserMonthlyCostLimit  money.Micros
 
 	// IsSystemAdmin is 1 when the owning user has users.is_system_admin set.
 	IsSystemAdmin int
@@ -125,13 +135,17 @@ SELECT
     k.org_id, k.team_id, k.user_id, k.service_account_id,
     k.daily_token_limit, k.monthly_token_limit,
     k.requests_per_minute, k.requests_per_day,
+    k.daily_cost_limit, k.monthly_cost_limit,
     k.expires_at,
     o.daily_token_limit, o.monthly_token_limit,
     o.requests_per_minute, o.requests_per_day,
+    o.daily_cost_limit, o.monthly_cost_limit,
     COALESCE(t.daily_token_limit, 0), COALESCE(t.monthly_token_limit, 0),
     COALESCE(t.requests_per_minute, 0), COALESCE(t.requests_per_day, 0),
+    COALESCE(t.daily_cost_limit, 0), COALESCE(t.monthly_cost_limit, 0),
     COALESCE(m.daily_token_limit, 0), COALESCE(m.monthly_token_limit, 0),
     COALESCE(m.requests_per_minute, 0), COALESCE(m.requests_per_day, 0),
+    COALESCE(m.daily_cost_limit, 0), COALESCE(m.monthly_cost_limit, 0),
     COALESCE(u.is_system_admin, 0),
     COALESCE(m.role, ''),
     sa.team_id,
@@ -168,13 +182,17 @@ func scanKeyRecord(row interface {
 		&r.OrgID, &r.TeamID, &r.UserID, &r.ServiceAccountID,
 		&r.DailyTokenLimit, &r.MonthlyTokenLimit,
 		&r.RequestsPerMinute, &r.RequestsPerDay,
+		&r.DailyCostLimit, &r.MonthlyCostLimit,
 		&expiresAtRaw,
 		&r.OrgDailyTokenLimit, &r.OrgMonthlyTokenLimit,
 		&r.OrgRequestsPerMinute, &r.OrgRequestsPerDay,
+		&r.OrgDailyCostLimit, &r.OrgMonthlyCostLimit,
 		&r.TeamDailyTokenLimit, &r.TeamMonthlyTokenLimit,
 		&r.TeamRequestsPerMinute, &r.TeamRequestsPerDay,
+		&r.TeamDailyCostLimit, &r.TeamMonthlyCostLimit,
 		&r.UserDailyTokenLimit, &r.UserMonthlyTokenLimit,
 		&r.UserRequestsPerMinute, &r.UserRequestsPerDay,
+		&r.UserDailyCostLimit, &r.UserMonthlyCostLimit,
 		&r.IsSystemAdmin, &r.MembershipRole,
 		&r.ServiceAccountTeamID, &serviceAccountActive,
 		&userActive, &membershipExists, &teamActive,

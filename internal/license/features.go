@@ -40,3 +40,10 @@ const CommunityMaxOrgs = 1
 // CommunityMaxTeams is the maximum number of teams permitted on the community
 // (unlicensed) edition.
 const CommunityMaxTeams = 3
+
+// CostBudgetsEnabled reports whether lic allows setting non-zero cost limits
+// (daily and monthly cost budgets). It reuses FeatureCostReports, which every
+// Pro license carries. A nil license reports false.
+func CostBudgetsEnabled(lic License) bool {
+	return lic != nil && lic.HasFeature(FeatureCostReports)
+}

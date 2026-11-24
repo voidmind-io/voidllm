@@ -1,6 +1,9 @@
 package admin
 
-import "github.com/voidmind-io/voidllm/internal/db"
+import (
+	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/money"
+)
 
 // TeamUpdateRequest mirrors the unexported updateTeamRequest so the admin_test
 // package can build one for TeamUpdateParams.
@@ -10,6 +13,8 @@ type TeamUpdateRequest struct {
 	MonthlyTokenLimit *int64
 	RequestsPerMinute *int
 	RequestsPerDay    *int
+	DailyCostLimit    *money.Micros
+	MonthlyCostLimit  *money.Micros
 }
 
 // TeamUpdateParams exposes the internal teamUpdateParams function for
@@ -22,5 +27,5 @@ func TeamUpdateParams(callerRole string, current *db.Team, req TeamUpdateRequest
 		MonthlyTokenLimit: req.MonthlyTokenLimit,
 		RequestsPerMinute: req.RequestsPerMinute,
 		RequestsPerDay:    req.RequestsPerDay,
-	})
+	}, costLimitChange{Daily: req.DailyCostLimit, Monthly: req.MonthlyCostLimit})
 }

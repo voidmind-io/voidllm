@@ -1023,24 +1023,32 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 			RequestsPerDay:    keyInfo.RequestsPerDay,
 			DailyTokenLimit:   keyInfo.DailyTokenLimit,
 			MonthlyTokenLimit: keyInfo.MonthlyTokenLimit,
+			DailyCostLimit:    int64(keyInfo.DailyCostLimit),
+			MonthlyCostLimit:  int64(keyInfo.MonthlyCostLimit),
 		},
 		User: ratelimit.Limits{
 			RequestsPerMinute: keyInfo.UserRequestsPerMinute,
 			RequestsPerDay:    keyInfo.UserRequestsPerDay,
 			DailyTokenLimit:   keyInfo.UserDailyTokenLimit,
 			MonthlyTokenLimit: keyInfo.UserMonthlyTokenLimit,
+			DailyCostLimit:    int64(keyInfo.UserDailyCostLimit),
+			MonthlyCostLimit:  int64(keyInfo.UserMonthlyCostLimit),
 		},
 		Team: ratelimit.Limits{
 			RequestsPerMinute: keyInfo.TeamRequestsPerMinute,
 			RequestsPerDay:    keyInfo.TeamRequestsPerDay,
 			DailyTokenLimit:   keyInfo.TeamDailyTokenLimit,
 			MonthlyTokenLimit: keyInfo.TeamMonthlyTokenLimit,
+			DailyCostLimit:    int64(keyInfo.TeamDailyCostLimit),
+			MonthlyCostLimit:  int64(keyInfo.TeamMonthlyCostLimit),
 		},
 		Org: ratelimit.Limits{
 			RequestsPerMinute: keyInfo.OrgRequestsPerMinute,
 			RequestsPerDay:    keyInfo.OrgRequestsPerDay,
 			DailyTokenLimit:   keyInfo.OrgDailyTokenLimit,
 			MonthlyTokenLimit: keyInfo.OrgMonthlyTokenLimit,
+			DailyCostLimit:    int64(keyInfo.OrgDailyCostLimit),
+			MonthlyCostLimit:  int64(keyInfo.OrgMonthlyCostLimit),
 		},
 	}
 

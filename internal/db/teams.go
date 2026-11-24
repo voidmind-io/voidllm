@@ -9,12 +9,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/voidmind-io/voidllm/internal/money"
 )
 
 // teamSelectColumns is the ordered column list used in all team SELECT queries.
 // It must match the scan order in scanTeam.
 const teamSelectColumns = "id, org_id, name, slug, daily_token_limit, monthly_token_limit, " +
-	"requests_per_minute, requests_per_day, created_at, updated_at, deleted_at"
+	"requests_per_minute, requests_per_day, daily_cost_limit, monthly_cost_limit, created_at, updated_at, deleted_at"
 
 // Team represents a team record in the database.
 type Team struct {
@@ -26,6 +27,8 @@ type Team struct {
 	MonthlyTokenLimit int64
 	RequestsPerMinute int
 	RequestsPerDay    int
+	DailyCostLimit    money.Micros
+	MonthlyCostLimit  money.Micros
 	CreatedAt         string
 	UpdatedAt         string
 	DeletedAt         *string
@@ -40,6 +43,8 @@ type CreateTeamParams struct {
 	MonthlyTokenLimit int64
 	RequestsPerMinute int
 	RequestsPerDay    int
+	DailyCostLimit    money.Micros
+	MonthlyCostLimit  money.Micros
 }
 
 // UpdateTeamParams holds optional fields for updating a team.
@@ -51,6 +56,8 @@ type UpdateTeamParams struct {
 	MonthlyTokenLimit *int64
 	RequestsPerMinute *int
 	RequestsPerDay    *int
+	DailyCostLimit    *money.Micros
+	MonthlyCostLimit  *money.Micros
 }
 
 // CreateTeam inserts a new team and returns the persisted record.
@@ -69,10 +76,10 @@ func (d *DB) CreateTeam(ctx context.Context, params CreateTeamParams) (*Team, er
 
 	p := d.dialect.Placeholder
 	insertQuery := "INSERT INTO teams " +
-		"(id, org_id, name, slug, daily_token_limit, monthly_token_limit, requests_per_minute, requests_per_day, created_at, updated_at) " +
+		"(id, org_id, name, slug, daily_token_limit, monthly_token_limit, requests_per_minute, requests_per_day, daily_cost_limit, monthly_cost_limit, created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " +
-		p(5) + ", " + p(6) + ", " + p(7) + ", " + p(8) + ", " +
+		p(5) + ", " + p(6) + ", " + p(7) + ", " + p(8) + ", " + p(9) + ", " + p(10) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + teamSelectColumns +
@@ -89,6 +96,8 @@ func (d *DB) CreateTeam(ctx context.Context, params CreateTeamParams) (*Team, er
 			params.MonthlyTokenLimit,
 			params.RequestsPerMinute,
 			params.RequestsPerDay,
+			params.DailyCostLimit,
+			params.MonthlyCostLimit,
 		)
 		if execErr != nil {
 			return translateError(execErr)
@@ -178,6 +187,7 @@ func (d *DB) ListTeams(ctx context.Context, orgID string, cursor string, limit i
 			&t.ID, &t.OrgID, &t.Name, &t.Slug,
 			&t.DailyTokenLimit, &t.MonthlyTokenLimit,
 			&t.RequestsPerMinute, &t.RequestsPerDay,
+			&t.DailyCostLimit, &t.MonthlyCostLimit,
 			&t.CreatedAt, &t.UpdatedAt, &t.DeletedAt,
 		); err != nil {
 			return nil, fmt.Errorf("ListTeams scan: %w", err)
@@ -236,6 +246,16 @@ func (d *DB) UpdateTeam(ctx context.Context, id string, params UpdateTeamParams)
 	if params.RequestsPerDay != nil {
 		setClauses = append(setClauses, "requests_per_day = "+p(argN))
 		args = append(args, *params.RequestsPerDay)
+		argN++
+	}
+	if params.DailyCostLimit != nil {
+		setClauses = append(setClauses, "daily_cost_limit = "+p(argN))
+		args = append(args, int64(*params.DailyCostLimit))
+		argN++
+	}
+	if params.MonthlyCostLimit != nil {
+		setClauses = append(setClauses, "monthly_cost_limit = "+p(argN))
+		args = append(args, int64(*params.MonthlyCostLimit))
 		argN++
 	}
 
@@ -324,6 +344,7 @@ type TeamWithCounts struct {
 const teamWithCountsBase = "SELECT t.id, t.org_id, t.name, t.slug, " +
 	"t.daily_token_limit, t.monthly_token_limit, " +
 	"t.requests_per_minute, t.requests_per_day, " +
+	"t.daily_cost_limit, t.monthly_cost_limit, " +
 	"t.created_at, t.updated_at, t.deleted_at, " +
 	"COUNT(DISTINCT tm.user_id) AS member_count, " +
 	"COUNT(DISTINCT " + teamActiveKeyCase + ") AS key_count" +
@@ -349,6 +370,7 @@ func scanTeamWithCounts(rows interface {
 		&t.ID, &t.OrgID, &t.Name, &t.Slug,
 		&t.DailyTokenLimit, &t.MonthlyTokenLimit,
 		&t.RequestsPerMinute, &t.RequestsPerDay,
+		&t.DailyCostLimit, &t.MonthlyCostLimit,
 		&t.CreatedAt, &t.UpdatedAt, &t.DeletedAt,
 		&t.MemberCount, &t.KeyCount,
 	)
@@ -457,6 +479,7 @@ func scanTeam(row *sql.Row) (*Team, error) {
 		&t.ID, &t.OrgID, &t.Name, &t.Slug,
 		&t.DailyTokenLimit, &t.MonthlyTokenLimit,
 		&t.RequestsPerMinute, &t.RequestsPerDay,
+		&t.DailyCostLimit, &t.MonthlyCostLimit,
 		&t.CreatedAt, &t.UpdatedAt, &t.DeletedAt,
 	)
 	if err != nil {

@@ -61,6 +61,9 @@ type meResponse struct {
 	Role          string `json:"role"`
 	OrgID         string `json:"org_id,omitempty"`
 	IsSystemAdmin bool   `json:"is_system_admin"`
+	// Currency is the ISO 4217 code that cost limits and model prices are
+	// denominated in (settings.currency). Read-only.
+	Currency string `json:"currency"`
 }
 
 // loginResponse is the JSON body returned on successful authentication.
@@ -265,6 +268,7 @@ func (h *Handler) Login(c fiber.Ctx) error {
 			Role:          role,
 			OrgID:         orgID,
 			IsSystemAdmin: user.IsSystemAdmin,
+			Currency:      h.Currency,
 		},
 	})
 }
@@ -553,5 +557,6 @@ func (h *Handler) Me(c fiber.Ctx) error {
 		Role:          keyInfo.Role,
 		OrgID:         keyInfo.OrgID,
 		IsSystemAdmin: user.IsSystemAdmin,
+		Currency:      h.Currency,
 	})
 }

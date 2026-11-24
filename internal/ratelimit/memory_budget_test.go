@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/voidmind-io/voidllm/internal/money"
 )
 
 // fakeClock is a settable time source for budget counters.
@@ -816,12 +818,12 @@ func (f *fakeTotalsScanner) Scan(dest ...any) error {
 	*dest[2].(*string) = r.userID
 	*dest[3].(*string) = r.keyID
 	*dest[4].(*int64) = r.tokens
-	*dest[5].(*int64) = CostToMicros(r.cost)
+	*dest[5].(*int64) = int64(money.FromCost(r.cost))
 	*dest[6].(*int64) = 0
 	*dest[7].(*int64) = 0
 	if !r.at.Before(f.dayStart) {
 		*dest[6].(*int64) = r.tokens
-		*dest[7].(*int64) = CostToMicros(r.cost)
+		*dest[7].(*int64) = int64(money.FromCost(r.cost))
 	}
 	return nil
 }
@@ -1036,37 +1038,6 @@ func TestMemoryBudgetCounter_Seed_QueryError(t *testing.T) {
 	}
 	if !errors.Is(err, wantErr) {
 		t.Errorf("Seed() error = %v, want it to wrap %v", err, wantErr)
-	}
-}
-
-// TestCostToMicros covers the conversion used when seeding cost.
-func TestCostToMicros(t *testing.T) {
-	t.Parallel()
-
-	nan := 0.0
-	nan /= nan
-	tests := []struct {
-		name string
-		in   float64
-		want int64
-	}{
-		{"zero", 0, 0},
-		{"negative", -1.5, 0},
-		{"nan", nan, 0},
-		{"one micro", 0.000001, 1},
-		{"rounds up", 0.0000016, 2},
-		{"rounds down", 0.0000014, 1},
-		{"major units", 25, 25_000_000},
-		{"float noise", 0.000123, 123},
-		{"beyond int64", 1e300, 1<<63 - 1},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if got := CostToMicros(tc.in); got != tc.want {
-				t.Errorf("CostToMicros(%v) = %d, want %d", tc.in, got, tc.want)
-			}
-		})
 	}
 }
 

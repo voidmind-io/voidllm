@@ -221,6 +221,11 @@ models:
 # =============================================================================
 
 settings:
+  # Currency (ISO 4217 code) that model prices and cost limits are denominated
+  # in. A label only: no exchange rates are applied and changing it converts
+  # nothing. Default: USD.
+  # currency: USD
+
   # Bootstrap admin key — used ONLY when the database is empty (first startup).
   # After first startup, create a proper user with system_admin role and remove this.
   # Must be at least 32 characters.

@@ -562,6 +562,9 @@ func (c MCPConfig) EffectiveStreamMaxBytes() int64 {
 // hit, not an edge case.
 const defaultToolCacheTTL = time.Hour
 
+// DefaultCurrency is the currency used when settings.currency is not set.
+const DefaultCurrency = "USD"
+
 // EffectiveToolCacheTTL returns the resolved freshness window mcp.ToolCache
 // falls back to for an upstream that sent no CacheableResult ttlMs hint: the
 // configured value (including an explicit 0, meaning entries never expire)
@@ -734,6 +737,10 @@ type SettingsConfig struct {
 	HealthCheck    HealthCheckConfig    `yaml:"health_check"`
 	MCP            MCPConfig            `yaml:"mcp"`
 	Retention      RetentionConfig      `yaml:"retention"`
+	// Currency is the ISO 4217 code (three uppercase letters, default "USD")
+	// that model prices and cost limits are denominated in. It is a label
+	// only: no exchange rates are applied and changing it converts nothing.
+	Currency string `yaml:"currency" json:"currency"`
 	// FallbackMaxDepth limits how deep the model fallback chain can recurse
 	// per request. Default 3, valid range [1, 10]. Ignored when no model has
 	// fallback configured or when the license lacks FeatureFallbackChains.
@@ -1030,6 +1037,10 @@ func (c *Config) setDefaults() {
 	// "disabled" value and must not be overwritten to the default.
 	if c.Settings.FallbackMaxDepth < 0 {
 		c.Settings.FallbackMaxDepth = 3
+	}
+
+	if c.Settings.Currency == "" {
+		c.Settings.Currency = DefaultCurrency
 	}
 
 	// Bootstrap

@@ -16,6 +16,12 @@ type Limits struct {
 	// MonthlyTokenLimit is the maximum number of tokens allowed per calendar month (UTC).
 	// Zero means unlimited.
 	MonthlyTokenLimit int64
+	// DailyCostLimit is the maximum cost allowed per calendar day (UTC), in
+	// micro-units of the configured currency. Zero means unlimited.
+	DailyCostLimit int64
+	// MonthlyCostLimit is the maximum cost allowed per calendar month (UTC), in
+	// micro-units of the configured currency. Zero means unlimited.
+	MonthlyCostLimit int64
 }
 
 // Scopes identifies the key, user, team, and org a request belongs to, for
