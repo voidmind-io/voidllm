@@ -46,6 +46,13 @@ func NewMemoryBudgetCounter() *MemoryBudgetCounter {
 	return &MemoryBudgetCounter{now: time.Now}
 }
 
+// NewMemoryBudgetCounterWithClock constructs an empty MemoryBudgetCounter that
+// reads the current time from now, which decides the daily and monthly
+// windows. It lets callers pin the windows, e.g. in tests.
+func NewMemoryBudgetCounterWithClock(now func() time.Time) *MemoryBudgetCounter {
+	return &MemoryBudgetCounter{now: now}
+}
+
 // Check implements BudgetCounter.
 func (m *MemoryBudgetCounter) Check(_ context.Context, s Scopes, l ScopeLimits) error {
 	var checkBuf [maxBudgetChecks]budgetCheck
@@ -218,15 +225,11 @@ func windowUsage(w *usageWindow, start int64) Usage {
 	return Usage{Tokens: w.tokens.Load(), CostMicros: w.cost.Load()}
 }
 
-// spent appends the tokens used so far for each of checks to dst, in order.
+// spent appends the usage so far for each of checks to dst, in order: tokens
+// for token budgets and cost in micro-units for cost budgets.
 func (m *MemoryBudgetCounter) spent(dst []int64, checks []budgetCheck, w budgetWindows) []int64 {
 	for _, c := range checks {
-		u := m.usage(c.scope, w)
-		if c.monthly {
-			dst = append(dst, u.Monthly.Tokens)
-		} else {
-			dst = append(dst, u.Daily.Tokens)
-		}
+		dst = append(dst, c.spentOf(m.usage(c.scope, w)))
 	}
 	return dst
 }

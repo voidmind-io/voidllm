@@ -1,4 +1,4 @@
-// Package ratelimit provides in-memory rate limiting and token budget enforcement.
+// Package ratelimit provides rate limiting and token and cost budget enforcement.
 package ratelimit
 
 // Limits holds rate and token limit values for a single scope.
@@ -53,4 +53,15 @@ type ScopeLimits struct {
 	Team Limits
 	// Org holds the org-level limits.
 	Org Limits
+}
+
+// WithoutCostLimits returns l with the cost limits of every scope removed, so
+// that a BudgetCounter given the result enforces token budgets only. Counting
+// is not affected: cost usage keeps being recorded.
+func (l ScopeLimits) WithoutCostLimits() ScopeLimits {
+	l.Key.DailyCostLimit, l.Key.MonthlyCostLimit = 0, 0
+	l.User.DailyCostLimit, l.User.MonthlyCostLimit = 0, 0
+	l.Team.DailyCostLimit, l.Team.MonthlyCostLimit = 0, 0
+	l.Org.DailyCostLimit, l.Org.MonthlyCostLimit = 0, 0
+	return l
 }

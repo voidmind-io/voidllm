@@ -67,8 +67,10 @@ var UpstreamErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 }, []string{"model", "provider"})
 
 // RateLimitRejectionsTotal counts requests rejected before being proxied due
-// to rate or token budget limits, partitioned by scope: "request" for
-// requests-per-minute/day limits and "token" for daily/monthly token budgets.
+// to rate or budget limits, partitioned by scope: "request" for
+// requests-per-minute/day limits, "token" for daily/monthly token budgets and
+// "cost" for daily/monthly cost budgets. A request that exceeds token and cost
+// budgets together counts as "token".
 var RateLimitRejectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "voidllm_ratelimit_rejections_total",
 	Help: "Total requests rejected by rate limiting.",

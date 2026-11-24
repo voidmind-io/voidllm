@@ -248,7 +248,7 @@ func TestRedisBudgetCounter_TwoInstancesShareOneBudget(t *testing.T) {
 			t.Errorf("instance %s: Check() = %v, want ErrTokenBudgetExceeded (shared 110 >= 100)", name, err)
 		}
 		var le *LimitError
-		if !errors.As(err, &le) || le.Scope != "org" || le.Window != "daily" || le.Metric != "tokens" {
+		if !errors.As(err, &le) || le.RetryScope != "org" || le.RetryWindow != "daily" || le.RetryMetric != "tokens" {
 			t.Errorf("instance %s: LimitError = %+v, want org/daily/tokens", name, le)
 		}
 		if d, _ := RetryAfterFromError(err); d != 12*time.Hour {
@@ -309,7 +309,7 @@ func TestRedisBudgetCounter_UserScopeAndCost(t *testing.T) {
 		t.Errorf("Check() = %v, want ErrTokenBudgetExceeded (user 500 >= 400)", err)
 	}
 	var le *LimitError
-	if !errors.As(err, &le) || le.Scope != "user" {
+	if !errors.As(err, &le) || le.RetryScope != "user" {
 		t.Errorf("LimitError = %+v, want scope user", le)
 	}
 	if err := checkTokens(a, Scopes{KeyID: "key-3", UserID: "user-1", OrgID: "org-2"}, limits); err != nil {
@@ -1186,5 +1186,30 @@ func TestRedisBudgetCounter_IdleCounterRecovers(t *testing.T) {
 	}
 	if n := logs.count("budget backend degraded"); n != 1 {
 		t.Errorf("degraded logged %d times, want once", n)
+	}
+}
+
+// TestRedisBudgetCounter_BrokenCostCounterDoesNotHideTokens verifies that a
+// cost counter of the wrong type in the shared Redis reads as 0 for that
+// counter only, so an exhausted token budget is still enforced.
+func TestRedisBudgetCounter_BrokenCostCounterDoesNotHideTokens(t *testing.T) {
+	env := newRedisBudgetEnv(t)
+	a, _ := env.liveCounter(t, &fakeUsageSeeder{})
+	b, _ := env.liveCounter(t, &fakeUsageSeeder{})
+
+	addTokens(a, Scopes{KeyID: "key-a", OrgID: "org-1"}, 150)
+	orgTokens := env.key("tok", redisTestDay, "org:org-1")
+	eventually(t, "tokens in redis", func() bool { return env.sum(t, orgTokens) == 150 })
+
+	orgCost := env.key("cost", redisTestDay, "org:org-1")
+	env.mr.Del(orgCost)
+	if err := env.mr.Set(orgCost, "broken"); err != nil {
+		t.Fatalf("miniredis Set: %v", err)
+	}
+
+	limits := ScopeLimits{Org: Limits{DailyTokenLimit: 100, DailyCostLimit: 1_000_000}}
+	err := checkTokens(b, Scopes{KeyID: "key-b", OrgID: "org-1"}, limits)
+	if !errors.Is(err, ErrTokenBudgetExceeded) {
+		t.Errorf("Check() = %v, want ErrTokenBudgetExceeded despite the broken cost counter", err)
 	}
 }

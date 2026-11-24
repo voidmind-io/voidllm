@@ -72,7 +72,9 @@ type nhOpts struct {
 	fallbackDepth int
 	rateLimiter   bool
 	budgetCounter bool
-	access        func(keyID string) *proxy.ModelAccessCache
+	// budgetClock, when set, is the clock of the budget counter.
+	budgetClock func() time.Time
+	access      func(keyID string) *proxy.ModelAccessCache
 }
 
 type nhEnv struct {
@@ -119,7 +121,11 @@ func newNHEnv(t *testing.T, o nhOpts) *nhEnv {
 	// counting disabled) when no counter is wanted.
 	var tc ratelimit.BudgetCounter
 	if o.budgetCounter {
-		tc = ratelimit.NewMemoryBudgetCounter()
+		if o.budgetClock != nil {
+			tc = ratelimit.NewMemoryBudgetCounterWithClock(o.budgetClock)
+		} else {
+			tc = ratelimit.NewMemoryBudgetCounter()
+		}
 	}
 	ul := usage.NewLogger(d, config.UsageConfig{BufferSize: 64, FlushInterval: 20 * time.Millisecond}, log, tc)
 	ul.Start()

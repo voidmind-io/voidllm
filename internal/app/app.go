@@ -831,6 +831,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	proxyHandler.UsageLogger = usageLogger
 	proxyHandler.RateLimiter = rateLimiter
 	proxyHandler.BudgetCounter = budgetCounter
+	proxyHandler.License = licHolder
 	proxyHandler.ShutdownState = shutdownState
 	proxyHandler.Tracer = tracer
 	proxyHandler.MaxRequestBody = cfg.Server.Proxy.MaxRequestBody

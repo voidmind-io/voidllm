@@ -324,12 +324,7 @@ func (r *RedisBudgetCounter) Check(ctx context.Context, s Scopes, l ScopeLimits)
 	var spentBuf [maxBudgetChecks]int64
 	spent := r.shadow.spent(spentBuf[:0], checks, w)
 	for i, c := range checks {
-		view := r.persisted.usage(c.scope, w)
-		if c.monthly {
-			spent[i] = max(spent[i], view.Monthly.Tokens)
-		} else {
-			spent[i] = max(spent[i], view.Daily.Tokens)
-		}
+		spent[i] = max(spent[i], c.spentOf(r.persisted.usage(c.scope, w)))
 	}
 
 	if r.backendAllowed(w.now) {
@@ -340,7 +335,11 @@ func (r *RedisBudgetCounter) Check(ctx context.Context, s Scopes, l ScopeLimits)
 			if c.monthly {
 				bucket = b.month
 			}
-			keys[i] = r.client.BudgetKey(voidredis.BudgetMetricTokens, bucket, c.scope)
+			metric := voidredis.BudgetMetricTokens
+			if c.cost {
+				metric = voidredis.BudgetMetricCost
+			}
+			keys[i] = r.client.BudgetKey(metric, bucket, c.scope)
 		}
 		shared, err := r.sumBudgets(ctx, keys)
 		if err != nil {
