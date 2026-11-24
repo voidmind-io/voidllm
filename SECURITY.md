@@ -21,6 +21,10 @@ Include:
 - **Initial assessment:** within 5 business days
 - **Fix timeline:** depends on severity, typically within 14 days for critical issues
 
+## Rewards
+
+We do not offer a bug bounty or monetary rewards. Valid reports are credited in the published advisory and release notes if the reporter wishes.
+
 ## Scope
 
 The following are in scope:
