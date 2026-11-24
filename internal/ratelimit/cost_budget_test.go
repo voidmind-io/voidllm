@@ -87,7 +87,7 @@ func TestCostBudget_ExceedPerScopeAndWindow(t *testing.T) {
 						t.Errorf("Check() = %v, must not be ErrTokenBudgetExceeded", err)
 					}
 					le := limitErrorOf(t, err)
-					if le.Metric != "cost" || le.Scope != sc.kind || le.Window != w.name {
+					if le.RetryMetric != "cost" || le.RetryScope != sc.kind || le.RetryWindow != w.name {
 						t.Errorf("LimitError = %+v, want metric cost, scope %s, window %s", le, sc.kind, w.name)
 					}
 					if le.RetryAfter != w.reset {
@@ -194,7 +194,7 @@ func TestCostBudget_LatestResetAndTokenPrecedence(t *testing.T) {
 				if le.RetryAfter != tt.wantReset {
 					t.Errorf("RetryAfter = %v, want %v", le.RetryAfter, tt.wantReset)
 				}
-				if le.Metric != tt.wantMetric || le.Scope != tt.wantScope || le.Window != tt.wantWindow {
+				if le.RetryMetric != tt.wantMetric || le.RetryScope != tt.wantScope || le.RetryWindow != tt.wantWindow {
 					t.Errorf("LimitError = %+v, want metric %s, scope %s, window %s",
 						le, tt.wantMetric, tt.wantScope, tt.wantWindow)
 				}
@@ -393,7 +393,7 @@ func TestRedisBudgetCounter_TwoInstancesShareOneCostBudget(t *testing.T) {
 			t.Errorf("instance %s: Check() = %v, want ErrCostBudgetExceeded (shared 11000 >= 10000)", name, err)
 			continue
 		}
-		if le := limitErrorOf(t, err); le.Metric != "cost" || le.Scope != "org" || le.Window != "daily" || le.RetryAfter != costUntilMidnight {
+		if le := limitErrorOf(t, err); le.RetryMetric != "cost" || le.RetryScope != "org" || le.RetryWindow != "daily" || le.RetryAfter != costUntilMidnight {
 			t.Errorf("instance %s: LimitError = %+v, want cost/org/daily, RetryAfter %v", name, le, costUntilMidnight)
 		}
 		if err := checkTokens(c, s, roomy); err != nil {
@@ -510,7 +510,7 @@ func TestRedisBudgetCounter_CostFromRefreshedView(t *testing.T) {
 	if !errors.Is(err, ErrCostBudgetExceeded) {
 		t.Fatalf("Check() after the refresh = %v, want ErrCostBudgetExceeded (2.5 persisted >= 2.0)", err)
 	}
-	if le := limitErrorOf(t, err); le.Metric != "cost" || le.Scope != "org" || le.Window != "monthly" {
+	if le := limitErrorOf(t, err); le.RetryMetric != "cost" || le.RetryScope != "org" || le.RetryWindow != "monthly" {
 		t.Errorf("LimitError = %+v, want cost/org/monthly", le)
 	}
 }

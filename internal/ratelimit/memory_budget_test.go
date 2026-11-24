@@ -1096,7 +1096,7 @@ func TestCheck_RetryAfterLatestReset(t *testing.T) {
 		t.Errorf("daily RetryAfter = %v, want %v", d, untilMidnight)
 	}
 	var le *LimitError
-	if !errors.As(err, &le) || le.Metric != "tokens" || le.Scope != "org" || le.Window != "daily" {
+	if !errors.As(err, &le) || le.RetryMetric != "tokens" || le.RetryScope != "org" || le.RetryWindow != "daily" {
 		t.Errorf("daily LimitError = %+v, want metric tokens, scope org, window daily", le)
 	}
 
@@ -1105,7 +1105,7 @@ func TestCheck_RetryAfterLatestReset(t *testing.T) {
 	if d, ok := RetryAfterFromError(err); !ok || d != untilMonth {
 		t.Errorf("monthly RetryAfter = %v, want %v", d, untilMonth)
 	}
-	if !errors.As(err, &le) || le.Scope != "key" || le.Window != "monthly" {
+	if !errors.As(err, &le) || le.RetryScope != "key" || le.RetryWindow != "monthly" {
 		t.Errorf("monthly LimitError = %+v, want scope key, window monthly", le)
 	}
 
@@ -1120,7 +1120,7 @@ func TestCheck_RetryAfterLatestReset(t *testing.T) {
 	if d, ok := RetryAfterFromError(err); !ok || d != untilMonth {
 		t.Errorf("combined RetryAfter = %v, want %v (latest reset)", d, untilMonth)
 	}
-	if !errors.As(err, &le) || le.Scope != "org" || le.Window != "monthly" {
+	if !errors.As(err, &le) || le.RetryScope != "org" || le.RetryWindow != "monthly" {
 		t.Errorf("combined LimitError = %+v, want scope org, window monthly", le)
 	}
 }

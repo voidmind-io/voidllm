@@ -89,7 +89,7 @@ type RowScanner interface {
 	Err() error
 }
 
-// Scope kinds, used as LimitError.Scope and as the prefix of scope keys.
+// Scope kinds, used as LimitError.RetryScope and as the prefix of scope keys.
 const (
 	scopeKindKey  = "key"
 	scopeKindUser = "user"
@@ -97,7 +97,7 @@ const (
 	scopeKindOrg  = "org"
 )
 
-// Values of LimitError.Metric and LimitError.Window for budget errors.
+// Values of LimitError.Reason, RetryMetric and RetryWindow for budget errors.
 const (
 	metricTokens  = "tokens"
 	metricCost    = "cost"
@@ -226,13 +226,14 @@ func appendScopeChecks(dst []budgetCheck, kind, scope string, lim Limits) []budg
 
 // evaluateBudget compares the usage spent[i] with the limit of checks[i]. It
 // returns nil while every usage is below its limit. Otherwise it returns a
-// *LimitError whose RetryAfter, Metric, Scope and Window describe the exceeded
-// budget with the latest reset: daily budgets reset at the next UTC midnight,
-// monthly ones on the 1st of the next UTC month. Among budgets that reset at
-// the same time a token budget is described rather than a cost budget, and
-// otherwise the first in check order. The error wraps ErrTokenBudgetExceeded
-// when any token budget is exceeded, whichever budget resets last, and
-// ErrCostBudgetExceeded when only cost budgets are.
+// *LimitError. Its RetryAfter, RetryMetric, RetryScope and RetryWindow describe
+// the exceeded budget with the latest reset: daily budgets reset at the next
+// UTC midnight, monthly ones on the 1st of the next UTC month. Among budgets
+// that reset at the same time a token budget is described rather than a cost
+// budget, and otherwise the first in check order. The error wraps
+// ErrTokenBudgetExceeded (Reason "tokens") when any token budget is exceeded,
+// whichever budget resets last, and ErrCostBudgetExceeded (Reason "cost") when
+// only cost budgets are.
 func evaluateBudget(checks []budgetCheck, spent []int64, w budgetWindows) error {
 	var (
 		latest         budgetCheck
@@ -251,29 +252,34 @@ func evaluateBudget(checks []budgetCheck, spent []int64, w budgetWindows) error 
 		if c.monthly {
 			reset = nextUTCMonth(w.now).Sub(w.now)
 		}
-		if found && (reset < latestReset || (reset == latestReset && (c.cost || !latest.cost))) {
-			continue
+		if found {
+			tokenBeatsCost := !c.cost && latest.cost
+			if reset < latestReset || (reset == latestReset && !tokenBeatsCost) {
+				continue
+			}
 		}
 		latest, latestReset, found = c, reset, true
 	}
 	if !found {
 		return nil
 	}
+
 	exceeded := &LimitError{
-		Err:        ErrCostBudgetExceeded,
-		RetryAfter: latestReset,
-		Metric:     metricTokens,
-		Scope:      latest.kind,
-		Window:     windowDaily,
+		RetryAfter:  latestReset,
+		RetryMetric: metricTokens,
+		RetryScope:  latest.kind,
+		RetryWindow: windowDaily,
 	}
 	if tokensExceeded {
-		exceeded.Err = ErrTokenBudgetExceeded
+		exceeded.Err, exceeded.Reason = ErrTokenBudgetExceeded, metricTokens
+	} else {
+		exceeded.Err, exceeded.Reason = ErrCostBudgetExceeded, metricCost
 	}
 	if latest.cost {
-		exceeded.Metric = metricCost
+		exceeded.RetryMetric = metricCost
 	}
 	if latest.monthly {
-		exceeded.Window = windowMonthly
+		exceeded.RetryWindow = windowMonthly
 	}
 	return exceeded
 }

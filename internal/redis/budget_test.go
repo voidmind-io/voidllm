@@ -114,9 +114,39 @@ func TestSetAndSumBudgets(t *testing.T) {
 		t.Errorf("TTL = %v, want 36h", ttl)
 	}
 
-	// A value that is not a number is an error, not a silent zero.
+	// A value that is not a number counts as 0, the other fields still add up.
 	mr.HSet(a, "broken", "not-a-number")
-	if _, err := c.SumBudgets(ctx, []string{a}); err == nil {
-		t.Error("SumBudgets() on a non-numeric field error = nil, want an error")
+	assertSums("non-numeric field", 65, 3_000_000_000_500)
+}
+
+func TestSumBudgetsMalformedCounterReadsAsZero(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
+	c, mr := newBudgetTestClient(t, now)
+	ctx := context.Background()
+
+	good := c.BudgetKey(BudgetMetricTokens, "d:2026-03-10", "org:o")
+	wrongType := c.BudgetKey(BudgetMetricCost, "d:2026-03-10", "org:o")
+	badField := c.BudgetKey(BudgetMetricCost, "m:2026-03", "org:o")
+
+	expire := now.Add(36 * time.Hour)
+	if err := c.SetBudgets(ctx, "inst-1", []BudgetValue{{Key: good, Value: 42, ExpireAt: expire}}); err != nil {
+		t.Fatalf("SetBudgets: %v", err)
+	}
+	if err := mr.Set(wrongType, "not a hash"); err != nil {
+		t.Fatalf("miniredis Set: %v", err)
+	}
+	mr.HSet(badField, "inst-1", "oops", "inst-2", "7")
+
+	sums, err := c.SumBudgets(ctx, []string{wrongType, good, badField})
+	if err != nil {
+		t.Fatalf("SumBudgets error = %v, want nil", err)
+	}
+	want := []int64{0, 42, 7}
+	for i := range want {
+		if sums[i] != want[i] {
+			t.Errorf("sums[%d] = %d, want %d (all: %v)", i, sums[i], want[i], sums)
+		}
 	}
 }

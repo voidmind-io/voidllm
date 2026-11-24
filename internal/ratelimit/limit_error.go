@@ -14,20 +14,22 @@ type LimitError struct {
 	Err error
 	// RetryAfter is how long until the exceeded window resets.
 	RetryAfter time.Duration
-	// Metric names the metric of the budget that determines RetryAfter
-	// ("tokens" or "cost"). When token and cost budgets are exceeded together
-	// it can be "cost" although Err is ErrTokenBudgetExceeded; which kind of
-	// rejection it is follows from Err. Set for budget errors only; for logs
-	// and metrics, never for clients.
-	Metric string
-	// Scope names the kind of scope whose budget determines RetryAfter
-	// ("key", "user", "team" or "org"). Set for budget errors only; for logs
-	// and metrics, never for clients.
-	Scope string
-	// Window names the window that determines RetryAfter ("daily" or
-	// "monthly"). Set for budget errors only; for logs and metrics, never for
-	// clients.
-	Window string
+	// Reason says why the request was rejected, "tokens" or "cost". It always
+	// agrees with Err: "tokens" for ErrTokenBudgetExceeded (also when cost
+	// budgets are exceeded as well), "cost" for ErrCostBudgetExceeded. Set for
+	// budget errors only; for logs and metrics, never for clients.
+	Reason string
+	// RetryMetric names the metric ("tokens" or "cost") of the budget that
+	// determines RetryAfter. It can differ from Reason: when token and cost
+	// budgets are exceeded together, Reason is "tokens" while the cost budget
+	// may reset last. Set for budget errors only.
+	RetryMetric string
+	// RetryScope names the kind of scope ("key", "user", "team" or "org") of
+	// the budget that determines RetryAfter. Set for budget errors only.
+	RetryScope string
+	// RetryWindow names the window ("daily" or "monthly") of the budget that
+	// determines RetryAfter. Set for budget errors only.
+	RetryWindow string
 }
 
 // Error returns the wrapped sentinel's message.

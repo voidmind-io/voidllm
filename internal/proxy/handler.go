@@ -1098,9 +1098,10 @@ func (p *ProxyHandler) checkLimits(c fiber.Ctx, keyInfo *auth.KeyInfo) error {
 			var limitErr *ratelimit.LimitError
 			if errors.As(err, &limitErr) {
 				attrs = append(attrs,
-					slog.String("metric", limitErr.Metric),
-					slog.String("scope", limitErr.Scope),
-					slog.String("window", limitErr.Window),
+					slog.String("reason", limitErr.Reason),
+					slog.String("retry_metric", limitErr.RetryMetric),
+					slog.String("retry_scope", limitErr.RetryScope),
+					slog.String("retry_window", limitErr.RetryWindow),
 				)
 			}
 			p.Log.LogAttrs(c.Context(), slog.LevelWarn, rejection.message, attrs...)

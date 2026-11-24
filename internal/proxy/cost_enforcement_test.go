@@ -34,6 +34,14 @@ const (
 	ceStreamCost = money.Micros(25)
 )
 
+// ceNow is the instant the budget counter of every cost enforcement test
+// reads as the current time: mid-day and mid-month, so no test can straddle a
+// UTC midnight or month boundary. It is 12h before the next UTC midnight and
+// 15.5 days before the 1st of the next month.
+var ceNow = time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+
+func ceClock() time.Time { return ceNow }
+
 var cePricing = config.PricingConfig{InputPer1M: 1, OutputPer1M: 2}
 
 // ceChatStream is an OpenAI chat completions stream reporting 7 prompt and 9
@@ -146,6 +154,7 @@ func newCEEnv(t *testing.T, ep ceEndpoint, stream bool, lic *license.Holder, mut
 	priced.Pricing = cePricing
 	env := newNHEnv(t, nhOpts{
 		budgetCounter: true,
+		budgetClock:   ceClock,
 		models:        []config.ModelConfig{priced, oaiModel(ceUnpriced, ep.provider, up.srv.URL)},
 		mutateKey: func(k *auth.KeyInfo) {
 			k.UserID = ceUserID
@@ -213,9 +222,10 @@ func ceRetryAfter(t *testing.T, h http.Header) int {
 	return secs
 }
 
+// ceSecondsUntilMonthEnd is the time from ceNow to the 1st of the next UTC
+// month, in seconds.
 func ceSecondsUntilMonthEnd() int {
-	now := time.Now().UTC()
-	return int(time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, time.UTC).Sub(now).Seconds())
+	return int(time.Date(ceNow.Year(), ceNow.Month()+1, 1, 0, 0, 0, 0, time.UTC).Sub(ceNow).Seconds())
 }
 
 // TestCostEnforcement_RejectsOnceBudgetIsSpent drives a real request through
@@ -255,16 +265,20 @@ func TestCostEnforcement_RejectsOnceBudgetIsSpent(t *testing.T) {
 					if got := hdr.Get("x-should-retry"); got != "false" {
 						t.Errorf("x-should-retry = %q, want false", got)
 					}
-					if secs := ceRetryAfter(t, hdr); secs > 86400 {
-						t.Errorf("Retry-After = %d, want at most 86400 (daily window)", secs)
+					if secs := ceRetryAfter(t, hdr); secs != 12*3600 {
+						t.Errorf("Retry-After = %d, want %d (until the next UTC midnight)", secs, 12*3600)
 					}
 					if got := up.hits.Load(); got != 1 {
 						t.Errorf("upstream hits = %d, want 1 (the rejected request must not be forwarded)", got)
 					}
-					wantLog := "scope=" + scope.name
-					if out := env.logs.String(); !strings.Contains(out, "cost budget exceeded") ||
-						!strings.Contains(out, "metric=cost") || !strings.Contains(out, wantLog) || !strings.Contains(out, "window=daily") {
-						t.Errorf("log lacks the cost rejection with metric=cost %s window=daily:\n%s", wantLog, out)
+					out := env.logs.String()
+					if !strings.Contains(out, "cost budget exceeded") {
+						t.Errorf("log lacks the cost rejection:\n%s", out)
+					}
+					for _, attr := range []string{"reason=cost", "retry_metric=cost", "retry_scope=" + scope.name, "retry_window=daily"} {
+						if !strings.Contains(out, attr) {
+							t.Errorf("log lacks %s:\n%s", attr, out)
+						}
 					}
 				})
 			}
@@ -367,8 +381,8 @@ func TestCostEnforcement_FollowsLicenseAtRuntime(t *testing.T) {
 		t.Fatalf("request after license activation: status %d body %s, want 429", status, body)
 	}
 	ep.wantRejection(t, body)
-	if secs, want := ceRetryAfter(t, hdr), ceSecondsUntilMonthEnd(); secs < want-5 || secs > want+5 {
-		t.Errorf("Retry-After = %d, want ~%d (until the 1st of next UTC month)", secs, want)
+	if secs, want := ceRetryAfter(t, hdr), ceSecondsUntilMonthEnd(); secs != want {
+		t.Errorf("Retry-After = %d, want %d (until the 1st of next UTC month)", secs, want)
 	}
 
 	holder.Store(license.Verify("", false))
@@ -398,8 +412,8 @@ func TestCostEnforcement_RetryAfterIsLatestReset(t *testing.T) {
 				t.Fatalf("status %d body %s, want 429", status, body)
 			}
 			ep.wantRejection(t, body)
-			if secs, want := ceRetryAfter(t, hdr), ceSecondsUntilMonthEnd(); secs < want-5 || secs > want+5 {
-				t.Errorf("Retry-After = %d, want ~%d (until the 1st of next UTC month)", secs, want)
+			if secs, want := ceRetryAfter(t, hdr), ceSecondsUntilMonthEnd(); secs != want {
+				t.Errorf("Retry-After = %d, want %d (until the 1st of next UTC month)", secs, want)
 			}
 			if hdr.Get("x-should-retry") != "false" {
 				t.Errorf("x-should-retry = %q, want false", hdr.Get("x-should-retry"))
@@ -441,11 +455,23 @@ func TestCostEnforcement_TokenRejectionWinsWhenBothAreSpent(t *testing.T) {
 			if ep.path != "/v1/messages" && !strings.Contains(body, `"code":"token_limit_exceeded"`) {
 				t.Errorf("rejection = %s, want code token_limit_exceeded", body)
 			}
-			if secs, want := ceRetryAfter(t, hdr), ceSecondsUntilMonthEnd(); secs < want-5 || secs > want+5 {
-				t.Errorf("Retry-After = %d, want ~%d (the monthly cost budget resets last)", secs, want)
+			if secs, want := ceRetryAfter(t, hdr), ceSecondsUntilMonthEnd(); secs != want {
+				t.Errorf("Retry-After = %d, want %d (the monthly cost budget resets last)", secs, want)
 			}
 			if hdr.Get("x-should-retry") != "false" {
 				t.Errorf("x-should-retry = %q, want false", hdr.Get("x-should-retry"))
+			}
+			// The log separates the rejection reason from the budget that sets
+			// Retry-After: tokens were the reason, the monthly org cost budget
+			// resets last.
+			out := env.logs.String()
+			for _, attr := range []string{"reason=tokens", "retry_metric=cost", "retry_scope=org", "retry_window=monthly"} {
+				if !strings.Contains(out, attr) {
+					t.Errorf("log lacks %s:\n%s", attr, out)
+				}
+			}
+			if strings.Contains(out, "reason=cost") {
+				t.Errorf("log reports reason=cost for a token rejection:\n%s", out)
 			}
 		})
 	}
@@ -510,6 +536,7 @@ func TestCostEnforcement_CountTokens(t *testing.T) {
 	priced.Pricing = cePricing
 	env := newNHEnv(t, nhOpts{
 		budgetCounter: true,
+		budgetClock:   ceClock,
 		models:        []config.ModelConfig{priced},
 		mutateKey: func(k *auth.KeyInfo) {
 			k.UserID, k.TeamID = ceUserID, ceTeamID
@@ -545,11 +572,11 @@ func TestCostEnforcement_CountTokens(t *testing.T) {
 	}
 }
 
-// TestCostEnforcement_RejectionMetric verifies that a cost rejection is
-// counted under the "cost" label. Other tests reject in parallel, so the
-// counter is only required to grow.
+// TestCostEnforcement_RejectionMetric verifies that exactly one cost rejection
+// is counted under the "cost" label. It is deliberately not parallel: parallel
+// tests of this package only resume after every serial test has finished, so
+// nothing else increments the counter between the two reads.
 func TestCostEnforcement_RejectionMetric(t *testing.T) {
-	t.Parallel()
 	ep := ceEndpoints[0]
 	env, _ := newCEEnv(t, ep, false, ceLicensed(), func(k *auth.KeyInfo) { k.DailyCostLimit = ceJSONCost })
 	if status, _, body := cePost(t, env, ep.path, ep.body(cePriced, false)); status != http.StatusOK {
@@ -557,11 +584,59 @@ func TestCostEnforcement_RejectionMetric(t *testing.T) {
 	}
 	waitCECost(t, env, ceJSONCost)
 
-	before := testutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("cost"))
+	counter := metrics.RateLimitRejectionsTotal.WithLabelValues("cost")
+	before := testutil.ToFloat64(counter)
 	if status, _, body := cePost(t, env, ep.path, ep.body(cePriced, false)); status != http.StatusTooManyRequests {
 		t.Fatalf("status %d body %s, want 429", status, body)
 	}
-	if after := testutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("cost")); after < before+1 {
-		t.Errorf(`rejections{scope="cost"} went from %v to %v, want an increase of at least 1`, before, after)
+	if after := testutil.ToFloat64(counter); after != before+1 {
+		t.Errorf(`rejections{scope="cost"} went from %v to %v, want an increase of exactly 1`, before, after)
+	}
+}
+
+// TestCostEnforcement_MonthlyLimitOnEveryScope drives a real request with a
+// monthly cost limit equal to its cost on each of the four scopes. The next
+// request must be rejected, Retry-After must point at the 1st of the next UTC
+// month and the log must name the scope and the monthly window.
+func TestCostEnforcement_MonthlyLimitOnEveryScope(t *testing.T) {
+	t.Parallel()
+	monthly := []struct {
+		name string
+		set  func(k *auth.KeyInfo, limit money.Micros)
+	}{
+		{"key", func(k *auth.KeyInfo, l money.Micros) { k.MonthlyCostLimit = l }},
+		{"user", func(k *auth.KeyInfo, l money.Micros) { k.UserMonthlyCostLimit = l }},
+		{"team", func(k *auth.KeyInfo, l money.Micros) { k.TeamMonthlyCostLimit = l }},
+		{"org", func(k *auth.KeyInfo, l money.Micros) { k.OrgMonthlyCostLimit = l }},
+	}
+	ep := ceEndpoints[0]
+	for _, scope := range monthly {
+		t.Run(scope.name, func(t *testing.T) {
+			t.Parallel()
+			env, up := newCEEnv(t, ep, false, ceLicensed(), func(k *auth.KeyInfo) { scope.set(k, ceJSONCost) })
+
+			if status, _, body := cePost(t, env, ep.path, ep.body(cePriced, false)); status != http.StatusOK {
+				t.Fatalf("first request: status %d body %s", status, body)
+			}
+			waitCECost(t, env, ceJSONCost)
+
+			status, hdr, body := cePost(t, env, ep.path, ep.body(cePriced, false))
+			if status != http.StatusTooManyRequests {
+				t.Fatalf("request over the monthly cost budget: status %d body %s, want 429", status, body)
+			}
+			ep.wantRejection(t, body)
+			if secs, want := ceRetryAfter(t, hdr), ceSecondsUntilMonthEnd(); secs != want {
+				t.Errorf("Retry-After = %d, want %d (until the 1st of next UTC month)", secs, want)
+			}
+			if got := up.hits.Load(); got != 1 {
+				t.Errorf("upstream hits = %d, want 1", got)
+			}
+			out := env.logs.String()
+			for _, attr := range []string{"reason=cost", "retry_metric=cost", "retry_scope=" + scope.name, "retry_window=monthly"} {
+				if !strings.Contains(out, attr) {
+					t.Errorf("log lacks %s:\n%s", attr, out)
+				}
+			}
+		})
 	}
 }

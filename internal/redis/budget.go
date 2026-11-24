@@ -30,13 +30,18 @@ type BudgetValue struct {
 // budgetSumScript returns, for every key, the sum of all fields of the hash
 // stored there (0 for a missing key). Summing on the server keeps a budget
 // check at one round trip and one small reply regardless of how many
-// instances reported into a counter. Sums are exact up to 2^53.
+// instances reported into a counter. Sums are exact up to 2^53. A key of the
+// wrong type or a non-numeric field counts as 0 for that counter only, so one
+// broken counter cannot hide the others.
 var budgetSumScript = goredis.NewScript(`
 local sums = {}
 for i, key in ipairs(KEYS) do
     local sum = 0
-    for _, v in ipairs(redis.call('HVALS', key)) do
-        sum = sum + tonumber(v)
+    local vals = redis.pcall('HVALS', key)
+    if type(vals) == 'table' and not vals.err then
+        for _, v in ipairs(vals) do
+            sum = sum + (tonumber(v) or 0)
+        end
     end
     sums[i] = sum
 end
@@ -87,8 +92,8 @@ func (c *Client) SetBudgets(ctx context.Context, instanceID string, values []Bud
 }
 
 // SumBudgets returns, in the order of keys, the usage all instances together
-// reported for each counter, in one round trip. Counters that do not exist
-// read as 0.
+// reported for each counter, in one round trip. Counters that do not exist or
+// are malformed read as 0.
 func (c *Client) SumBudgets(ctx context.Context, keys []string) ([]int64, error) {
 	if len(keys) == 0 {
 		return nil, nil

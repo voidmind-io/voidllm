@@ -46,6 +46,13 @@ func NewMemoryBudgetCounter() *MemoryBudgetCounter {
 	return &MemoryBudgetCounter{now: time.Now}
 }
 
+// NewMemoryBudgetCounterWithClock constructs an empty MemoryBudgetCounter that
+// reads the current time from now, which decides the daily and monthly
+// windows. It lets callers pin the windows, e.g. in tests.
+func NewMemoryBudgetCounterWithClock(now func() time.Time) *MemoryBudgetCounter {
+	return &MemoryBudgetCounter{now: now}
+}
+
 // Check implements BudgetCounter.
 func (m *MemoryBudgetCounter) Check(_ context.Context, s Scopes, l ScopeLimits) error {
 	var checkBuf [maxBudgetChecks]budgetCheck
