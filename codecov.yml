@@ -20,3 +20,5 @@ ignore:
   - "ui/"
   - "docs/"
   - "scripts/"
+
+comment: false
