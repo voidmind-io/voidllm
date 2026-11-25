@@ -1324,6 +1324,7 @@ func New(cfg *config.Config, log *slog.Logger, devMode bool) (*Application, erro
 	adminHandler.MCPAllowPrivateURLs = cfg.Settings.MCP.AllowPrivateURLs
 	adminHandler.MCPAllowedOrigins = cfg.Settings.MCP.AllowedOrigins
 	adminHandler.FallbackMaxDepth = cfg.Settings.FallbackMaxDepth
+	adminHandler.Currency = cfg.Settings.Currency
 
 	mcpLogger := usage.NewMCPLogger(database, 1000, log)
 	adminHandler.MCPLogger = mcpLogger

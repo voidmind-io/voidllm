@@ -73,7 +73,10 @@ type Handler struct {
 	// the package default (10s timeout, no redirects). Set only by tests.
 	trialClient      *http.Client
 	FallbackMaxDepth int // from config; 0 = fallback disabled; exposed via GET /license
-	Log              *slog.Logger
+	// Currency is the ISO 4217 code that model prices and cost limits are
+	// denominated in, from settings.currency. Exposed read-only on GET /me.
+	Currency string
+	Log      *slog.Logger
 	// AWSSigner signs Bedrock IAM test-connection probes. Nil makes such
 	// probes report that credentials are unavailable.
 	AWSSigner proxy.BedrockSigner

@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"regexp"
@@ -9,6 +10,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/money"
 )
 
 // slugRegex validates that a slug consists of lowercase alphanumeric characters
@@ -25,6 +27,14 @@ type createOrgRequest struct {
 	MonthlyTokenLimit int64   `json:"monthly_token_limit"`
 	RequestsPerMinute int     `json:"requests_per_minute"`
 	RequestsPerDay    int     `json:"requests_per_day"`
+	// DailyCostLimit is the daily cost budget in major currency units as a
+	// decimal string, for example "25.00". "0" or omitted means unlimited.
+	// Requires a license with cost budgets.
+	DailyCostLimit json.RawMessage `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
+	// MonthlyCostLimit is the monthly cost budget in major currency units as a
+	// decimal string, for example "500.00". "0" or omitted means unlimited.
+	// Requires a license with cost budgets.
+	MonthlyCostLimit json.RawMessage `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
 }
 
 // updateOrgRequest is the JSON body accepted by UpdateOrg.
@@ -37,6 +47,14 @@ type updateOrgRequest struct {
 	MonthlyTokenLimit *int64  `json:"monthly_token_limit"`
 	RequestsPerMinute *int    `json:"requests_per_minute"`
 	RequestsPerDay    *int    `json:"requests_per_day"`
+	// DailyCostLimit is the daily cost budget in major currency units as a
+	// decimal string, for example "25.00". Omitted or null leaves it
+	// unchanged, "0" means unlimited. Requires a license with cost budgets.
+	DailyCostLimit json.RawMessage `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
+	// MonthlyCostLimit is the monthly cost budget in major currency units as a
+	// decimal string, for example "500.00". Omitted or null leaves it
+	// unchanged, "0" means unlimited. Requires a license with cost budgets.
+	MonthlyCostLimit json.RawMessage `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
 }
 
 // orgResponse is the JSON representation of an organization returned by the API.
@@ -49,11 +67,17 @@ type orgResponse struct {
 	MonthlyTokenLimit int64   `json:"monthly_token_limit"`
 	RequestsPerMinute int     `json:"requests_per_minute"`
 	RequestsPerDay    int     `json:"requests_per_day"`
-	MemberCount       int     `json:"member_count"`
-	TeamCount         int     `json:"team_count"`
-	CreatedAt         string  `json:"created_at"`
-	UpdatedAt         string  `json:"updated_at"`
-	DeletedAt         *string `json:"deleted_at,omitempty"`
+	// DailyCostLimit is the daily cost budget as a decimal string in major
+	// currency units. "0.00" means unlimited.
+	DailyCostLimit money.Micros `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
+	// MonthlyCostLimit is the monthly cost budget as a decimal string in major
+	// currency units. "0.00" means unlimited.
+	MonthlyCostLimit money.Micros `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
+	MemberCount      int          `json:"member_count"`
+	TeamCount        int          `json:"team_count"`
+	CreatedAt        string       `json:"created_at"`
+	UpdatedAt        string       `json:"updated_at"`
+	DeletedAt        *string      `json:"deleted_at,omitempty"`
 }
 
 // paginatedOrgsResponse wraps a page of organizations with pagination metadata.
@@ -95,6 +119,8 @@ func orgToResponse(o *db.OrgWithCounts) orgResponse {
 		MonthlyTokenLimit: o.MonthlyTokenLimit,
 		RequestsPerMinute: o.RequestsPerMinute,
 		RequestsPerDay:    o.RequestsPerDay,
+		DailyCostLimit:    o.DailyCostLimit,
+		MonthlyCostLimit:  o.MonthlyCostLimit,
 		MemberCount:       o.MemberCount,
 		TeamCount:         o.TeamCount,
 		CreatedAt:         o.CreatedAt,
@@ -128,6 +154,10 @@ func (h *Handler) CreateOrg(c fiber.Ctx) error {
 	if sent, err := rejectNegativeLimits(c, &req.DailyTokenLimit, &req.MonthlyTokenLimit, &req.RequestsPerMinute, &req.RequestsPerDay); sent {
 		return err
 	}
+	costLimits, sent, err := parseCostLimits(c, req.DailyCostLimit, req.MonthlyCostLimit)
+	if sent {
+		return err
+	}
 	if req.Name == "" {
 		return apierror.BadRequest(c, "name is required")
 	}
@@ -136,6 +166,9 @@ func (h *Handler) CreateOrg(c fiber.Ctx) error {
 	}
 	if !slugRegex.MatchString(req.Slug) {
 		return apierror.BadRequest(c, "slug must be lowercase alphanumeric with hyphens, 2-63 characters")
+	}
+	if _, sent, err := h.rejectUnlicensedCostLimits(c, costLimits, nil, ""); sent {
+		return err
 	}
 
 	lic := h.License.Load()
@@ -159,6 +192,8 @@ func (h *Handler) CreateOrg(c fiber.Ctx) error {
 		MonthlyTokenLimit: req.MonthlyTokenLimit,
 		RequestsPerMinute: req.RequestsPerMinute,
 		RequestsPerDay:    req.RequestsPerDay,
+		DailyCostLimit:    costLimits.dailyValue(),
+		MonthlyCostLimit:  costLimits.monthlyValue(),
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
@@ -341,11 +376,26 @@ func (h *Handler) UpdateOrg(c fiber.Ctx) error {
 	if sent, err := rejectNegativeLimits(c, req.DailyTokenLimit, req.MonthlyTokenLimit, req.RequestsPerMinute, req.RequestsPerDay); sent {
 		return err
 	}
+	costLimits, sent, err := parseCostLimits(c, req.DailyCostLimit, req.MonthlyCostLimit)
+	if sent {
+		return err
+	}
 	if req.Slug != nil && !slugRegex.MatchString(*req.Slug) {
 		return apierror.BadRequest(c, "slug must be lowercase alphanumeric with hyphens, 2-63 characters")
 	}
+	loadCurrent := func() (money.Micros, money.Micros, error) {
+		org, getErr := h.DB.GetOrg(c.Context(), id)
+		if getErr != nil {
+			return 0, 0, getErr
+		}
+		return org.DailyCostLimit, org.MonthlyCostLimit, nil
+	}
+	costLimits, sent, err = h.rejectUnlicensedCostLimits(c, costLimits, loadCurrent, "organization not found")
+	if sent {
+		return err
+	}
 
-	_, err := h.DB.UpdateOrg(c.Context(), id, db.UpdateOrgParams{
+	_, err = h.DB.UpdateOrg(c.Context(), id, db.UpdateOrgParams{
 		Name:              req.Name,
 		Slug:              req.Slug,
 		Timezone:          req.Timezone,
@@ -353,6 +403,8 @@ func (h *Handler) UpdateOrg(c fiber.Ctx) error {
 		MonthlyTokenLimit: req.MonthlyTokenLimit,
 		RequestsPerMinute: req.RequestsPerMinute,
 		RequestsPerDay:    req.RequestsPerDay,
+		DailyCostLimit:    costLimits.Daily,
+		MonthlyCostLimit:  costLimits.Monthly,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {

@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/money"
 	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 	"github.com/voidmind-io/voidllm/pkg/keygen"
 )
@@ -26,7 +28,15 @@ type createAPIKeyRequest struct {
 	MonthlyTokenLimit int64   `json:"monthly_token_limit"`
 	RequestsPerMinute int     `json:"requests_per_minute"`
 	RequestsPerDay    int     `json:"requests_per_day"`
-	ExpiresAt         *string `json:"expires_at"`
+	// DailyCostLimit is the daily cost budget in major currency units as a
+	// decimal string, for example "25.00". "0" or omitted means unlimited.
+	// Requires a license with cost budgets.
+	DailyCostLimit json.RawMessage `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
+	// MonthlyCostLimit is the monthly cost budget in major currency units as a
+	// decimal string, for example "500.00". "0" or omitted means unlimited.
+	// Requires a license with cost budgets.
+	MonthlyCostLimit json.RawMessage `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
+	ExpiresAt        *string         `json:"expires_at"`
 }
 
 // updateAPIKeyRequest is the JSON body accepted by UpdateAPIKey.
@@ -37,7 +47,15 @@ type updateAPIKeyRequest struct {
 	MonthlyTokenLimit *int64  `json:"monthly_token_limit"`
 	RequestsPerMinute *int    `json:"requests_per_minute"`
 	RequestsPerDay    *int    `json:"requests_per_day"`
-	ExpiresAt         *string `json:"expires_at"`
+	// DailyCostLimit is the daily cost budget in major currency units as a
+	// decimal string, for example "25.00". Omitted or null leaves it
+	// unchanged, "0" means unlimited. Requires a license with cost budgets.
+	DailyCostLimit json.RawMessage `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
+	// MonthlyCostLimit is the monthly cost budget in major currency units as a
+	// decimal string, for example "500.00". Omitted or null leaves it
+	// unchanged, "0" means unlimited. Requires a license with cost budgets.
+	MonthlyCostLimit json.RawMessage `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
+	ExpiresAt        *string         `json:"expires_at"`
 }
 
 // createAPIKeyResponse is the JSON representation returned by CreateAPIKey.
@@ -56,10 +74,16 @@ type createAPIKeyResponse struct {
 	MonthlyTokenLimit int64   `json:"monthly_token_limit"`
 	RequestsPerMinute int     `json:"requests_per_minute"`
 	RequestsPerDay    int     `json:"requests_per_day"`
-	ExpiresAt         *string `json:"expires_at,omitempty"`
-	CreatedBy         string  `json:"created_by"`
-	CreatedAt         string  `json:"created_at"`
-	UpdatedAt         string  `json:"updated_at"`
+	// DailyCostLimit is the daily cost budget as a decimal string in major
+	// currency units. "0.00" means unlimited.
+	DailyCostLimit money.Micros `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
+	// MonthlyCostLimit is the monthly cost budget as a decimal string in major
+	// currency units. "0.00" means unlimited.
+	MonthlyCostLimit money.Micros `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
+	ExpiresAt        *string      `json:"expires_at,omitempty"`
+	CreatedBy        string       `json:"created_by"`
+	CreatedAt        string       `json:"created_at"`
+	UpdatedAt        string       `json:"updated_at"`
 }
 
 // apiKeyResponse is the JSON representation of an API key returned by GET and LIST operations.
@@ -77,11 +101,17 @@ type apiKeyResponse struct {
 	MonthlyTokenLimit int64   `json:"monthly_token_limit"`
 	RequestsPerMinute int     `json:"requests_per_minute"`
 	RequestsPerDay    int     `json:"requests_per_day"`
-	ExpiresAt         *string `json:"expires_at,omitempty"`
-	LastUsedAt        *string `json:"last_used_at,omitempty"`
-	CreatedBy         string  `json:"created_by"`
-	CreatedAt         string  `json:"created_at"`
-	UpdatedAt         string  `json:"updated_at"`
+	// DailyCostLimit is the daily cost budget as a decimal string in major
+	// currency units. "0.00" means unlimited.
+	DailyCostLimit money.Micros `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
+	// MonthlyCostLimit is the monthly cost budget as a decimal string in major
+	// currency units. "0.00" means unlimited.
+	MonthlyCostLimit money.Micros `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
+	ExpiresAt        *string      `json:"expires_at,omitempty"`
+	LastUsedAt       *string      `json:"last_used_at,omitempty"`
+	CreatedBy        string       `json:"created_by"`
+	CreatedAt        string       `json:"created_at"`
+	UpdatedAt        string       `json:"updated_at"`
 }
 
 // paginatedAPIKeysResponse wraps a page of API keys with pagination metadata.
@@ -127,6 +157,8 @@ func apiKeyToResponse(k *db.APIKey) apiKeyResponse {
 		MonthlyTokenLimit: k.MonthlyTokenLimit,
 		RequestsPerMinute: k.RequestsPerMinute,
 		RequestsPerDay:    k.RequestsPerDay,
+		DailyCostLimit:    k.DailyCostLimit,
+		MonthlyCostLimit:  k.MonthlyCostLimit,
 		ExpiresAt:         k.ExpiresAt,
 		LastUsedAt:        k.LastUsedAt,
 		CreatedBy:         k.CreatedBy,
@@ -359,6 +391,10 @@ func (h *Handler) CreateAPIKey(c fiber.Ctx) error {
 	if req.DailyTokenLimit < 0 || req.MonthlyTokenLimit < 0 || req.RequestsPerMinute < 0 || req.RequestsPerDay < 0 {
 		return apierror.BadRequest(c, "limit fields must be >= 0")
 	}
+	costLimits, sent, err := parseCostLimits(c, req.DailyCostLimit, req.MonthlyCostLimit)
+	if sent {
+		return err
+	}
 	normalizedExpiresAt, err := normalizeExpiresAt(req.ExpiresAt)
 	if err != nil {
 		return apierror.BadRequest(c, err.Error())
@@ -375,9 +411,13 @@ func (h *Handler) CreateAPIKey(c fiber.Ctx) error {
 		// Only org admins and system admins may set key limits at creation.
 		// A non-admin who mints their own key must not be able to grant
 		// themselves a higher (or unlimited) budget than an admin assigned.
-		if req.DailyTokenLimit != 0 || req.MonthlyTokenLimit != 0 || req.RequestsPerMinute != 0 || req.RequestsPerDay != 0 {
+		if req.DailyTokenLimit != 0 || req.MonthlyTokenLimit != 0 || req.RequestsPerMinute != 0 || req.RequestsPerDay != 0 ||
+			costLimits.setsNonZero() {
 			return apierror.Send(c, fiber.StatusForbidden, "forbidden", "only administrators can set key limits")
 		}
+	}
+	if _, sent, err := h.rejectUnlicensedCostLimits(c, costLimits, nil, ""); sent {
+		return err
 	}
 
 	switch req.KeyType {
@@ -524,6 +564,8 @@ func (h *Handler) CreateAPIKey(c fiber.Ctx) error {
 		MonthlyTokenLimit: req.MonthlyTokenLimit,
 		RequestsPerMinute: req.RequestsPerMinute,
 		RequestsPerDay:    req.RequestsPerDay,
+		DailyCostLimit:    costLimits.dailyValue(),
+		MonthlyCostLimit:  costLimits.monthlyValue(),
 		ExpiresAt:         req.ExpiresAt,
 		CreatedBy:         keyInfo.UserID,
 	})
@@ -572,6 +614,8 @@ func (h *Handler) CreateAPIKey(c fiber.Ctx) error {
 		MonthlyTokenLimit: apiKey.MonthlyTokenLimit,
 		RequestsPerMinute: apiKey.RequestsPerMinute,
 		RequestsPerDay:    apiKey.RequestsPerDay,
+		DailyCostLimit:    apiKey.DailyCostLimit,
+		MonthlyCostLimit:  apiKey.MonthlyCostLimit,
 		ExpiresAt:         apiKey.ExpiresAt,
 		CreatedBy:         apiKey.CreatedBy,
 		CreatedAt:         apiKey.CreatedAt,
@@ -802,6 +846,10 @@ func (h *Handler) UpdateAPIKey(c fiber.Ctx) error {
 	if req.RequestsPerDay != nil && *req.RequestsPerDay < 0 {
 		return apierror.BadRequest(c, "requests_per_day must be >= 0")
 	}
+	costLimits, sent, err := parseCostLimits(c, req.DailyCostLimit, req.MonthlyCostLimit)
+	if sent {
+		return err
+	}
 	normalizedExpiresAt, err := normalizeExpiresAt(req.ExpiresAt)
 	if err != nil {
 		return apierror.BadRequest(c, err.Error())
@@ -814,7 +862,8 @@ func (h *Handler) UpdateAPIKey(c fiber.Ctx) error {
 	limitChanged := (req.DailyTokenLimit != nil && *req.DailyTokenLimit != existing.DailyTokenLimit) ||
 		(req.MonthlyTokenLimit != nil && *req.MonthlyTokenLimit != existing.MonthlyTokenLimit) ||
 		(req.RequestsPerMinute != nil && *req.RequestsPerMinute != existing.RequestsPerMinute) ||
-		(req.RequestsPerDay != nil && *req.RequestsPerDay != existing.RequestsPerDay)
+		(req.RequestsPerDay != nil && *req.RequestsPerDay != existing.RequestsPerDay) ||
+		costLimits.differsFrom(existing.DailyCostLimit, existing.MonthlyCostLimit)
 	if limitChanged && !canSetKeyLimits(keyInfo, existing) {
 		return apierror.Send(c, fiber.StatusForbidden, "forbidden", "only administrators can set key limits")
 	}
@@ -829,6 +878,14 @@ func (h *Handler) UpdateAPIKey(c fiber.Ctx) error {
 		req.MonthlyTokenLimit = nil
 		req.RequestsPerMinute = nil
 		req.RequestsPerDay = nil
+		costLimits = costLimitChange{}
+	}
+	storedCost := func() (money.Micros, money.Micros, error) {
+		return existing.DailyCostLimit, existing.MonthlyCostLimit, nil
+	}
+	costLimits, sent, err = h.rejectUnlicensedCostLimits(c, costLimits, storedCost, "api key not found")
+	if sent {
+		return err
 	}
 
 	apiKey, err := h.DB.UpdateAPIKey(c.Context(), existing.ID, db.UpdateAPIKeyParams{
@@ -837,6 +894,8 @@ func (h *Handler) UpdateAPIKey(c fiber.Ctx) error {
 		MonthlyTokenLimit: req.MonthlyTokenLimit,
 		RequestsPerMinute: req.RequestsPerMinute,
 		RequestsPerDay:    req.RequestsPerDay,
+		DailyCostLimit:    costLimits.Daily,
+		MonthlyCostLimit:  costLimits.Monthly,
 		ExpiresAt:         req.ExpiresAt,
 	})
 	if err != nil {
@@ -1059,6 +1118,8 @@ func (h *Handler) RotateAPIKey(c fiber.Ctx) error {
 		MonthlyTokenLimit: existing.MonthlyTokenLimit,
 		RequestsPerMinute: existing.RequestsPerMinute,
 		RequestsPerDay:    existing.RequestsPerDay,
+		DailyCostLimit:    existing.DailyCostLimit,
+		MonthlyCostLimit:  existing.MonthlyCostLimit,
 		ExpiresAt:         existing.ExpiresAt,
 		CreatedBy:         rotatedCreatedBy,
 	})

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/money"
 	"github.com/voidmind-io/voidllm/pkg/keygen"
 )
 
@@ -427,5 +428,36 @@ func TestCacheable(t *testing.T) {
 				t.Errorf("Cacheable(%+v) = %v, want %v", tc.rec, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestKeyInfoFromRecord_CarriesCostLimits verifies that the key, org, team and
+// user cost limits of a record are copied into the cached KeyInfo.
+func TestKeyInfoFromRecord_CarriesCostLimits(t *testing.T) {
+	t.Parallel()
+
+	ki, _ := KeyInfoFromRecord(db.KeyRecord{
+		KeyType:              keygen.KeyTypeUser,
+		MembershipRole:       RoleMember,
+		DailyCostLimit:       1,
+		MonthlyCostLimit:     2,
+		OrgDailyCostLimit:    3,
+		OrgMonthlyCostLimit:  4,
+		TeamDailyCostLimit:   5,
+		TeamMonthlyCostLimit: 6,
+		UserDailyCostLimit:   7,
+		UserMonthlyCostLimit: 8,
+	})
+
+	got := []money.Micros{
+		ki.DailyCostLimit, ki.MonthlyCostLimit,
+		ki.OrgDailyCostLimit, ki.OrgMonthlyCostLimit,
+		ki.TeamDailyCostLimit, ki.TeamMonthlyCostLimit,
+		ki.UserDailyCostLimit, ki.UserMonthlyCostLimit,
+	}
+	for i, v := range got {
+		if want := money.Micros(i + 1); v != want {
+			t.Errorf("cost limit #%d = %d, want %d", i, v, want)
+		}
 	}
 }

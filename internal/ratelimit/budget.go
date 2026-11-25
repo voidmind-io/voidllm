@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"time"
+
+	"github.com/voidmind-io/voidllm/internal/money"
 )
 
 // ErrTokenBudgetExceeded is returned by BudgetCounter.Check when a token
@@ -69,7 +70,7 @@ type UsageSeeder interface {
 	// tokens, cost_micros, day_tokens, day_cost_micros), where the day
 	// columns only cover events since dayStart. team_id and user_id are
 	// empty strings when unset; costs are integer micro-units, rounded per
-	// event like CostToMicros does.
+	// event like money.FromCost does.
 	QueryUsageTotals(ctx context.Context, from, until, dayStart time.Time) (RowScanner, error)
 }
 
@@ -97,8 +98,9 @@ const (
 )
 
 // maxBudgetChecks is the largest number of budgets one request can be subject
-// to: daily and monthly tokens on each of the four scopes.
-const maxBudgetChecks = 8
+// to: 4 scopes x daily/monthly x tokens/cost. Cost budgets are enforced in
+// addition to token budgets, so the bound covers both.
+const maxBudgetChecks = 16
 
 // KeyScope returns the counter scope key of an API key.
 func KeyScope(keyID string) string { return scopeKindKey + ":" + keyID }
@@ -246,7 +248,7 @@ func scanUsageSeed(ctx context.Context, seeder UsageSeeder, w budgetWindows, fn 
 		}
 		// A negative token count can only be bad data; it must not lower
 		// the usage of a scope.
-		u := Usage{Tokens: tokens, CostMicros: CostToMicros(cost)}.clamped()
+		u := Usage{Tokens: tokens, CostMicros: int64(money.FromCost(cost))}.clamped()
 		forEachScope(Scopes{KeyID: keyID, UserID: userID, TeamID: teamID, OrgID: orgID}, func(scope string) {
 			fn(scope, u, inDay != 0)
 		})
@@ -255,20 +257,4 @@ func scanUsageSeed(ctx context.Context, seeder UsageSeeder, w budgetWindows, fn 
 		return fmt.Errorf("iterate usage_events: %w", err)
 	}
 	return nil
-}
-
-// CostToMicros converts a cost estimate in major currency units to
-// micro-units, rounded to the nearest micro-unit. Values that are not
-// positive (including NaN) convert to 0; values beyond the int64 range are
-// capped. Live usage and seeded usage both go through it, so a request counts
-// the same before and after a restart.
-func CostToMicros(cost float64) int64 {
-	if !(cost > 0) {
-		return 0
-	}
-	micros := math.Round(cost * 1e6)
-	if micros >= math.MaxInt64 {
-		return math.MaxInt64
-	}
-	return int64(micros)
 }

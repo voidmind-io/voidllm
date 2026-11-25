@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/voidmind-io/voidllm/internal/money"
 )
 
 // apiKeySelectColumns is the ordered column list used in all api_keys SELECT queries.
@@ -15,7 +16,7 @@ import (
 // key_hash is included for cache population; it must never be exposed in API responses.
 const apiKeySelectColumns = "id, key_hash, key_hint, key_type, name, " +
 	"org_id, team_id, user_id, service_account_id, " +
-	"daily_token_limit, monthly_token_limit, requests_per_minute, requests_per_day, " +
+	"daily_token_limit, monthly_token_limit, requests_per_minute, requests_per_day, daily_cost_limit, monthly_cost_limit, " +
 	"expires_at, last_used_at, created_by, created_at, updated_at, deleted_at"
 
 // APIKey represents an API key record in the database.
@@ -34,6 +35,8 @@ type APIKey struct {
 	MonthlyTokenLimit int64
 	RequestsPerMinute int
 	RequestsPerDay    int
+	DailyCostLimit    money.Micros
+	MonthlyCostLimit  money.Micros
 	ExpiresAt         *string
 	LastUsedAt        *string
 	CreatedBy         string
@@ -57,6 +60,8 @@ type CreateAPIKeyParams struct {
 	MonthlyTokenLimit int64
 	RequestsPerMinute int
 	RequestsPerDay    int
+	DailyCostLimit    money.Micros
+	MonthlyCostLimit  money.Micros
 	ExpiresAt         *string
 	CreatedBy         string
 }
@@ -69,6 +74,8 @@ type UpdateAPIKeyParams struct {
 	MonthlyTokenLimit *int64
 	RequestsPerMinute *int
 	RequestsPerDay    *int
+	DailyCostLimit    *money.Micros
+	MonthlyCostLimit  *money.Micros
 	ExpiresAt         *string
 }
 
@@ -83,13 +90,13 @@ func (d *DB) CreateAPIKey(ctx context.Context, params CreateAPIKeyParams) (*APIK
 	insertQuery := "INSERT INTO api_keys " +
 		"(id, key_hash, key_hint, key_type, name, " +
 		"org_id, team_id, user_id, service_account_id, " +
-		"daily_token_limit, monthly_token_limit, requests_per_minute, requests_per_day, " +
+		"daily_token_limit, monthly_token_limit, requests_per_minute, requests_per_day, daily_cost_limit, monthly_cost_limit, " +
 		"expires_at, created_by, created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " +
 		p(6) + ", " + p(7) + ", " + p(8) + ", " + p(9) + ", " +
 		p(10) + ", " + p(11) + ", " + p(12) + ", " + p(13) + ", " +
-		p(14) + ", " + p(15) + ", " +
+		p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	selectQuery := "SELECT " + apiKeySelectColumns +
@@ -111,6 +118,8 @@ func (d *DB) CreateAPIKey(ctx context.Context, params CreateAPIKeyParams) (*APIK
 			params.MonthlyTokenLimit,
 			params.RequestsPerMinute,
 			params.RequestsPerDay,
+			params.DailyCostLimit,
+			params.MonthlyCostLimit,
 			params.ExpiresAt,
 			params.CreatedBy,
 		)
@@ -173,6 +182,7 @@ func (d *DB) ListAPIKeys(ctx context.Context, orgID, userID, teamID, cursor stri
 			&k.OrgID, &k.TeamID, &k.UserID, &k.ServiceAccountID,
 			&k.DailyTokenLimit, &k.MonthlyTokenLimit,
 			&k.RequestsPerMinute, &k.RequestsPerDay,
+			&k.DailyCostLimit, &k.MonthlyCostLimit,
 			&k.ExpiresAt, &k.LastUsedAt,
 			&k.CreatedBy, &k.CreatedAt, &k.UpdatedAt, &k.DeletedAt,
 		); err != nil {
@@ -220,6 +230,16 @@ func (d *DB) UpdateAPIKey(ctx context.Context, id string, params UpdateAPIKeyPar
 	if params.RequestsPerDay != nil {
 		setClauses = append(setClauses, "requests_per_day = "+p(argN))
 		args = append(args, *params.RequestsPerDay)
+		argN++
+	}
+	if params.DailyCostLimit != nil {
+		setClauses = append(setClauses, "daily_cost_limit = "+p(argN))
+		args = append(args, int64(*params.DailyCostLimit))
+		argN++
+	}
+	if params.MonthlyCostLimit != nil {
+		setClauses = append(setClauses, "monthly_cost_limit = "+p(argN))
+		args = append(args, int64(*params.MonthlyCostLimit))
 		argN++
 	}
 	if params.ExpiresAt != nil {
@@ -444,13 +464,13 @@ func (d *DB) RotateKeyTx(ctx context.Context, oldID string, oldExpiresAt string,
 	insertQuery := "INSERT INTO api_keys " +
 		"(id, key_hash, key_hint, key_type, name, " +
 		"org_id, team_id, user_id, service_account_id, " +
-		"daily_token_limit, monthly_token_limit, requests_per_minute, requests_per_day, " +
+		"daily_token_limit, monthly_token_limit, requests_per_minute, requests_per_day, daily_cost_limit, monthly_cost_limit, " +
 		"expires_at, created_by, created_at, updated_at) " +
 		"VALUES (" +
 		p(1) + ", " + p(2) + ", " + p(3) + ", " + p(4) + ", " + p(5) + ", " +
 		p(6) + ", " + p(7) + ", " + p(8) + ", " + p(9) + ", " +
 		p(10) + ", " + p(11) + ", " + p(12) + ", " + p(13) + ", " +
-		p(14) + ", " + p(15) + ", " +
+		p(14) + ", " + p(15) + ", " + p(16) + ", " + p(17) + ", " +
 		"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
 
 	updateQuery := "UPDATE api_keys SET expires_at = " + p(1) + ", updated_at = CURRENT_TIMESTAMP" +
@@ -475,6 +495,8 @@ func (d *DB) RotateKeyTx(ctx context.Context, oldID string, oldExpiresAt string,
 			newParams.MonthlyTokenLimit,
 			newParams.RequestsPerMinute,
 			newParams.RequestsPerDay,
+			newParams.DailyCostLimit,
+			newParams.MonthlyCostLimit,
 			newParams.ExpiresAt,
 			newParams.CreatedBy,
 		)
@@ -646,6 +668,7 @@ func scanAPIKey(row *sql.Row) (*APIKey, error) {
 		&k.OrgID, &k.TeamID, &k.UserID, &k.ServiceAccountID,
 		&k.DailyTokenLimit, &k.MonthlyTokenLimit,
 		&k.RequestsPerMinute, &k.RequestsPerDay,
+		&k.DailyCostLimit, &k.MonthlyCostLimit,
 		&k.ExpiresAt, &k.LastUsedAt,
 		&k.CreatedBy, &k.CreatedAt, &k.UpdatedAt, &k.DeletedAt,
 	)

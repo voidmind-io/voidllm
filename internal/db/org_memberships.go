@@ -7,12 +7,14 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/voidmind-io/voidllm/internal/money"
 )
 
 // orgMembershipSelectColumns is the ordered column list used in all org_memberships
 // SELECT queries. It must match the scan order in scanOrgMembership.
 const orgMembershipSelectColumns = "id, org_id, user_id, role, created_at, " +
-	"daily_token_limit, monthly_token_limit, requests_per_minute, requests_per_day"
+	"daily_token_limit, monthly_token_limit, requests_per_minute, requests_per_day, " +
+	"daily_cost_limit, monthly_cost_limit"
 
 // OrgMembership represents a single org_memberships record in the database.
 // The four limit fields cap a single user's aggregate usage within this org,
@@ -37,6 +39,12 @@ type OrgMembership struct {
 	// RequestsPerDay is the maximum number of requests this user may make per
 	// day across all their keys in this org. Zero means unlimited.
 	RequestsPerDay int
+	// DailyCostLimit is the maximum cost this user may incur per day (UTC)
+	// across all their keys in this org. Zero means unlimited.
+	DailyCostLimit money.Micros
+	// MonthlyCostLimit is the maximum cost this user may incur per calendar
+	// month (UTC) across all their keys in this org. Zero means unlimited.
+	MonthlyCostLimit money.Micros
 }
 
 // CreateOrgMembershipParams holds the input for creating an org membership.
@@ -55,6 +63,8 @@ type UpdateOrgMembershipParams struct {
 	MonthlyTokenLimit *int64
 	RequestsPerMinute *int
 	RequestsPerDay    *int
+	DailyCostLimit    *money.Micros
+	MonthlyCostLimit  *money.Micros
 }
 
 // CreateOrgMembership inserts a new org membership and returns the persisted record.
@@ -135,6 +145,7 @@ func (d *DB) ListOrgMemberships(ctx context.Context, orgID string, cursor string
 		if err := rows.Scan(
 			&m.ID, &m.OrgID, &m.UserID, &m.Role, &m.CreatedAt,
 			&m.DailyTokenLimit, &m.MonthlyTokenLimit, &m.RequestsPerMinute, &m.RequestsPerDay,
+			&m.DailyCostLimit, &m.MonthlyCostLimit,
 		); err != nil {
 			return nil, fmt.Errorf("ListOrgMemberships scan: %w", err)
 		}
@@ -153,7 +164,8 @@ func (d *DB) ListOrgMemberships(ctx context.Context, orgID string, cursor string
 // It returns ErrNotFound if the record does not exist.
 func (d *DB) UpdateOrgMembership(ctx context.Context, id string, params UpdateOrgMembershipParams) (*OrgMembership, error) {
 	if params.Role == nil && params.DailyTokenLimit == nil && params.MonthlyTokenLimit == nil &&
-		params.RequestsPerMinute == nil && params.RequestsPerDay == nil {
+		params.RequestsPerMinute == nil && params.RequestsPerDay == nil &&
+		params.DailyCostLimit == nil && params.MonthlyCostLimit == nil {
 		return d.GetOrgMembership(ctx, id)
 	}
 
@@ -185,6 +197,16 @@ func (d *DB) UpdateOrgMembership(ctx context.Context, id string, params UpdateOr
 	if params.RequestsPerDay != nil {
 		setClauses = append(setClauses, "requests_per_day = "+p(argN))
 		args = append(args, *params.RequestsPerDay)
+		argN++
+	}
+	if params.DailyCostLimit != nil {
+		setClauses = append(setClauses, "daily_cost_limit = "+p(argN))
+		args = append(args, int64(*params.DailyCostLimit))
+		argN++
+	}
+	if params.MonthlyCostLimit != nil {
+		setClauses = append(setClauses, "monthly_cost_limit = "+p(argN))
+		args = append(args, int64(*params.MonthlyCostLimit))
 		argN++
 	}
 
@@ -249,6 +271,7 @@ func scanOrgMembership(row *sql.Row) (*OrgMembership, error) {
 	err := row.Scan(
 		&m.ID, &m.OrgID, &m.UserID, &m.Role, &m.CreatedAt,
 		&m.DailyTokenLimit, &m.MonthlyTokenLimit, &m.RequestsPerMinute, &m.RequestsPerDay,
+		&m.DailyCostLimit, &m.MonthlyCostLimit,
 	)
 	if err != nil {
 		return nil, err

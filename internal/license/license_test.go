@@ -181,3 +181,17 @@ func TestDevLicense_FeaturesContainsAllConstants(t *testing.T) {
 		}
 	}
 }
+
+func TestCostBudgetsEnabled(t *testing.T) {
+	t.Parallel()
+
+	if license.CostBudgetsEnabled(nil) {
+		t.Error("license.CostBudgetsEnabled(nil) = true, want false")
+	}
+	if license.CostBudgetsEnabled(license.Verify("", false)) {
+		t.Error("license.CostBudgetsEnabled(community) = true, want false")
+	}
+	if !license.CostBudgetsEnabled(license.Verify("", true)) {
+		t.Error("license.CostBudgetsEnabled(dev) = false, want true")
+	}
+}

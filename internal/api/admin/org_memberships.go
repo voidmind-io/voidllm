@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"encoding/json"
 	"errors"
 	"log/slog"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/voidmind-io/voidllm/internal/apierror"
 	"github.com/voidmind-io/voidllm/internal/auth"
 	"github.com/voidmind-io/voidllm/internal/db"
+	"github.com/voidmind-io/voidllm/internal/money"
 	voidredis "github.com/voidmind-io/voidllm/internal/redis"
 )
 
@@ -33,6 +35,14 @@ type updateOrgMembershipRequest struct {
 	MonthlyTokenLimit *int64  `json:"monthly_token_limit"`
 	RequestsPerMinute *int    `json:"requests_per_minute"`
 	RequestsPerDay    *int    `json:"requests_per_day"`
+	// DailyCostLimit is the user's daily cost budget in this org in major
+	// currency units as a decimal string, for example "25.00". Omitted or null
+	// leaves it unchanged, "0" means unlimited. Requires a license with cost budgets.
+	DailyCostLimit json.RawMessage `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
+	// MonthlyCostLimit is the user's monthly cost budget in this org in major
+	// currency units as a decimal string, for example "500.00". Omitted or null
+	// leaves it unchanged, "0" means unlimited. Requires a license with cost budgets.
+	MonthlyCostLimit json.RawMessage `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
 }
 
 // orgMembershipResponse is the JSON representation of an org membership returned by the API.
@@ -46,6 +56,12 @@ type orgMembershipResponse struct {
 	MonthlyTokenLimit int64  `json:"monthly_token_limit"`
 	RequestsPerMinute int    `json:"requests_per_minute"`
 	RequestsPerDay    int    `json:"requests_per_day"`
+	// DailyCostLimit is the daily cost budget as a decimal string in major
+	// currency units. "0.00" means unlimited.
+	DailyCostLimit money.Micros `json:"daily_cost_limit" swaggertype:"string" example:"25.00"`
+	// MonthlyCostLimit is the monthly cost budget as a decimal string in major
+	// currency units. "0.00" means unlimited.
+	MonthlyCostLimit money.Micros `json:"monthly_cost_limit" swaggertype:"string" example:"500.00"`
 }
 
 // paginatedOrgMembershipsResponse wraps a page of org memberships with pagination metadata.
@@ -78,6 +94,8 @@ func orgMembershipToResponse(m *db.OrgMembership) orgMembershipResponse {
 		MonthlyTokenLimit: m.MonthlyTokenLimit,
 		RequestsPerMinute: m.RequestsPerMinute,
 		RequestsPerDay:    m.RequestsPerDay,
+		DailyCostLimit:    m.DailyCostLimit,
+		MonthlyCostLimit:  m.MonthlyCostLimit,
 	}
 }
 
@@ -309,6 +327,17 @@ func (h *Handler) UpdateOrgMembership(c fiber.Ctx) error {
 	if req.RequestsPerDay != nil && *req.RequestsPerDay < 0 {
 		return apierror.BadRequest(c, "requests_per_day must be >= 0")
 	}
+	costLimits, sent, err := parseCostLimits(c, req.DailyCostLimit, req.MonthlyCostLimit)
+	if sent {
+		return err
+	}
+	storedCost := func() (money.Micros, money.Micros, error) {
+		return existing.DailyCostLimit, existing.MonthlyCostLimit, nil
+	}
+	costLimits, sent, err = h.rejectUnlicensedCostLimits(c, costLimits, storedCost, "org membership not found")
+	if sent {
+		return err
+	}
 
 	m, err := h.DB.UpdateOrgMembership(c.Context(), membershipID, db.UpdateOrgMembershipParams{
 		Role:              req.Role,
@@ -316,6 +345,8 @@ func (h *Handler) UpdateOrgMembership(c fiber.Ctx) error {
 		MonthlyTokenLimit: req.MonthlyTokenLimit,
 		RequestsPerMinute: req.RequestsPerMinute,
 		RequestsPerDay:    req.RequestsPerDay,
+		DailyCostLimit:    costLimits.Daily,
+		MonthlyCostLimit:  costLimits.Monthly,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {

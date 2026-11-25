@@ -17,6 +17,9 @@ import (
 // characters and hyphens, starting with an alphanumeric character.
 var mcpAliasRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
+// currencyRe matches an ISO 4217 style currency code: three uppercase letters.
+var currencyRe = regexp.MustCompile(`^[A-Z]{3}$`)
+
 // reservedTombstoneMarker mirrors db.tombstoneMarker (internal/db/tombstone.go).
 // It cannot be imported directly — internal/db imports internal/config, so the
 // reverse import would create a cycle. Model and deployment names configured
@@ -417,6 +420,11 @@ func (c *Config) validate() error {
 	// --- settings.soft_limit_threshold ---
 	if t := c.Settings.GetSoftLimitThreshold(); t < 0.0 || t > 1.0 {
 		errs = append(errs, fmt.Errorf("settings.soft_limit_threshold: must be between 0.0 and 1.0, got %g", t))
+	}
+
+	// --- settings.currency ---
+	if !currencyRe.MatchString(c.Settings.Currency) {
+		errs = append(errs, fmt.Errorf("settings.currency: must be a three-letter uppercase ISO 4217 code such as USD or EUR, got %q", c.Settings.Currency))
 	}
 
 	// --- settings.fallback_max_depth ---
